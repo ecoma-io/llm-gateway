@@ -74,10 +74,11 @@ jobs:
           # a job with no `permissions:`.
           - language: actions
             build-mode: none
-          # The API's Go sources. `none` extracts without building — the module
-          # is stdlib-only and needs no compile database to be read.
-          - language: go
-            build-mode: none
+          # No `go` leg: CodeQL's Go extractor has no `none` build mode — it
+          # builds the module to extract it, and the repo-root matrix entry
+          # would have to carry a build step for a module that lives in
+          # `apps/api`. The API's Go analysis is carried elsewhere instead:
+          # golangci-lint in `ci.yml`, Semgrep `p/golang` below.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
