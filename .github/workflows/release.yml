@@ -1,0 +1,70 @@
+name: Release
+
+# release-please watches `main` and keeps one pull request open holding the next
+# version and the changelog it derived from the conventional commits since the
+# last tag. That pull request *is* the release proposal: merging it is what
+# tags, and the tag is the release. Nothing publishes at scaffold stage — no
+# registry, no artifact — because there is nothing to publish yet; the structure
+# below is the whole lane the future publish jobs grow into.
+#
+# The repository is one release unit: the root `package.json` is the version
+# source, the tag is `v<version>`, the changelog is the root `CHANGELOG.md`.
+# The Go binary's version is injectable from that tag (the `version` variable
+# in `apps/api/cmd/gateway/main.go`, `-ldflags "-X main.version=<tag>"`); no
+# step consumes it yet, and this comment is the pointer for the lane that will.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    # Hoisted so the App-token step below has something its `if:` is allowed to
+    # read — GitHub's runtime does not allow a `secrets` context directly in a
+    # step `if:`, but an `env:` hoisted from a secret is allowed. Only the id is
+    # lifted: the private key is passed straight into the action's `with:`,
+    # where the `secrets` context IS available, so it never becomes an
+    # environment variable any later step in this job could read.
+    env:
+      RELEASE_APP_ID: ${{ secrets.ECOMA_APP_ID }}
+    steps:
+      # The escape hatch. GitHub documents that events raised with
+      # `GITHUB_TOKEN` do not start new workflow runs, which leaves a release
+      # pull request with no `ci-gate` and no `analysis-gate`: the two checks
+      # required to merge it. Those runs arrive as `action_required` — created,
+      # never started — so the pull request sits blocked with nothing red to
+      # open, and every release needs a hand.
+      #
+      # So the token is minted: an App token is an ordinary actor, and its pull
+      # request triggers CI the way a contributor's does. The organisation's
+      # `ecoma-io` App is installed on every repository in the org, and the
+      # credentials are organisation SECRETS (`ECOMA_APP_ID`, `ECOMA_APP_KEY`)
+      # shared with every repository — if either is ever absent here, the `if:`
+      # skips the mint and the fallback below is the workflow token, with the
+      # manual re-run it implies. A missing App is a named limitation, not a
+      # silent one.
+      - name: Mint a GitHub App token
+        id: app-token
+        if: env.RELEASE_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.ECOMA_APP_ID }}
+          private-key: ${{ secrets.ECOMA_APP_KEY }}
+
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

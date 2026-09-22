@@ -1,0 +1,62 @@
+# The Go API service of the Ecoma LLM Gateway.
+#
+# The repository's release unit is the root, so this module's version is not
+# written anywhere in it: a Go module carries no version field, and the
+# repository-level `v<version>` tag release-please mints is what a build
+# stamps through `-ldflags` into `cmd/gateway`'s version variable.
+id: api
+language: go
+tasks:
+  # `script` rather than `command`, because this task is two checks and a Moon
+  # `command` is one.
+  #
+  # The static half is `golangci-lint run` (.golangci.yml argues the roster:
+  # errcheck, govet, ineffassign, staticcheck, unused — the v2 defaults, and
+  # the whole mandate for a stdlib-only service). `go vet` is NOT run beside
+  # it: golangci-lint's default roster already runs govet, and the same
+  # analyzer twice is one verdict paying two CI bills.
+  #
+  # The `if` is not decoration. `gofmt -l` PRINTS the files it would reformat
+  # and exits 0 either way, so `script: gofmt -l . && golangci-lint run ./...`
+  # would report a green lint over a package whose every file was misformatted
+  # — an exit code that means nothing. Emptiness of its output is the only
+  # signal it gives, so emptiness is what this reads.
+  lint:
+    script: |
+      if [ -n "$(gofmt -l .)" ]; then
+        echo "gofmt would reformat these files; run gofmt -w ."
+        gofmt -l .
+        exit 1
+      fi
+      golangci-lint run ./...
+  # `script` rather than `command`, because a bare `go test ./...` exits 0 over
+  # a tree that ran nothing. Both shapes are exit 0: a package with no
+  # `_test.go` prints `?  pkg [no test files]`, and a package whose test file
+  # declares no `Test…` function prints `ok pkg [no tests to run]` — which
+  # makes a target that ran nothing byte-for-byte identical to one that ran
+  # everything. `-v` is what makes the count visible: it prints one `=== RUN`
+  # line per test, cached replays included, and neither zero-test shape above
+  # prints a single one. The output is captured rather than streamed so it can
+  # be both printed and counted; `|| status=$?` keeps a failing run's output
+  # on screen instead of aborting before the `printf`.
+  test:
+    script: |
+      status=0
+      output="$(go test -v ./... 2>&1)" || status=$?
+      printf '%s\n' "$output"
+      [ "$status" -eq 0 ] || exit "$status"
+      if ! printf '%s\n' "$output" | grep -q '^=== RUN'; then
+        echo "go test ./... executed no tests — a green target here would mean nothing ran"
+        exit 1
+      fi
+  # The Go half of what `vue-tsc --noEmit` is for the web project. `go build`
+  # over more than one package compiles and discards, writing no binary — a
+  # typecheck target that dropped an executable into the package root would be
+  # an untracked file in every contributor's tree.
+  typecheck:
+    command: go build ./...
+  # The deliverable itself: one statically-linked binary into `bin/`, which is
+  # gitignored. Distinct from `typecheck` on purpose — proving `cmd/gateway`
+  # links into an executable is a claim `go build ./...` never makes.
+  build:
+    command: go build -o bin/gateway ./cmd/gateway

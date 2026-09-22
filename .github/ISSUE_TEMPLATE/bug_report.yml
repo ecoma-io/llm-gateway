@@ -1,0 +1,87 @@
+name: Bug report
+description: The gateway or the console behaves differently from what it documents.
+title: "bug: "
+labels: ["needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file this.
+
+        **Do not report a security vulnerability through this form** — use a
+        private security advisory instead (the link is on the repository's
+        Security tab).
+
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched the existing issues and this is not a duplicate.
+          required: true
+        - label: I reproduced this on the latest `main`.
+          required: false
+
+  - type: textarea
+    id: what-happens
+    attributes:
+      label: What happens
+      description: The behaviour you observed, without interpretation. Paste the actual output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-should-happen
+    attributes:
+      label: What should happen instead
+      description: And where that expectation comes from — a document, the OpenAPI contract, the console.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: A minimal request or sequence is best. A report nobody can reproduce cannot be fixed.
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where does this happen?
+      options:
+        - Gateway API — an endpoint behaves wrong
+        - Console (web)
+        - OpenAPI contract — the document disagrees with the implementation
+        - Tooling, CI, or repository workflow
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Read these from commands rather than memory.
+      value: |
+        - Gateway version (or commit):
+        - Node (`node --version`):
+        - pnpm (`pnpm --version`):
+        - Go (`go version`):
+        - OS:
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Terminal output, the relevant request or config. Paste text as text rather than as an image where you can.
+    validations:
+      required: false

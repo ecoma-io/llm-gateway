@@ -1,0 +1,66 @@
+name: Feature request
+description: Propose a capability for the gateway or the console.
+title: "feat: "
+labels: ["needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The repository is a scaffold: the product domains (providers, routing,
+        keys, usage) are deliberately not designed yet. A proposal that designs
+        one of them is welcome — the more it names the problem rather than the
+        solution, the more of it survives the design.
+
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched the existing issues and this is not a duplicate.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the traffic you want to route or govern, not the solution you have in mind. What do you do instead today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you are proposing
+      description: A rough sketch is fine — the endpoint shape, the OpenAPI change, what the console would show.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of addition is this?
+      options:
+        - A gateway API capability
+        - A console (web) capability
+        - An OpenAPI contract change
+        - Tooling or repository workflow
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including doing nothing, and any workaround you already have.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I am willing to open a pull request for this.
+          required: false

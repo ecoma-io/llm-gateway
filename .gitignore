@@ -1,0 +1,39 @@
+node_modules/
+dist/
+coverage/
+
+# Moon's local cache — keyed on a machine's own inputs, and a stale entry
+# replaying as green is the one failure mode a cache must not have.
+.moon/cache/
+
+# The Go build target's output (apps/api/bin/gateway).
+bin/
+
+# Editors / OS
+.DS_Store
+*.local
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Claude Code local overrides — the shared settings.json IS tracked, if one
+# lands here.
+.claude/settings.local.json
+# Claude Code plan files
+.claude/plans/
+# Claude Code worktrees — full clones of this repository, one per worktree.
+# Prettier and ESLint would otherwise scan every clone.
+.claude/worktrees/
+# Claude Code session scratch — same reasoning as the entries above: an
+# untracked residue dir is exactly the shape of accidental `git add -A`.
+.claude/tmp/
+
+# A directory literally named `~` — the residue of a path whose leading `~`
+# did not expand before `git add` ran. Ignored so a recurrence is invisible to
+# `git add -A` instead of riding it into a commit.
+~/

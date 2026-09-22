@@ -1,0 +1,15 @@
+# Moonrepo workspace configuration for the llm-gateway repository.
+#
+# Projects are discovered by glob rather than listed: any directory under
+# `apps/` carrying a `moon.yml` is a project the moment it exists, which is why
+# `../scripts/check-projects.mjs` asserts every `apps/*` directory declares one
+# — the failure it exists to catch is a directory Moon cannot see, and a glob
+# turns every other shape of arrival into a project automatically.
+projects:
+  - "apps/*"
+vcs:
+  provider: other
+  # The repository uses `main`, not the traditional `master`. Without this
+  # Moon defaults to `master` and fails on push events to `main` with
+  # "fatal: ambiguous argument 'master'".
+  defaultBranch: main

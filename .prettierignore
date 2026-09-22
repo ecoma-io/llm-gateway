@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+bin/
+.moon/
+pnpm-lock.yaml
+
+# Verbatim third-party legal text — reflowing it would alter a document that is
+# only valid unmodified.
+LICENSE
+
+# release-please owns every byte of the changelog, and its layout is not
+# Prettier's: it writes `*` list markers where Prettier wants `-`, and omits the
+# blank line after a heading that Prettier inserts. Neither tool yields — so
+# without this line the release pull request fails `format:check` on the one
+# file in the repository no human wrote.
+CHANGELOG.md

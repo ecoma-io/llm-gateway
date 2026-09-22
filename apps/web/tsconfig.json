@@ -1,0 +1,15 @@
+// One program, deliberately not the create-vue split into app/node configs:
+// this is one small app, and a single program is one thing to keep green. It
+// covers the app sources, the tests beside them, and vite.config.ts — the
+// `node` type is what that last one needs.
+{
+  "extends": "@vue/tsconfig/tsconfig.dom.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["vite/client", "node"],
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.vue", "vite.config.ts"]
+}

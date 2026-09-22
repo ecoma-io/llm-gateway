@@ -1,0 +1,60 @@
+{
+  "name": "llm-gateway",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Ecoma LLM Gateway — a Vue 3 console and a Go API for routing and governing LLM traffic. Repository scaffold; the product domains are not built yet.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ecoma-io/llm-gateway.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ecoma-io/llm-gateway/issues"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Mai Ngọc Hóa (John Martin)",
+    "email": "john.itvn@gmail.com"
+  },
+  "type": "module",
+  "packageManager": "pnpm@12.5.0",
+  "engines": {
+    "node": ">=24",
+    "pnpm": ">=11"
+  },
+  "scripts": {
+    "prepare": "lefthook install",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "pnpm exec moon run ...:lint",
+    "test": "pnpm exec moon run ...:test",
+    "typecheck": "pnpm exec moon run ...:typecheck",
+    "build": "pnpm exec moon run ...:build",
+    "check-projects": "node scripts/check-projects.mjs",
+    "dev:web": "pnpm --filter @ecoma-io/llm-gateway-web dev",
+    "dev:api": "cd apps/api && go run ./cmd/gateway"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.2.3",
+    "@commitlint/config-conventional": "^21.2.3",
+    "@eslint/js": "^10.0.1",
+    "@moonrepo/cli": "^2.5.5",
+    "@types/node": "^26.2.0",
+    "@vitejs/plugin-vue": "^6.0.9",
+    "@vue/test-utils": "^2.5.1",
+    "@vue/tsconfig": "^0.9.1",
+    "eslint": "^10.11.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-vue": "^10.11.0",
+    "globals": "^17.11.0",
+    "jsdom": "^30.1.0",
+    "lefthook": "^2.1.14",
+    "prettier": "^3.9.8",
+    "release-please": "17.6.0",
+    "typescript": "^6.0.0",
+    "typescript-eslint": "^8.70.1",
+    "vite": "^8.3.0",
+    "vitest": "^5.0.1",
+    "vue-eslint-parser": "^10.4.1",
+    "vue-tsc": "^3.3.11"
+  }
+}

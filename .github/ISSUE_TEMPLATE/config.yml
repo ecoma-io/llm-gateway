@@ -1,0 +1,10 @@
+# A blank issue skips every question the forms ask, and the answers to those
+# questions are what make a report actionable.
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/ecoma-io/llm-gateway/security/advisories/new
+    about: Never open a public issue for a vulnerability — use a private security advisory.
+  - name: The Ecoma platform
+    url: https://github.com/ecoma-io/ecoma
+    about: This repository holds the LLM Gateway. Anything about the Ecoma labor OS itself belongs there.

@@ -1,0 +1,177 @@
+name: CI
+
+on:
+  # Deliberately NOT filtered to `branches: [main]`. A filter there skips CI
+  # entirely on a stacked pull request — one targeting another feature branch —
+  # so the branch merges having never been checked, and the failure only appears
+  # later against someone else's change.
+  pull_request:
+  # The merge queue re-runs these checks against `main + every pull request
+  # ahead in the queue + this one`, which is the only place a semantic conflict
+  # between two independently-green pull requests can surface. GitHub reports
+  # the result against the required check name below, so `ci-gate` must exist on
+  # this event or the queue waits forever.
+  merge_group:
+  push:
+    # `main` is the one development line: its merged tree runs the full suite
+    # on every push, so a red push names its commit instead of surfacing in a
+    # release lane later.
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # A merge-queue run must never be cancelled: the queue is blocked on exactly
+  # this run, and cancelling it ejects the batch. `github.ref` is already unique
+  # per queued batch, and `cancel-in-progress` is true only for pull requests.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify-web:
+    name: Verify (web)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Moon's VCS layer wants the base branch ref; a shallow clone lacks
+          # it, and the jobs here run Moon. Full history is Moon's own
+          # recommended CI setup.
+          fetch-depth: 0
+
+      # Reads the pnpm version from `packageManager` in package.json, so the
+      # runner uses the same pnpm a contributor's Corepack fetches.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Every pull request lands as a squash, and the squash commit's subject is
+      # the pull request title — so the title is the one commit message that
+      # never reaches the `commit-msg` hook: no commit carrying that text exists
+      # until GitHub writes it at merge time. Same commitlint configuration as
+      # the hook, so a valid message has one definition rather than two.
+      #
+      # The title arrives through the environment, never through `${{ }}`
+      # interpolation into the script: interpolation pastes it into the shell
+      # source, where a title containing `$(...)` or a backtick would run.
+      - name: Check the pull request title
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: printf '%s\n' "$PR_TITLE" | pnpm exec commitlint
+
+      # Skipped in the merge queue, and it is the only check that is. Prettier's
+      # verdict is a pure function of each file's own bytes: merging other pull
+      # requests into this one cannot unformat a file that was formatted, so
+      # re-running it would re-prove what the pull-request run already proved.
+      # Everything below can change under a merge, which is the entire reason
+      # the queue exists.
+      - name: Check formatting
+        if: github.event_name != 'merge_group'
+        run: pnpm format:check
+
+      # Asserts every directory under `apps/` is a project Moon can see with
+      # the four targets. Runs BEFORE the Moon step, so an unreachable project
+      # fails as an error rather than passing as an absence.
+      - run: pnpm check-projects
+
+      # The console's four targets, always in full — this repository has two
+      # projects and the suite is small, so affected selection would buy
+      # nothing today. When the tree grows to where it matters, the switch is
+      # `moon ci --base=<base>` exactly as archkeep runs it, and this comment
+      # is the pointer.
+      - name: Lint, test, typecheck and build the console
+        run: pnpm exec moon run web:lint web:test web:typecheck web:build
+
+  verify-api:
+    name: Verify (api)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # The Go module's floor is owned by the module that requires it:
+      # `go-version-file` reads `apps/api/go.mod`.
+      - name: Pin the Go toolchain the api targets run
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: apps/api/go.mod
+          cache: false
+
+      # golangci-lint is downloaded and checksum-pinned rather than taken from
+      # the runner image (whose copy moves underneath every job) and rather
+      # than an installer action (a second moving piece when the release
+      # tarball's digest is already the pin). The digest was read off the
+      # v2.12.2 release artifact itself. The `lint` target in
+      # `apps/api/moon.yml` argues the linter roster and why `go vet` is not
+      # run beside it.
+      #
+      # The download itself retries bounded — `--retry 3 --retry-all-errors
+      # --retry-delay 10` — because a transient 5xx from the release endpoint
+      # must not fail the pipeline on an unchanged tree. The checksum line
+      # below stays OUTSIDE the retry on purpose: it fails loudly on a wrong
+      # or partial download, and a retry must never paper over bytes that do
+      # not match the pin.
+      #
+      # /usr/local/bin, not $GITHUB_PATH: Moon composes a task's PATH from its
+      # toolchain dirs and drops the runner's per-step PATH additions. A system
+      # location is on every PATH a task can build.
+      - name: Install the pinned golangci-lint the api lint target runs
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/golangci-lint"
+          mkdir -p "$dir"
+          curl --silent --show-error --fail --location \
+            --retry 3 --retry-all-errors --retry-delay 10 \
+            --output "$dir/golangci-lint.tar.gz" \
+            "https://github.com/golangci/golangci-lint/releases/download/v2.12.2/golangci-lint-2.12.2-linux-amd64.tar.gz"
+          echo "8df580d2670fed8fa984aac0507099af8df275e665215f5c7a2ae3943893a553  $dir/golangci-lint.tar.gz" | sha256sum --check --strict
+          tar -xzf "$dir/golangci-lint.tar.gz" -C "$dir"
+          sudo mv "$dir/golangci-lint-2.12.2-linux-amd64/golangci-lint" /usr/local/bin/golangci-lint
+
+      # The API's four targets — gofmt/vet via golangci-lint, go test, the
+      # compile pass, and the binary. Same always-in-full reasoning as the
+      # web step above.
+      - name: Lint, test, typecheck and build the api
+        run: pnpm exec moon run api:lint api:test api:typecheck api:build
+
+  ci-gate:
+    name: ci-gate
+    # The single check name a branch ruleset requires, on pull requests and in
+    # the merge queue alike. It exists so the required-check name is stable
+    # while the job list is not: add a job to `needs` and the gate tightens
+    # without anyone editing repository settings — and forgetting to add it is
+    # the only way to widen what green means, which is visible in this file.
+    needs: [verify-web, verify-api]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      # `needs` alone would let a skipped or cancelled job pass as green, since
+      # only `failure` blocks a dependent job by default.
+      - name: Fail unless every job succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1

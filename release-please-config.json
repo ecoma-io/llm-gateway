@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "$comment": "What a release means here, and what it deliberately leaves alone.\n\nThe releasable unit is the repository: one version, everywhere. The root `package.json` is the version source — release-please bumps it, writes the root `CHANGELOG.md`, and tags `v<version>`. Nothing publishes at scaffold stage: the tag is the release, and the Go binary's version is injectable from it later via the `version` variable in `apps/api/cmd/gateway/main.go` (`-ldflags \"-X main.version=<tag>\"`) — the structure exists, no pipeline step consumes it yet.\n\n`pull-request-title-pattern` overrides the default this repository would reject: release-please titles a release pull request `chore${scope}: release ${version}` where `${scope}` is the target branch — `chore(main): release 0.1.0`. CI runs commitlint on every pull request title, and `main` is not a valid scope in `commitlint.config.mjs`, so the release pull request would fail its own required check and could never merge. `workspace` is the scope that names a change owning no app, which is what a release is.\n\nNo `extra-files`: there is no second version-bearing manifest in the tree. The root `package.json` is the only one — `apps/web/package.json` stays at 0.0.0 (it is never released as a package) and the Go module carries no version field at all (its version is the tag). When a real version-bearing artifact appears, it joins `extra-files` here rather than growing a second release unit.",
+  "packages": {
+    ".": {
+      "release-type": "node",
+      "initial-version": "0.1.0",
+      "include-component-in-tag": false,
+      "pull-request-title-pattern": "chore(workspace): release ${version}",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": false,
+      "changelog-sections": [
+        { "type": "feat", "section": "Features" },
+        { "type": "fix", "section": "Bug Fixes" },
+        { "type": "docs", "section": "Documentation" },
+        { "type": "refactor", "section": "Internal", "hidden": true },
+        { "type": "perf", "section": "Internal", "hidden": true },
+        { "type": "test", "section": "Internal", "hidden": true },
+        { "type": "build", "section": "Internal", "hidden": true },
+        { "type": "ci", "section": "Internal", "hidden": true },
+        { "type": "chore", "section": "Internal", "hidden": true },
+        { "type": "style", "section": "Internal", "hidden": true }
+      ]
+    }
+  }
+}

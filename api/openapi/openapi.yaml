@@ -1,0 +1,59 @@
+# The API contract of the Ecoma LLM Gateway.
+#
+# This is a placeholder in the honest sense: it documents exactly what the
+# service implements today — the two health endpoints — and nothing else. The
+# gateway's product surface (providers, routing, keys, usage) is not designed
+# yet; when it is, the contract changes in this file first and the
+# implementation follows it, never the reverse. See AGENTS.md, "The contract is
+# the OpenAPI document".
+openapi: 3.1.0
+info:
+  title: Ecoma LLM Gateway API
+  version: 0.1.0
+  description: >-
+    Health and readiness probes of the Ecoma LLM Gateway API service. The
+    gateway's product endpoints are not designed yet; this document carries the
+    surface that exists and the process every later endpoint follows.
+servers:
+  - url: /
+paths:
+  /healthz:
+    get:
+      operationId: getHealth
+      summary: Liveness of the API process
+      description: >-
+        Returns 200 while the process is able to serve. Anything more than
+        "is the process alive" belongs to /readyz, not here.
+      responses:
+        "200":
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /readyz:
+    get:
+      operationId: getReadiness
+      summary: Readiness of the API service
+      description: >-
+        Returns 200 when the service may receive traffic. The scaffold has no
+        dependencies, so it is always ready; the future dependency checks hang
+        off this endpoint.
+      responses:
+        "200":
+          description: The service is ready to receive traffic.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          description: '"ok" today; the vocabulary grows only through this contract.'
+      additionalProperties: false
