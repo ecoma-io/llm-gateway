@@ -44,6 +44,9 @@ lands — is in [CONTRIBUTING.md](CONTRIBUTING.md); the rules agents and
 contributors are held to are in [AGENTS.md](AGENTS.md). A `Makefile` at the
 root spells the same commands as `make` targets.
 
+`main` is governed: no direct pushes, pull requests only, squash-merged
+through the merge queue once `ci-gate` and `analysis-gate` are green.
+
 ## Release
 
 The repository is one release unit: [release-please](https://github.com/googleapis/release-please)
