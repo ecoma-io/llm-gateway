@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 )
@@ -173,6 +174,40 @@ func TestWithinTxSurfacesACommitFailureWithoutTouchingThePoolAgain(t *testing.T)
 	want := []event{evBegin}
 	if !equal(got, want) {
 		t.Fatalf("driver calls were %v, want %v — after a refused commit the adapter must not drive the discarded connection further", got, want)
+	}
+}
+
+func TestWithinTxCarriesTheOpenTransactionInTheWorkContext(t *testing.T) {
+	f, db := registerFake(t)
+	store := New(db)
+
+	// The port's query surface belongs to the repositories built on it, and
+	// none exist yet — so no query can be routed here. What can and must be
+	// pinned now is the mechanism those repositories will resolve: the work
+	// context carries the open *sql.Tx itself, under the key the adapter
+	// owns, from the moment fn starts. A repository that reads its
+	// transaction from the context — never from the pool, as the port
+	// requires — therefore holds the real, in-flight transaction: the same
+	// one this test watches the driver begin exactly once for the unit.
+	var carried *sql.Tx
+	err := store.WithinTx(context.Background(), func(ctx context.Context) error {
+		tx, ok := ctx.Value(txKey{}).(*sql.Tx)
+		if !ok || tx == nil {
+			t.Fatal("the work context carries no live *sql.Tx — a repository resolving its transaction from the context would silently query outside the unit of work")
+		}
+		carried = tx
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WithinTx: %v", err)
+	}
+	if carried == nil {
+		t.Fatal("the work function never ran")
+	}
+	got := of(f.recorded(), evBegin, evCommit, evRollback)
+	want := []event{evBegin, evCommit}
+	if !equal(got, want) {
+		t.Fatalf("driver calls were %v, want %v — the carried transaction must be the unit's one and only", got, want)
 	}
 }
 

@@ -40,7 +40,12 @@ type Store interface {
 	// future repository method runs with that context — rather than the one
 	// the call arrived on — participates in the same transaction; that is
 	// what makes the scope composable rather than a flag threaded through
-	// every signature.
+	// every signature. The rule that follows from it, and which every
+	// repository method obeys: resolve the transaction from the context,
+	// never from the pool. A query sent to the pool while a unit of work
+	// holds a connection both escapes that unit's commit and rollback and,
+	// on a pool with one connection, waits on the transaction's own
+	// connection forever.
 	//
 	// Nesting a WithinTx inside another one joins the transaction already in
 	// flight instead of opening a second: an inner scope that returns an

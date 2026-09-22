@@ -1,7 +1,6 @@
 // Package postgres adapts the storage port to PostgreSQL through the standard
 // library's database/sql — the one adapter surface the gateway will have for
-// the authoritative store described in
-// docs/adr/0001-postgres-timescaledb-migration-foundation.md.
+// the authoritative store documented in deploy/postgres/README.md.
 //
 // The adapter is handed an open *sql.DB rather than opening one itself: which
 // driver backs that handle is a wiring decision, and the import that
