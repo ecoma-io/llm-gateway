@@ -1,0 +1,2 @@
+# Pinia is installed at app startup. Stores land here only with a real product
+# domain; the Vite counter store was starter residue and has been removed.

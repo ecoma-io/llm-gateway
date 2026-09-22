@@ -4,9 +4,31 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Ecoma LLM Gateway</title>
+    <script>
+      // Applies the persisted Loom theme before first paint, so a
+      // dark-preference user never flashes light while the app bundle boots.
+      // This mirrors Loom's public theme contract — the `loom:theme` storage
+      // key and the `data-theme` attribute on <html> — and must move with it;
+      // Loom's own runtime re-applies from the same state after mount.
+      (function () {
+        var stored = null;
+        try {
+          stored = window.localStorage.getItem("loom:theme");
+        } catch (error) {
+          /* storage unavailable: fall back to the system preference */
+        }
+        var theme =
+          stored === "light" || stored === "dark"
+            ? stored
+            : window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light";
+        document.documentElement.setAttribute("data-theme", theme);
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>
-    <script type="module" src="/src/main.ts"></script>
+    <script type="module" src="/src/app/main.ts"></script>
   </body>
 </html>

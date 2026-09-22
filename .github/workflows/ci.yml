@@ -85,18 +85,24 @@ jobs:
         if: github.event_name != 'merge_group'
         run: pnpm format:check
 
-      # Asserts every directory under `apps/` is a project Moon can see with
-      # the four targets. Runs BEFORE the Moon step, so an unreachable project
-      # fails as an error rather than passing as an absence.
+      # Asserts every directory under `apps/` and `packages/` is a project
+      # Moon can see with the four targets. Runs BEFORE the Moon step, so an
+      # unreachable project fails as an error rather than passing as an
+      # absence.
       - run: pnpm check-projects
 
-      # The console's four targets, always in full — this repository has two
-      # projects and the suite is small, so affected selection would buy
-      # nothing today. When the tree grows to where it matters, the switch is
-      # `moon ci --base=<base>` exactly as archkeep runs it, and this comment
-      # is the pointer.
-      - name: Lint, test, typecheck and build the console
-        run: pnpm exec moon run web:lint web:test web:typecheck web:build
+      # The JavaScript projects' targets, always in full — this repository has
+      # small suites, so affected selection would buy nothing today. When the
+      # tree grows to where it matters, the switch is `moon ci --base=<base>`
+      # exactly as archkeep runs it, and this comment is the pointer.
+      # api-client's `build` is a non-mutating freshness gate: it generates
+      # the client from the OpenAPI contract into a temporary directory and
+      # fails on any diff against committed source, so a stale contract cannot
+      # pass alongside the console's typecheck.
+      - name: Lint, test, typecheck and build the JavaScript projects
+        run: >-
+          pnpm exec moon run api-client:lint api-client:test api-client:typecheck
+          api-client:build web:lint web:test web:typecheck web:build
 
   verify-api:
     name: Verify (api)

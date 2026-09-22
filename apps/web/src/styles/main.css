@@ -1,0 +1,15 @@
+/* Loom's public global entry owns the complete Tailwind 4 setup: it imports
+ * Tailwind itself, the static design tokens, self-hosted fonts, base styles,
+ * reduced-motion protections, and an @source for Loom's own components. Do
+ * not add a second `@import "tailwindcss"` here — doing so would register the
+ * engine twice. */
+@import "@ecoma-io/loom/styles/global.css";
+
+/* Loom's AppShell is `flex h-full`: it fills its parent and scrolls its
+ * content column internally, so the sidebar stays put while pages grow. The
+ * mount point is the parent it fills — without an explicit height on it,
+ * `h-full` collapses to auto and the whole document scrolls instead,
+ * un-engaging the shell's scroll region. */
+#app {
+  height: 100dvh;
+}

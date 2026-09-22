@@ -37,7 +37,7 @@ is because that step was skipped. Do not skip it.
 | `pnpm test`           | Every project's `test` target through Moon — Vitest for the console, `go test` for the API             |
 | `pnpm typecheck`      | Every project's `typecheck` target through Moon — `vue-tsc --noEmit` and `go build ./...`              |
 | `pnpm build`          | Every project's `build` target through Moon — `vite build` and the gateway binary                      |
-| `pnpm check-projects` | Asserts every `apps/*` directory is a project Moon can see, with the four targets                      |
+| `pnpm check-projects` | Asserts every `apps/*` and `packages/*` directory is a project Moon can see, with the four targets     |
 | `pnpm dev:web`        | The console's Vite dev server                                                                          |
 | `pnpm dev:api`        | The API server (`go run ./cmd/gateway`, serves `/healthz` and `/readyz` on :8080)                      |
 
@@ -47,6 +47,7 @@ single project's targets run directly:
 
 ```bash
 pnpm exec moon run web:lint web:test web:typecheck web:build
+pnpm exec moon run api-client:lint api-client:test api-client:typecheck api-client:build
 pnpm exec moon run api:lint api:test api:typecheck api:build
 ```
 
@@ -56,7 +57,8 @@ green, in one place.
 
 ### Why `check-projects` exists, and what it would catch
 
-Three states of `apps/` produce an identical exit 0 out of `moon run`:
+Three states of `apps/` or `packages/` produce an identical exit 0 out of
+`moon run`:
 
 1. **Nothing is there.** Moon prints nothing to run and exits 0.
 2. **A project is there but declares none of the four targets.** It is skipped

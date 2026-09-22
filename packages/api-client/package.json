@@ -1,0 +1,20 @@
+{
+  "name": "@ecoma-io/llm-gateway-api-client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "generate": "openapi-ts && prettier --config ../../.prettierrc --write src/generated",
+    "generate:check": "node scripts/check-generated.mjs",
+    "lint": "eslint . --max-warnings 0",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "build": "pnpm run generate:check"
+  },
+  "devDependencies": {
+    "@hey-api/openapi-ts": "0.99.0"
+  }
+}

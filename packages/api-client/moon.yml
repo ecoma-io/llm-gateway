@@ -1,0 +1,55 @@
+# The generated API client package.
+#
+# Same conventions as apps/web/moon.yml: the whole JS toolchain (eslint,
+# vitest, tsc) is a root devDependency, so the tasks call the tools directly
+# and resolve them from the workspace root's node_modules/.bin — which is on
+# PATH because every entry point runs Moon through `pnpm exec` — except
+# `openapi-ts`, which is this package's own devDependency because only this
+# package generates, and the web app should never inherit the generator.
+#
+# The four task keys sit at exactly two spaces of indent — the root
+# scripts/check-projects.mjs scans for these four keys and fails a project
+# that declares fewer targets than CI runs.
+#
+# `build` is not a bundler pass — the package ships committed source. It is
+# the freshness gate: regenerate src/generated from the contract and fail if
+# the committed copy differs, so an openapi.yaml edit cannot land with a
+# stale client (CONTRIBUTING.md, "The contract").
+id: api-client
+language: javascript
+tasks:
+  lint:
+    command: eslint . --max-warnings 0
+    inputs:
+      - "**/*"
+      - "/package.json"
+      - "/pnpm-lock.yaml"
+      - "/eslint.config.mjs"
+  test:
+    command: vitest run
+    inputs:
+      - "**/*"
+      - "/package.json"
+      - "/pnpm-lock.yaml"
+  typecheck:
+    command: tsc --noEmit
+    inputs:
+      - "**/*"
+      - "/package.json"
+      - "/pnpm-lock.yaml"
+  build:
+    # The Node check script generates to a temporary directory and diffs it
+    # after explicit root-config formatting: unlike re-generating in
+    # src/generated, it cannot race typecheck/test tasks that import it.
+    command: node scripts/check-generated.mjs
+    inputs:
+      - "**/*"
+      # The contract is an input to the client: change it and the freshness
+      # gate re-runs rather than replaying a stale green from cache.
+      - "/api/openapi/openapi.yaml"
+      - "/package.json"
+      - "/pnpm-lock.yaml"
+      # The gate diffs Prettier-formatted bytes, so the config that formatted
+      # them is an input too: a `.prettierrc` change must re-run the gate
+      # rather than replay the green formatted under the old one.
+      - "/.prettierrc"
