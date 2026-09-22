@@ -5,7 +5,13 @@ on:
   # entirely on a stacked pull request — one targeting another feature branch —
   # so the branch merges having never been checked, and the failure only appears
   # later against someone else's change.
+  # `types` replaces the default set (opened, synchronize, reopened) rather
+  # than adding to it, so `edited` has to name its siblings explicitly. The
+  # PR title becomes the subject of the squash commit on `main`, and a title
+  # edited to something invalid after the checks went green would otherwise
+  # keep its stale pass forever — nothing revalidates it at merge time.
   pull_request:
+    types: [opened, synchronize, reopened, edited]
   # The merge queue re-runs these checks against `main + every pull request
   # ahead in the queue + this one`, which is the only place a semantic conflict
   # between two independently-green pull requests can surface. GitHub reports
