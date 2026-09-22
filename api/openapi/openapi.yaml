@@ -170,7 +170,6 @@ components:
         code:
           type: string
           enum:
-            - invalid_request
             - not_found
             - method_not_allowed
             - internal
