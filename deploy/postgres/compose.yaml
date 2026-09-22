@@ -1,0 +1,104 @@
+# The gateway's local PostgreSQL/TimescaleDB — the authoritative primary store
+# this repository migrates against. One file on purpose: what a contributor
+# runs locally and what the integration suite (verify.sh) runs are the same
+# compose project, so "works on my machine" and "works in the suite" cannot
+# fork.
+#
+# Usage (from the repository root — the -f path below is relative to it; the
+# integration suite computes its own absolute path):
+#   docker compose -f deploy/postgres/compose.yaml up -d --wait
+#   docker compose -f deploy/postgres/compose.yaml down
+# See deploy/postgres/README.md for the full command roster and decision
+# record — including why this image and migration tool, and nothing else.
+
+# The compose project name is pinned rather than left to the directory name:
+# `deploy/postgres` would yield a project called `postgres` whose volume is
+# `postgres_postgres-data` — a name that collides with every other PostgreSQL
+# a developer happens to run this way. It is overridable for the developer
+# who runs two checkouts of this repository at once (two worktrees are two
+# projects only if they ask to be).
+name: ${GATEWAY_POSTGRES_PROJECT:-llm-gateway-postgres}
+
+services:
+  # The database itself. TimescaleDB is PostgreSQL with the timescaledb
+  # extension preloaded — transactional tables for the OLTP domains, and
+  # hypertables for the time-series workloads, in one authoritative store.
+  postgres:
+    # Pinned to an exact version+digest pair, the way every tool in this
+    # repository is pinned: the tag carries the readable version and the
+    # digest is what actually resolves, so a re-pull cannot silently move.
+    image: timescale/timescaledb:2.30.1-pg18@sha256:9dede0e3ccc071cf71935b17f76bf243331df0b1575338c8ac294640fcf12a36
+    environment:
+      # Explicit and boring on purpose: the database and its owner are named,
+      # and the password comes from the environment with a local-development
+      # default. No value here is a secret — the default is for a database
+      # bound to this machine's compose project, and anything real overrides
+      # GATEWAY_POSTGRES_PASSWORD without touching this file.
+      POSTGRES_DB: gateway
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: ${GATEWAY_POSTGRES_PASSWORD:-gateway-dev-only}
+      # A development database has no business phoning home: telemetry is
+      # off here, and a production deployment decides for itself.
+      TIMESCALEDB_TELEMETRY: "off"
+    ports:
+      # Published for the tools a compose network cannot host: a local psql,
+      # a GUI client, an ad-hoc script. The host side binds to the loopback
+      # interface by default — a development database is nobody else's on
+      # the network; GATEWAY_POSTGRES_HOST widens it deliberately (0.0.0.0
+      # for a sibling container on another compose project), and the host
+      # port is overridable for the machine that already runs a PostgreSQL
+      # on 5432.
+      - "${GATEWAY_POSTGRES_HOST:-127.0.0.1}:${GATEWAY_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # PostgreSQL 18 stores a cluster under a major-version subdirectory
+      # here (rather than the old /var/lib/postgresql/data mount point).
+      # Mounting the parent is the upstream-prescribed shape: it lets a later
+      # major upgrade use pg_upgrade without a volume boundary in the way.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      # pg_isready, not a TCP probe: a port that answers is not a database
+      # that accepts transactions, and everything downstream of this check
+      # (the migration runner, the verify suite) needs the latter.
+      test: ["CMD-SHELL", 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
+  # The migration runner, from the pinned official image of the migration
+  # tool chosen in deploy/postgres/README.md — never a host-installed binary,
+  # so a contributor needs Docker and nothing else to migrate.
+  #
+  # It is a profile service: `up` never starts it; it exists so
+  #   docker compose -f deploy/postgres/compose.yaml run --rm migrate up
+  # reaches the database by service name, on the project's own network, with
+  # the repository's migrations mounted read-only at the path the tool
+  # expects. The entrypoint carries the connection string so the command a
+  # contributor types is the verb and nothing else; compose interpolates the
+  # same password fallback the postgres service above uses. The fallback is
+  # spelled in both services because a YAML anchor cannot land inside this
+  # URL string — the one duplication in this file, and both sites are
+  # `${GATEWAY_POSTGRES_PASSWORD:-gateway-dev-only}`, greppable in one line.
+  migrate:
+    image: migrate/migrate:v4.20.1@sha256:76cc2074cb6642631f34a898ced71e6aeaa6b1a4d78c4daa743275a22e0c5be7
+    profiles: ["tools"]
+    entrypoint:
+      - migrate
+      - -path
+      - /migrations
+      - -database
+      - postgres://gateway:${GATEWAY_POSTGRES_PASSWORD:-gateway-dev-only}@postgres:5432/gateway?sslmode=disable
+    volumes:
+      - ../../migrations:/migrations:ro
+    # Depends on the database being healthy, not merely started: `compose
+    # run` starts dependencies and honours their health conditions, so an
+    # eager `run --rm migrate up` against a cold project still waits for the
+    # database rather than racing it.
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  # Named, not a bind mount: the data survives `down` and dies only when a
+  # contributor says `down -v` — the reset lever the README documents.
+  postgres-data:

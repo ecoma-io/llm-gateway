@@ -1,6 +1,7 @@
 // Package postgres adapts the storage port to PostgreSQL through the standard
 // library's database/sql — the one adapter surface the gateway will have for
-// the authoritative store documented in deploy/postgres/README.md.
+// the authoritative store decided in ADR 0005 (relational state and
+// Timescale-oriented event history) and operated per deploy/postgres/README.md.
 //
 // The adapter is handed an open *sql.DB rather than opening one itself: which
 // driver backs that handle is a wiring decision, and the import that

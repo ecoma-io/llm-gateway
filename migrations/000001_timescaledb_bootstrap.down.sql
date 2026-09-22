@@ -1,0 +1,12 @@
+-- The inverse of the up migration: remove the extension and nothing else.
+-- No CASCADE: if any object still depends on TimescaleDB, the drop fails
+-- loudly rather than taking that object with it — which is the safety
+-- property a rollback wants, because a rollback that silently destroys
+-- dependent data is not a rollback, it is a second disaster.
+--
+-- On a database built by the timescaledb docker image, this down migration
+-- is not the exact inverse of its up: the image pre-created the extension
+-- before any migration ran, so dropping it leaves the database one
+-- extension shy of how the image delivered it. The suite's down-proof runs
+-- on a database the image built, and accepts exactly that.
+DROP EXTENSION IF EXISTS timescaledb;
