@@ -13,14 +13,15 @@ repository.
 
 ## What is here today
 
-| Path                       | What it is                                                                                                                                  |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apps/api`                 | The Go API service. Serves `GET /healthz` and `GET /readyz` from the standard library, with graceful SIGTERM/SIGINT shutdown. Nothing else. |
-| `apps/web`                 | The Vue 3 + TypeScript console: Vite, Vue Router, Pinia. A minimal shell that boots, routes and builds — no product UI.                     |
-| `api/openapi/openapi.yaml` | The API contract. Today it documents exactly the two health endpoints the service implements.                                               |
-| `migrations/`              | Empty. Database changes, when they arrive, land here as migrations — never as out-of-band schema edits.                                     |
-| `scripts/`                 | Repository gates (`check-projects.mjs`).                                                                                                    |
-| `.github/workflows/`       | `ci.yml`, `analysis.yml`, `release.yml`.                                                                                                    |
+| Path                       | What it is                                                                                                                                                                                                          |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apps/api`                 | The Go API service. Serves `GET /healthz` and `GET /readyz` from the standard library, with graceful SIGTERM/SIGINT shutdown. Nothing else.                                                                         |
+| `apps/web`                 | The Vue 3 + TypeScript console: Vite, Vue Router, Pinia, styled by `@ecoma-io/loom`. Today it is the app shell — navigation, light/dark/system theming — plus one page surfacing the two contract probes.           |
+| `packages/api-client`      | The TypeScript API client generated from `api/openapi/openapi.yaml` by `@hey-api/openapi-ts` — the console's only API surface, with a build-time check that fails if the committed client drifts from the contract. |
+| `api/openapi/openapi.yaml` | The API contract. Today it documents exactly the two health endpoints the service implements.                                                                                                                       |
+| `migrations/`              | Empty. Database changes, when they arrive, land here as migrations — never as out-of-band schema edits.                                                                                                             |
+| `scripts/`                 | Repository gates (`check-projects.mjs`).                                                                                                                                                                            |
+| `.github/workflows/`       | `ci.yml`, `analysis.yml`, `release.yml`.                                                                                                                                                                            |
 
 ## Working in the repository
 
@@ -38,6 +39,11 @@ pnpm build          # every project's build target (vite build; go build -o bin/
 pnpm dev:web        # the console's Vite dev server
 pnpm dev:api        # the API server via go run
 ```
+
+`pnpm dev:api` serves the probes on :8080, and the dev server `pnpm dev:web`
+proxies `/healthz` and `/readyz` to it — so the console's status page works
+against the local API with no configuration. To point the console at a
+gateway on another origin instead, set `VITE_API_BASE_URL`.
 
 The full contributor flow — hooks, commit conventions, how a pull request
 lands — is in [CONTRIBUTING.md](CONTRIBUTING.md); the rules agents and

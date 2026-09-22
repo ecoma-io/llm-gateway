@@ -12,6 +12,9 @@
     "lint": "eslint ."
   },
   "dependencies": {
+    "@ecoma-io/llm-gateway-api-client": "workspace:*",
+    "@ecoma-io/loom": "^0.8.3",
+    "@lucide/vue": "^1.47.0",
     "pinia": "^4.0.3",
     "vue": "^3.5.43",
     "vue-router": "^5.3.1"

@@ -1,0 +1,3 @@
+# Product modules are intentionally absent until their API domain is designed
+# contract-first. The shell's status page lives in pages/ because it consumes
+# the two probes that exist today; it is not a speculative health domain.

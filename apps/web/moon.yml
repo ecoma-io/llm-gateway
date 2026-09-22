@@ -6,8 +6,11 @@
 #
 # - The whole JS toolchain is a root devDependency (`eslint`, `vitest`,
 #   `vue-tsc`, `vite`, … in the root package.json); this package declares only
-#   its runtime deps. Moon puts the workspace root's `node_modules/.bin` on
-#   the task's PATH, so the tools resolve from there.
+#   its runtime deps. Tool resolution rides on how Moon is invoked, not on
+#   Moon itself: every sanctioned entry point (the root scripts, CI,
+#   lefthook) runs `pnpm exec moon run …`, and `pnpm exec` puts the workspace
+#   root's `node_modules/.bin` on the PATH the tasks inherit. A bare
+#   `moon run` from a shell without that directory fails exit 127.
 # - Deliberately NOT `pnpm exec …`: a `pnpm` invocation is routed through
 #   Moon's proto toolchain layer, which pins the version out of
 #   `packageManager` and demands a proto-installed pnpm — a second pnpm
@@ -28,6 +31,7 @@ tasks:
     command: eslint . --max-warnings 0
     inputs:
       - "**/*"
+      - "/packages/api-client/**/*"
       - "/package.json"
       - "/pnpm-lock.yaml"
       - "/eslint.config.mjs"
@@ -35,17 +39,26 @@ tasks:
     command: vitest run
     inputs:
       - "**/*"
+      - "/api/openapi/openapi.yaml"
+      - "/packages/api-client/**/*"
       - "/package.json"
       - "/pnpm-lock.yaml"
   typecheck:
     command: vue-tsc --noEmit
     inputs:
       - "**/*"
+      # A package dependency and the contract that generates it are external
+      # inputs: without them Moon can replay a cached web green after a client
+      # type changes, hiding exactly the contract drift this boundary prevents.
+      - "/api/openapi/openapi.yaml"
+      - "/packages/api-client/**/*"
       - "/package.json"
       - "/pnpm-lock.yaml"
   build:
     command: vite build
     inputs:
       - "**/*"
+      - "/api/openapi/openapi.yaml"
+      - "/packages/api-client/**/*"
       - "/package.json"
       - "/pnpm-lock.yaml"

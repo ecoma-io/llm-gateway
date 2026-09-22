@@ -32,7 +32,7 @@ typecheck: ## Every project's typecheck target through Moon
 build: ## Every project's build target through Moon
 	pnpm build
 
-check-projects: ## Assert every apps/* directory is a project Moon can see
+check-projects: ## Assert every apps/* and packages/* directory is a Moon project
 	pnpm check-projects
 
 dev-web: ## Run the Vue console dev server

@@ -1,10 +1,12 @@
 # A workspace from the first commit: `apps/` holds the two products of this
-# repository — the Go API (`apps/api`) and the Vue console (`apps/web`). A glob
-# rather than an explicit map, so a new app registers itself the moment its
-# `moon.yml` lands; `scripts/check-projects.mjs` is what turns a directory
-# Moon cannot see into a red check instead of a silent skip.
+# repository — the Go API (`apps/api`) and the Vue console (`apps/web`) — and
+# `packages/` holds the libraries they share, starting with the generated API
+# client. Globs rather than an explicit map, so a new project registers itself
+# the moment its `moon.yml` lands; `scripts/check-projects.mjs` is what turns
+# a directory Moon cannot see into a red check instead of a silent skip.
 packages:
   - "apps/*"
+  - "packages/*"
 
 # Every dependency install script is blocked until it is decided on here, and
 # pnpm fails the install while any decision is missing — so an unreviewed
@@ -16,3 +18,11 @@ packages:
 # build step, so nothing is lost by never running it.
 allowBuilds:
   lefthook: false
+  # vue-demi: false — pinia's Vue 2/3 compatibility shim. Its postinstall
+  # rewrites the package's entry points to target Vue 2; the published
+  # default already targets Vue 3, the only Vue this repository runs, so the
+  # script has nothing to do here and stays blocked.
+  vue-demi: false
+
+minimumReleaseAgeExclude:
+  - "@ecoma-io/loom@0.8.3"

@@ -1,0 +1,22 @@
+// Plain strict TypeScript, deliberately NOT the @vue/tsconfig preset: this
+// package is framework-free — a fetch client and the types generated from the
+// OpenAPI contract. The DOM lib is present for one reason: the generated
+// client is written against the platform fetch API (Request, Response,
+// BodyInit), and those types live there. `node` types because the generator
+// config above runs under Node; `noEmit` because the console bundles the
+// source through Vite, so this package ships types and source, not artifacts.
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "openapi-ts.config.ts"]
+}
