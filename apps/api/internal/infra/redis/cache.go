@@ -10,7 +10,8 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/api/internal/cache"
 )
 
-// keyPrefix is the keyspace namespace of this abstraction, per ADR 0001: keys
+// keyPrefix is the keyspace namespace of this abstraction, per the keyspace
+// policy in deploy/redis/README.md: keys
 // this package writes are stored prefixed, so a future subsystem in the same
 // database cannot collide with them and its keys cannot collide with this
 // one. The prefix lives here, not in the caller's view of a key.

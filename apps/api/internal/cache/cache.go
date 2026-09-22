@@ -39,9 +39,9 @@ var ErrInvalidTTL = errors.New("cache: ttl must be positive")
 // Cache is a shared, TTL-scoped key/value store.
 //
 // Keys are logical names scoped to this abstraction: implementations may
-// namespace them in the backing store (the keyspace policy in the ADR), so a
-// key passed here is not promised to be the key stored there. Values are
-// opaque bytes.
+// namespace them in the backing store (the keyspace policy in
+// deploy/redis/README.md), so a key passed here is not promised to be the key
+// stored there. Values are opaque bytes.
 //
 // Every method binds ctx to the underlying round trip, so a stalled store
 // stalls the caller no longer than the context allows.
