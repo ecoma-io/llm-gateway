@@ -9,9 +9,12 @@ name: Release
 #
 # The repository is one release unit: the root `package.json` is the version
 # source, the tag is `v<version>`, the changelog is the root `CHANGELOG.md`.
-# The Go binary's version is injectable from that tag (the `version` variable
-# in `apps/api/cmd/gateway/main.go`, `-ldflags "-X main.version=<tag>"`); no
-# step consumes it yet, and this comment is the pointer for the lane that will.
+# The three Go binaries' versions are injectable from that tag — each
+# application's composition root holds a `version` variable, stamped with
+# `-ldflags "-X main.version=<tag>"` at build time, so the three can be
+# cross-checked against one release rather than versioned separately. No step
+# consumes the tag yet, and this comment is the pointer for the lane that
+# will.
 
 on:
   push:

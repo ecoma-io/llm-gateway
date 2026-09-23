@@ -74,11 +74,15 @@ jobs:
           # a job with no `permissions:`.
           - language: actions
             build-mode: none
-          # No `go` leg: CodeQL's Go extractor has no `none` build mode — it
-          # builds the module to extract it, and the repo-root matrix entry
-          # would have to carry a build step for a module that lives in
-          # `apps/api`. The API's Go analysis is carried elsewhere instead:
-          # golangci-lint in `ci.yml`, Semgrep `p/golang` below.
+          # No `go` leg, for three modules. CodeQL's Go extractor has no
+          # `none` build mode: it builds the module to extract it, so a matrix
+          # entry would have to carry a build step against one application's
+          # `go.mod` and a working directory — and three of those is a
+          # second Go CI pipeline, in a job whose other legs are per-language
+          # databases rather than per-module runs. The three applications' Go
+          # analysis is carried by `ci.yml` instead: golangci-lint in the
+          # `verify-go` matrix, one leg per module, plus Semgrep `p/golang`
+          # below, which analyses every module from the repo root.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

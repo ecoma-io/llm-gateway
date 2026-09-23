@@ -19,12 +19,15 @@ export default defineConfig({
     },
   },
   server: {
-    // The console talks to the gateway same-origin (src/lib/api.ts): one
+    // The console talks to its backend same-origin (src/lib/api.ts): one
     // origin in production, and in development the dev server proxies the two
-    // contract probes to the Go process on :8080 — so `pnpm dev:api` +
-    // `pnpm dev:web` work together with no CORS on the API and no env
-    // override. Point the console at a gateway elsewhere with
-    // `VITE_API_BASE_URL`.
+    // contract probes to the Control Plane API on :8080 — so `pnpm
+    // dev:console-api` + `pnpm dev:console` work together with no CORS on the
+    // API and no env override. The runtime's :8081 is deliberately absent from
+    // this list: an inference request is not a browser call, and a console
+    // that could reach `/v1/*` through its own origin would be the hop the
+    // plane split removes (ADR 0006 §4). Point the console at a console-api
+    // elsewhere with `VITE_API_BASE_URL`.
     proxy: {
       "/healthz": "http://localhost:8080",
       "/readyz": "http://localhost:8080",

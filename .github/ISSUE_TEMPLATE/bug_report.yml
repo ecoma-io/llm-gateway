@@ -55,9 +55,11 @@ body:
     attributes:
       label: Where does this happen?
       options:
-        - Gateway API — an endpoint behaves wrong
-        - Console (web)
-        - OpenAPI contract — the document disagrees with the implementation
+        - Console — the web interface behaves wrong
+        - Console API — a Control Plane endpoint behaves wrong
+        - Data Plane runtime — an OpenAI-compatible endpoint behaves wrong
+        - Data Plane management API — an internal administrative endpoint behaves wrong
+        - OpenAPI contract — a document disagrees with the implementation
         - Tooling, CI, or repository workflow
         - Documentation
         - Not sure
