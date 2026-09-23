@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-09-23
 - Issue: [#5](https://github.com/ecoma-io/llm-gateway/issues/5)
+- Amended by: [ADR 0006](0006-control-plane-and-data-plane.md) — the transactions below are plane-scoped, and settlement is split across the plane boundary
 
 ## Context
 
@@ -35,6 +36,31 @@ close Reservation as settled
 finalise the Request
 ```
 
+> **Amended by [ADR 0006](0006-control-plane-and-data-plane.md): the blocks are
+> plane-scoped, and settlement is no longer one transaction.** The rows above do
+> not all live in one database, so no transaction can write them all:
+>
+> | Record                                                                                            | Database                        |
+> | ------------------------------------------------------------------------------------------------- | ------------------------------- |
+> | `Settlement`, `LedgerEntry`, `FundingBucket`                                                      | `control` — the Control Plane's |
+> | `RequestIntake`, `Request`, `RequestAttempt`, `UsageEvent`, `Reservation` and its allocation legs | `dataplane` — the Data Plane's  |
+>
+> Every one of these rows is written by the transaction that the diagram
+> attributes it to, and that transaction is now plane-local — which is what
+> decides the database, not the shape of the row. Admission is therefore
+> **entirely the Data Plane's**: one transaction writing the shell, the intake
+> record, the reservation with its allocation legs and the execution lease,
+> against the runtime's own capacity projection. The hold legs are written in
+> the Control Plane, from the reservation as a fact — see the note under
+> admission below. Settlement splits along the table: the runtime writes the usage
+> fact and closes its reservation locally, and the Control Plane writes the
+> `Settlement`, its ledger legs and its bucket projections from that fact,
+> idempotently by `request_id`. Everything this ADR says about exactly-once
+> settlement still holds — the uniqueness is on `settlements.request_id`, and
+> one request still yields one settlement — but the atomicity between the
+> charge and the fact it derives from is gone, replaced by a fact that is the
+> authority the charge derives from.
+
 - **RequestIntake** is the relational replay record: unique
   `(account_id, idempotency_key)`, the canonical request **digest**, the
   request ID, and a terminal status pointer. It is the only idempotency
@@ -52,10 +78,11 @@ finalise the Request
 - **Settlement** is an accounting header, unique by `request_id`; it is the
   idempotency boundary, not a vague verb. It carries `request_id`, a
   `settled_total` equal to the sum of its consume legs (written once), and
-  `created_at`; nothing on it is ever mutated. It is created in the same
-  transaction as its `UsageEvent` and ledger legs. A second finalizer hits
-  the unique `settlements.request_id` constraint and reads the first result
-  instead of charging again.
+  `created_at`; nothing on it is ever mutated. It is written in the Control
+  Plane in the same transaction as its ledger legs, from the usage fact the
+  Data Plane recorded (amended by ADR 0006; see the table above). A second
+  finalizer hits the unique `settlements.request_id` constraint and reads the
+  first result instead of charging again.
 - **UsageEvent** is one immutable actual-usage fact per settlement:
   `(request, committed attempt, normalized input/output token counts, price
 revision snapshot, capture method)`. Capture method is `reported` when the
@@ -88,6 +115,23 @@ revision snapshot, capture method)`. Capture method is `reported` when the
   verified/rebuildable from those legs; it is a concurrency control projection,
   not an independently editable balance. Conditional updates such as
   `available_amount >= take` protect both entitlement and PAYG admission.
+
+> **Amended by [ADR 0006](0006-control-plane-and-data-plane.md): this one
+> bucket becomes two rows in two planes.** Within the **Control Plane**, a
+> funding bucket's cached settled/held/available values are still maintained in
+> the same transaction as its ledger legs and remain rebuildable from them, and
+> everything above about the formal projections, the guards and the adjustment
+> algebra still describes that row exactly. Separately, the **Data Plane** holds
+> a _quota projection_ — the lockable capacity row the runtime's admission
+> conditionally updates in the same transaction as its reservation and hold
+> legs. The projection is not a balance: it is the enforcement ceiling for one
+> entitlement cycle or PAYG balance, seeded from Control-Plane grants and
+> updated only by the runtime. Settlement of record happens in the Control Plane
+> from the runtime's usage facts. The projection converges to the ledger by
+> reconciliation, and **the ledger, never the projection, is the source of truth
+> for money**. The projection exists because the runtime must be able to refuse
+> an over-budget request with the Control Plane switched off; it is the price of
+> that, paid in a convergence step that did not previously exist.
 
 ### Formal balance projections
 
@@ -135,6 +179,20 @@ shell and its intake record and, atomically:
 3. inserts allocation rows and one `hold` LedgerEntry per allocation;
 4. updates the corresponding bucket projections; and
 5. begins the execution lease.
+
+> **Amended by [ADR 0006](0006-control-plane-and-data-plane.md): three of those
+> five steps stay in the admission transaction and two move.** Steps 3 and 4
+> write Control-Plane rows, so they cannot be in a Data-Plane transaction. What
+> the runtime does atomically at admission is: create the request shell and the
+> intake record, create the reservation and its allocation legs, conditionally
+> draw the allocation down from its **quota projection**, and begin the lease.
+> The `hold` legs and the bucket projections of steps 3 and 4 are written in the
+> Control Plane from the reservation as a fact, idempotently by `request_id`.
+> The waterfall order and the guards are unchanged; what changes is that the
+> runtime enforces them against a row it owns, and the ledger records them
+> afterwards. That is deliberate: the runtime must not hold ledger write
+> authority (ADR 0006, section 2), and the alternative — the runtime writing
+> money from the hot path — is the blast radius the split exists to prevent.
 
 No provider call is inside that transaction (ADR 0001, rule 7). The adapter
 enforces the canonical output ceiling, so client-billable actual usage is at
@@ -189,16 +247,28 @@ streamed tool arguments; pre-content lifecycle frames are buffered).
 
 The live executor renews a reservation's execution lease; `expires_at` is
 strictly longer than the maximum accepted request duration and a reaper expires
-only `open` reservations with a dead/expired lease. The reaper writes release
-legs and changes state to `expired` atomically.
+only `open` reservations with a dead/expired lease. The reaper returns the
+capacity to the runtime's projection and changes state to `expired` atomically;
+its release legs are written in the Control Plane from that state change
+(ADR 0006 — the reaper is the runtime, and the ledger is not its to write).
 
 After an expiry, customer settlement is intentionally **forbidden**: the
 reservation's capacity has been released for future customers, so consuming it
 later could double-spend it. When the **reaper** expires a reservation it
 inspects the attempt telemetry; if it already proves an orphaned provider
 completion, the reaper writes an immutable `UsageEvent` classified
-`unbillable_orphaned` **in the same transaction as its release legs**. Proof
-that only surfaces afterwards is appended by reconciliation on its own —
+`unbillable_orphaned` **in the same transaction as its release legs**.
+
+> **Amended by [ADR 0006](0006-control-plane-and-data-plane.md): the reaper is
+> the runtime, so those two rows are in different databases.** The reaper
+> writes the `unbillable_orphaned` usage event and closes the reservation in
+> one Data-Plane transaction; the Control Plane writes the release legs from
+> that fact, idempotently. What the sentence was protecting survives — the fact
+> and the release cannot disagree, because the release is derived from the
+> fact — and it is now the ordering this ADR uses everywhere else: the fact is
+> written where it was observed, and the ledger follows it.
+
+Proof that only surfaces afterwards is appended by reconciliation on its own —
 appending an unbillable fact late is safe; settling late is not. The orphaned
 event exists for operations and provider-cost reconciliation; it carries no
 customer `Settlement` and no consume leg. This is an explicit gateway loss /
@@ -214,9 +284,15 @@ this path because its lease is renewed.
 3. **Entitlements cannot be double-spent.** Every capacity drawdown is a
    conditional, lock/version-guarded FundingBucket update
    (`available >= take`) inside one of the four cross-context coordinated
-   transactions (ADR 0001, rule 6); refills are ledger-backed writes outside
-   the admission path — the grant-cycle roll, and the topup/adjustment
-   flows, each with its own ledger legs and uniqueness guards.
+   transactions (ADR 0001, rule 6, plane-scoped by ADR 0006); refills are
+   ledger-backed writes outside the admission path — the grant-cycle roll, and
+   the topup/adjustment flows, each with its own ledger legs and uniqueness
+   guards. Under the plane split the invariant is held twice over rather than
+   once: the runtime's admission keeps the same guard on its quota projection,
+   in the same transaction as its reservation, while the Control Plane's bucket
+   guard is unchanged. The runtime's guard is the load-bearing one — it is the
+   only thing standing between a request and an unpriced provider call when the
+   Control Plane is unreachable, which is precisely why the projection exists.
 4. **Reservation and settlement are distinct.** Hold and consume are different
    ledger legs; one unique Settlement per request makes settlement exactly-once.
 5. **Logical requests and provider attempts are distinct.** One Request owns
@@ -272,7 +348,10 @@ because compensating legs move them (invariants 1–2).
   contention.
 - Customer credit exposure is bounded by the reservation, even during streams
   and fallback. A provider can cost the gateway more than a capped client
-  request, but it cannot create unbounded customer debt.
+  request, but it cannot create unbounded customer debt. The bound is now
+  enforced by the runtime's own projection rather than by a lock on an
+  Accounting row, so the guarantee survives the Control Plane being down — and
+  is bought with the reconciliation step named in ADR 0006.
 
 ## Alternatives considered
 

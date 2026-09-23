@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-09-23
 - Issue: [#5](https://github.com/ecoma-io/llm-gateway/issues/5)
+- Amended by: [ADR 0006](0006-control-plane-and-data-plane.md) — the two families now sit in two databases, one per plane
 
 ## Context
 
@@ -21,6 +22,20 @@ would force a transactional outbox into the accounting path — extra tables,
 a delivery contract, dedup keys, and a window where a charge exists without
 its usage fact.
 
+> **Amended by [ADR 0006](0006-control-plane-and-data-plane.md).** That
+> constraint is answered rather than ignored, and the split it rejected is one
+> this ADR now makes — along a different line. The event family (`requests`,
+> `request_attempts`, `usage_events`) and the runtime's own relational rows live
+> in the Data Plane's database; the Control Plane's relational working set lives
+> in its own. What replaces the outbox is not a delivery mechanism but an
+> inversion: the usage fact is not downstream of the charge, it is the
+> **authority the charge is derived from**, written by the process that observed
+> it, and the Control Plane settles from it idempotently by `request_id`. The
+> window this Context called disqualifying still exists — it is now a named,
+> bounded convergence property instead of a transactional guarantee (ADR 0006).
+> Between planes, rows are referenced by ID with no foreign key in either
+> direction.
+
 ## Decision
 
 One PostgreSQL cluster, two table families, decided by one rule: **mutable
@@ -30,6 +45,29 @@ same cluster (TimescaleDB extension); "family" separates access patterns,
 partitioning, and retention — not databases. Extraction to a separate
 analytics store, if it ever happens, moves **reads** (replicas, aggregates),
 never the accounting write path.
+
+> **Amended by [ADR 0006](0006-control-plane-and-data-plane.md): family and
+> database are now two different lines.** They were the same line when this ADR
+> was written. They are not any more, and the separation is worth stating
+> plainly because everything below reads differently once it holds:
+>
+> - The **Control Plane's database** holds a relational family and no event
+>   family: identity and access, commerce, and the accounting working set
+>   (`funding_buckets`, `settlements`, `ledger_entries`).
+> - The **Data Plane's database** holds both families: the runtime's own
+>   relational rows — Catalog configuration, `request_intake`, `reservations`
+>   and their allocation legs, API-key records — and the event family
+>   (`requests`, `request_attempts`, `usage_events`), with the TimescaleDB
+>   extension and the hypertables.
+>
+> So a table's **family** is still decided by the placement rule below, and its
+> **database** is decided by which plane owns it — which is a different question,
+> with a different answer. `reservations` is the row that makes the difference
+> visible: mutable, low-volume, lockable, unambiguously relational by the rule,
+> and yet the runtime's, because the hot path draws it down and must be able to
+> do that with the Control Plane unreachable. The table-by-table matrix with a
+> reason per row is in
+> [../architecture/planes.md](../architecture/planes.md).
 
 ### Relational family
 
@@ -66,6 +104,21 @@ reservations (+ allocation legs)    settlements (+ ledger legs)
   is request-rate, not token-rate.
 - `reservations` are mutable lifecycle rows (`open → settled | released |
 expired`) with a renewable lease.
+- The list above splits across the two databases, because the plane that writes
+  a row is what decides its address. The **Control Plane's** are `accounts`,
+  `users`, `plans`, `subscriptions`, `entitlements`, and the accounting working
+  set — `funding_buckets`, `settlements` with their ledger legs. The **Data
+  Plane's** are `model_aliases` with their candidates, `backends`,
+  `alias_group_versions`, `client_price_list_revisions` (Catalog configuration,
+  which the runtime prices from — ADR 0003), and the runtime's own
+  `request_intake` and `reservations` with their allocation legs. `api_keys`
+  appears on both sides, and deliberately: the Control Plane owns which
+  account a key belongs to and who may manage it, and the Data Plane owns the
+  record the hot path authenticates against (ADR 0006, section 8).
+  `funding_buckets` is the entry whose ownership
+  the split changed rather than only its address — ADR 0004 now defines it as
+  two rows in two planes, the Accounting bucket here and the runtime's quota
+  projection there.
 
 ### Event family (hypertables)
 
@@ -113,10 +166,17 @@ is two tables, and the design is wrong, not the rule.
 - The synchronous path writes relational state (admission, settlement) and
   appends event rows; settlement writes both families in **one transaction on
   one cluster**, which is the whole reason the families share a database.
+  Amended by ADR 0006: within the **Control Plane** the settlement writes its
+  relational rows in one transaction, and the usage fact it settles is written
+  in the **Data Plane** and referenced by ID. No transaction writes both
+  families, because no transaction spans the two databases they now occupy.
 - Asynchronous analytics read the event tables and continuous aggregates and
   never write the relational working set. There is no "job that fixes up
   balances": a wrong number is corrected by compensating ledger legs
-  (invariants 1–2, ADR 0004).
+  (invariants 1–2, ADR 0004). Reconciliation across the plane boundary is not
+  that job and must not become it — it derives Control-Plane rows from
+  Data-Plane facts and corrects through compensating legs like any other
+  correction, never by editing a balance to match.
 
 ## Consequences
 
@@ -135,7 +195,14 @@ is two tables, and the design is wrong, not the rule.
   both directions; that is safe because every **load-bearing** guard — the
   unique settlement, the bucket conditional updates, the intake uniqueness —
   lives on the relational side, which is exactly what the family split
-  guarantees.
+  guarantees. Amended by ADR 0006: the Data Plane's database holds both
+  families, so this bullet describes it; the Control Plane's database holds one,
+  and the references from its rows to the runtime's — a settlement naming the
+  request it settles, a ledger leg naming the reservation it holds against —
+  cross a database boundary and therefore carry no foreign key at all. They are
+  ID references that nothing in the engine can enforce, which is why the guards
+  that matter are all reachable inside the transaction that writes them and why
+  the reconciliation path exists to notice a reference that never arrives.
 
 ## Alternatives considered
 
@@ -146,7 +213,11 @@ is two tables, and the design is wrong, not the rule.
 - **Event tables in a separate analytics database**: rejected _for the
   accounting path_ — it forces a transactional outbox between a charge and
   its usage fact. Analytics reads may be extracted later; the writes stay
-  together.
+  together. ADR 0006 parts the event tables from the ledger's tables anyway, and
+  this objection is the one it had to answer first: its answer is that the fact
+  becomes the authority the charge derives from, so what would have been an
+  outbox carrying a charge to its fact becomes a fact the charge is computed
+  from, delivered by a retry that is safe.
 - **Event sourcing for the relational state**: rejected — conditional
   capacity updates and settlement uniqueness are natural in SQL and painful
   as replayed projections.
