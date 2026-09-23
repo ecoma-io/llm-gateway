@@ -145,8 +145,11 @@ implementation, never discovered in code review after it. Where practical, the
 console binds to types generated from the document rather than hand-written
 copies of it — see [AGENTS.md](AGENTS.md), "The rules".
 
-Database schema — when a database arrives — lands as migrations under
-`migrations/`, never as out-of-band edits.
+Database schema lands as migrations under `migrations/` — ordered
+`.up.sql`/`.down.sql` pairs a reviewer reads, applied by the golang-migrate
+runner and proven against a real database by the suite in
+[`deploy/postgres/README.md`](deploy/postgres/README.md), never as
+out-of-band edits.
 
 ## Opening a pull request
 

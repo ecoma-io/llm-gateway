@@ -13,15 +13,17 @@ repository.
 
 ## What is here today
 
-| Path                       | What it is                                                                                                                                                                                                          |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apps/api`                 | The Go API service. Serves `GET /healthz` and `GET /readyz` from the standard library, with graceful SIGTERM/SIGINT shutdown. Nothing else.                                                                         |
-| `apps/web`                 | The Vue 3 + TypeScript console: Vite, Vue Router, Pinia, styled by `@ecoma-io/loom`. Today it is the app shell — navigation, light/dark/system theming — plus one page surfacing the two contract probes.           |
-| `packages/api-client`      | The TypeScript API client generated from `api/openapi/openapi.yaml` by `@hey-api/openapi-ts` — the console's only API surface, with a build-time check that fails if the committed client drifts from the contract. |
-| `api/openapi/openapi.yaml` | The API contract. Today it documents exactly the two health endpoints the service implements.                                                                                                                       |
-| `migrations/`              | Empty. Database changes, when they arrive, land here as migrations — never as out-of-band schema edits.                                                                                                             |
-| `scripts/`                 | Repository gates (`check-projects.mjs`).                                                                                                                                                                            |
-| `.github/workflows/`       | `ci.yml`, `analysis.yml`, `release.yml`.                                                                                                                                                                            |
+| Path                       | What it is                                                                                                                                                                                                                                       |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `apps/api`                 | The Go API service. Serves `GET /healthz` and `GET /readyz` from the standard library, with graceful SIGTERM/SIGINT shutdown. Nothing else.                                                                                                      |
+| `apps/web`                 | The Vue 3 + TypeScript console: Vite, Vue Router, Pinia, styled by `@ecoma-io/loom`. Today it is the app shell — navigation, light/dark/system theming — plus one page surfacing the two contract probes.                                        |
+| `packages/api-client`      | The TypeScript API client generated from `api/openapi/openapi.yaml` by `@hey-api/openapi-ts` — the console's only API surface, with a build-time check that fails if the committed client drifts from the contract.                              |
+| `api/openapi/openapi.yaml` | The API contract. Today it documents exactly the two health endpoints the service implements.                                                                                                                                                    |
+| `migrations/`              | Database migrations — ordered, hand-authored `NNNNNN_name.up.sql`/`.down.sql` pairs applied by golang-migrate. Today it holds the `000001_timescaledb_bootstrap` pair, which enables the `timescaledb` extension and creates no business schema. |
+| `deploy/`                  | Local development and integration fixtures for the backing infrastructure: `postgres/` (the TimescaleDB compose project with its migration runner and the `verify.sh` verification suite) and `redis/` (the disposable Valkey fixture).          |
+| `docs/`                    | Longer-form documentation: [`adr/`](docs/adr) (accepted architecture decision records) and [`architecture/`](docs/architecture) (reference pages for the designed domain model), indexed in [`docs/README.md`](docs/README.md).                  |
+| `scripts/`                 | Repository gates (`check-projects.mjs`).                                                                                                                                                                                                         |
+| `.github/workflows/`       | `ci.yml`, `analysis.yml`, `release.yml`.                                                                                                                                                                                                         |
 
 ## Working in the repository
 
