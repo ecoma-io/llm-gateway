@@ -14,9 +14,9 @@ import (
 // once, here, so a reader sees the behaviour they get without opening the
 // library: the dial timeout is the library's DefaultDialTimeout, and the
 // connection timeout is the deadline the library derives when none is set
-// (TCP keepalive 1s × the 10 probes Linux needs to declare an idle connection
-// dead). Inventing tighter numbers now would be guessing with a straight face
-// — the workload that would tune them does not exist yet.
+// (TCP keepalive 1s × 10 — Linux's 9 keepalive probes plus one interval).
+// Inventing tighter numbers now would be guessing with a straight face —
+// the workload that would tune them does not exist yet.
 const (
 	defaultAddress           = "127.0.0.1:6379"
 	defaultDialTimeout       = 5 * time.Second
