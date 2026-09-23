@@ -91,7 +91,9 @@ AI-assisted commits carry a trailer — `Assisted-by: <tool>` or
 2. Make the change: contract first when the API surface moves, tests beside
    the behaviour, migrations for schema.
 3. Run the gates — `pnpm format:check && pnpm lint && pnpm test && pnpm typecheck && pnpm build` — and the Go
-   checks directly if you touched `apps/api` (`cd apps/api && go vet ./... && go test ./...`).
+   tests directly if you touched `apps/api` (`cd apps/api && go test ./...`).
+   `go vet` is not listed: golangci-lint in `pnpm lint` already runs govet
+   (`apps/api/.golangci.yml` argues the roster).
 4. Commit with a conventional message, push the branch, open the pull request
    against `main`, and let the required checks judge it.
 

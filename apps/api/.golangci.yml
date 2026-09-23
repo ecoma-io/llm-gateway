@@ -1,10 +1,12 @@
 # golangci-lint configuration for the gateway API service.
 #
-# The scaffold is stdlib-only (go.mod declares zero requires), so the default
-# v2 linter set is the whole mandate: `errcheck` (unchecked errors), `govet`,
-# `ineffassign`, `staticcheck` and `unused`. Nothing is enabled beyond it: a
-# linter roster longer than the code it reads is noise, and the service is a
-# handful of files.
+# The default v2 linter set is the whole mandate: `errcheck` (unchecked
+# errors), `govet`, `ineffassign`, `staticcheck` and `unused`. Nothing is
+# enabled beyond it: a linter roster longer than the code it reads is noise.
+# go.mod's dependency list does not move the roster — valkey-go (the one
+# direct require) is a library like the standard library pieces, not a reason
+# to arm more analyzers; this file stays the place that argues the roster in
+# either direction.
 #
 # `go vet` is NOT run beside golangci-lint anywhere in this repository — the
 # default roster already runs govet, and the same analyzer twice is one
