@@ -30,7 +30,7 @@
     "typecheck": "pnpm exec moon run ...:typecheck",
     "build": "pnpm exec moon run ...:build",
     "check-projects": "node scripts/check-projects.mjs",
-    "dev:web": "pnpm --filter @ecoma-io/llm-gateway-web dev",
+    "dev:console": "pnpm --filter @ecoma-io/llm-gateway-console dev",
     "dev:api": "cd apps/api && go run ./cmd/gateway"
   },
   "devDependencies": {

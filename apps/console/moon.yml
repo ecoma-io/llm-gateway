@@ -1,4 +1,4 @@
-# The web console project.
+# The console project — the Vue 3 presentation layer of the LLM Gateway.
 #
 # The tasks call the tools directly — `eslint`, `vitest`, `vue-tsc`, `vite` —
 # the same shape every JavaScript package in this organisation uses. Two
@@ -24,7 +24,7 @@
 # scripts/check-projects.mjs scans moon.yml files for these four keys and
 # fails a project that declares fewer targets than CI runs, because Moon
 # skips a target that does not exist and exits 0 having run nothing.
-id: web
+id: console
 language: javascript
 tasks:
   lint:
@@ -48,8 +48,9 @@ tasks:
     inputs:
       - "**/*"
       # A package dependency and the contract that generates it are external
-      # inputs: without them Moon can replay a cached web green after a client
-      # type changes, hiding exactly the contract drift this boundary prevents.
+      # inputs: without them Moon can replay a cached console green after a
+      # client type changes, hiding exactly the contract drift this boundary
+      # prevents.
       - "/api/openapi/openapi.yaml"
       - "/packages/api-client/**/*"
       - "/package.json"

@@ -1,6 +1,6 @@
 # The generated API client package.
 #
-# Same conventions as apps/web/moon.yml: the whole JS toolchain (eslint,
+# Same conventions as apps/console/moon.yml: the whole JS toolchain (eslint,
 # vitest, tsc) is a root devDependency, so the tasks call the tools directly
 # and resolve them from the workspace root's node_modules/.bin — which is on
 # PATH because every entry point runs Moon through `pnpm exec` — except

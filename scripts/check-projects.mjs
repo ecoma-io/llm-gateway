@@ -24,7 +24,7 @@
 // What it deliberately does NOT do: parse YAML. The `moon.yml` files this
 // repository carries are handwritten with a stable two-space shape, and the
 // scan below asserts the four task keys at that indent plus an `id:` matching
-// the directory's name — which is what the CI rosters (`web:*`, `api:*`,
+// the directory's name — which is what the CI rosters (`console:*`, `api:*`,
 // `api-client:*`) and the workspace globs in `.moon/workspace.yml` route on. A
 // real YAML parser would be a dependency bought to re-state those two facts.
 

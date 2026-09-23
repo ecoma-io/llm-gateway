@@ -36,8 +36,8 @@ permissions:
   contents: read
 
 jobs:
-  verify-web:
-    name: Verify (web)
+  verify-console:
+    name: Verify (console)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -102,7 +102,8 @@ jobs:
       - name: Lint, test, typecheck and build the JavaScript projects
         run: >-
           pnpm exec moon run api-client:lint api-client:test api-client:typecheck
-          api-client:build web:lint web:test web:typecheck web:build
+          api-client:build console:lint console:test console:typecheck
+          console:build
 
   verify-api:
     name: Verify (api)
@@ -256,7 +257,7 @@ jobs:
 
       # The API's four targets — gofmt/vet via golangci-lint, go test, the
       # compile pass, and the binary. Same always-in-full reasoning as the
-      # web step above.
+      # console step above.
       - name: Lint, test, typecheck and build the api
         run: pnpm exec moon run api:lint api:test api:typecheck api:build
 
@@ -298,7 +299,7 @@ jobs:
     # while the job list is not: add a job to `needs` and the gate tightens
     # without anyone editing repository settings — and forgetting to add it is
     # the only way to widen what green means, which is visible in this file.
-    needs: [verify-web, verify-api, verify-persistence]
+    needs: [verify-console, verify-api, verify-persistence]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

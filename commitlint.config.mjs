@@ -14,7 +14,7 @@ export default {
       [
         // One entry per app under `apps/`, plus the surfaces that name a
         // change owning no app.
-        "web",
+        "console",
         "api",
         // The OpenAPI contract at `api/openapi/` — a contract change is not an
         // implementation change, and the scope is how a reader tells them

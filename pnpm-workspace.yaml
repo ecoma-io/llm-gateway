@@ -1,5 +1,5 @@
 # A workspace from the first commit: `apps/` holds the two products of this
-# repository — the Go API (`apps/api`) and the Vue console (`apps/web`) — and
+# repository — the Go API (`apps/api`) and the Vue console (`apps/console`) — and
 # `packages/` holds the libraries they share, starting with the generated API
 # client. Globs rather than an explicit map, so a new project registers itself
 # the moment its `moon.yml` lands; `scripts/check-projects.mjs` is what turns

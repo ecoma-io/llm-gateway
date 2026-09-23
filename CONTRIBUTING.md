@@ -38,7 +38,7 @@ is because that step was skipped. Do not skip it.
 | `pnpm typecheck`      | Every project's `typecheck` target through Moon — `vue-tsc --noEmit` and `go build ./...`              |
 | `pnpm build`          | Every project's `build` target through Moon — `vite build` and the gateway binary                      |
 | `pnpm check-projects` | Asserts every `apps/*` and `packages/*` directory is a project Moon can see, with the four targets     |
-| `pnpm dev:web`        | The console's Vite dev server                                                                          |
+| `pnpm dev:console`    | The console's Vite dev server                                                                          |
 | `pnpm dev:api`        | The API server (`go run ./cmd/gateway`, serves `/healthz`, `/readyz` and `/version` on :8080)          |
 
 A `Makefile` at the root spells the same commands as `make` targets
@@ -46,7 +46,7 @@ A `Makefile` at the root spells the same commands as `make` targets
 single project's targets run directly:
 
 ```bash
-pnpm exec moon run web:lint web:test web:typecheck web:build
+pnpm exec moon run console:lint console:test console:typecheck console:build
 pnpm exec moon run api-client:lint api-client:test api-client:typecheck api-client:build
 pnpm exec moon run api:lint api:test api:typecheck api:build
 ```
@@ -94,13 +94,13 @@ commitlint.
 **Types:** `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`,
 `ci`, `chore`, `revert`.
 
-**Scope is optional**, and when used it names where the change lands: `web`
-(the console), `api` (the Go service), `openapi` (the contract), `workspace`
+**Scope is optional**, and when used it names where the change lands: `console`
+(the Vue app), `api` (the Go service), `openapi` (the contract), `workspace`
 (the repository and its tooling), `docs`, `deps`, `ci`.
 
 ```
 feat(api): proxy a completion request to a provider
-fix(web): keep the token field masked after a failed submit
+fix(console): keep the token field masked after a failed submit
 chore(workspace): scaffold llm gateway monorepo
 ```
 
@@ -120,7 +120,7 @@ body of the single commit that lands, trailers and all.
 
 ## Tests
 
-Tests live beside the code they test: `*.spec.ts` under `apps/web/src` run on
+Tests live beside the code they test: `*.spec.ts` under `apps/console/src` run on
 Vitest, `_test.go` under `apps/api` run on the standard `go test`. No mocking
 library is in the tree — the surface is small enough that tests drive real
 handlers and real stores, and the day that stops being true is the day a test

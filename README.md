@@ -16,7 +16,7 @@ repository.
 | Path                       | What it is                                                                                                                                                                                                                                       |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `apps/api`                 | The Go API service. Serves `GET /healthz`, `GET /readyz` and `GET /version` from the standard library, with graceful SIGTERM/SIGINT shutdown. Nothing else.                                                                                      |
-| `apps/web`                 | The Vue 3 + TypeScript console: Vite, Vue Router, Pinia, styled by `@ecoma-io/loom`. Today it is the app shell — navigation, light/dark/system theming — plus one page surfacing the two contract probes.                                        |
+| `apps/console`             | The Vue 3 + TypeScript console: Vite, Vue Router, Pinia, styled by `@ecoma-io/loom`. Today it is the app shell — navigation, light/dark/system theming — plus one page surfacing the two contract probes.                                        |
 | `packages/api-client`      | The TypeScript API client generated from `api/openapi/openapi.yaml` by `@hey-api/openapi-ts` — the console's only API surface, with a build-time check that fails if the committed client drifts from the contract.                              |
 | `api/openapi/openapi.yaml` | The API contract. Today it documents exactly the three endpoints the service implements.                                                                                                                                                         |
 | `migrations/`              | Database migrations — ordered, hand-authored `NNNNNN_name.up.sql`/`.down.sql` pairs applied by golang-migrate. Today it holds the `000001_timescaledb_bootstrap` pair, which enables the `timescaledb` extension and creates no business schema. |
@@ -38,11 +38,11 @@ pnpm lint           # every project's lint target (ESLint; gofmt + golangci-lint
 pnpm test           # every project's test target (Vitest; go test)
 pnpm typecheck      # every project's typecheck target (vue-tsc; go build)
 pnpm build          # every project's build target (vite build; go build -o bin/gateway)
-pnpm dev:web        # the console's Vite dev server
+pnpm dev:console    # the console's Vite dev server
 pnpm dev:api        # the API server via go run
 ```
 
-`pnpm dev:api` serves the probes on :8080, and the dev server `pnpm dev:web`
+`pnpm dev:api` serves the probes on :8080, and the dev server `pnpm dev:console`
 proxies `/healthz` and `/readyz` to it — so the console's status page works
 against the local API with no configuration. To point the console at a
 gateway on another origin instead, set `VITE_API_BASE_URL`.

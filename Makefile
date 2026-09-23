@@ -6,7 +6,7 @@
 
 .DEFAULT_GOAL := help
 .PHONY: help install format format-check lint test typecheck build check-projects \
-	dev-web dev-api go-fmt go-vet go-test
+	dev-console dev-api go-fmt go-vet go-test
 
 help: ## List the available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -35,8 +35,8 @@ build: ## Every project's build target through Moon
 check-projects: ## Assert every apps/* and packages/* directory is a Moon project
 	pnpm check-projects
 
-dev-web: ## Run the Vue console dev server
-	pnpm dev:web
+dev-console: ## Run the Vue console dev server
+	pnpm dev:console
 
 dev-api: ## Run the Go API server (go run)
 	pnpm dev:api

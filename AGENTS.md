@@ -18,7 +18,7 @@ below), never as scaffolding someone left around.
 | Path                       | What lives there                                                                                                                                                                |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `apps/api`                 | The Go service. `cmd/gateway` is the entry point; `internal/` is the implementation.                                                                                            |
-| `apps/web`                 | The Vue 3 console.                                                                                                                                                              |
+| `apps/console`             | The Vue 3 console.                                                                                                                                                              |
 | `api/openapi/openapi.yaml` | The API contract.                                                                                                                                                               |
 | `migrations/`              | Database migrations — ordered, reviewed `.up.sql`/`.down.sql` pairs (the bootstrap pair enables TimescaleDB).                                                                   |
 | `deploy/`                  | Local development and integration fixtures for the backing infrastructure: `postgres/` (compose, migration runner, `verify.sh` suite) and `redis/` (disposable Valkey fixture). |
@@ -60,8 +60,8 @@ below), never as scaffolding someone left around.
 9. **Changes land through pull requests.** Branch, pull request, required
    checks green, merge through the queue. See CONTRIBUTING.md for the flow.
 10. **Conventional Commits are required.** `type(scope): subject`, enforced by
-    commitlint on every commit and on every pull request title. Scopes: `web`,
-    `api`, `openapi`, `workspace`, `docs`, `deps`, `ci`.
+    commitlint on every commit and on every pull request title. Scopes:
+    `console`, `api`, `openapi`, `workspace`, `docs`, `deps`, `ci`.
 11. **No dependency without justification.** A new import — npm or Go module —
     arrives with a reason in the diff: what it does, why the standard library
     and the existing tree cannot. "It is popular" is not a reason.
@@ -70,16 +70,16 @@ below), never as scaffolding someone left around.
 
 The root `package.json` is the roster; `pnpm <script>` is the form.
 `format`, `format:check`, `lint`, `test`, `typecheck`, `build`,
-`check-projects`, `dev:web`, `dev:api`. The Moon tasks behind `lint`/`test`/
+`check-projects`, `dev:console`, `dev:api`. The Moon tasks behind `lint`/`test`/
 `typecheck`/`build` live in `apps/*/moon.yml` and run per project; a single
-project's targets run as `pnpm exec moon run web:lint` (or `api:...`). The
+project's targets run as `pnpm exec moon run console:lint` (or `api:...`). The
 hooks (`lefthook.yml`) run format, lint and the projects gate on commit, tests
 and the graph on push, commitlint on the message.
 
 ## Commits
 
 [Conventional Commits](https://www.conventionalcommits.org/), with the scope
-naming where the change lands (`web`, `api`, `openapi`, `workspace`, `docs`,
+naming where the change lands (`console`, `api`, `openapi`, `workspace`, `docs`,
 `deps`, `ci` — optional when the change owns no surface). The pull request
 title becomes the squash commit's subject, so it is held to the same rule.
 AI-assisted commits carry a trailer — `Assisted-by: <tool>` or
