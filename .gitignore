@@ -6,7 +6,9 @@ coverage/
 # replaying as green is the one failure mode a cache must not have.
 .moon/cache/
 
-# The Go build target's output (apps/api/bin/gateway).
+# The Go build targets' output (apps/*/bin/<app>, one per Go module under
+# apps/). Globbed rather than listed so a fourth module's binary cannot land
+# in a commit because its author forgot this file.
 bin/
 
 # Editors / OS

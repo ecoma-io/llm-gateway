@@ -1,0 +1,22 @@
+-- Bootstrap the Data Plane's database: PostgreSQL with TimescaleDB.
+--
+-- The lane is the directory this file sits in. `migrations/dataplane/` is
+-- applied to the `dataplane` database and to no other, and the Control
+-- Plane's lane is its sibling — `migrations/README.md` states the rule.
+-- This migration exists to prove the migration pipeline end to end — apply,
+-- validate, roll back — and to establish the one thing every future
+-- time-series migration depends on: the timescaledb extension. It creates no
+-- business schema. Tables arrive with the domains that own them, as their own
+-- reviewed migrations (accounts, users, api keys and their like are
+-- deliberately absent; the reasoning lives in ecoma-io/llm-gateway#8 and in
+-- deploy/postgres/README.md's decision record).
+--
+-- IF NOT EXISTS is load-bearing: the timescaledb docker image installs this
+-- extension into `postgres` and into `template1` when it first builds a
+-- volume, so every database created from that template — `dataplane` among
+-- them, by deploy/postgres/initdb/ — carries it before any migration runs. On
+-- a fresh local database this migration therefore records itself over work
+-- the image already did, the honest no-op, instead of failing on it. On a
+-- database that did not come from that image, the extension is created here
+-- and this migration is its single reviewable provenance.
+CREATE EXTENSION IF NOT EXISTS timescaledb;

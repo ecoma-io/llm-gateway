@@ -1,8 +1,12 @@
-# A workspace from the first commit: `apps/` holds the two products of this
-# repository — the Go API (`apps/api`) and the Vue console (`apps/web`) — and
-# `packages/` holds the libraries they share, starting with the generated API
-# client. Globs rather than an explicit map, so a new project registers itself
-# the moment its `moon.yml` lands; `scripts/check-projects.mjs` is what turns
+# A workspace from the first commit: `apps/` holds the four applications of
+# this repository — the Vue console (`apps/console`), the Control Plane API
+# (`apps/console-api`), the Data Plane runtime (`apps/dataplane`) and the Data
+# Plane management API (`apps/dataplane-api`) — and `packages/` holds the
+# libraries they share, starting with the generated console client. Only the
+# console is a pnpm project: the three Go applications are modules of their own
+# (go.work), and Moon sees all four. Globs rather than an explicit map, so a new
+# project registers itself the moment its `moon.yml` lands;
+# `scripts/check-projects.mjs` is what turns
 # a directory Moon cannot see into a red check instead of a silent skip.
 packages:
   - "apps/*"

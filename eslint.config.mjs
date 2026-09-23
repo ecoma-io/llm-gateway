@@ -3,7 +3,7 @@
 // over, leaving ESLint to judge correctness only.
 //
 // The repository's JavaScript has three homes: the Vue console under
-// `apps/web` (typed TypeScript in `.ts` and `.vue`, type-checked by
+// `apps/console` (typed TypeScript in `.ts` and `.vue`, type-checked by
 // `vue-tsc` through the typecheck target), the API client under
 // `packages/api-client` (its generated sources get their own block below),
 // and the plain-Node scripts and root configs (`.mjs`).
@@ -16,8 +16,8 @@
 // `<script lang="ts">` blocks inside it.
 //
 // What is deliberately absent: Go files. ESLint cannot read them; `gofmt` and
-// `golangci-lint` are the half of the lint target that owns them
-// (`apps/api/moon.yml`).
+// `golangci-lint` are the half of the lint target that owns them (the
+// `moon.yml` of each application under `apps/`).
 import js from "@eslint/js";
 import pluginVue from "eslint-plugin-vue";
 import globals from "globals";

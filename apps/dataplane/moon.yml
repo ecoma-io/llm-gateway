@@ -1,0 +1,132 @@
+# The Data Plane runtime — the OpenAI-compatible gateway (ADR 0006).
+#
+# The repository's release unit is the root, so this module's version is not
+# written anywhere in it: a Go module carries no version field, and the
+# repository-level `v<version>` tag release-please mints is what a build
+# stamps through `-ldflags` into `cmd/dataplane`'s version variable.
+#
+# Every Go task declares `/go.work` and `/go.work.sum` as inputs. The
+# workspace file is outside this project, and Moon hashes a task's inputs to
+# decide whether a cached result is still valid: without those two lines,
+# adding a module or bumping a shared dependency would leave this project's
+# cached green standing over a tree that no longer builds.
+id: dataplane
+language: go
+tasks:
+  # `script` rather than `command`, because this task is two checks and a Moon
+  # `command` is one.
+  #
+  # The static half is `golangci-lint run` (.golangci.yml argues the roster:
+  # errcheck, govet, ineffassign, staticcheck, unused — the v2 defaults, and
+  # the whole mandate). `go vet` is NOT run beside
+  # it: golangci-lint's default roster already runs govet, and the same
+  # analyzer twice is one verdict paying two CI bills.
+  #
+  # The `if` is not decoration. `gofmt -l` PRINTS the files it would reformat
+  # and exits 0 either way, so `script: gofmt -l . && golangci-lint run ./...`
+  # would report a green lint over a package whose every file was misformatted
+  # — an exit code that means nothing. Emptiness of its output is the only
+  # signal it gives, so emptiness is what this reads.
+  #
+  # `--allow-serial-runners` is the one flag this repository adds to the
+  # linter's defaults, and it is about the workspace rather than about this
+  # module: golangci-lint locks the shared analysis cache on start and exits
+  # with an error if a second instance already holds it, and `pnpm lint` runs
+  # all three modules' lint targets at once. Serializing around that lock —
+  # rather than disabling it with `--allow-parallel-runners` — keeps one cache
+  # and one verdict per module with no concurrent writer to either. CI's
+  # `verify-go` matrix never contends (one module per runner), so this costs
+  # CI nothing and fixes the local run.
+  lint:
+    script: |
+      if [ -n "$(gofmt -l .)" ]; then
+        echo "gofmt would reformat these files; run gofmt -w ."
+        gofmt -l .
+        exit 1
+      fi
+      golangci-lint run --allow-serial-runners ./...
+    inputs:
+      - "**/*"
+      - "/go.work"
+      - "/go.work.sum"
+  # `script` rather than `command`, because a bare `go test ./...` exits 0 over
+  # a tree that ran nothing. Both shapes are exit 0: a package with no
+  # `_test.go` prints `?  pkg [no test files]`, and a package whose test file
+  # declares no `Test…` function prints `ok pkg [no tests to run]` — which
+  # makes a target that ran nothing byte-for-byte identical to one that ran
+  # everything. `-v` is what makes the count visible: it prints one `=== RUN`
+  # line per test, cached replays included, and neither zero-test shape above
+  # prints a single one. The output is captured rather than streamed so it can
+  # be both printed and counted; `|| status=$?` keeps a failing run's output
+  # on screen instead of aborting before the `printf`.
+  test:
+    script: |
+      status=0
+      output="$(go test -v ./... 2>&1)" || status=$?
+      printf '%s\n' "$output"
+      [ "$status" -eq 0 ] || exit "$status"
+      if ! printf '%s\n' "$output" | grep -q '^=== RUN'; then
+        echo "go test ./... executed no tests — a green target here would mean nothing ran"
+        exit 1
+      fi
+    inputs:
+      - "**/*"
+      - "/go.work"
+      - "/go.work.sum"
+  # The integration tier: the `//go:build integration` suite in
+  # `internal/adapters/outbound/valkey` against a real Redis-compatible server.
+  # One suite, two runners — a developer against `deploy/redis/docker-compose.yml`
+  # (that directory's README has the commands) and CI's `verify-go` job against
+  # its pinned service container — and this target is the single definition of
+  # the run both perform, so the tier cannot drift between them.
+  #
+  # The scope is the package that owns the tagged tests, not `./...`: with the
+  # tag applied, `./...` would recompile and re-run every unit suite a second
+  # time for nothing. The vacuity guard below is what catches that scope going
+  # stale — the tagged file moved, renamed, or lost its build constraint —
+  # because `go test -tags=…` exits 0 over a run of nothing, byte-for-byte
+  # identical to a full pass.
+  #
+  # VALKEY_ADDRESS is required here rather than left to the suite's own
+  # `t.Fatal` for the same reason the missing variable fails the run at all:
+  # one line naming the fix beats four tests failing on it, and it states the
+  # tier's contract — nothing runs without an explicit server — before go test
+  # is even invoked. VALKEY_USERNAME and VALKEY_PASSWORD pass through
+  # untouched, as the suite itself documents.
+  test-integration:
+    script: |
+      if [ -z "${VALKEY_ADDRESS:-}" ]; then
+        echo "VALKEY_ADDRESS is required — start the fixture (from the repository root: docker compose -f deploy/redis/docker-compose.yml up -d) and set it to 127.0.0.1:6379 (see deploy/redis/README.md)"
+        exit 1
+      fi
+      status=0
+      output="$(go test -v -tags=integration ./internal/adapters/outbound/valkey 2>&1)" || status=$?
+      printf '%s\n' "$output"
+      [ "$status" -eq 0 ] || exit "$status"
+      if ! printf '%s\n' "$output" | grep -q '^=== RUN'; then
+        echo "go test -tags=integration executed no tests — a green target here would mean nothing ran"
+        exit 1
+      fi
+    inputs:
+      - "**/*"
+      - "/go.work"
+      - "/go.work.sum"
+  # The Go half of what `vue-tsc --noEmit` is for the console project. `go
+  # build` over more than one package compiles and discards, writing no binary
+  # — a typecheck target that dropped an executable into the package root would
+  # be an untracked file in every contributor's tree.
+  typecheck:
+    command: go build ./...
+    inputs:
+      - "**/*"
+      - "/go.work"
+      - "/go.work.sum"
+  # The deliverable itself: one statically-linked binary into `bin/`, which is
+  # gitignored. Distinct from `typecheck` on purpose — proving `cmd/dataplane`
+  # links into an executable is a claim `go build ./...` never makes.
+  build:
+    command: go build -o bin/dataplane ./cmd/dataplane
+    inputs:
+      - "**/*"
+      - "/go.work"
+      - "/go.work.sum"

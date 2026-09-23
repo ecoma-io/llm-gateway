@@ -36,8 +36,8 @@ permissions:
   contents: read
 
 jobs:
-  verify-web:
-    name: Verify (web)
+  verify-console:
+    name: Verify (console)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -102,12 +102,38 @@ jobs:
       - name: Lint, test, typecheck and build the JavaScript projects
         run: >-
           pnpm exec moon run api-client:lint api-client:test api-client:typecheck
-          api-client:build web:lint web:test web:typecheck web:build
+          api-client:build console:lint console:test console:typecheck
+          console:build
 
-  verify-api:
-    name: Verify (api)
+  verify-go:
+    name: Verify (go ${{ matrix.app }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # One leg per Go module under `apps/`, each running the module's own four
+    # targets. A matrix rather than three jobs because the three legs are the
+    # same run with a different name — and because a fourth module then costs
+    # one line instead of thirty.
+    #
+    # `fail-fast: false` is the point of the matrix for a change that touches
+    # more than one module: the default cancels the remaining legs as soon as
+    # one fails, so a red run reports the first module to break and hides
+    # whether the other two survived the same edit.
+    #
+    # `integration` marks the legs that own a `test-integration` target. The
+    # service container below is declared once for the job and therefore starts
+    # for every leg, including the one that does not use it; declaring it per
+    # leg would need three copies of a digest pin, which is exactly the drift
+    # the parity step below exists to prevent.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - app: console-api
+            integration: true
+          - app: dataplane
+            integration: true
+          - app: dataplane-api
+            integration: false
     # The integration tier's server: the same digest-pinned image the local
     # fixture in `deploy/redis/docker-compose.yml` runs, as a job-scoped
     # service container. One suite, two runners — a developer's compose stack
@@ -162,11 +188,14 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       # The Go module's floor is owned by the module that requires it:
-      # `go-version-file` reads `apps/api/go.mod`.
-      - name: Pin the Go toolchain the api targets run
+      # `go-version-file` reads this leg's own `go.mod`, so a module that
+      # raises its floor raises it for its own job without a second place to
+      # edit. Committing `go.work` does not change this — the workspace pins
+      # no toolchain of its own.
+      - name: Pin the Go toolchain the ${{ matrix.app }} targets run
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: apps/api/go.mod
+          go-version-file: apps/${{ matrix.app }}/go.mod
           cache: false
 
       # The two files that name a Valkey image — this workflow's service
@@ -227,9 +256,8 @@ jobs:
       # the runner image (whose copy moves underneath every job) and rather
       # than an installer action (a second moving piece when the release
       # tarball's digest is already the pin). The digest was read off the
-      # v2.12.2 release artifact itself. The `lint` target in
-      # `apps/api/moon.yml` argues the linter roster and why `go vet` is not
-      # run beside it.
+      # v2.12.2 release artifact itself. Each application's `moon.yml` argues
+      # the linter roster and why `go vet` is not run beside it.
       #
       # The download itself retries bounded — `--retry 3 --retry-all-errors
       # --retry-delay 10` — because a transient 5xx from the release endpoint
@@ -241,7 +269,7 @@ jobs:
       # /usr/local/bin, not $GITHUB_PATH: Moon composes a task's PATH from its
       # toolchain dirs and drops the runner's per-step PATH additions. A system
       # location is on every PATH a task can build.
-      - name: Install the pinned golangci-lint the api lint target runs
+      - name: Install the pinned golangci-lint the Go lint targets run
         run: |
           set -euo pipefail
           dir="$RUNNER_TEMP/golangci-lint"
@@ -254,32 +282,42 @@ jobs:
           tar -xzf "$dir/golangci-lint.tar.gz" -C "$dir"
           sudo mv "$dir/golangci-lint-2.12.2-linux-amd64/golangci-lint" /usr/local/bin/golangci-lint
 
-      # The API's four targets — gofmt/vet via golangci-lint, go test, the
-      # compile pass, and the binary. Same always-in-full reasoning as the
-      # web step above.
-      - name: Lint, test, typecheck and build the api
-        run: pnpm exec moon run api:lint api:test api:typecheck api:build
+      # This module's four targets — gofmt/golangci-lint, go test, the compile
+      # pass, and the binary. Same always-in-full reasoning as the console step
+      # above, and the same four target names in every application, which is
+      # what makes the matrix leg a name rather than a list.
+      - name: Lint, test, typecheck and build ${{ matrix.app }}
+        run: >-
+          pnpm exec moon run ${{ matrix.app }}:lint ${{ matrix.app }}:test
+          ${{ matrix.app }}:typecheck ${{ matrix.app }}:build
 
       # The integration tier against the service container above, through the
-      # same target a developer runs — `api:test-integration` is the single
-      # definition of the run (the `apps/api/moon.yml` target owns the
+      # same target a developer runs — the module's `test-integration` is the
+      # single definition of the run (its `moon.yml` target owns the
       # required-address and executed-something guards). The address is the
       # loopback literal the fixture README documents rather than `localhost`:
       # the published port is IPv4, and a resolver answering ::1 first would
       # dial nothing. The suite itself refuses to run without an explicit
       # address; the variable here is what satisfies that contract in CI.
-      - name: Run the Redis integration suite against the service container
+      #
+      # The variable is named for the server rather than for the protocol
+      # family, and it matches the prefix `apps/*/internal/adapters/outbound/valkey`
+      # reads — so the name this job sets is the name an adapter consumes, with
+      # no translation step in between that nobody would remember to update.
+      - name: Run the Valkey integration suite against the service container
+        if: matrix.integration
         env:
-          REDIS_ADDRESS: 127.0.0.1:6379
-        run: pnpm exec moon run api:test-integration
+          VALKEY_ADDRESS: 127.0.0.1:6379
+        run: pnpm exec moon run ${{ matrix.app }}:test-integration
 
   verify-persistence:
     name: Verify (persistence)
     # The database foundation's one definition of green, run verbatim: the
     # same `bash deploy/postgres/verify.sh` a contributor runs, against the
-    # same pinned TimescaleDB — startup, migration application and rollback,
-    # transaction semantics, dirty-state refusal and recovery. What the suite
-    # proves and why each step exists: deploy/postgres/README.md. Docker and
+    # same pinned TimescaleDB — startup, both plane databases answering,
+    # migration application and rollback, transaction semantics, dirty-state
+    # refusal and recovery. What the suite proves and why each step exists:
+    # deploy/postgres/README.md. Docker and
     # the compose plugin are preinstalled on the runner, so the job needs no
     # toolchain setup beyond the checkout — no Node, no Go, no full history.
     runs-on: ubuntu-latest
@@ -298,7 +336,7 @@ jobs:
     # while the job list is not: add a job to `needs` and the gate tightens
     # without anyone editing repository settings — and forgetting to add it is
     # the only way to widen what green means, which is visible in this file.
-    needs: [verify-web, verify-api, verify-persistence]
+    needs: [verify-console, verify-go, verify-persistence]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

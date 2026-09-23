@@ -239,7 +239,7 @@ importers:
         specifier: ^3.3.11
         version: 3.3.11(typescript@6.0.3)
 
-  apps/web:
+  apps/console:
     dependencies:
       '@ecoma-io/llm-gateway-api-client':
         specifier: workspace:*

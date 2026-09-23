@@ -4,6 +4,12 @@
 # compose project, so "works on my machine" and "works in the suite" cannot
 # fork.
 #
+# One cluster, two databases: `control` for the Control Plane API and
+# `dataplane` for the runtime (ADR 0006 §7). The separation is the point —
+# PostgreSQL has no cross-database query, so "an application reads only its
+# own plane's tables" is enforced by the engine rather than by review — and
+# the two migration lanes under `migrations/` mirror it exactly.
+#
 # Usage (from the repository root — the -f path below is relative to it; the
 # integration suite computes its own absolute path):
 #   docker compose -f deploy/postgres/compose.yaml up -d --wait
@@ -29,12 +35,21 @@ services:
     # digest is what actually resolves, so a re-pull cannot silently move.
     image: timescale/timescaledb:2.30.1-pg18@sha256:9dede0e3ccc071cf71935b17f76bf243331df0b1575338c8ac294640fcf12a36
     environment:
-      # Explicit and boring on purpose: the database and its owner are named,
-      # and the password comes from the environment with a local-development
-      # default. No value here is a secret — the default is for a database
-      # bound to this machine's compose project, and anything real overrides
-      # GATEWAY_POSTGRES_PASSWORD without touching this file.
-      POSTGRES_DB: gateway
+      # Explicit and boring on purpose: the superuser role and its password
+      # are named, and the password comes from the environment with a
+      # local-development default. No value here is a secret — the default is
+      # for a cluster bound to this machine's compose project, and anything
+      # real overrides GATEWAY_POSTGRES_PASSWORD without touching this file.
+      #
+      # `postgres` is PostgreSQL's own maintenance database, and it is named
+      # here so that neither plane's database arrives as a side effect: the
+      # entrypoint would otherwise create whichever database this variable
+      # names, and one plane would be built by a default while the other was
+      # built by a script. Both are built by `initdb/`, in one file a reviewer
+      # reads. The role is the cluster's owner and owns both databases; per-
+      # plane roles are a production question this fixture does not pre-answer
+      # (deploy/postgres/README.md, "What is deliberately not here").
+      POSTGRES_DB: postgres
       POSTGRES_USER: gateway
       POSTGRES_PASSWORD: ${GATEWAY_POSTGRES_PASSWORD:-gateway-dev-only}
       # A development database has no business phoning home: telemetry is
@@ -55,6 +70,11 @@ services:
       # Mounting the parent is the upstream-prescribed shape: it lets a later
       # major upgrade use pg_upgrade without a volume boundary in the way.
       - postgres-data:/var/lib/postgresql
+      # The two plane databases are created by the entrypoint, on the first
+      # start of an empty volume, from this file. Read-only like every other
+      # mount here: what builds the cluster is a reviewed file, not something
+      # a running container can rewrite.
+      - ./initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # pg_isready, not a TCP probe: a port that answers is not a database
       # that accepts transactions, and everything downstream of this check
@@ -79,15 +99,25 @@ services:
   # spelled in both services because a YAML anchor cannot land inside this
   # URL string — the one duplication in this file, and both sites are
   # `${GATEWAY_POSTGRES_PASSWORD:-gateway-dev-only}`, greppable in one line.
+  #
+  # The lane is one variable, and it names both halves of the run: the
+  # directory under `migrations/` the tool reads and the database it writes.
+  # That is deliberate — the two cannot be pointed at different planes by
+  # editing a path here, which is what keeps "a migration is applied to the
+  # database its plane owns" a property of this file rather than of whoever
+  # typed the command. The default is `dataplane`, the only lane with a
+  # migration today:
+  #
+  #   GATEWAY_MIGRATE_LANE=control ... run --rm migrate up
   migrate:
     image: migrate/migrate:v4.20.1@sha256:76cc2074cb6642631f34a898ced71e6aeaa6b1a4d78c4daa743275a22e0c5be7
     profiles: ["tools"]
     entrypoint:
       - migrate
       - -path
-      - /migrations
+      - /migrations/${GATEWAY_MIGRATE_LANE:-dataplane}
       - -database
-      - postgres://gateway:${GATEWAY_POSTGRES_PASSWORD:-gateway-dev-only}@postgres:5432/gateway?sslmode=disable
+      - postgres://gateway:${GATEWAY_POSTGRES_PASSWORD:-gateway-dev-only}@postgres:5432/${GATEWAY_MIGRATE_LANE:-dataplane}?sslmode=disable
     volumes:
       - ../../migrations:/migrations:ro
     # Depends on the database being healthy, not merely started: `compose

@@ -7,8 +7,8 @@ Closes #
 ## Type of change
 
 - [ ] Bug fix (non-breaking change fixing an issue)
-- [ ] New capability in the gateway API
-- [ ] Console (web) change
+- [ ] New capability in an application (`console`, `console-api`, `dataplane`, `dataplane-api`)
+- [ ] Console change
 - [ ] OpenAPI contract change
 - [ ] Breaking change (a consumer must edit configuration or code to upgrade)
 - [ ] Documentation
@@ -17,8 +17,9 @@ Closes #
 ## Contract impact
 
 <!-- The OpenAPI document (api/openapi/openapi.yaml) is the contract. Say what
-a consumer of the API sees after this change. Write "none" explicitly rather
-than leaving it out. -->
+a consumer of the API sees after this change — and which consumer, because the
+document describes more than one surface today and will describe three
+separate ones. Write "none" explicitly rather than leaving it out. -->
 
 - [ ] No API surface changes
 - [ ] The API surface changes, and the change is described above and reflected in `api/openapi/openapi.yaml`

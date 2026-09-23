@@ -40,8 +40,10 @@ body:
     attributes:
       label: What kind of addition is this?
       options:
-        - A gateway API capability
-        - A console (web) capability
+        - A console capability
+        - A Control Plane API capability (console-api)
+        - A Data Plane runtime capability (the OpenAI-compatible surface)
+        - A Data Plane management API capability (dataplane-api)
         - An OpenAPI contract change
         - Tooling or repository workflow
         - Documentation

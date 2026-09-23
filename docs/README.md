@@ -12,13 +12,14 @@ architecture decisions land the same way: an ADR is written and accepted
 first, and the implementation follows the decision — an architecture decision
 that is not recorded as an ADR has not been made.
 
-| ADR                                                           | Decision                                                                   |
-| ------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| [0001](adr/0001-bounded-contexts-and-aggregates.md)           | Bounded contexts and aggregate boundaries                                  |
-| [0002](adr/0002-routing-and-fallback-ownership.md)            | Routing model — who owns fallback, translation, and egress                 |
-| [0003](adr/0003-concurrent-subscriptions-and-entitlements.md) | Commerce — concurrent subscriptions, scoped entitlements, and PAYG         |
-| [0004](adr/0004-reserve-and-settle-accounting.md)             | Accounting — reserve, execute, settle                                      |
-| [0005](adr/0005-relational-and-event-storage-split.md)        | Storage — PostgreSQL relational state and Timescale-oriented event history |
+| ADR                                                           | Decision                                                                              |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| [0001](adr/0001-bounded-contexts-and-aggregates.md)           | Bounded contexts and aggregate boundaries                                             |
+| [0002](adr/0002-routing-and-fallback-ownership.md)            | Routing model — who owns fallback, translation, and egress                            |
+| [0003](adr/0003-concurrent-subscriptions-and-entitlements.md) | Commerce — concurrent subscriptions, scoped entitlements, and PAYG                    |
+| [0004](adr/0004-reserve-and-settle-accounting.md)             | Accounting — reserve, execute, settle                                                 |
+| [0005](adr/0005-relational-and-event-storage-split.md)        | Storage — PostgreSQL relational state and Timescale-oriented event history            |
+| [0006](adr/0006-control-plane-and-data-plane.md)              | Control Plane and Data Plane — the four applications, their boundaries and their data |
 
 ## Architecture pages
 

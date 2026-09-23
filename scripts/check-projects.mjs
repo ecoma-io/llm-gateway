@@ -24,8 +24,9 @@
 // What it deliberately does NOT do: parse YAML. The `moon.yml` files this
 // repository carries are handwritten with a stable two-space shape, and the
 // scan below asserts the four task keys at that indent plus an `id:` matching
-// the directory's name — which is what the CI rosters (`web:*`, `api:*`,
-// `api-client:*`) and the workspace globs in `.moon/workspace.yml` route on. A
+// the directory's name — which is what the CI rosters (`console:*`,
+// `console-api:*`, `dataplane:*`, `dataplane-api:*`, `api-client:*`) and the
+// workspace globs in `.moon/workspace.yml` route on. A
 // real YAML parser would be a dependency bought to re-state those two facts.
 
 import { readdir, readFile } from "node:fs/promises";
@@ -34,7 +35,7 @@ import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 // The two workspace roots of pnpm-workspace.yaml / .moon/workspace.yml. `apps`
-// carries the products; `packages` carries what they share. A root that does
+// carries the applications; `packages` carries what they share. A root that does
 // not exist yet is an empty roster, not an error — absence of a whole root is
 // visible in the tree, unlike a silently-skipped directory inside one.
 const workspaceRoots = ["apps", "packages"];
