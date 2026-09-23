@@ -18,8 +18,8 @@
 // This is the runtime's own surface and nobody else's: the Data Plane's
 // management transport is a different application (apps/dataplane-api), and
 // console or management routes appearing here would put the Control Plane back
-// on the hot path this split exists to remove. `internal/arch` fails the build
-// if one does.
+// on the hot path this split exists to remove. routes_test.go fails if one
+// does.
 package http
 
 import (

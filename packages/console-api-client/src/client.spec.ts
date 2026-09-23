@@ -63,8 +63,19 @@ describe("generated client", () => {
     expectTypeOf(data).toEqualTypeOf<HealthStatus | undefined>();
   });
 
+  // The body is the contract's ErrorEnvelope, which is the only failure shape
+  // this document declares — the contract declares no 503 anywhere, and the
+  // scaffold's /readyz is always ready, so a 503 here would document a response
+  // the service cannot produce. What is being pinned is the client's handling of
+  // a status outside 2xx, not a response the contract promises; the status is
+  // chosen because it is what an orchestrator reads a failing probe as, and the
+  // body because an error the gateway does declare is the honest stand-in for
+  // one it does not.
   it("reports a failing probe as an error result rather than throwing", async () => {
-    stubJsonFetch({ status: "unavailable" }, 503);
+    stubJsonFetch(
+      { error: { code: "internal", message: "readiness probe failed" }, request_id: "test" },
+      503,
+    );
 
     const { data, error, response } = await getReadiness();
 

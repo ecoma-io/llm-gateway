@@ -17,7 +17,7 @@
 // Nor does anything here serve a runtime request. The OpenAI-compatible
 // surface belongs to apps/dataplane: a `/v1/...` route registered in this
 // application would put a management process on the LLM path, and
-// `internal/arch` fails the build if one appears.
+// routes_test.go fails if one appears.
 package http
 
 import (

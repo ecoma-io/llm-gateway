@@ -9,18 +9,17 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/application"
 )
 
-// inferenceSurface names the OpenAI-compatible paths that belong to the Data
-// Plane's runtime, in the spelling ADR 0002 fixes for the one of them that
-// exists. A Control Plane route matching any of these would put the LLM
+// runtimeNamespace names the OpenAI-compatible namespace that belongs to the
+// Data Plane's runtime. A Control Plane route under it would put the LLM
 // request path behind the console's backend — the single thing ADR 0006
 // forbids — and it would do it quietly, because the route would work.
-var inferenceSurface = []string{
-	"/v1/chat/completions",
-	"/v1/completions",
-	"/v1/embeddings",
-	"/v1/messages",
-	"/v1/responses",
-}
+//
+// The check is this prefix rather than the handful of paths that exist today
+// (`/v1/chat/completions` and its siblings, ADR 0002's spelling). The defect
+// is the arrival of the *surface*, not of one endpoint of it, and
+// `/v1/chat/completions/stream` is that defect while matching none of the
+// listed spellings.
+const runtimeNamespace = "/v1/"
 
 // TestTheSurfaceIsTheDeclaredSet pins what this application serves. It fails
 // on an endpoint added without a decision: the table and this list move
@@ -53,10 +52,8 @@ func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 // Control Plane API grows, it does not grow the LLM request path.
 func TestTheControlPlaneServesNoInferenceRoute(t *testing.T) {
 	for _, rt := range routes(application.New("test")) {
-		for _, inference := range inferenceSurface {
-			if rt.path == inference {
-				t.Errorf("the Control Plane API declares %s %s: the inference surface belongs to the Data Plane runtime (ADR 0006)", rt.method, rt.path)
-			}
+		if strings.HasPrefix(rt.path, runtimeNamespace) {
+			t.Errorf("the Control Plane API declares %s %s: %s belongs to the Data Plane runtime (ADR 0006)", rt.method, rt.path, runtimeNamespace)
 		}
 	}
 }

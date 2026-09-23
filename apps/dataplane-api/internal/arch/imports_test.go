@@ -1,6 +1,7 @@
 package arch
 
 import (
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -166,5 +167,51 @@ func TestEveryRuleGovernsSomething(t *testing.T) {
 				t.Errorf("the rule for %v allows %s, which is no package in this module — the allow-list has drifted from the tree", r.forbidden, prefix)
 			}
 		}
+	}
+}
+
+// TestTheRuleRosterIsTheDeclaredOne is the guard the two tests above cannot
+// give: they check the rules that are present, and nothing checks that a rule
+// is still there. Delete one — either of this application's two blanket
+// prohibitions, say — and the table stays internally consistent, every package
+// in the module agrees with it, and this suite passes while the boundary it
+// named is gone. That is the failure mode of every architecture test written
+// as a loop over its own declarations, and it is why the roster is pinned here
+// by literal.
+//
+// The forged list is every forbidden prefix with the module path folded back
+// to `<module>`, sorted. Adding a boundary is therefore two edits — the rule
+// and this line — and removing one is two edits and a sentence of reasoning in
+// the diff. Both are deliberate acts, which is the whole claim the table makes
+// about itself.
+func TestTheRuleRosterIsTheDeclaredOne(t *testing.T) {
+	self := modulePath(t)
+
+	forged := []string{}
+	for _, r := range rules(self) {
+		if len(r.forbidden) == 0 {
+			// Already reported by TestEveryRuleGovernsSomething; nothing to pin.
+			continue
+		}
+		for _, prefix := range r.forbidden {
+			forged = append(forged, strings.Replace(prefix, self, "<module>", 1))
+		}
+	}
+	sort.Strings(forged)
+
+	want := []string{
+		"<module>/internal/adapters/",
+		"<module>/internal/application",
+		"<module>/internal/config",
+		"database/sql",
+		"github.com/jackc/pgx",
+		"github.com/lib/pq",
+		"github.com/valkey-io/valkey-go",
+		"net/http",
+	}
+	sort.Strings(want)
+
+	if !slices.Equal(forged, want) {
+		t.Errorf("the rule table forges %v, want %v — a rule was added or removed, which is a change to the dependency rule itself", forged, want)
 	}
 }
