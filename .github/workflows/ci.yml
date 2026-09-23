@@ -108,6 +108,30 @@ jobs:
     name: Verify (api)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # The integration tier's server: the same digest-pinned image the local
+    # fixture in `deploy/redis/docker-compose.yml` runs, as a job-scoped
+    # service container. One suite, two runners — a developer's compose stack
+    # and this job — which is why the image line below and the compose file
+    # name the same tag AND digest, byte for byte: the parity step further
+    # down re-derives both pins at run time and fails this job if they ever
+    # diverge. Compose pins by tag+digest for the same reason; see that
+    # directory's README for the verified source and the upgrade procedure.
+    services:
+      valkey:
+        image: valkey/valkey:9.1.2@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
+        ports:
+          - 6379:6379
+        # The compose fixture's healthcheck, verbatim in effect (ping, 2s
+        # interval, 1s timeout, 10 retries, 2s start period): a container
+        # that will never answer holds a job for the same bounded time in
+        # both runners, and the start period is what absorbs a cold image
+        # pull rather than spending retries on it.
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 2s
+          --health-timeout 1s
+          --health-retries 10
+          --health-start-period 2s
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -167,6 +191,65 @@ jobs:
       # web step above.
       - name: Lint, test, typecheck and build the api
         run: pnpm exec moon run api:lint api:test api:typecheck api:build
+
+      # The two files that name a Valkey image — this workflow's service
+      # container and `deploy/redis/docker-compose.yml`, the fixture a
+      # developer runs — are written out by hand in both places, and nothing
+      # structural ties them together. A one-sided upgrade would leave this
+      # job green against a server version no developer has ever executed,
+      # which is exactly the drift the suite exists to prevent. This step
+      # re-derives both pins from their files at run time instead of comparing
+      # against a third hardcoded copy: a third copy is a third place to
+      # forget, and this way the compose file stays the single source.
+      #
+      # Absence and ambiguity fail as loudly as divergence: a pin missing from
+      # either file, or two distinct pins on either side, means the comparison
+      # would prove nothing, so it errors rather than passes. The `|| true` on
+      # each extraction keeps an unmatched pattern flowing into the explicit
+      # failure branch — `pipefail` would otherwise abort on grep's exit 1
+      # before the reason is printed.
+      - name: Assert the CI and local fixture Valkey pins agree
+        run: |
+          set -euo pipefail
+          pattern='valkey/valkey:[0-9A-Za-z._-]+@sha256:[0-9a-f]{64}'
+          compose="$(grep -ohE "$pattern" deploy/redis/docker-compose.yml | sort -u || true)"
+          workflow="$(grep -ohE "$pattern" .github/workflows/ci.yml | sort -u || true)"
+
+          require_single_pin() {
+            if [ -z "$2" ]; then
+              echo "No Valkey tag@digest pin found in $1 — both files must carry exactly one" >&2
+              exit 1
+            fi
+            if [ "$(printf '%s\n' "$2" | wc -l)" -gt 1 ]; then
+              echo "$1 carries more than one distinct Valkey pin:" >&2
+              printf '%s\n' "$2" >&2
+              exit 1
+            fi
+          }
+
+          require_single_pin "deploy/redis/docker-compose.yml" "$compose"
+          require_single_pin ".github/workflows/ci.yml" "$workflow"
+
+          if [ "$compose" != "$workflow" ]; then
+            echo "The Valkey pins diverge — upgrade both files in the same change:" >&2
+            echo "  deploy/redis/docker-compose.yml  $compose" >&2
+            echo "  .github/workflows/ci.yml         $workflow" >&2
+            exit 1
+          fi
+          echo "CI and the local fixture pin the same image: $compose"
+
+      # The integration tier against the service container above, through the
+      # same target a developer runs — `api:test-integration` is the single
+      # definition of the run (the `apps/api/moon.yml` target owns the
+      # required-address and executed-something guards). The address is the
+      # loopback literal the fixture README documents rather than `localhost`:
+      # the published port is IPv4, and a resolver answering ::1 first would
+      # dial nothing. The suite itself refuses to run without an explicit
+      # address; the variable here is what satisfies that contract in CI.
+      - name: Run the Redis integration suite against the service container
+        env:
+          REDIS_ADDRESS: 127.0.0.1:6379
+        run: pnpm exec moon run api:test-integration
 
   ci-gate:
     name: ci-gate
