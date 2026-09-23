@@ -15,7 +15,8 @@ never authoritative. Two PostgreSQL databases in one TimescaleDB cluster own
 the durable state instead, and they own it separately: `control` holds the
 Control Plane's users, keys, subscriptions, entitlements, wallets, ledgers and
 payments, and `dataplane` holds the runtime's catalog, routing and provider
-configuration, quota projection and usage history (ADR 0006 §7). Neither
+configuration, its quota and key projections, and its request and usage
+history (ADR 0006 §7). Neither
 application reads the other's database.
 
 ## Decision record
@@ -26,10 +27,12 @@ Redis OSS 7.2 client protocol. Redis 8 offers RSALv2, SSPLv1 or AGPLv3 instead;
 Valkey avoids that licensing friction for the same core RESP commands this
 foundation uses (`PING`, `AUTH`, `SELECT`, `GET`, `SET`, `DEL`).
 
-The Go service uses exactly one client: `github.com/valkey-io/valkey-go`
-v1.0.78 (Apache-2.0, actively maintained, one runtime module dependency). It
-is the official Valkey client and its CI exercises Valkey plus Redis 5, Redis
-8 and Redis Stack. The standard library has no RESP client; this is the
+Each Go application that talks to it uses exactly one client:
+`github.com/valkey-io/valkey-go` v1.0.78 — Apache-2.0, actively maintained,
+and the only runtime requirement in the two modules that have one,
+`apps/console-api/go.mod` and `apps/dataplane/go.mod`. It is the official
+Valkey client and its CI exercises Valkey plus Redis 5, Redis 8 and Redis
+Stack. The standard library has no RESP client; this is the
 smallest reasonable dependency. Vendor imports stay inside each application's
 own adapter — `apps/console-api/internal/adapters/outbound/valkey` and
 `apps/dataplane/internal/adapters/outbound/valkey` — and consumers see only
