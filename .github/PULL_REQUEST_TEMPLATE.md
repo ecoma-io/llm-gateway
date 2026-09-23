@@ -45,7 +45,7 @@ than leaving it out. -->
 ## AI-assisted development
 
 - [ ] This pull request is AI-assisted (drafted or substantially written by an AI coding agent)
-- [ ] Each such commit carries its disclosure trailer: `Assisted-by: <tool>`, or `Generated-by: <tool>` where the tool produced substantially the whole commit
+- [ ] The pull request carries exactly one disclosure trailer, on its last commit: `Assisted-by: <tool>`, or `Generated-by: <tool>` where the tool produced substantially the whole commit
 
 <!-- Name the tool and model, e.g. "Claude Code". A description can be edited
 later and no clone carries it — the commit trailer travels with the code. -->
