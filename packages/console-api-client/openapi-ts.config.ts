@@ -1,14 +1,22 @@
 // The client is generated, never hand-written: this config plus
-// ../../api/openapi/openapi.yaml is the entire definition of src/generated,
+// ../../api/openapi/console.yaml is the entire definition of src/generated,
 // and the `build` target re-runs the generator and fails on any diff so a
 // contract change cannot land without its regenerated client (AGENTS.md,
 // "The rules", 3). The generator version is pinned exactly in package.json —
 // output bytes are a function of (spec, config, versions), and a floating
 // caret would let a release rewrite the tree overnight.
+//
+// The input is the Console contract and not the runtime's or the management
+// API's. That is the plane boundary made mechanical in the one place a
+// consumer would otherwise cross it by accident: this package cannot generate
+// a type for `/v1/chat/completions`, so no console code can call the runtime,
+// and the mistake is a compile error rather than a review comment. The
+// fragment directory `api/openapi/shared/` is an input too — the generator
+// resolves those `$ref`s, so a change there is a change to this client.
 import { defineConfig } from "@hey-api/openapi-ts";
 
 export default defineConfig({
-  input: "../../api/openapi/openapi.yaml",
+  input: "../../api/openapi/console.yaml",
   output: {
     path: "src/generated",
     // Formatting runs in package scripts instead of here, with an explicit

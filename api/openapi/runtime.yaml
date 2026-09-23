@@ -1,0 +1,134 @@
+# The runtime contract: the OpenAI-compatible surface the Data Plane serves,
+# and the only contract on the LLM request path.
+#
+# This is the surface the gateway exists to serve. It is also the one whose
+# availability profile is unlike the others: the Control Plane may be down
+# while this answers, and a runtime request must never wait on it (ADR 0006
+# §4). That is why this document is separate rather than a section of the
+# console's: the client generated from `console.yaml` cannot see these paths,
+# and the two surfaces' uptime commitments are stated apart because they do not
+# move together.
+#
+# Exactly one operation exists today, and it is not implemented. It is
+# contracted anyway, as a 501 with `not_implemented`, because the alternative —
+# omitting it — would make the boundary invisible: `POST /v1/chat/completions`
+# belongs to this application, and a caller who sends one gets an answer that
+# says so rather than a 404 that says the path is nothing. The success path is
+# deliberately absent: a documented 200 this code cannot produce would be the
+# contract claiming a capability that does not exist.
+openapi: 3.1.0
+info:
+  title: Ecoma LLM Gateway — OpenAI-compatible runtime
+  version: 0.1.0
+  description: >-
+    The OpenAI-compatible inference surface of the Ecoma LLM Gateway's Data
+    Plane, plus the process probes this application serves. Every response
+    returns X-Request-Id. An unmatched path returns the ErrorEnvelope with HTTP
+    404; a method unsupported by a known path returns it with HTTP 405; a
+    contracted operation that is not built returns it with HTTP 501 and the
+    `not_implemented` code. The runtime's routing, provider and usage behaviour
+    is not designed yet — this document carries the surface that exists and the
+    process every later endpoint follows.
+servers:
+  - url: /
+paths:
+  /healthz:
+    get:
+      operationId: getHealth
+      summary: Liveness of the runtime process
+      description: >-
+        Returns 200 while the process is able to serve. This is the endpoint an
+        orchestrator restarts the runtime on, and it stays a statement about
+        the process: an upstream provider being unreachable is not a reason to
+        restart the gateway that would talk to it.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The process is alive.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/probes.yaml#/components/schemas/HealthStatus"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+  /readyz:
+    get:
+      operationId: getReadiness
+      summary: Readiness of the runtime service
+      description: >-
+        Returns 200 when the service may receive traffic. The scaffold has no
+        dependencies, so it is always ready; the runtime's own checks — its
+        database, its cache, its egress — hang off this endpoint. The Control
+        Plane is never among them: the runtime is ready when it can serve an
+        inference request, and it can do that while the Control Plane is down.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The service is ready to receive traffic.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/probes.yaml#/components/schemas/HealthStatus"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+  /version:
+    get:
+      operationId: getVersion
+      summary: Build version of the runtime service
+      description: >-
+        Returns the version stamped into the dataplane binary at build time. It
+        is the repository release version when the release lane supplies one,
+        and "dev" for an unstamped local build.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The build version of the runtime service.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/probes.yaml#/components/schemas/Version"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+  /v1/chat/completions:
+    post:
+      operationId: createChatCompletion
+      summary: Create a chat completion
+      description: >-
+        The OpenAI-compatible chat completion endpoint. It is contracted and
+        not implemented: the routing, provider and accounting behaviour behind
+        it is not designed yet, and this operation answers 501 with the
+        `not_implemented` code until it is.
+
+        The request body is a pass-through — the OpenAI-compatible request
+        shape, forwarded as received — and is not asserted on, because the
+        scaffold neither validates nor forwards it. Whatever the caller sends
+        gets the same 501.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      requestBody:
+        required: false
+        description: >-
+          The OpenAI-compatible chat completion request. Forwarded as received
+          once this operation is implemented; not inspected today.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "501":
+          $ref: "./shared/errors.yaml#/components/responses/NotImplemented"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"

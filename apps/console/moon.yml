@@ -31,7 +31,7 @@ tasks:
     command: eslint . --max-warnings 0
     inputs:
       - "**/*"
-      - "/packages/api-client/**/*"
+      - "/packages/console-api-client/**/*"
       - "/package.json"
       - "/pnpm-lock.yaml"
       - "/eslint.config.mjs"
@@ -39,8 +39,9 @@ tasks:
     command: vitest run
     inputs:
       - "**/*"
-      - "/api/openapi/openapi.yaml"
-      - "/packages/api-client/**/*"
+      - "/api/openapi/console.yaml"
+      - "/api/openapi/shared/**/*"
+      - "/packages/console-api-client/**/*"
       - "/package.json"
       - "/pnpm-lock.yaml"
   typecheck:
@@ -51,15 +52,17 @@ tasks:
       # inputs: without them Moon can replay a cached console green after a
       # client type changes, hiding exactly the contract drift this boundary
       # prevents.
-      - "/api/openapi/openapi.yaml"
-      - "/packages/api-client/**/*"
+      - "/api/openapi/console.yaml"
+      - "/api/openapi/shared/**/*"
+      - "/packages/console-api-client/**/*"
       - "/package.json"
       - "/pnpm-lock.yaml"
   build:
     command: vite build
     inputs:
       - "**/*"
-      - "/api/openapi/openapi.yaml"
-      - "/packages/api-client/**/*"
+      - "/api/openapi/console.yaml"
+      - "/api/openapi/shared/**/*"
+      - "/packages/console-api-client/**/*"
       - "/package.json"
       - "/pnpm-lock.yaml"

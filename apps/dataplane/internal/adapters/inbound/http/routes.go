@@ -61,6 +61,23 @@ func routes(app *application.App) []route {
 				writeJSON(w, stdhttp.StatusOK, versionResponse{Version: app.Version()})
 			},
 		},
+		// The inference surface, contracted and not built. It is registered
+		// rather than left unrouted because the difference matters to a
+		// caller: 501 with `not_implemented` says the path belongs to this
+		// application and the capability does not exist yet, while the 404 an
+		// unrouted path would produce says the gateway has no such endpoint —
+		// and the second is a lie that costs someone an afternoon.
+		//
+		// The body is not read, parsed or forwarded. Reading it would be the
+		// first line of an implementation, and this endpoint's whole content
+		// today is the fact that there is not one.
+		{
+			method: stdhttp.MethodPost,
+			path:   "/v1/chat/completions",
+			handler: func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+				writeError(w, r, notImplementedError{})
+			},
+		},
 	}
 }
 

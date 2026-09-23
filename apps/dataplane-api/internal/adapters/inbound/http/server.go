@@ -6,7 +6,7 @@
 // wire errors — then calls the application for use-case work. Product endpoints
 // do not exist yet: health and readiness remain infrastructure-level, while
 // GET /version proves the HTTP → application → response path every domain
-// endpoint will follow. The public contract is api/openapi/openapi.yaml; it
+// endpoint will follow. The public contract is api/openapi/dataplane.yaml; it
 // changes before this package does, never after.
 //
 // Nothing here decides a business rule. A handler translates a request into a
@@ -17,7 +17,7 @@
 // Nor does anything here serve a runtime request. The OpenAI-compatible
 // surface belongs to apps/dataplane: a `/v1/...` route registered in this
 // application would put a management process on the LLM path, and
-// `internal/arch` fails the build if one appears.
+// routes_test.go fails if one appears.
 package http
 
 import (
@@ -38,7 +38,7 @@ const (
 	serviceName = "dataplane-api"
 
 	// RequestIDHeader is the one request-correlation header this application
-	// accepts and returns. Its spelling matches api/openapi/openapi.yaml
+	// accepts and returns. Its spelling matches api/openapi/dataplane.yaml
 	// exactly.
 	RequestIDHeader = "X-Request-Id"
 
@@ -61,7 +61,7 @@ func New(app *application.App) stdhttp.Handler {
 	}
 
 	// The fallback every other path and method lands on. Unmatched paths are
-	// not an operation in api/openapi/openapi.yaml, but their envelope is
+	// not an operation in api/openapi/dataplane.yaml, but their envelope is
 	// contracted in its description: JSON, code "not_found", request ID.
 	mux.HandleFunc("/", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		writeError(w, r, notFoundError{})
@@ -71,7 +71,7 @@ func New(app *application.App) stdhttp.Handler {
 	// segment — into an HTML 301/307 before routing, a response shape the
 	// contract does not have. The path as requested matches no operation, so
 	// the transport answers it here instead of letting the redirect through,
-	// and every reachable response stays inside api/openapi/openapi.yaml.
+	// and every reachable response stays inside api/openapi/dataplane.yaml.
 	handler := stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if r.URL.Path != cleanPath(r.URL.Path) {
 			writeError(w, r, notFoundError{})
@@ -101,7 +101,7 @@ func cleanPath(p string) string {
 
 // writeStatus is the one definition of what a health endpoint's body looks
 // like, shared by /healthz and /readyz so the two cannot drift apart; the
-// shape and trailing newline are exactly what api/openapi/openapi.yaml
+// shape and trailing newline are exactly what api/openapi/dataplane.yaml
 // documents.
 func writeStatus(w stdhttp.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
@@ -109,16 +109,19 @@ func writeStatus(w stdhttp.ResponseWriter) {
 	_, _ = w.Write([]byte("{\"status\":\"ok\"}\n"))
 }
 
-// versionResponse is the one wire shape for a version answer, mirroring
-// api/openapi/openapi.yaml's Version schema field for field. The application
-// returns the bare value; serialization stays on this side of the boundary,
-// exactly as it does for the error envelope below.
+// versionResponse is the one wire shape for a version answer, mirroring the
+// shared Version schema (api/openapi/shared/probes.yaml) field for field. The
+// application returns the bare value; serialization stays on this side of the
+// boundary, exactly as it does for the error envelope below.
 type versionResponse struct {
 	Version string `json:"version"`
 }
 
-// errorEnvelope is the one wire shape for failures, mirroring
-// api/openapi/openapi.yaml's ErrorEnvelope field for field.
+// errorEnvelope is the one wire shape for failures, mirroring the shared
+// ErrorEnvelope (api/openapi/shared/errors.yaml) field for field. The two
+// fragments are shared because all three contracts return the same envelope:
+// a caller who learns this shape on one surface has learned it on all of
+// them.
 type errorEnvelope struct {
 	Error     errorBody `json:"error"`
 	RequestID string    `json:"request_id"`

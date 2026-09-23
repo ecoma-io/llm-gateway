@@ -33,7 +33,7 @@ export type Options<
 };
 
 /**
- * Liveness of the API process
+ * Liveness of the Control Plane API process
  *
  * Returns 200 while the process is able to serve. Anything more than "is the process alive" belongs to /readyz, not here.
  */
@@ -46,9 +46,9 @@ export const getHealth = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Readiness of the API service
+ * Readiness of the Control Plane API service
  *
- * Returns 200 when the service may receive traffic. The scaffold has no dependencies, so it is always ready; the future dependency checks hang off this endpoint.
+ * Returns 200 when the service may receive traffic. The scaffold has no dependencies, so it is always ready; the Control Plane's own dependency checks — its database, its cache — hang off this endpoint. The Data Plane is not among them: this service is ready when it can serve the console, whether or not the runtime is reachable.
  */
 export const getReadiness = <ThrowOnError extends boolean = false>(
   options?: Options<GetReadinessData, ThrowOnError>,
@@ -59,9 +59,9 @@ export const getReadiness = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Build version of the API service
+ * Build version of the Control Plane API service
  *
- * Returns the version stamped into the gateway binary at build time. It is the repository release version when the release lane supplies one, and "dev" for an unstamped local build.
+ * Returns the version stamped into the console-api binary at build time. It is the repository release version when the release lane supplies one, and "dev" for an unstamped local build.
  */
 export const getVersion = <ThrowOnError extends boolean = false>(
   options?: Options<GetVersionData, ThrowOnError>,

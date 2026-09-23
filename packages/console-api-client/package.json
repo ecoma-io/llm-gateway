@@ -1,5 +1,5 @@
 {
-  "name": "@ecoma-io/llm-gateway-api-client",
+  "name": "@ecoma-io/llm-gateway-console-api-client",
   "version": "0.0.0",
   "private": true,
   "type": "module",

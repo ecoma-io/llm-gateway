@@ -59,10 +59,19 @@ tasks:
   # prints a single one. The output is captured rather than streamed so it can
   # be both printed and counted; `|| status=$?` keeps a failing run's output
   # on screen instead of aborting before the `printf`.
+  # `-count=1` and the `/api/openapi/**/*` input are one defect seen from its
+  # two sides. contract_test.go opens the contract at run time, and neither
+  # cache can see a file a test reads: Go hashes the package's source and its
+  # imported packages, not the documents a test opens, and Moon hashes the
+  # inputs this file lists. So an edit to api/openapi/runtime.yaml alone — a
+  # path added, say — would replay a cached `ok` produced against the previous
+  # document, and the gate would report a checked contradiction it never
+  # checked. `-count=1` disables Go's replay; the `/api/openapi/**/*` line is
+  # what makes Moon run the target at all.
   test:
     script: |
       status=0
-      output="$(go test -v ./... 2>&1)" || status=$?
+      output="$(go test -count=1 -v ./... 2>&1)" || status=$?
       printf '%s\n' "$output"
       [ "$status" -eq 0 ] || exit "$status"
       if ! printf '%s\n' "$output" | grep -q '^=== RUN'; then
@@ -71,6 +80,7 @@ tasks:
       fi
     inputs:
       - "**/*"
+      - "/api/openapi/**/*"
       - "/go.work"
       - "/go.work.sum"
   # The integration tier: the `//go:build integration` suite in

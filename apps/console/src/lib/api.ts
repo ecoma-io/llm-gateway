@@ -10,7 +10,7 @@ import {
   getHealth,
   getReadiness,
   type HealthStatus,
-} from "@ecoma-io/llm-gateway-api-client";
+} from "@ecoma-io/llm-gateway-console-api-client";
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? window.location.origin;
 

@@ -9,13 +9,12 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/application"
 )
 
-// inferenceSurface names the OpenAI-compatible paths the runtime will serve,
-// in the spelling ADR 0002 fixes for the one of them that exists. The scaffold
-// serves none of them yet — POST /v1/chat/completions arrives in the contract
-// split, as a contracted 501 and nothing more — so this list is a membership
-// claim rather than an inventory: these paths belong here and nowhere else,
-// and the check that they are absent from the other two applications lives in
-// their own route tests.
+// inferenceSurface names the OpenAI-compatible paths this runtime serves or
+// will serve, in the spelling ADR 0002 fixes for the one of them that exists.
+// Exactly one is contracted today — POST /v1/chat/completions, which answers
+// 501 — and the rest are named so the surface is legible as a whole: this list
+// is this application's to serve, and the check that it stays out of the other
+// two applications lives in their own route tests.
 var inferenceSurface = []string{
 	"/v1/chat/completions",
 	"/v1/completions",
@@ -43,10 +42,16 @@ var foreignSurface = []string{
 }
 
 // TestTheSurfaceIsTheDeclaredSet pins what this application serves. It fails
-// on an endpoint added without a decision: the table, this list and
-// api/openapi/openapi.yaml move together, and a new row is one edit in each.
-// It is deliberately an equality rather than a subset — a route silently
-// dropped is as much a defect as one silently added.
+// on an endpoint added without a decision: the table and this list move
+// together, and a new row is one edit in each. It is deliberately an equality
+// rather than a subset — a route silently dropped is as much a defect as one
+// silently added.
+//
+// The document is the other half of that decision and is checked by
+// contract_test.go, which compares this same table against
+// api/openapi/runtime.yaml in both directions. This list makes adding an
+// endpoint a deliberate act; that test is what notices the document moving
+// alone.
 func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 	got := []string{}
 	for _, rt := range routes(application.New("test")) {
@@ -54,7 +59,7 @@ func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 	}
 	sort.Strings(got)
 
-	want := []string{"GET /healthz", "GET /readyz", "GET /version"}
+	want := []string{"GET /healthz", "GET /readyz", "GET /version", "POST /v1/chat/completions"}
 	sort.Strings(want)
 
 	if !slices.Equal(got, want) {
@@ -78,11 +83,10 @@ func TestTheRuntimeServesNoForeignRoute(t *testing.T) {
 }
 
 // TestTheInferenceSurfaceIsTheRuntimes names the endpoints that are this
-// application's to serve, so that the split is legible in the test suite
-// rather than only in the contract that has not been written yet. It asserts
-// membership rather than presence: none of these exists today, and the
-// assertion that will matter when one arrives is that it arrives *here* — the
-// Control Plane's route test asserts the same list stays out of its table.
+// application's to serve. It asserts membership rather than presence, because
+// the list is deliberately wider than what exists: it is the surface, and the
+// assertion that will matter as each endpoint lands is that it lands *here* —
+// the Control Plane's route test asserts the same list stays out of its table.
 func TestTheInferenceSurfaceIsTheRuntimes(t *testing.T) {
 	if len(inferenceSurface) == 0 {
 		t.Fatal("the inference surface is empty; the claim below would be vacuous")

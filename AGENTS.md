@@ -20,29 +20,32 @@ change (contract first, see below), never as scaffolding someone left around.
 
 ## Layout
 
-| Path                       | What lives there                                                                                                                                                                |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apps/console`             | The Vue 3 console — the Control Plane's presentation layer, and the only browser-reachable application.                                                                         |
-| `apps/console-api`         | The Control Plane API. `cmd/console-api` is the entry point; `internal/` is the implementation.                                                                                 |
-| `apps/dataplane`           | The Data Plane runtime — the OpenAI-compatible gateway. `cmd/dataplane` is the entry point.                                                                                     |
-| `apps/dataplane-api`       | The Data Plane's management API. `cmd/dataplane-api` is the entry point; it holds no state of its own.                                                                          |
-| `go.work`                  | The Go workspace over the three Go modules. Committed, so CI and contributors run the same commands.                                                                            |
-| `api/openapi/openapi.yaml` | The API contract.                                                                                                                                                               |
-| `migrations/`              | Database migrations — one lane per plane, `migrations/<plane>/`, holding ordered, reviewed `.up.sql`/`.down.sql` pairs (the Data Plane's bootstrap pair enables TimescaleDB).   |
-| `deploy/`                  | Local development and integration fixtures for the backing infrastructure: `postgres/` (compose, migration runner, `verify.sh` suite) and `redis/` (disposable Valkey fixture). |
-| `docs/`                    | Long-form documentation — `adr/` decision records and `architecture/` reference pages, indexed in `docs/README.md`.                                                             |
-| `scripts/`                 | Repository gates.                                                                                                                                                               |
-| `.github/workflows/`       | `ci.yml`, `analysis.yml`, `release.yml`.                                                                                                                                        |
+| Path                          | What lives there                                                                                                                                                                |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apps/console`                | The Vue 3 console — the Control Plane's presentation layer, and the only browser-reachable application.                                                                         |
+| `apps/console-api`            | The Control Plane API. `cmd/console-api` is the entry point; `internal/` is the implementation.                                                                                 |
+| `apps/dataplane`              | The Data Plane runtime — the OpenAI-compatible gateway. `cmd/dataplane` is the entry point.                                                                                     |
+| `apps/dataplane-api`          | The Data Plane's management API. `cmd/dataplane-api` is the entry point; it holds no state of its own.                                                                          |
+| `go.work`                     | The Go workspace over the three Go modules. Committed, so CI and contributors run the same commands.                                                                            |
+| `packages/console-api-client` | The TypeScript client the console consumes, generated from `api/openapi/console.yaml`.                                                                                          |
+| `api/openapi/`                | The three contracts, one per boundary — `console.yaml`, `dataplane.yaml`, `runtime.yaml` — with the wire shapes they share in `shared/`.                                        |
+| `migrations/`                 | Database migrations — one lane per plane, `migrations/<plane>/`, holding ordered, reviewed `.up.sql`/`.down.sql` pairs (the Data Plane's bootstrap pair enables TimescaleDB).   |
+| `deploy/`                     | Local development and integration fixtures for the backing infrastructure: `postgres/` (compose, migration runner, `verify.sh` suite) and `redis/` (disposable Valkey fixture). |
+| `docs/`                       | Long-form documentation — `adr/` decision records and `architecture/` reference pages, indexed in `docs/README.md`.                                                             |
+| `scripts/`                    | Repository gates.                                                                                                                                                               |
+| `.github/workflows/`          | `ci.yml`, `analysis.yml`, `release.yml`.                                                                                                                                        |
 
 ## The rules
 
 1. **Inspect before modifying.** Read the file you are about to change and the
    files around it before writing. A change that contradicts its neighbours is
    a defect even when it is green.
-2. **The API contract is the OpenAPI document.** `api/openapi/openapi.yaml`
-   changes first, the implementation follows. An endpoint that exists in code
-   and not in the contract is a bug; a contract entry with no implementation is
-   a bug.
+2. **The API contract is the OpenAPI document.** The contract for the surface
+   you are changing — `api/openapi/console.yaml`, `dataplane.yaml` or
+   `runtime.yaml` — changes first, the implementation follows. An endpoint that
+   exists in code and not in the contract is a bug; a contract entry with no
+   implementation is a bug. Each application's route table is compared against
+   its own document by a test, in both directions, so neither can move alone.
 3. **The console consumes the contract, not the implementation.** Where it is
    practical, the frontend binds to types generated from the OpenAPI document
    rather than hand-writing shapes that mirror it. A hand-written copy is drift
@@ -75,7 +78,8 @@ change (contract first, see below), never as scaffolding someone left around.
    checks green, merge through the queue. See CONTRIBUTING.md for the flow.
 10. **Conventional Commits are required.** `type(scope): subject`, enforced by
     commitlint on every commit and on every pull request title. Scopes:
-    `console`, `api`, `openapi`, `workspace`, `docs`, `deps`, `ci`.
+    `console`, `console-api`, `dataplane`, `dataplane-api`, `openapi`,
+    `workspace`, `docs`, `deps`, `ci`.
 11. **No dependency without justification.** A new import — npm or Go module —
     arrives with a reason in the diff: what it does, why the standard library
     and the existing tree cannot. "It is popular" is not a reason.

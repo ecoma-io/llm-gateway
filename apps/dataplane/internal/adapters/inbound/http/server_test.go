@@ -14,7 +14,7 @@ import (
 )
 
 // The status body every health endpoint returns, exactly as
-// api/openapi/openapi.yaml documents it — trailing newline included.
+// api/openapi/runtime.yaml documents it — trailing newline included.
 const statusBody = "{\"status\":\"ok\"}\n"
 
 func TestServerServesTheContractedRoutes(t *testing.T) {
@@ -76,6 +76,27 @@ func TestServerServesTheContractedRoutes(t *testing.T) {
 			wantStatus: stdhttp.StatusMethodNotAllowed,
 			wantAllow:  "GET, HEAD",
 			wantBody:   "{\"error\":{\"code\":\"method_not_allowed\",\"message\":\"method not allowed\"},\"request_id\":\"method-request\"}\n",
+		},
+		{
+			// The exact bytes api/openapi/runtime.yaml contracts for the one
+			// operation on this surface. A 404 would be the wrong answer here
+			// and a plausible one — the path would look unrouted — which is
+			// why the status is asserted rather than only the envelope.
+			name:       "the contracted inference endpoint reports not implemented",
+			method:     stdhttp.MethodPost,
+			path:       "/v1/chat/completions",
+			requestID:  "inference-request",
+			wantStatus: stdhttp.StatusNotImplemented,
+			wantBody:   "{\"error\":{\"code\":\"not_implemented\",\"message\":\"not implemented\"},\"request_id\":\"inference-request\"}\n",
+		},
+		{
+			name:       "the inference endpoint refuses the methods it does not accept",
+			method:     stdhttp.MethodGet,
+			path:       "/v1/chat/completions",
+			requestID:  "inference-method-request",
+			wantStatus: stdhttp.StatusMethodNotAllowed,
+			wantAllow:  "POST",
+			wantBody:   "{\"error\":{\"code\":\"method_not_allowed\",\"message\":\"method not allowed\"},\"request_id\":\"inference-method-request\"}\n",
 		},
 	}
 

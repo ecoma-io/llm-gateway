@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 
 const packageRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const workspaceRoot = resolve(packageRoot, "../..");
-const output = await mkdtemp(join(tmpdir(), "llm-gateway-api-client-"));
+const output = await mkdtemp(join(tmpdir(), "llm-gateway-console-api-client-"));
 
 function run(executable, args) {
   return new Promise((resolveRun, reject) => {

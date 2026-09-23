@@ -14,7 +14,7 @@ import (
 )
 
 // The status body every health endpoint returns, exactly as
-// api/openapi/openapi.yaml documents it — trailing newline included.
+// api/openapi/dataplane.yaml documents it — trailing newline included.
 const statusBody = "{\"status\":\"ok\"}\n"
 
 func TestServerServesTheContractedRoutes(t *testing.T) {

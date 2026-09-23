@@ -14,7 +14,7 @@ import (
 )
 
 // The status body every health endpoint returns, exactly as
-// api/openapi/openapi.yaml documents it — trailing newline included.
+// api/openapi/console.yaml documents it — trailing newline included.
 const statusBody = "{\"status\":\"ok\"}\n"
 
 func TestServerServesTheContractedRoutes(t *testing.T) {
@@ -76,6 +76,19 @@ func TestServerServesTheContractedRoutes(t *testing.T) {
 			wantStatus: stdhttp.StatusMethodNotAllowed,
 			wantAllow:  "GET, HEAD",
 			wantBody:   "{\"error\":{\"code\":\"method_not_allowed\",\"message\":\"method not allowed\"},\"request_id\":\"method-request\"}\n",
+		},
+		{
+			// The behavioural half of the route table's claim, and the one
+			// that would catch a break the table cannot see: the Control Plane
+			// answers the inference path exactly as it answers any path it does
+			// not serve. Not a 501 — that would mean the endpoint is contracted
+			// here — and not a 405, which would mean the path is known.
+			name:       "the inference surface is not a path on the Control Plane",
+			method:     stdhttp.MethodPost,
+			path:       "/v1/chat/completions",
+			requestID:  "inference-request",
+			wantStatus: stdhttp.StatusNotFound,
+			wantBody:   "{\"error\":{\"code\":\"not_found\",\"message\":\"resource not found\"},\"request_id\":\"inference-request\"}\n",
 		},
 	}
 

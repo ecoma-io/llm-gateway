@@ -5,7 +5,7 @@
 // The repository's JavaScript has three homes: the Vue console under
 // `apps/console` (typed TypeScript in `.ts` and `.vue`, type-checked by
 // `vue-tsc` through the typecheck target), the API client under
-// `packages/api-client` (its generated sources get their own block below),
+// `packages/console-api-client` (its generated sources get their own block below),
 // and the plain-Node scripts and root configs (`.mjs`).
 // `typescript-eslint`'s non-type-checked recommended set covers all of them:
 // it is a strict superset of `eslint-js.recommended` carrying
@@ -89,15 +89,15 @@ export default [
   },
 
   {
-    // Generated client sources (packages/api-client/src/generated) are the
+    // Generated client sources (packages/console-api-client/src/generated) are the
     // bytes of @hey-api/openapi-ts — regenerated, never edited, when the
     // OpenAPI contract moves. Correctness rules that assume a human chose
     // every type (`no-explicit-any` in the vendored fetch/SSE core) would
     // have the lint gate fight the generator over code nobody writes here.
     // Prettier still owns their formatting, and everything outside this block
-    // — including the curated surface in packages/api-client/src — keeps the
+    // — including the curated surface in packages/console-api-client/src — keeps the
     // full rule set.
-    files: ["packages/api-client/src/generated/**/*.ts"],
+    files: ["packages/console-api-client/src/generated/**/*.ts"],
     rules: {
       "@typescript-eslint/no-explicit-any": "off",
       "@typescript-eslint/no-unused-vars": "off",

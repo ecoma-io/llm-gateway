@@ -4,10 +4,21 @@ export type ClientOptions = {
   baseUrl: `${string}://${string}` | (string & {});
 };
 
-/**
- * A bounded, safe-to-log request correlation identifier. The gateway uses a generated identifier when a supplied header does not meet this shape.
- */
-export type RequestId = string;
+export type Error = {
+  /**
+   * A stable machine-readable category for the failure. The list is shared by all three contracts; `not_implemented` is returned only by the runtime's contracted-but-unbuilt endpoint.
+   */
+  code: "not_found" | "method_not_allowed" | "not_implemented" | "internal";
+  /**
+   * A human-readable explanation safe to present to a client. Internal implementation details and stack traces never appear here.
+   */
+  message: string;
+};
+
+export type ErrorEnvelope = {
+  error: Error;
+  request_id: RequestId;
+};
 
 export type HealthStatus = {
   /**
@@ -16,27 +27,16 @@ export type HealthStatus = {
   status: string;
 };
 
+/**
+ * A bounded, safe-to-log request correlation identifier. The gateway uses a generated identifier when a supplied header does not meet this shape.
+ */
+export type RequestId = string;
+
 export type Version = {
   /**
-   * The build version injected through the gateway binary's ldflags.
+   * The build version injected through the application binary's ldflags.
    */
   version: string;
-};
-
-export type ErrorEnvelope = {
-  error: Error;
-  request_id: RequestId;
-};
-
-export type Error = {
-  /**
-   * A stable machine-readable category for the failure.
-   */
-  code: "not_found" | "method_not_allowed" | "internal";
-  /**
-   * A human-readable explanation safe to present to a client. Internal implementation details and stack traces never appear here.
-   */
-  message: string;
 };
 
 /**
@@ -130,7 +130,7 @@ export type GetVersionError = GetVersionErrors[keyof GetVersionErrors];
 
 export type GetVersionResponses = {
   /**
-   * The build version of the API service.
+   * The build version of the Control Plane API service.
    */
   200: Version;
 };
