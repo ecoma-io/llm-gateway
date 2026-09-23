@@ -160,25 +160,29 @@ func TestApplicationErrorsMapToSafeHTTPResponses(t *testing.T) {
 }
 
 func TestTheHandlerChainKeepsStreamingInterfacesReachable(t *testing.T) {
-	// New() composes requestID around a mux whose routes come from registerGET;
+	// New() composes requestID around a mux whose routes come from routes.go;
 	// this probe serves those exact pieces over a real socket, because an
 	// httptest.ResponseRecorder never implements Hijacker and would therefore
 	// hide a wrapper that strips it. Any future ResponseWriter wrapper — the
 	// failure mode that would silently break streaming responses — turns both
 	// assertions red.
 	mux := stdhttp.NewServeMux()
-	registerGET(mux, "/probe", func(w stdhttp.ResponseWriter, _ *stdhttp.Request) {
-		flusher, flushes := w.(stdhttp.Flusher)
-		if !flushes {
-			t.Error("the writer a route receives is not an http.Flusher")
-		}
-		if _, hijacks := w.(stdhttp.Hijacker); !hijacks {
-			t.Error("the writer a route receives is not an http.Hijacker")
-		}
-		_, _ = w.Write([]byte("first\n"))
-		if flushes {
-			flusher.Flush()
-		}
+	register(mux, route{
+		method: stdhttp.MethodGet,
+		path:   "/probe",
+		handler: func(w stdhttp.ResponseWriter, _ *stdhttp.Request) {
+			flusher, flushes := w.(stdhttp.Flusher)
+			if !flushes {
+				t.Error("the writer a route receives is not an http.Flusher")
+			}
+			if _, hijacks := w.(stdhttp.Hijacker); !hijacks {
+				t.Error("the writer a route receives is not an http.Hijacker")
+			}
+			_, _ = w.Write([]byte("first\n"))
+			if flushes {
+				flusher.Flush()
+			}
+		},
 	})
 	server := httptest.NewServer(requestID(mux))
 	t.Cleanup(server.Close)

@@ -44,38 +44,15 @@ const (
 
 // New returns the console-api's HTTP handler: middleware first, routes after.
 //
-// The mux's method patterns ("GET /healthz") mean the method is part of the
-// route. ServeMux answers a mismatched method with a plain-text 405, so every
-// route also carries a method-agnostic companion pattern below that answers
-// with the contract's JSON envelope instead — an ordinary handler, not a
-// ResponseWriter wrapper that would silently strip streaming interfaces such
-// as Flusher from every response this service will ever write.
+// The surface itself is declared in routes.go and mounted here; this function
+// owns everything around it — the middleware, the two fallbacks below, and the
+// order they are composed in.
 func New(app *application.App) stdhttp.Handler {
 	mux := stdhttp.NewServeMux()
 
-	// Liveness: the process is up and its loop is turning. Anything about
-	// whether the gateway could do useful work — a dependency reachable, a
-	// cache warm — is readiness's job and never appears here, so an
-	// orchestrator restarting on /healthz never kills a process for a
-	// downstream outage it cannot fix.
-	registerGET(mux, "/healthz", func(w stdhttp.ResponseWriter, _ *stdhttp.Request) {
-		writeStatus(w)
-	})
-
-	// Readiness: the scaffold has no dependencies, so it is always ready.
-	// The checks that will gate this endpoint later — a database ping, an
-	// upstream probe — hang off here, and only here.
-	registerGET(mux, "/readyz", func(w stdhttp.ResponseWriter, _ *stdhttp.Request) {
-		writeStatus(w)
-	})
-
-	// Version flows through the application rather than reading main's stamp
-	// directly: cmd/console-api owns the one ldflags version source and hands it
-	// to application.New, and this handler reads the result across the same
-	// boundary every future domain endpoint will use.
-	registerGET(mux, "/version", func(w stdhttp.ResponseWriter, _ *stdhttp.Request) {
-		writeJSON(w, stdhttp.StatusOK, versionResponse{Version: app.Version()})
-	})
+	for _, rt := range routes(app) {
+		register(mux, rt)
+	}
 
 	// The fallback every other path and method lands on. Unmatched paths are
 	// not an operation in api/openapi/openapi.yaml, but their envelope is
@@ -114,17 +91,6 @@ func cleanPath(p string) string {
 		np += "/"
 	}
 	return np
-}
-
-// registerGET mounts a GET route with its method-agnostic companion, which
-// owns every other method on the path. GET patterns already match HEAD, so
-// the companion answers exactly the methods the resource refuses.
-func registerGET(mux *stdhttp.ServeMux, path string, handler stdhttp.HandlerFunc) {
-	mux.HandleFunc("GET "+path, handler)
-	mux.HandleFunc(path, func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-		w.Header().Set("Allow", "GET, HEAD")
-		writeError(w, r, methodNotAllowedError{})
-	})
 }
 
 // writeStatus is the one definition of what a health endpoint's body looks
