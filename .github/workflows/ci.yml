@@ -314,9 +314,10 @@ jobs:
     name: Verify (persistence)
     # The database foundation's one definition of green, run verbatim: the
     # same `bash deploy/postgres/verify.sh` a contributor runs, against the
-    # same pinned TimescaleDB — startup, migration application and rollback,
-    # transaction semantics, dirty-state refusal and recovery. What the suite
-    # proves and why each step exists: deploy/postgres/README.md. Docker and
+    # same pinned TimescaleDB — startup, both plane databases answering,
+    # migration application and rollback, transaction semantics, dirty-state
+    # refusal and recovery. What the suite proves and why each step exists:
+    # deploy/postgres/README.md. Docker and
     # the compose plugin are preinstalled on the runner, so the job needs no
     # toolchain setup beyond the checkout — no Node, no Go, no full history.
     runs-on: ubuntu-latest

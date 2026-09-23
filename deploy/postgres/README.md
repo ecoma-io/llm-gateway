@@ -7,11 +7,23 @@ same suite — there is no second definition of green.
 
 The store is PostgreSQL with the
 [TimescaleDB](https://docs.timescale.com/) extension: transactional tables
-for the OLTP domains, hypertables for the time-series workloads, one
-database. Which tables belong to which family is not decided here —
+for the OLTP domains, hypertables for the time-series workloads. Which
+tables belong to which family is not decided here —
 [ADR 0005](../../docs/adr/0005-relational-and-event-storage-split.md) set
 the placement rule, and every future migration applies it. Not every table
 becomes a hypertable.
+
+**One cluster, two databases.** `control` belongs to the Control Plane API
+(`apps/console-api`) and `dataplane` to the runtime (`apps/dataplane`) — the
+split [ADR 0006 §7](../../docs/adr/0006-control-plane-and-data-plane.md)
+decides. It is not filing: PostgreSQL has no cross-database query, so "neither
+application reads the other plane's tables" is enforced by the engine rather
+than by review, and there is no query anyone could write to break it. The two
+migration lanes under [`migrations/`](../../migrations) mirror the two
+databases exactly, and `migrations/README.md` states the rule that ties them
+together. Both databases are created by
+[`initdb/`](initdb/10-create-plane-databases.sh), on the first start of an
+empty volume.
 
 ## Decision record
 
@@ -21,7 +33,7 @@ Pinned as of 2026-09-23:
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
 | PostgreSQL       | **18** via `timescale/timescaledb:2.30.1-pg18@sha256:9dede0e3ccc071cf71935b17f76bf243331df0b1575338c8ac294640fcf12a36` | TimescaleDB 2.30.1 (2026-09-17) supports PG 16/17/18; 18 is the newest. Community edition. |
 | Migration tool   | **golang-migrate** `migrate/migrate:v4.20.1@sha256:76cc2074cb6642631f34a898ced71e6aeaa6b1a4d78c4daa743275a22e0c5be7`   | See the comparison below.                                                                  |
-| Migration format | Sequential pairs under [`migrations/`](../../migrations): `000001_name.up.sql` + `000001_name.down.sql`                | Authored, reviewable, one file per direction.                                              |
+| Migration format | Sequential pairs under [`migrations/<plane>/`](../../migrations): `000001_name.up.sql` + `000001_name.down.sql`        | Authored, reviewable, one file per direction; one lane per database.                       |
 
 The tag is readable and the digest is what actually resolves: a re-pull
 cannot silently move either image. Both are multi-arch manifest lists, so an
@@ -112,10 +124,17 @@ interface; the default `127.0.0.1` keeps a development database off the
 network), and `GATEWAY_POSTGRES_PROJECT` (the compose project name; set it
 when a second checkout of this repository runs beside the first).
 
-One caveat on the password: `POSTGRES_PASSWORD` seeds the database only
+One caveat on the password: `POSTGRES_PASSWORD` seeds the cluster only
 when its volume is first created. Overriding `GATEWAY_POSTGRES_PASSWORD`
 on an existing volume does not change the role's password — reset the
 volume with `down -v` (or `ALTER ROLE` in place) after changing it.
+
+The same is true of the two databases, and it is the one thing a volume
+created before the plane split gets wrong: `control` and `dataplane` are
+created by [`initdb/`](initdb/10-create-plane-databases.sh) on the first
+start of an empty volume, so an older volume holds a single database named
+`gateway` and neither of these. `down -v` is the fix, and the one-time cost
+is the local data in it.
 
 ### Start, stop, reset
 
@@ -134,11 +153,19 @@ docker compose -f deploy/postgres/compose.yaml down -v
 ### Migrations
 
 The connection string lives in the compose file — the command is the verb
-and nothing else:
+and nothing else. The lane is one variable, `GATEWAY_MIGRATE_LANE`, and it
+names both the directory the runner reads and the database it writes:
 
 ```bash
-# Apply every pending migration.
+# Apply every pending migration. The default lane is `dataplane`, the only
+# one with migrations today.
 docker compose -f deploy/postgres/compose.yaml run --rm migrate up
+
+# The same command against the Control Plane's database. It refuses today —
+# an empty lane is an error, not a no-op (`migrations/README.md`) — and it
+# becomes the Control Plane's migration command the day its first file lands.
+GATEWAY_MIGRATE_LANE=control \
+  docker compose -f deploy/postgres/compose.yaml run --rm migrate up
 
 # Show the applied version and whether it is clean.
 docker compose -f deploy/postgres/compose.yaml run --rm migrate version
@@ -157,26 +184,34 @@ docker compose -f deploy/postgres/compose.yaml run --rm migrate down -all
 docker compose -f deploy/postgres/compose.yaml run --rm migrate force 1
 ```
 
-Migration files live in [`migrations/`](../../migrations) at the repository
-root — ordered, reviewed SQL, never an ad-hoc edit and never an ORM's
-auto-migration. A new migration is a hand-authored pair (the runner mounts
-`migrations/` read-only on purpose: migrations are written where every file
-in the repository is written — in an editor, as a reviewed diff):
+Migration files live under [`migrations/<plane>/`](../../migrations) at the
+repository root — ordered, reviewed SQL, never an ad-hoc edit and never an
+ORM's auto-migration. A new migration is a hand-authored pair placed in the
+lane that owns the schema (the runner mounts `migrations/` read-only on
+purpose: migrations are written where every file in the repository is
+written — in an editor, as a reviewed diff):
 
 ```text
-migrations/000002_<name>.up.sql    # what this change applies
-migrations/000002_<name>.down.sql  # its exact inverse — proven by the suite
+migrations/dataplane/000002_<name>.up.sql    # what this change applies
+migrations/dataplane/000002_<name>.down.sql  # its exact inverse — proven
 ```
 
-Sequential, zero-padded to six digits, one more than the highest pair that
-exists. The down file is not optional and not ceremonial: `verify.sh`
-executes every down file against the real database.
+Sequential, zero-padded to six digits, one more than the highest pair in
+that lane — each lane numbers from `000001`, because the version the runner
+records lives in the database it migrated. The down file is not optional and
+not ceremonial: `verify.sh` executes every down file against the real
+database.
 
 ### Connect
 
 ```bash
+# The Control Plane's database.
 docker compose -f deploy/postgres/compose.yaml exec postgres \
-  psql -U gateway -d gateway
+  psql -U gateway -d control
+
+# The Data Plane's.
+docker compose -f deploy/postgres/compose.yaml exec postgres \
+  psql -U gateway -d dataplane
 ```
 
 The database also listens on `127.0.0.1:5432` (`GATEWAY_POSTGRES_HOST` and
@@ -188,11 +223,12 @@ The database also listens on `127.0.0.1:5432` (`GATEWAY_POSTGRES_HOST` and
 bash deploy/postgres/verify.sh
 ```
 
-Runs the whole integration suite — startup, connectivity, migration
-application, validation, transaction behaviour, a migration that fails
-mid-file (proved to roll back whole, record itself dirty, refuse further
-runs, and recover through `force`), clean rollback — against the real
-database, and leaves the database migrated and running. CI runs this exact
+Runs the whole integration suite — startup, both databases answering,
+migration application, validation, the two lanes proving out as two
+databases, transaction behaviour, a migration that fails mid-file (proved to
+roll back whole, record itself dirty, refuse further runs, and recover
+through `force`), clean rollback — against the real database, and leaves the
+database migrated and running. CI runs this exact
 command: the `Verify (persistence)` job in
 [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) executes it on
 a runner whose preinstalled Docker and compose plugin meet the
@@ -203,8 +239,14 @@ definition of green, for a contributor and for the pipeline alike.
 ## What is deliberately not here
 
 - No business schema. Tables arrive with the domains that own them, as
-  migrations under `migrations/`; the bootstrap migration enables the
-  `timescaledb` extension and nothing else.
+  migrations in the lane that owns them; the Data Plane's bootstrap
+  migration enables the `timescaledb` extension and nothing else, and the
+  Control Plane's lane has no file yet.
+- No per-plane roles. One role owns both databases, which makes the
+  database split the enforcement — not the credential. A deployment that
+  wants the second layer (a role per plane, with `CONNECT` revoked on the
+  other's database) decides it where credentials are decided, and this
+  fixture does not pre-answer that.
 - No production deployment. This compose project is a development database;
   how the store runs in production is a deployment decision that has not
   been made yet, and this file will not pre-make it.

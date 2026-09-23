@@ -28,7 +28,7 @@ change (contract first, see below), never as scaffolding someone left around.
 | `apps/dataplane-api`       | The Data Plane's management API. `cmd/dataplane-api` is the entry point; it holds no state of its own.                                                                          |
 | `go.work`                  | The Go workspace over the three Go modules. Committed, so CI and contributors run the same commands.                                                                            |
 | `api/openapi/openapi.yaml` | The API contract.                                                                                                                                                               |
-| `migrations/`              | Database migrations — ordered, reviewed `.up.sql`/`.down.sql` pairs (the bootstrap pair enables TimescaleDB).                                                                   |
+| `migrations/`              | Database migrations — one lane per plane, `migrations/<plane>/`, holding ordered, reviewed `.up.sql`/`.down.sql` pairs (the Data Plane's bootstrap pair enables TimescaleDB).   |
 | `deploy/`                  | Local development and integration fixtures for the backing infrastructure: `postgres/` (compose, migration runner, `verify.sh` suite) and `redis/` (disposable Valkey fixture). |
 | `docs/`                    | Long-form documentation — `adr/` decision records and `architecture/` reference pages, indexed in `docs/README.md`.                                                             |
 | `scripts/`                 | Repository gates.                                                                                                                                                               |
@@ -62,9 +62,12 @@ change (contract first, see below), never as scaffolding someone left around.
 6. **Behavioural changes arrive with tests.** A change to what the service or
    the console does lands with a test that fails without it. A green suite
    that cannot go red is not coverage.
-7. **Database changes are migrations.** Schema arrives as a file under
-   `migrations/`, ordered and reviewable. Never an ad-hoc edit, never a
-   change only applied by hand.
+7. **Database changes are migrations.** Schema arrives as a file in the lane
+   of the plane that owns it — `migrations/control/` or
+   `migrations/dataplane/` — ordered and reviewable. The lane is the
+   database, so a file's directory is also the deployment decision about
+   where it runs; there is no shared lane and no cross-plane migration.
+   Never an ad-hoc edit, never a change only applied by hand.
 8. **No direct commits to `main`.** The branch is protected; the ruleset
    enforces it. If you find a way to push to `main` directly, that is a defect
    to report, not a shortcut to use.
