@@ -12,7 +12,7 @@ tasks:
   #
   # The static half is `golangci-lint run` (.golangci.yml argues the roster:
   # errcheck, govet, ineffassign, staticcheck, unused — the v2 defaults, and
-  # the whole mandate for a stdlib-only service). `go vet` is NOT run beside
+  # the whole mandate). `go vet` is NOT run beside
   # it: golangci-lint's default roster already runs govet, and the same
   # analyzer twice is one verdict paying two CI bills.
   #
