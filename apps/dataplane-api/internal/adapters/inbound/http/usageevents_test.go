@@ -55,6 +55,11 @@ func TestTheUsageEventFeedRefusesAnUntrustedCaller(t *testing.T) {
 			authorization: []string{"Bearer "},
 		},
 		{
+			name:          "a credential carrying whitespace inside itself is refused",
+			configured:    testCredential,
+			authorization: []string{"Bearer " + "bad secret"},
+		},
+		{
 			name:          "the header given twice",
 			configured:    testCredential,
 			authorization: []string{"Bearer " + testCredential, "Bearer another-deployment-secret"},
@@ -312,6 +317,28 @@ func TestAnEmptyCursorIsRefusedRatherThanReadAsTheBeginning(t *testing.T) {
 	}
 	if len(usage.calls) != 1 || usage.calls[0].after != "" {
 		t.Errorf("the port was asked for %+v, want one call with no cursor", usage.calls)
+	}
+}
+
+// TestExtraWhitespaceBetweenSchemeAndCredentialIsAccepted pins the RFC 6750
+// shape of the header on the façade's side: the scheme and the bearer token
+// are separated by optional whitespace, and the token itself carries none. The
+// Data Plane's management listener accepts the same shape, so a credential a
+// caller can present to one hop can be presented to the other.
+func TestExtraWhitespaceBetweenSchemeAndCredentialIsAccepted(t *testing.T) {
+	usage := &fakeUsageFacts{}
+	handler := testHandler(application.New("test", usage))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath, nil)
+	req.Header.Set("Authorization", "Bearer  "+testCredential)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != stdhttp.StatusOK {
+		t.Errorf("GET %s status = %d, want %d (body %q)", usageEventsPath, rec.Code, stdhttp.StatusOK, rec.Body.String())
+	}
+	if len(usage.calls) != 1 {
+		t.Errorf("the port was called %d times, want exactly 1", len(usage.calls))
 	}
 }
 

@@ -243,6 +243,36 @@ func TestAnEmptyPageSerializesAsAnEmptyArray(t *testing.T) {
 	}
 }
 
+func TestTheFeedWritesAmpersandsAndAngleBracketsLiterally(t *testing.T) {
+	// The cursor and the payload are the two values the feed's consumers treat
+	// as opaque bytes, and neither may be HTML-escaped on the wire: the cursor
+	// is decoded back by dataplane-api and re-emitted, and the chain test at
+	// the composition root pins the whole page byte for byte. `&` and `<` are
+	// the two runes encoding/json would escape by default, and a payload that
+	// contains them — a reason string, a provider's body — is exactly the kind
+	// of content this surface will be the head of.
+	facts := &stubFacts{page: usagefacts.Page{
+		Events: []usagefacts.Event{{
+			RequestID:     "req_amp",
+			Kind:          "settled",
+			SchemaVersion: 1,
+			OccurredAt:    time.Date(2026, 9, 24, 10, 0, 0, 0, time.UTC),
+			Payload:       json.RawMessage(`{"reason":"a<b & c"}`),
+		}},
+		NextCursor: "cur:9f2&=<",
+		HasMore:    true,
+	}}
+
+	rec := serve(t, facts, authed(t, "/internal/usage-events"))
+
+	want := `{"events":[{"request_id":"req_amp","kind":"settled","schema_version":1,` +
+		`"occurred_at":"2026-09-24T10:00:00Z","payload":{"reason":"a<b & c"}}],` +
+		`"next_cursor":"cur:9f2&=<","has_more":true}` + "\n"
+	if got := rec.Body.String(); got != want {
+		t.Errorf("body = %s\nwant %s\nthe write must not HTML-escape the cursor or the payload", got, want)
+	}
+}
+
 func TestAFactWithNoBodySerializesAsAnEmptyObject(t *testing.T) {
 	facts := &stubFacts{page: usagefacts.Page{
 		Events:     []usagefacts.Event{{RequestID: "req_2", Kind: "released", SchemaVersion: 1}},

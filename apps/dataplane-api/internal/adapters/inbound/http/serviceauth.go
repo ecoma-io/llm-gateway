@@ -118,16 +118,23 @@ func requireServiceCaller(authenticator dataplane.Authenticator, next stdhttp.Ha
 // are two claims, HTTP gives no rule for which one wins, and picking one would
 // mean the answer depends on which side of the connection is parsing — exactly
 // the difference a request smuggled through a proxy exploits.
+//
+// The header itself is split on any run of whitespace (RFC 6750 allows
+// optional whitespace between the scheme and the credential), and the
+// credential may contain none: the two parts of a bearer header are the
+// scheme and the token, nothing else. This is the same shape the Data Plane's
+// management listener parses, so a credential the caller can present to one
+// hop can be presented to the other.
 func authenticatedServiceCaller(r *stdhttp.Request, authenticator dataplane.Authenticator) bool {
 	values := r.Header.Values(credentialHeader)
 	if len(values) != 1 {
 		return false
 	}
-	scheme, credential, found := strings.Cut(values[0], " ")
-	if !found || !strings.EqualFold(scheme, credentialScheme) {
+	parts := strings.Fields(values[0])
+	if len(parts) != 2 || !strings.EqualFold(parts[0], credentialScheme) {
 		return false
 	}
-	_, ok := authenticator.Authenticate(r.Context(), credential)
+	_, ok := authenticator.Authenticate(r.Context(), parts[1])
 	return ok
 }
 

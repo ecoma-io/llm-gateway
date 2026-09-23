@@ -157,7 +157,7 @@ func violations(self string, graph map[string][]string) []string {
 			}
 			for _, imported := range graph[dir] {
 				for _, forbidden := range r.forbidden {
-					if imported == forbidden || strings.HasPrefix(imported, forbidden) {
+					if matches(imported, forbidden) {
 						found = append(found, fmt.Sprintf("%s imports %s: %s", dir, imported, r.why))
 					}
 				}
@@ -166,6 +166,24 @@ func violations(self string, graph map[string][]string) []string {
 	}
 	sort.Strings(found)
 	return found
+}
+
+// matches reports whether imported is forbidden itself, or a package below
+// it. A forbidden prefix that ends in "/" has already drawn its own boundary —
+// it names a tree, and anything starting with it is inside. Any other prefix
+// names a module or a package, and a package below it continues with "/"
+// (a subpackage) or "." (a vendored or dot-joined path); a sibling that merely
+// shares the leading text — `github.com/jackc/pgx2` against
+// `github.com/jackc/pgx` — must not count, because an import rule stated as a
+// module name is a rule about that module and its packages, not about
+// everything that begins with its spelling.
+func matches(imported, forbidden string) bool {
+	if strings.HasSuffix(forbidden, "/") {
+		return strings.HasPrefix(imported, forbidden)
+	}
+	return imported == forbidden ||
+		strings.HasPrefix(imported, forbidden+"/") ||
+		strings.HasPrefix(imported, forbidden+".")
 }
 
 // allowedToImport reports whether a package directory is one an allow-list

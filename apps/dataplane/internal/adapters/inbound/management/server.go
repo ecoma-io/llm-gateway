@@ -122,10 +122,22 @@ func cleanPath(p string) string {
 // than a method on a wrapper type is what keeps the streaming interfaces a
 // future management operation might need — Flusher above all — reachable
 // through the handler chain.
+//
+// The encoder is told not to HTML-escape, and that is a byte-level decision
+// rather than a cosmetic one. The defaults would write `<`, `>` and `&` as
+// `<`, `>` and `&`, which the consumer — dataplane-api, and
+// through it console-api — decodes back to the same runes, so nothing is
+// corrupted; but this surface is the head of the fact feed, the value being
+// written is often the opaque cursor or the fact's payload, and the chain test
+// at the composition root asserts the page arrives at the caller byte for
+// byte. An escape here and a re-escape there is how a promise like that rots
+// into a hope.
 func writeJSON(w stdhttp.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(value); err != nil {
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
 		// Status and headers are already on the wire; a retry cannot repair a
 		// half-written response. Log the fact without echoing the payload.
 		log.Printf("%s management response JSON write failed: %T", serviceName, err)
