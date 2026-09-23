@@ -14,32 +14,34 @@ PostgreSQL relational tables                        Timescale-oriented event tab
 ────────────────────────────────                    ───────────────────────────────
 accounts   users   api_keys                         requests
 plans      subscriptions   entitlements             request_attempts
-           funding_buckets                          usage_events
+                                                    usage_events
 client_price_list_revisions   alias_group_versions
 model_aliases (+ candidates)   backends
 reservations (+ allocation legs)
-settlements   ledger_entries
+funding_buckets   settlements   ledger_entries
 request_intake
 ```
 
 ### Relational family
 
-| Table group            | Tables                                                                                            | Why relational (ADR 0005 placement rule)                                                                                     |
-| ---------------------- | ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| Identity               | `accounts`, `users`, `api_keys`                                                                   | Mutable state; hot-path lookups; revocation must be immediate.                                                               |
-| Catalog                | `model_aliases` (+ candidates), `backends`, `alias_group_versions`, `client_price_list_revisions` | Configured state; alias+candidates one transaction (ADR 0001, rule 3); configuration activation is Catalog-local (ADR 0003). |
-| Commerce               | `plans` (+ versions), `subscriptions`, `entitlements`, `funding_buckets`                          | Lifecycle and guarded capacity; admission and cycle-roll transactions write here.                                            |
-| Accounting working set | `reservations` (+ allocation legs), `settlements`, `ledger_entries`                               | Must be transactional with bucket capacity and each other (invariants 3–4).                                                  |
-| Intake                 | `request_intake`                                                                                  | Permanent idempotency replay — decided inside the admission transaction from relational state alone (ADR 0004).              |
+| Table group            | Tables                                                                                            | Why relational (ADR 0005 placement rule)                                                                                                             |
+| ---------------------- | ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Identity               | `accounts`, `users`, `api_keys`                                                                   | Mutable state; hot-path lookups; revocation must be immediate.                                                                                       |
+| Catalog                | `model_aliases` (+ candidates), `backends`, `alias_group_versions`, `client_price_list_revisions` | Configured state; alias+candidates one transaction (ADR 0001, rule 3); configuration activation is Catalog-local (ADR 0003).                         |
+| Commerce               | `plans` (+ versions), `subscriptions`, `entitlements`                                             | Commercial lifecycle; admission and cycle-roll transactions write here.                                                                              |
+| Accounting working set | `reservations` (+ allocation legs), `funding_buckets`, `settlements`, `ledger_entries`            | One consistency unit — bucket capacity, holds, and legs must be written together (invariants 3–4); the bucket is an Accounting aggregate (ADR 0001). |
+| Intake                 | `request_intake`                                                                                  | Permanent idempotency replay — decided inside the admission transaction from relational state alone (ADR 0004).                                      |
 
 Notes for the schema designer:
 
-- `funding_buckets` — one lockable capacity row per entitlement cycle and per
+- `funding_buckets` — an Accounting aggregate (ADR 0001): one lockable
+  capacity row per entitlement cycle and per
   account PAYG balance (created at account creation for PAYG, at each roll
   for cycles), with cached `settled`/`held`/`available` maintained in
   the same transaction as the legs; rebuildable from `ledger_entries`, and
   wrong if it ever disagrees with them. The bucket row also allocates each
-  leg's per-bucket `sequence`.
+  leg's per-bucket `sequence`. The Commerce entitlement cycle it projects
+  references it by identifier, never the reverse.
 - `settlements` — one row per settled request (unique `request_id`); the
   double-settlement guard. `ledger_entries` reference their settlement (or
   reservation), bucket, kind, and carry positive amounts; the price snapshot
@@ -102,12 +104,21 @@ nothing else spans contexts:
 Catalog configuration activation (aliases, group versions, price revisions)
 is a coordinated transaction internal to the Catalog context (ADR 0003) —
 Catalog-local, not a fifth cross-context transaction; it never spans
-contexts, though it does coordinate more than one Catalog aggregate. Apart
-from the four transactions above and Catalog activation, every transaction
-is single-aggregate. The map is not exhaustive of every write: the
-topup/adjustment ledger flows of ADR 0004 are capacity-funding writes
-outside the four, each appending its own ledger legs under its own
-uniqueness guards.
+contexts, though it does coordinate more than one Catalog aggregate. The
+same is true of the capacity-funding and correction flows of ADR 0004
+(`topup`; `adjustment`; a usage correction's compensating legs): with
+funding buckets Accounting-owned (ADR 0001) they coordinate the bucket,
+the ledger, and — for a correction — the usage event inside one context,
+so they too are context-local rather than members of the cross-context
+set. Apart from the four transactions above and those named
+context-local coordinated transactions, every transaction is
+single-aggregate — and nothing else crosses a context boundary at all:
+account creation, for instance, is a choreography over IDs, not a
+coordinated transaction (the account row is an Identity write, and the
+zero-balance PAYG bucket it promises (ADR 0003) is its own Accounting
+write in the same workflow). The map is not exhaustive of every write:
+the topup/adjustment flows each append their own ledger legs under their
+own uniqueness guards.
 
 ## What must be derivable from this page alone
 

@@ -146,7 +146,12 @@ available = 93 − 0         = 93
 Each bucket's funding-bucket row caches these three numbers **inside the
 same transaction** that writes legs; the cache exists for contention control
 (conditional updates) and is rebuildable from legs — if cache and legs ever
-disagree, the legs win and the cache is wrong. `adjustment` is an operator
+disagree, the legs win and the cache is wrong. The funding bucket is an
+**Accounting aggregate** (ADR 0001): its row is written only by the
+accounting flows — the four coordinated transactions' capacity updates, and
+the context-local `topup`/`adjustment` refills — while the Commerce
+entitlement cycle or PAYG flag it projects references it by identifier.
+`adjustment` is an operator
 correction that states its settled/held deltas explicitly; it is never an
 automatic overdraw path (the reservation ceiling means automatic debt cannot
 arise).

@@ -69,7 +69,9 @@ enabled".
 The roll — verify renewal → create each entitlement and its funding bucket →
 append `grant` ledger legs → advance cycle fields — is **one** transaction:
 the grant-cycle-roll member of ADR 0001's four cross-context coordinated
-transactions (rule 6), keyed by `(subscription_id, cycle_number)`. A worker
+transactions (rule 6) — cross-context because the entitlement is Commerce's
+and the bucket it creates is an Accounting aggregate (ADR 0001), with its
+`grant` legs — keyed by `(subscription_id, cycle_number)`. A worker
 retry after a crash cannot grant a cycle twice; a partial roll cannot exist.
 Admission and the roll serialise on the subscription row: an admission either
 sees the old cycle or the new one, never a half-rolled state, and cycle
@@ -173,8 +175,11 @@ the bound. Consequences:
 
 - **Activation** is the per-account enablement flag — operator-set today,
   self-service later. It authorises spending; it funds nothing. The PAYG
-  funding-bucket row exists from account creation with a zero balance, so
-  enabling is only a flag flip. **Disabling** blocks new spills at admission
+  funding-bucket row exists from account creation with a zero balance —
+  created as the Accounting-side write of the account-creation workflow, a
+  choreography over IDs rather than a shared transaction (ADR 0001; the
+  bucket is an Accounting aggregate), so enabling is only a flag flip.
+  **Disabling** blocks new spills at admission
   (the waterfall treats PAYG as absent); holds already secured against the
   bucket settle normally against it.
 - **Funding** appends `topup` legs to the account's PAYG funding bucket

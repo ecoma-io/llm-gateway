@@ -28,13 +28,13 @@ The gateway is modelled as **five bounded contexts**. A context owns a
 vocabulary and a set of aggregates; contexts reference each other by
 identifier only, never by shared tables or shared rows.
 
-| Context    | Owns (aggregates in bold)                                                                                   | Responsibility in one line                                              |
-| ---------- | ----------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| Identity   | **Account**, **User**, **APIKey**                                                                           | Who may call the gateway at all.                                        |
-| Catalog    | **ModelAlias** (with its ordered candidates), **Backend**                                                   | What can be requested and where it can be served from.                  |
-| Execution  | **Request** and its **RequestAttempt** records (append-oriented history, not a mutable aggregate root)      | What actually happened on the wire, per logical request.                |
-| Commerce   | **Plan**, **Subscription**, **Entitlement**, **PriceList**                                                  | What an account is allowed and expected to consume, at what price.      |
-| Accounting | **Reservation**, **LedgerEntry**, **UsageEvent** (UsageEvent is an immutable fact, not a mutable aggregate) | How consumption is held, recorded, and settled without double-counting. |
+| Context    | Owns (aggregates in bold)                                                                                                      | Responsibility in one line                                              |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
+| Identity   | **Account**, **User**, **APIKey**                                                                                              | Who may call the gateway at all.                                        |
+| Catalog    | **ModelAlias** (with its ordered candidates), **Backend**                                                                      | What can be requested and where it can be served from.                  |
+| Execution  | **Request** and its **RequestAttempt** records (append-oriented history, not a mutable aggregate root)                         | What actually happened on the wire, per logical request.                |
+| Commerce   | **Plan**, **Subscription**, **Entitlement**, **PriceList**                                                                     | What an account is allowed and expected to consume, at what price.      |
+| Accounting | **Reservation**, **FundingBucket**, **LedgerEntry**, **UsageEvent** (UsageEvent is an immutable fact, not a mutable aggregate) | How consumption is held, recorded, and settled without double-counting. |
 
 Aggregate rules:
 
@@ -43,11 +43,15 @@ Aggregate rules:
    about a set of rows must be enforceable inside a transaction on the
    aggregate that owns them. The normal write is a **local aggregate
    transaction** — one aggregate's rows in one short transaction.
-   Coordination across aggregates is never implicit: it exists only as two
+   Coordination across aggregates is never implicit: it exists only as three
    named exceptions — the four cross-context coordinated transactions of
-   rule 6, and Catalog configuration activation, a coordinated transaction
+   rule 6; Catalog configuration activation, a coordinated transaction
    local to the Catalog context (ADR 0003) that spans more than one
-   Catalog aggregate. Outside those named transactions, no transaction
+   Catalog aggregate; and the capacity-funding and correction flows of
+   ADR 0004 (topup, adjustment, and a usage correction's compensating
+   legs), coordinated transactions local to the Accounting context that
+   span the funding bucket, the ledger legs, and — for a correction — the
+   usage event it adjusts. Outside those named transactions, no transaction
    spans aggregates.
 2. **Identity is three small aggregates, not one big one.** `Account` carries
    the billing relationship's identity; `User` and `APIKey` each reference the
@@ -68,9 +72,12 @@ Aggregate rules:
    upstream call finishes. The live state of an in-flight request (current
    candidate, stream position) lives in the request's own memory during
    execution. Nothing in Execution is a lock the business waits on.
-5. **Quota capacity is guarded state, written only by the accounting flows.**
-   Each entitlement cycle and each PAYG balance has a funding-bucket
-   projection (ADR 0004). Its available capacity is drawn down only by
+5. **Quota capacity is guarded state owned by Accounting, written only by
+   the accounting flows.** Each entitlement cycle and each PAYG balance has
+   a funding-bucket projection (ADR 0004). The bucket is an Accounting
+   aggregate: the Commerce entitlement cycle it projects and the account's
+   PAYG flag reference it by identifier and never write it outside the
+   named transactions. Its available capacity is drawn down only by
    conditional updates inside the four cross-context coordinated
    transactions of rule 6; refills arrive through the ledger-backed flows
    that grant or fund it — the grant-cycle roll of rule 6, and the
@@ -106,7 +113,10 @@ Aggregate rules:
      Configuration activation (aliases, group versions, price revisions) is
      a coordinated transaction **inside the Catalog context only** (ADR 0003)
      — Catalog-local, not a fifth member of the cross-context set; it never
-     spans contexts.
+     spans contexts. The same holds for the Accounting-local funding and
+     correction flows of ADR 0004 (topup, adjustment): with funding buckets
+     Accounting-owned (rule 5), they coordinate bucket and ledger inside one
+     context, so they are not members of the cross-context set either.
 7. **No transaction is open while a provider call is in flight.** Quota is
    held as committed data (a reservation and its legs), not as a held lock,
    and an in-flight request keeps its hold alive by renewing its execution
@@ -126,7 +136,8 @@ Each term has exactly one owning context (full glossary in
 - _request_, _attempt_, _commitment_ — Execution;
 - _alias_, _candidate_, _backend_, _adapter_, _egress_ — Catalog;
 - _subscription_, _entitlement_, _plan_, _PAYG_ — Commerce;
-- _reservation_, _settlement_, _usage event_, _ledger entry_ — Accounting;
+- _reservation_, _settlement_, _usage event_, _ledger entry_, _funding
+  bucket_ — Accounting;
 - _account_, _user_, _API key_ — Identity.
 
 A document or schema using a synonym where a glossary term exists is a defect.
