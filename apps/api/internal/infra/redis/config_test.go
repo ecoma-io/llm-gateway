@@ -13,8 +13,7 @@ func TestConfigValidate(t *testing.T) {
 		Address:           "cache.example.test:6379",
 		Database:          0,
 		DialTimeout:       time.Second,
-		ReadTimeout:       time.Second,
-		WriteTimeout:      time.Second,
+		ConnTimeout:       time.Second,
 		PipelineMultiplex: 2,
 		BlockingPoolSize:  1,
 	}
@@ -44,14 +43,14 @@ func TestConfigValidate(t *testing.T) {
 			want: "dial timeout 0s must be positive",
 		},
 		{
-			name: "requires a positive read timeout",
-			edit: func(c *Config) { c.ReadTimeout = -time.Second },
-			want: "read timeout -1s must be positive",
+			name: "requires a positive connection timeout",
+			edit: func(c *Config) { c.ConnTimeout = -time.Second },
+			want: "conn timeout -1s must be positive",
 		},
 		{
-			name: "requires a positive write timeout",
-			edit: func(c *Config) { c.WriteTimeout = 0 },
-			want: "write timeout 0s must be positive",
+			name: "rejects a zero connection timeout",
+			edit: func(c *Config) { c.ConnTimeout = 0 },
+			want: "conn timeout 0s must be positive",
 		},
 		{
 			name: "rejects an out-of-range connection bound",
@@ -86,8 +85,7 @@ func TestFromEnv(t *testing.T) {
 	t.Setenv("REDIS_PASSWORD", "not-for-logs")
 	t.Setenv("REDIS_DATABASE", "3")
 	t.Setenv("REDIS_DIAL_TIMEOUT", "2s")
-	t.Setenv("REDIS_READ_TIMEOUT", "4s")
-	t.Setenv("REDIS_WRITE_TIMEOUT", "6s")
+	t.Setenv("REDIS_CONN_TIMEOUT", "4s")
 	t.Setenv("REDIS_PIPELINE_MULTIPLEX", "1")
 	t.Setenv("REDIS_BLOCKING_POOL_SIZE", "2")
 
@@ -101,8 +99,7 @@ func TestFromEnv(t *testing.T) {
 		Password:          "not-for-logs",
 		Database:          3,
 		DialTimeout:       2 * time.Second,
-		ReadTimeout:       4 * time.Second,
-		WriteTimeout:      6 * time.Second,
+		ConnTimeout:       4 * time.Second,
 		PipelineMultiplex: 1,
 		BlockingPoolSize:  2,
 	}
@@ -118,8 +115,7 @@ func TestFromEnvDefaults(t *testing.T) {
 		"REDIS_PASSWORD",
 		"REDIS_DATABASE",
 		"REDIS_DIAL_TIMEOUT",
-		"REDIS_READ_TIMEOUT",
-		"REDIS_WRITE_TIMEOUT",
+		"REDIS_CONN_TIMEOUT",
 		"REDIS_PIPELINE_MULTIPLEX",
 		"REDIS_BLOCKING_POOL_SIZE",
 	} {
@@ -134,8 +130,7 @@ func TestFromEnvDefaults(t *testing.T) {
 		Address:           defaultAddress,
 		Database:          0,
 		DialTimeout:       defaultDialTimeout,
-		ReadTimeout:       defaultReadTimeout,
-		WriteTimeout:      defaultWriteTimeout,
+		ConnTimeout:       defaultConnTimeout,
 		PipelineMultiplex: defaultPipelineMultiplex,
 		BlockingPoolSize:  defaultBlockingPoolSize,
 	}
@@ -164,16 +159,10 @@ func TestFromEnvRejectsInvalidValues(t *testing.T) {
 			want:  "REDIS_DIAL_TIMEOUT must be a duration",
 		},
 		{
-			name:  "rejects a malformed read timeout",
-			key:   "REDIS_READ_TIMEOUT",
+			name:  "rejects a malformed connection timeout",
+			key:   "REDIS_CONN_TIMEOUT",
 			value: "later",
-			want:  "REDIS_READ_TIMEOUT must be a duration",
-		},
-		{
-			name:  "rejects a malformed write timeout",
-			key:   "REDIS_WRITE_TIMEOUT",
-			value: "never",
-			want:  "REDIS_WRITE_TIMEOUT must be a duration",
+			want:  "REDIS_CONN_TIMEOUT must be a duration",
 		},
 		{
 			name:  "rejects a non-integer connection bound",
@@ -225,8 +214,7 @@ func TestConfigValidatePreservesUnderlyingAddressError(t *testing.T) {
 	cfg := Config{
 		Address:           "[::1",
 		DialTimeout:       time.Second,
-		ReadTimeout:       time.Second,
-		WriteTimeout:      time.Second,
+		ConnTimeout:       time.Second,
 		PipelineMultiplex: 2,
 		BlockingPoolSize:  1,
 	}

@@ -88,9 +88,11 @@ func (c *Client) Cache() cache.Cache {
 
 // clientOption maps Config onto the client library's option struct. Every
 // field the library would default is set from Config so the mapping is total
-// and visible; DisableCache turns off the library's opt-in client-side
-// response cache, which no code here or planned uses — off is the smaller
-// memory footprint and one less thing to reason about under invalidations.
+// and visible; ConnTimeout passes through unchanged to ConnWriteTimeout, the
+// library's single read/write deadline per connection, and DisableCache turns
+// off the library's opt-in client-side response cache, which no code here or
+// planned uses — off is the smaller memory footprint and one less thing to
+// reason about under invalidations.
 func (c Config) clientOption() valkey.ClientOption {
 	return valkey.ClientOption{
 		InitAddress:       []string{c.Address},
@@ -98,7 +100,7 @@ func (c Config) clientOption() valkey.ClientOption {
 		Password:          c.Password,
 		SelectDB:          c.Database,
 		Dialer:            net.Dialer{Timeout: c.DialTimeout},
-		ConnWriteTimeout:  min(c.ReadTimeout, c.WriteTimeout),
+		ConnWriteTimeout:  c.ConnTimeout,
 		PipelineMultiplex: c.PipelineMultiplex,
 		BlockingPoolSize:  c.BlockingPoolSize,
 		DisableCache:      true,
