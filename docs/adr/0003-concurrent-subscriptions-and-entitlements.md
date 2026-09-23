@@ -37,7 +37,7 @@ what concurrent requests can reserve, and when PAYG may be spent.
   number of subscriptions may be active concurrently, **including multiple
   active subscriptions to the same plan version**. They never merge; each has
   independent cycles and entitlements. No account has a `current_plan` field.
-- **Entitlement** — one live quota bucket materialised from exactly one
+- **Entitlement** — one live quota grant materialised from exactly one
   `(subscription, cycle_number, grant_definition_id)`. It records its
   immutable scope version, granted amount, and state (`active` or `expired`
   only — there is no suspended entitlement; suspension is a subscription
@@ -54,7 +54,9 @@ what concurrent requests can reserve, and when PAYG may be spent.
   so each cycle re-snapshots membership at roll time, and every admission in
   that cycle sees exactly that snapshot.
 - **PAYG** — an account-level prepaid funding source: an enablement flag and
-  an account PAYG funding bucket. It is neither a plan nor a subscription: no
+  an account PAYG funding bucket. The flag is this context's; the bucket row
+  is an Accounting aggregate the account references by identifier (ADR 0001,
+  rule 5). It is neither a plan nor a subscription: no
   recurring price, period, grant cycle, or expiry. The bucket row exists from
   account creation (balance zero); enabling is only the spending flag.
   Disabling blocks **new** spills at admission — open holds already secured

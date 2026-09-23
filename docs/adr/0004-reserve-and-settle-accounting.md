@@ -77,8 +77,13 @@ revision snapshot, capture method)`. Capture method is `reported` when the
   unique `(settlement_id, funding_bucket_id, kind)` permits a split
   settlement while preventing duplicate movement in a given bucket.
 - **FundingBucket** is an authoritative, lockable capacity projection for
-  exactly one entitlement cycle or one account PAYG balance. It carries a
-  version and cached `settled_amount`, `held_amount`, and `available_amount`.
+  exactly one entitlement cycle or one account PAYG balance. It is an
+  **Accounting aggregate** (ADR 0001): every write to the row happens inside
+  the accounting flows this ADR defines — admission, settlement, release,
+  the cycle roll's bucket creation, and the topup/adjustment refills — and
+  the Commerce entitlement cycle or PAYG flag it projects references it by
+  identifier, never the reverse. It carries a version and cached
+  `settled_amount`, `held_amount`, and `available_amount`.
   The cache is maintained in the same transaction as ledger legs and is
   verified/rebuildable from those legs; it is a concurrency control projection,
   not an independently editable balance. Conditional updates such as

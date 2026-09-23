@@ -46,7 +46,11 @@ reservations (+ allocation legs)    settlements (+ ledger legs)
   (funding-bucket capacity, open reservations, the append-only ledger legs).
 - `funding_buckets` exists because admission needs a **lockable capacity
   row** per entitlement cycle and per PAYG balance (ADR 0004). Without it,
-  concurrent PAYG admission would have nothing to serialise on.
+  concurrent PAYG admission would have nothing to serialise on. The bucket
+  is Accounting-owned (ADR 0001); the entitlement cycle or PAYG balance it
+  projects is Commerce's, referenced by identifier — which is why the table
+  sits with the accounting working set it must be transactional with, not
+  beside the tables of the context that projects onto it.
 - `request_intake` exists because idempotent replay must be decidable inside
   the admission transaction **from relational state alone** — an event-family
   row is never consulted for a business decision (below).
