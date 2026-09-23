@@ -2,14 +2,14 @@ package postgres
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"testing"
 )
 
 // Every test here pins one clause of the port's contract, phrased in
-// storage.go: what commits, what rolls back, what joins, and what a caller
-// is told when the driver refuses. The driver is the fake in
+// storage.go: what commits, what rolls back, what joins, which pool a join
+// belongs to, what a repository's Querier resolves to, and what a caller is
+// told when the driver refuses. The driver is the fake in
 // fakedriver_test.go; what these tests prove is the adapter's orchestration,
 // not PostgreSQL's — that belongs to the suite in deploy/postgres.
 
@@ -130,6 +130,98 @@ func TestNestedWithinTxJoinsTheTransactionAlreadyInFlight(t *testing.T) {
 	}
 }
 
+func TestNestedWithinTxOnADifferentStoreRunsItsOwnIndependentUnit(t *testing.T) {
+	fA, dbA := registerFake(t)
+	fB, dbB := registerFake(t)
+	storeA, storeB := New(dbA), New(dbB)
+
+	// Two stores over two pools. Store B's nested scope must not find store
+	// A's transaction — a transaction on pool A can no more carry B's
+	// writes than B's queries can reach pool A — so B begins its own unit
+	// and owns its own commit: BEGIN(A), BEGIN(B), COMMIT(B), COMMIT(A).
+	// The package-scoped key this test's predecessor once relied on made B
+	// silently join A's transaction; per-driver streams are what go red
+	// under that shape — B would record nothing at all.
+	err := storeA.WithinTx(context.Background(), func(ctx context.Context) error {
+		return storeB.WithinTx(ctx, func(context.Context) error { return nil })
+	})
+	if err != nil {
+		t.Fatalf("nested WithinTx across two stores: %v", err)
+	}
+	if got, want := of(fA.recorded(), evBegin, evCommit, evRollback), []event{evBegin, evCommit}; !equal(got, want) {
+		t.Fatalf("pool A saw %v, want %v — the outer store must begin and commit its own unit untouched", got, want)
+	}
+	if got, want := of(fB.recorded(), evBegin, evCommit, evRollback), []event{evBegin, evCommit}; !equal(got, want) {
+		t.Fatalf("pool B saw %v, want %v — the inner store must begin and commit its own unit, never join pool A's transaction", got, want)
+	}
+}
+
+func TestNestedWithinTxFailureOnADifferentStoreLeavesTheOuterVerdictToItsOwner(t *testing.T) {
+	fA, dbA := registerFake(t)
+	fB, dbB := registerFake(t)
+	storeA, storeB := New(dbA), New(dbB)
+
+	// The inner store's unit fails on its own pool and rolls its own work
+	// back; the outer owner interprets that failure and still commits its
+	// own. Neither transaction's fate may depend on the other's.
+	boom := errors.New("inner store's unit failed")
+	err := storeA.WithinTx(context.Background(), func(ctx context.Context) error {
+		_ = storeB.WithinTx(ctx, func(context.Context) error { return boom })
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WithinTx returned %v, want the outer owner's verdict (nil)", err)
+	}
+	if got, want := of(fA.recorded(), evBegin, evCommit, evRollback), []event{evBegin, evCommit}; !equal(got, want) {
+		t.Fatalf("pool A saw %v, want %v — store B's failure must not touch store A's unit", got, want)
+	}
+	if got, want := of(fB.recorded(), evBegin, evCommit, evRollback), []event{evBegin, evRollback}; !equal(got, want) {
+		t.Fatalf("pool B saw %v, want %v — store B's failed unit must roll back on its own pool", got, want)
+	}
+}
+
+func TestAStoreNeverHandsOutAnotherPoolsTransaction(t *testing.T) {
+	fA, dbA := registerFake(t)
+	fB, dbB := registerFake(t)
+	storeA, storeB := New(dbA), New(dbB)
+
+	// The leak this test forbids: store B's repository, running inside
+	// store A's unit, resolving its query surface and finding A's
+	// transaction there. Two probes pin the opposite, both at the driver:
+	//
+	//   - inside A's unit but outside any unit of B's own, B's Querier is
+	//     B's pool — the exec runs as a plain pool statement on pool B, and
+	//     pool A's stream shows no exec at all (it would if A's transaction
+	//     had answered);
+	//   - inside B's own nested unit, B's Querier is B's transaction — one
+	//     connect on B for the whole nested run, because the exec rode the
+	//     connection that transaction holds.
+	err := storeA.WithinTx(context.Background(), func(ctx context.Context) error {
+		if _, err := storeB.Querier(ctx).ExecContext(ctx, "SELECT 1"); err != nil {
+			return err
+		}
+		return storeB.WithinTx(ctx, func(bctx context.Context) error {
+			_, err := storeB.Querier(bctx).ExecContext(bctx, "UPDATE probe SET ok = true")
+			return err
+		})
+	})
+	if err != nil {
+		t.Fatalf("WithinTx: %v", err)
+	}
+	if got, want := of(fA.recorded(), evConnect, evBegin, evExec, evCommit), []event{evConnect, evBegin, evCommit}; !equal(got, want) {
+		t.Fatalf("pool A saw %v, want %v — store A's transaction must execute nothing that store B sent", got, want)
+	}
+	// Pool B's stream tells the whole story in order: an exec with no begin
+	// before it (the pool answering outside any unit of work), then B's own
+	// begin, exec, commit. One connect only — the first exec returned its
+	// connection to the pool and BeginTx reused it — so here the sequence,
+	// not the connect count, is the proof; the unit-bound test above is
+	// where the count carries the argument.
+	if got, want := of(fB.recorded(), evConnect, evBegin, evExec, evCommit), []event{evConnect, evExec, evBegin, evExec, evCommit}; !equal(got, want) {
+		t.Fatalf("pool B saw %v, want %v — the first exec is B's pool answering outside any unit, the begin/exec pair is B's own unit", got, want)
+	}
+}
+
 func TestWithinTxFailingWorkCannotHideARollbackFailure(t *testing.T) {
 	f, db := registerFake(t)
 	store := New(db)
@@ -177,37 +269,47 @@ func TestWithinTxSurfacesACommitFailureWithoutTouchingThePoolAgain(t *testing.T)
 	}
 }
 
-func TestWithinTxCarriesTheOpenTransactionInTheWorkContext(t *testing.T) {
+func TestQuerierInsideAUnitOfWorkRunsOnTheUnitsTransaction(t *testing.T) {
 	f, db := registerFake(t)
 	store := New(db)
 
-	// The port's query surface belongs to the repositories built on it, and
-	// none exist yet — so no query can be routed here. What can and must be
-	// pinned now is the mechanism those repositories will resolve: the work
-	// context carries the open *sql.Tx itself, under the key the adapter
-	// owns, from the moment fn starts. A repository that reads its
-	// transaction from the context — never from the pool, as the port
-	// requires — therefore holds the real, in-flight transaction: the same
-	// one this test watches the driver begin exactly once for the unit.
-	var carried *sql.Tx
+	// A repository inside the unit resolves its query surface from the work
+	// context and runs its statement through it. The exec must land on the
+	// connection the transaction holds: exactly one connect for the whole
+	// run, because a pool exec would find no idle connection — the
+	// transaction holds the only one the fake has opened — and be forced to
+	// open a second. One connect is the proof the statement went around no
+	// unit of work: it went through it.
 	err := store.WithinTx(context.Background(), func(ctx context.Context) error {
-		tx, ok := ctx.Value(txKey{}).(*sql.Tx)
-		if !ok || tx == nil {
-			t.Fatal("the work context carries no live *sql.Tx — a repository resolving its transaction from the context would silently query outside the unit of work")
-		}
-		carried = tx
-		return nil
+		_, err := store.Querier(ctx).ExecContext(ctx, "UPDATE probe SET ok = true")
+		return err
 	})
 	if err != nil {
 		t.Fatalf("WithinTx: %v", err)
 	}
-	if carried == nil {
-		t.Fatal("the work function never ran")
-	}
-	got := of(f.recorded(), evBegin, evCommit, evRollback)
-	want := []event{evBegin, evCommit}
+	got := of(f.recorded(), evConnect, evBegin, evExec, evCommit, evRollback)
+	want := []event{evConnect, evBegin, evExec, evCommit}
 	if !equal(got, want) {
-		t.Fatalf("driver calls were %v, want %v — the carried transaction must be the unit's one and only", got, want)
+		t.Fatalf("driver calls were %v, want %v — the resolved Querier must be the unit's transaction, not a second connection the pool found", got, want)
+	}
+}
+
+func TestQuerierOutsideAUnitOfWorkRunsOnThePool(t *testing.T) {
+	f, db := registerFake(t)
+	store := New(db)
+
+	// With no unit of work in flight the same resolution answers with the
+	// pool: the statement runs on its own connection, with no begin and no
+	// commit around it. The two Querier tests together pin both halves of
+	// the resolution — the context decides, and the storage layer is the
+	// only place that reads it.
+	if _, err := store.Querier(context.Background()).ExecContext(context.Background(), "SELECT 1"); err != nil {
+		t.Fatalf("ExecContext through the pool: %v", err)
+	}
+	got := of(f.recorded(), evConnect, evBegin, evExec, evCommit, evRollback)
+	want := []event{evConnect, evExec}
+	if !equal(got, want) {
+		t.Fatalf("driver calls were %v, want %v — outside a unit of work the Querier is the pool, not a transaction", got, want)
 	}
 }
 

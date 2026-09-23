@@ -27,6 +27,7 @@ const (
 	evBegin    event = "begin"
 	evCommit   event = "commit"
 	evRollback event = "rollback"
+	evExec     event = "exec"
 )
 
 // fakeDriver records every call into it. There is no per-connection
@@ -120,6 +121,21 @@ type fakeConn struct{ f *fakeDriver }
 
 func (c *fakeConn) Prepare(string) (driver.Stmt, error) {
 	return nil, errors.New("fake driver: statements are not part of this contract")
+}
+
+// ExecContext implements driver.ExecerContext, which database/sql consults
+// before Prepare for a plain ExecContext — the one path both the pool and
+// the transaction take. That makes exec the observable that says which
+// handle a resolved Querier answered with: an exec through the transaction
+// lands on the connection the transaction holds; an exec through the pool
+// finds no idle connection and opens a second one. The event stream, not
+// any pointer identity, is the proof.
+func (c *fakeConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+	if err := c.f.outcome(evExec); err != nil {
+		return nil, err
+	}
+	c.f.record(evExec)
+	return driver.RowsAffected(0), nil
 }
 
 func (c *fakeConn) Close() error { return nil }
