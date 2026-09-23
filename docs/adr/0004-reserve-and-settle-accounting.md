@@ -206,10 +206,12 @@ this path because its lease is renewed.
    are new linked facts.
 2. **Ledger history is append-only.** LedgerEntry rows are insert-only;
    reversals are compensating legs, never updates/deletes.
-3. **Entitlements cannot be double-spent.** Every FundingBucket allocation is
-   a conditional, lock/version-guarded update inside one of the four
-   cross-context coordinated transactions (ADR 0001, rule 6); no code path
-   changes capacity outside them.
+3. **Entitlements cannot be double-spent.** Every capacity drawdown is a
+   conditional, lock/version-guarded FundingBucket update
+   (`available >= take`) inside one of the four cross-context coordinated
+   transactions (ADR 0001, rule 6); refills are ledger-backed writes outside
+   the admission path — the grant-cycle roll, and the topup/adjustment
+   flows, each with its own ledger legs and uniqueness guards.
 4. **Reservation and settlement are distinct.** Hold and consume are different
    ledger legs; one unique Settlement per request makes settlement exactly-once.
 5. **Logical requests and provider attempts are distinct.** One Request owns

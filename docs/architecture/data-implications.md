@@ -102,7 +102,12 @@ nothing else spans contexts:
 Catalog configuration activation (aliases, group versions, price revisions)
 is a coordinated transaction internal to the Catalog context (ADR 0003) —
 Catalog-local, not a fifth cross-context transaction; it never spans
-contexts. Everything else is a single-aggregate transaction.
+contexts, though it does coordinate more than one Catalog aggregate. Apart
+from the four transactions above and Catalog activation, every transaction
+is single-aggregate. The map is not exhaustive of every write: the
+topup/adjustment ledger flows of ADR 0004 are capacity-funding writes
+outside the four, each appending its own ledger legs under its own
+uniqueness guards.
 
 ## What must be derivable from this page alone
 

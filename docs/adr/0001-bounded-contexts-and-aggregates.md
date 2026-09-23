@@ -43,9 +43,12 @@ Aggregate rules:
    about a set of rows must be enforceable inside a transaction on the
    aggregate that owns them. The normal write is a **local aggregate
    transaction** — one aggregate's rows in one short transaction.
-   Coordination across aggregates is never implicit: it exists only as the
-   explicitly authorised cross-context coordinated transactions of rule 6,
-   and no other transaction spans aggregates.
+   Coordination across aggregates is never implicit: it exists only as two
+   named exceptions — the four cross-context coordinated transactions of
+   rule 6, and Catalog configuration activation, a coordinated transaction
+   local to the Catalog context (ADR 0003) that spans more than one
+   Catalog aggregate. Outside those named transactions, no transaction
+   spans aggregates.
 2. **Identity is three small aggregates, not one big one.** `Account` carries
    the billing relationship's identity; `User` and `APIKey` each reference the
    account and are independently mutable (a key is revoked without touching
@@ -67,9 +70,12 @@ Aggregate rules:
    execution. Nothing in Execution is a lock the business waits on.
 5. **Quota capacity is guarded state, written only by the accounting flows.**
    Each entitlement cycle and each PAYG balance has a funding-bucket
-   projection (ADR 0004) whose available capacity is drawn down only by
+   projection (ADR 0004). Its available capacity is drawn down only by
    conditional updates inside the four cross-context coordinated
-   transactions of rule 6.
+   transactions of rule 6; refills arrive through the ledger-backed flows
+   that grant or fund it — the grant-cycle roll of rule 6, and the
+   topup/adjustment flows of ADR 0004 — each carrying its own ledger legs
+   and uniqueness guards.
 6. **Exactly four cross-context coordinated transactions exist.** They are
    authorised here by name; each writes rows owned by more than one context
    in one short database transaction, and no other database transaction
