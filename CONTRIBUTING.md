@@ -39,7 +39,7 @@ is because that step was skipped. Do not skip it.
 | `pnpm build`          | Every project's `build` target through Moon — `vite build` and the gateway binary                      |
 | `pnpm check-projects` | Asserts every `apps/*` and `packages/*` directory is a project Moon can see, with the four targets     |
 | `pnpm dev:web`        | The console's Vite dev server                                                                          |
-| `pnpm dev:api`        | The API server (`go run ./cmd/gateway`, serves `/healthz` and `/readyz` on :8080)                      |
+| `pnpm dev:api`        | The API server (`go run ./cmd/gateway`, serves `/healthz`, `/readyz` and `/version` on :8080)          |
 
 A `Makefile` at the root spells the same commands as `make` targets
 (`make lint`, `make go-test`, …) — aliases, not a second definition. And a
