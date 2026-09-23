@@ -9,11 +9,24 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/usagefacts"
 )
 
-// The management envelope's machine-readable categories, mirroring the enum in
-// api/openapi/shared/errors.yaml. They are spelled as literals here rather than
-// imported from anywhere because the contract is the source and this package
-// implements it; a constant shared with another surface would be a second
-// definition of the contract wearing a name.
+// The failure vocabulary of the private protocol this listener speaks, stated in
+// docs/architecture/cross-plane-protocols.md.
+//
+// It overlaps the façade's rather than being derived from it, and the overlap is
+// not inheritance. Both surfaces answer in the same envelope — the two are hops
+// of one chain, and an envelope per hop would mean a translation whose only
+// content was a rename — but the set of failures is each surface's own. Nothing
+// in api/openapi/shared/errors.yaml describes this listener: that enum is the
+// façade's, the façade is what a contracted caller reaches, and this process is
+// one it reaches in turn. `upstream_unavailable` is the clearest case and the
+// reason the two sets are written down separately: it is the façade's word for
+// "the Data Plane did not answer", which is a sentence this Data Plane could
+// only tell about itself.
+//
+// They are spelled as literals rather than imported from anywhere for the
+// reason every constant on a wire boundary is: the definition is the document,
+// and a constant shared across two processes would be a second definition
+// wearing a name.
 const (
 	codeNotFound         = "not_found"
 	codeMethodNotAllowed = "method_not_allowed"

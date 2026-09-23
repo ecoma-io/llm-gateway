@@ -125,6 +125,22 @@ func (ingestion *FactIngestion) Replay(ctx context.Context) (FactIngestionResult
 		return FactIngestionResult{}, fmt.Errorf("application: read usage facts: %w", err)
 	}
 
+	// A page with no position is a page this pass cannot act on, and the check
+	// is here — before the unit of work, and not only in the adapter that read
+	// the wire — because advancing is the one step in this flow that writes
+	// durable state outside this process.
+	//
+	// The adapter refuses a malformed response as it arrives, so a port that
+	// behaves as the seam documents never hands this one back. This second gate
+	// is not that check repeated: it guards the write rather than the read. An
+	// empty position stored here is indistinguishable from "never applied
+	// anything", so the consumer would re-read the same page on every cycle and
+	// never advance — a silent stall with nothing to observe, which is why it is
+	// worth refusing at the last point where it can still be refused.
+	if page.NextCursor == "" {
+		return FactIngestionResult{}, fmt.Errorf("application: read usage facts: %w", dataplane.ErrMalformedPage)
+	}
+
 	if err := ingestion.store.WithinTx(ctx, func(txCtx context.Context) error {
 		for _, event := range page.Events {
 			// The seam's vocabulary stops here: the applier is given the

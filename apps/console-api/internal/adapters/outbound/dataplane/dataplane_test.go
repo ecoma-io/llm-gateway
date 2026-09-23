@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -188,6 +189,122 @@ func TestReadUsageEventsDecodesAPage(t *testing.T) {
 	}
 	if len(drained.Events) != 0 {
 		t.Errorf("len(Events) = %d on an empty page, want 0", len(drained.Events))
+	}
+}
+
+// TestReadUsageEventsRefusesAPageItCannotAdvanceFrom is the consumer boundary
+// the port's Page contract opens with: a page's position is the one value in
+// this flow that becomes durable state in another database, and a response that
+// is not shaped like a page must fail the read rather than be handed on.
+//
+// Both refusals are statements about the envelope — is the field there, and can
+// the value be a cursor at all — and neither is a reading of the value. The
+// test is written so that a future adapter that started parsing cursors would
+// have to delete cases to keep passing.
+func TestReadUsageEventsRefusesAPageItCannotAdvanceFrom(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "a page whose position is an empty string",
+			body: `{"events":[],"next_cursor":"","has_more":false}`,
+		},
+		{
+			name: "a page that carries no position field at all",
+			body: `{"events":[],"has_more":false}`,
+		},
+		{
+			name: "a page whose position is null",
+			body: `{"events":[],"next_cursor":null,"has_more":false}`,
+		},
+		{
+			name: "a page whose position is longer than a cursor can be",
+			body: `{"events":[],"next_cursor":"` + strings.Repeat("c", 513) + `","has_more":false}`,
+		},
+		{
+			// The refusing half of the character-versus-byte pair: 513 code
+			// points, and so over the bound however it is counted. It is here so
+			// that the accepted row above cannot be satisfied by a bound that
+			// stopped refusing anything.
+			name: "a page whose position is past the bound in characters",
+			body: `{"events":[],"next_cursor":"` + strings.Repeat("é", 513) + `","has_more":false}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var seen *http.Request
+			client := New(capturingClient(&seen, jsonResponse(http.StatusOK, tt.body)), baseURL, credential)
+
+			page, err := client.ReadUsageEvents(context.Background(), "", 100)
+			if !errors.Is(err, port.ErrMalformedPage) {
+				t.Fatalf("ReadUsageEvents() error = %v, want it to wrap %v", err, port.ErrMalformedPage)
+			}
+			if page.NextCursor != "" || page.Events != nil || page.HasMore {
+				t.Errorf("ReadUsageEvents() returned %+v beside an error, want the zero Page — a caller that ignored the error must not find a position in it", page)
+			}
+			// The refusal is made of the response and not of the request, so it
+			// must not smuggle back the endpoint or the credential either.
+			for _, secret := range []string{baseURL, credential} {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("error %q carries %q", err.Error(), secret)
+				}
+			}
+		})
+	}
+}
+
+// TestAnAcceptedPageKeepsItsCursorByteForByte is the other half of the
+// boundary, and the half that keeps it from becoming enforcement for its own
+// sake: every position the contract admits is still passed through untouched.
+//
+// The values are chosen to be ones a checking implementation would be tempted
+// to normalise — a cursor with leading and trailing whitespace, one at exactly
+// the declared maximum, and one holding characters that look like a query
+// parameter of its own. None of them may be trimmed, rewritten or re-encoded.
+func TestAnAcceptedPageKeepsItsCursorByteForByte(t *testing.T) {
+	tests := []struct {
+		name   string
+		cursor string
+	}{
+		{name: "an opaque cursor in the shapes the Data Plane might issue", cursor: anOpaqueCursor},
+		{name: "a cursor padded with whitespace on both ends", cursor: "  cur-2  "},
+		{name: "a cursor exactly as long as the contract allows", cursor: strings.Repeat("c", 512)},
+		// The same declared length in code points and twice that in bytes. The
+		// schema's `maxLength` counts characters, and this is the row that fails
+		// if this adapter counts them with `len()`: it would refuse a page the
+		// contract admits, and refuse it as a malformed page — turning a value
+		// the Control Plane is entitled to store into a permanent ingestion stop.
+		{name: "a cursor of the declared length in characters and more in bytes", cursor: strings.Repeat("é", 512)},
+		{name: "a single character", cursor: "x"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]any{
+				"events":      []any{},
+				"next_cursor": tt.cursor,
+				"has_more":    false,
+			})
+			if err != nil {
+				t.Fatalf("building the response body: %v", err)
+			}
+
+			var seen *http.Request
+			client := New(capturingClient(&seen, jsonResponse(http.StatusOK, string(body))), baseURL, credential)
+
+			page, err := client.ReadUsageEvents(context.Background(), tt.cursor, 100)
+			if err != nil {
+				t.Fatalf("ReadUsageEvents() error = %v, want nil", err)
+			}
+			if page.NextCursor != tt.cursor {
+				t.Errorf("NextCursor = %q, want %q byte for byte", page.NextCursor, tt.cursor)
+			}
+			if got := seen.URL.Query().Get("after"); got != tt.cursor {
+				t.Errorf("after = %q, want %q byte for byte", got, tt.cursor)
+			}
+		})
 	}
 }
 

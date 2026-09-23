@@ -96,10 +96,17 @@ var capabilities = []capability{
 	{
 		prefix:  "<module>/internal/adapters/inbound/",
 		imports: "http",
-		// Outbound reaching into the inbound tree: the direction that was
-		// permitted before the adapter rule was split in two.
-		permitted: "internal/adapters/inbound/management",
-		refused:   "internal/adapters/outbound/valkey",
+		// One inbound adapter importing the other — the crossing this module is
+		// the only one able to demonstrate, because it is the only module with
+		// two. It is the case the allow-list used to permit while the rule's own
+		// rationale forbade it, so the refused side is the sibling now rather
+		// than the outbound tree the split was originally written for.
+		//
+		// The permitted side is the composition root, which is the rule's whole
+		// claim: an adapter is a leaf and only the package that constructs it may
+		// enter one.
+		permitted: "cmd/dataplane",
+		refused:   "internal/adapters/inbound/management",
 	},
 	{
 		prefix:  "<module>/internal/adapters/outbound/",
@@ -107,7 +114,7 @@ var capabilities = []capability{
 		// Inbound reaching into the outbound tree — the other direction of the
 		// same crossing, and the one a route is most likely to make: a handler
 		// that constructs its own infrastructure instead of taking a port.
-		permitted: "internal/adapters/outbound/usagefacts",
+		permitted: "cmd/dataplane",
 		refused:   "internal/adapters/inbound/http",
 	},
 	{

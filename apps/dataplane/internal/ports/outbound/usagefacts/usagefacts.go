@@ -94,16 +94,24 @@ type Event struct {
 
 // Page is one replayable slice of the feed.
 type Page struct {
-	// Events are the facts at or after the requested position, in the Data
+	// Events are the facts strictly after the requested position, in the Data
 	// Plane's append order. Ascending, and never reordered by a caller: the
 	// order is the store's, and a consumer that sorted these would be inventing
 	// an order it does not own.
+	//
+	// Strictly, and not at-or-after, because the requested position is the one
+	// the previous page's NextCursor named — which is the last fact that page
+	// delivered. Returning that fact again would be harmless (the consumer
+	// applies by RequestID and a repeat is a no-op) but returning it *instead*
+	// of the first new fact would be a page that makes no progress, and the two
+	// differ only by which side of the boundary the convention rounds to.
 	Events []Event
 
-	// NextCursor is the position immediately after the last event in this page
-	// — the value to send as the next `after`. It is opaque (see the package
-	// comment) and non-empty even when no events were returned, so a caller
-	// that applied nothing still gets a defined position to resume from.
+	// NextCursor is the position of the last event in this page — the value to
+	// send as the next `after`, since the next read resumes strictly after it.
+	// It is opaque (see the package comment) and non-empty even when no events
+	// were returned, so a caller that applied nothing still gets a defined
+	// position to resume from.
 	//
 	// It is produced here and never by a consumer: a consumer that computed its
 	// own position would be deriving a Data Plane address from a shape it was
@@ -123,11 +131,21 @@ type Page struct {
 // DefaultLimit is the page size when a caller does not ask for one: large
 // enough that a healthy consumer catches up in a few round trips, small enough
 // that one page is not a long-running query holding a read view open.
+//
+// It is one of the two numbers the fact contract declares (1..1000, default
+// 100) and this is the module that owns their meaning; the management surface
+// applies them to the caller's query, so this constant is enforced rather than
+// merely documented.
 const DefaultLimit = 100
 
 // MaxLimit bounds what a caller may ask for. A page is held in memory on both
 // sides of the wire, and an unbounded `limit` is a request for the whole
 // history — a denial-of-service the caller can trigger by accident.
+//
+// A request above it is refused with `400 invalid_request` rather than served
+// at the bound: a clamped answer is indistinguishable from a page the feed
+// itself produced, so the caller would never learn that the number it chose was
+// discarded.
 const MaxLimit = 1000
 
 // ErrCursorExpired says the requested position can no longer be replayed —
@@ -163,14 +181,18 @@ var ErrSourceUnavailable = errors.New("usage fact source is unavailable")
 // pass every test in this repository while losing every fact on restart, which
 // is the one failure this whole design exists to prevent.
 type Reader interface {
-	// Read returns the facts at or after the position named by after, in
+	// Read returns the facts strictly after the position named by after, in
 	// ascending append order.
 	//
 	// An empty after means "from the beginning of what is retained": it is how
 	// a consumer with no stored position starts, and it is not an error.
-	// limit is a page size the caller may ask for; an implementation applies
-	// its own bounds, and the application clamps the request before it arrives
-	// here.
+	//
+	// limit is a page size the caller asked for, already bounded: the management
+	// surface applies DefaultLimit and MaxLimit below before this method is
+	// reached, so the value here is one the fact contract allows and an
+	// implementation has no page size of its own to impose. A limit outside those
+	// bounds is a caller that reached this port without passing the surface, and
+	// that is a defect rather than a request to be adjusted.
 	//
 	// A read is side-effect free. Calling Read twice with the same arguments
 	// returns the same facts — modulo facts appended in between — because

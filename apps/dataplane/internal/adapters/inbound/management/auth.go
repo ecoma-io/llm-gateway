@@ -8,8 +8,10 @@ import (
 )
 
 // authorizationHeader is the header a management caller presents its service
-// credential in, as api/openapi/dataplane.yaml declares through its
-// `serviceCredential` scheme.
+// credential in. This listener's caller is dataplane-api, not the Control Plane
+// that reaches it, so the scheme is the private protocol's rather than
+// api/openapi/dataplane.yaml's — the two are shaped alike and carry different
+// secrets, and each hop checks its own (docs/architecture/cross-plane-protocols.md).
 const authorizationHeader = "Authorization"
 
 // credentialScheme is the authorization scheme this surface accepts. It is

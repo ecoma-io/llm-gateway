@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/ports/outbound/dataplane"
@@ -15,14 +16,21 @@ import (
 // here and answered from there.
 //
 // The delivery model is stated once in api/openapi/shared/usage-facts.yaml and
-// this file is the transport's part of it. What matters at this layer is that
-// the handler is a relay and behaves like one: `after` and `limit` go out as
-// they came in, the page comes back as the Data Plane wrote it, and nothing
-// between the two is remembered — no cursor kept for the next call, no page
-// cached for the next reader, no fact reordered or dropped. A position held
-// here would be a third party's opinion about a protocol whose two participants
-// are the Data Plane that owns the facts and the Control Plane that owns its
-// position.
+// this file is the transport's part of it. What matters at this layer is what
+// the handler does *not* do: it keeps nothing between the two calls — no cursor
+// for the next call, no page for the next reader, no fact reordered or dropped.
+// A position held here would be a third party's opinion about a protocol whose
+// two participants are the Data Plane that owns the facts and the Control Plane
+// that owns its position.
+//
+// Keeping nothing is not the same as passing everything through, and the
+// difference is this file's three checks: the parameters are validated against
+// the contract's declared shape, an undeclared name is refused, and the answer
+// is written from the port's values rather than copied from the listener's
+// body. Re-encoding a page from values read once, in this call, is statelessness
+// — the response type below exists for it. Answering from anything read earlier
+// is what the paragraph above forbids. The two are easy to conflate under the
+// word "relay", so the word is not used here (ADR 0006 §9, §11).
 //
 // The caller is verified before any of that runs. The check is the wrapper in
 // serviceauth.go, applied at the route table rather than inside the handler, so
@@ -49,16 +57,41 @@ const (
 	// request this surface refuses rather than clamps: the Data Plane would
 	// reject it too, and clamping here would answer a question the caller did
 	// not ask while hiding that it asked an invalid one.
+	//
+	// The Data Plane's private listener refuses exactly the same values — the
+	// numbers come from the one contract both hops implement
+	// (shared/usage-facts.yaml) — so a caller cannot discover a different bound
+	// by walking up or down the chain.
 	minUsageEventsLimit = 1
 	maxUsageEventsLimit = 1000
+
+	// maxUsageEventsCursorLength is the bound the contract declares on a cursor
+	// (`maxLength: 512`), and it is checked here for the same reason the Data
+	// Plane's own listener checks it: length is not content. A cursor longer
+	// than this cannot be one the feed issued, so forwarding it would spend a
+	// round trip to be told so — and the caller would learn it as a 502, which
+	// says the Data Plane is unavailable rather than that its own request was
+	// impossible. Refusing it here keeps the answer about the caller's request.
+	//
+	// Characters, not bytes, because that is what the schema's `maxLength`
+	// counts. The two differ only for a cursor with a multi-byte code point in
+	// it, and that is the case where being stricter than the contract would mean
+	// refusing a value the Data Plane had already issued and this surface had
+	// already served.
+	maxUsageEventsCursorLength = 512
 )
 
-// usageEventsHandler relays one page of the feed. It reaches the application —
+// usageEventsHandler serves one page of the feed. It reaches the application —
 // and through it the Data Plane — only after requireServiceCaller has admitted
 // the caller, and it adds nothing to what comes back.
 func usageEventsHandler(app *application.App) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		query := r.URL.Query()
+
+		if usageEventsUnknownParameter(query) {
+			writeError(w, r, invalidRequestError{message: "the only query parameters this operation accepts are after and limit"})
+			return
+		}
 
 		after, err := usageEventsAfter(query)
 		if err != nil {
@@ -86,12 +119,18 @@ func usageEventsHandler(app *application.App) stdhttp.HandlerFunc {
 // The façade does not interpret the value — that is the whole point of an
 // opaque cursor, and this function is where the temptation to do it would
 // appear. What it does check is the little that can be known without
-// interpreting: that the parameter is present at most once, and that it is not
-// empty. An empty `after` is refused rather than read as "from the beginning",
-// because the contract declares the cursor's minimum length as one and defines
-// the beginning by the parameter's *absence*; treating `after=` as a synonym
-// would be this process deciding that a value the caller sent means something
-// else, which is exactly the kind of help that hides a broken consumer.
+// interpreting: that the parameter is present at most once, that it is not
+// empty, and that it is not longer than a cursor can be. Those three are the
+// contract's declared *shape* and nothing about what the value means; the
+// length bound in particular is not a step toward parsing, since a string's
+// length says nothing about its content and every value the check admits is
+// still forwarded byte for byte.
+//
+// An empty `after` is refused rather than read as "from the beginning", because
+// the contract declares the cursor's minimum length as one and defines the
+// beginning by the parameter's *absence*; treating `after=` as a synonym would
+// be this process deciding that a value the caller sent means something else,
+// which is exactly the kind of help that hides a broken consumer.
 func usageEventsAfter(query url.Values) (string, error) {
 	values, present := query["after"]
 	if !present {
@@ -103,7 +142,33 @@ func usageEventsAfter(query url.Values) (string, error) {
 	if values[0] == "" {
 		return "", invalidRequestError{message: "after must be a cursor from a previous page; omit it to read from the beginning"}
 	}
+	if utf8.RuneCountInString(values[0]) > maxUsageEventsCursorLength {
+		return "", invalidRequestError{message: "after must be at most " + strconv.Itoa(maxUsageEventsCursorLength) + " characters; pass back the cursor a previous page returned"}
+	}
 	return values[0], nil
+}
+
+// usageEventsUnknownParameter reports whether the caller named something this
+// operation does not declare.
+//
+// The contract attaches `400 invalid_request` to this operation, and
+// shared/errors.yaml says what that code is for: a request the caller cannot be
+// allowed to believe took effect. `?position=abc` is exactly that — a caller
+// who named their starting point, and who would read a 200 as confirmation that
+// it was honoured. The private listener behind this façade refuses an
+// undeclared name for the same reason; without this check the two hops
+// disagree about one input and this is the permissive end of the protocol.
+//
+// The name that arrived is not in the message, which is the same rule the
+// listener follows: a caller-shaped string has no business travelling back out
+// of this process, however harmless it looks.
+func usageEventsUnknownParameter(query url.Values) bool {
+	for name := range query {
+		if name != "after" && name != "limit" {
+			return true
+		}
+	}
+	return false
 }
 
 // usageEventsLimit reads the page size, defaulting it and refusing anything the

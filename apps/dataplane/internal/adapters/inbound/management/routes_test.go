@@ -24,9 +24,16 @@ var runtimeSurface = []string{
 // because a management surface that stops answering is a Control Plane that
 // stops reconciling.
 //
-// The document is the other half of that decision and is checked by
-// contract_test.go, which compares this same table against
-// api/openapi/dataplane.yaml.
+// This listener is not the surface api/openapi/dataplane.yaml contracts, and it
+// is therefore not checked against that document by any test here. The document
+// is the façade's — dataplane-api — and contract_test.go lives in that module,
+// comparing the façade's routes against it. What the two hops share is the page
+// they carry, which is why the private protocol is pinned on each side by
+// protocol_test.go (this package's) and stated in
+// docs/architecture/cross-plane-protocols.md. A reader looking for "does this
+// process serve what the contract says" is one module over; the question here is
+// "does this listener serve exactly what the private protocol declares", and the
+// literal list below is that question asked.
 func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 	got := []string{}
 	for _, rt := range routes(newTestApp(t)) {

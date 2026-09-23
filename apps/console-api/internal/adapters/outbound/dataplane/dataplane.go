@@ -13,10 +13,16 @@
 // what the one-seam rule exists to prevent.
 //
 // The adapter holds no state: no buffer, no cache, no retry counter, no learned
-// position. It sends one request and decodes one answer, so a page is exactly
-// what the Data Plane said in that response — the façade's documented promise
-// that a page is never cached, buffered, reordered or transformed holds here as
-// well, by there being nothing in this package that could do it.
+// position. It sends one request and decodes one answer, so the facts it hands
+// the applier are the facts that arrived in that one response, in the order they
+// arrived — not because this package promises to pass bytes through, but because
+// there is nothing here that could do otherwise.
+//
+// What it does do is decode, and that is worth stating next to the promise it
+// does not make. Every hop on this chain re-encodes the page in its own types —
+// the listener from its store's, the façade from its own values, this adapter
+// from the façade's body — so "the page travels unchanged" is a statement about
+// the facts and their order and not about the bytes carrying them.
 //
 // Two rules of the seam are enforced in the code below and are worth naming
 // where a reader meets them: the cursor travels verbatim in both directions and
@@ -34,6 +40,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	// The port shares this package's name, so the import is aliased: every
 	// reference below is unambiguously the interface, and the adapter it
@@ -45,6 +52,29 @@ import (
 // declares it. It is a constant because it is the contract's, not the caller's:
 // nothing in the Control Plane chooses which path the feed lives at.
 const usageEventsPath = "/internal/usage-events"
+
+// usageCursorMaxLength is the bound the contract puts on a cursor
+// (`shared/usage-facts.yaml`, UsageCursor: `maxLength: 512`), and it is checked
+// on the way *in* rather than trusted.
+//
+// A page's position is the one value in this flow that becomes durable state
+// outside this process, in the Control Plane's own table, so it is the one
+// value worth refusing before anyone stores it. A response carrying no position
+// at all is the worse of the two cases and the reason the bound is not merely
+// hygiene: a consumer that stored an empty one would ask from the beginning of
+// retained history on every cycle and never advance, silently and forever.
+//
+// Enforcing it here is not parsing the cursor. A string's length is not its
+// content, nothing about the value's meaning is examined, and every cursor the
+// check admits still crosses byte for byte — the point is that a value outside
+// the contract's own declared shape is a response this seam cannot use, which
+// is a fact about the answer rather than a question about the position.
+//
+// Characters, not bytes: `maxLength` in the schema is a count of code points, so
+// counting bytes would refuse a page the contract permits. The difference only
+// appears for a cursor containing a multi-byte code point, and it would appear
+// as a page every other hop accepts and this one rejects.
+const usageCursorMaxLength = 512
 
 // Client reads pages of usage facts from a Data Plane's management surface.
 type Client struct {
@@ -167,7 +197,16 @@ func (c *Client) ReadUsageEvents(ctx context.Context, after string, limit int) (
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
 		return port.Page{}, fmt.Errorf("dataplane: decode the usage events page: %w", err)
 	}
-	return body.page(), nil
+	page, err := body.page()
+	if err != nil {
+		// The refusal is the whole point of this line: a page the consumer
+		// cannot act on leaves the read failed, so the stored position is not
+		// touched and the next pass asks for the same range again. Returning
+		// the page and letting the caller notice would put the decision
+		// somewhere that does not read the wire.
+		return port.Page{}, err
+	}
+	return page, nil
 }
 
 // pageResponse is the wire shape of one page, field for field as
@@ -176,12 +215,17 @@ func (c *Client) ReadUsageEvents(ctx context.Context, after string, limit int) (
 // in this repository exists: JSON tags and wire spellings are the transport's
 // vocabulary, and the port's types stay free of them.
 //
-// Nothing here validates the page. The contract's constraints — a non-empty
-// next_cursor, an enum of kinds, a payload whose shape only the schema knows —
-// are the Data Plane's to keep and the applier's to act on; a consumer that
-// re-checked them would be interpreting a value whose only promise is that it
-// may be returned verbatim, and the one thing this side must never do with a
-// cursor is decide what a valid one looks like.
+// Of the contract's constraints, this decode checks exactly two, and the line
+// between them and everything else is the whole design. `next_cursor` must be
+// present and no longer than a cursor can be — both statements about the
+// envelope, both decidable without knowing what a cursor is. What is left
+// alone is everything that would require understanding the page: the enum of
+// kinds belongs to the applier, which is the only code that knows which ones
+// this build can settle; the payload's shape belongs to the schema that wrote
+// it; and the cursor's meaning belongs to the Data Plane that issued it. A
+// consumer that re-checked those would be interpreting a value whose only
+// promise is that it may be returned verbatim, and the one thing this side must
+// never do with a cursor is decide what a valid one looks like.
 type pageResponse struct {
 	Events     []eventResponse `json:"events"`
 	NextCursor string          `json:"next_cursor"`
@@ -203,8 +247,23 @@ type eventResponse struct {
 
 // page translates the wire shape into the port's, one field at a time so a
 // field added to one and not the other is a compile-time omission rather than
-// a silent zero.
-func (r pageResponse) page() port.Page {
+// a silent zero — and refuses the two ways the answer can fail to be a page at
+// all.
+//
+// The refusal is a precondition on the translation rather than an extra rule
+// on top of it. Every field below is copied verbatim, and the only reason the
+// copy is conditional is that the port's Page promises a position a consumer
+// can store: a value out of the contract's declared shape would be a page that
+// broke that promise, and a caller that received it anyway would go on to
+// advance a durable cursor with it.
+func (r pageResponse) page() (port.Page, error) {
+	if r.NextCursor == "" {
+		return port.Page{}, fmt.Errorf("%w: the page carried no next_cursor, so there is no position to advance to", port.ErrMalformedPage)
+	}
+	if utf8.RuneCountInString(r.NextCursor) > usageCursorMaxLength {
+		return port.Page{}, fmt.Errorf("%w: the page's next_cursor is %d characters long and the contract allows %d", port.ErrMalformedPage, utf8.RuneCountInString(r.NextCursor), usageCursorMaxLength)
+	}
+
 	events := make([]port.Event, 0, len(r.Events))
 	for _, event := range r.Events {
 		events = append(events, port.Event{
@@ -215,7 +274,7 @@ func (r pageResponse) page() port.Page {
 			Payload:       event.Payload,
 		})
 	}
-	return port.Page{Events: events, NextCursor: r.NextCursor, HasMore: r.HasMore}
+	return port.Page{Events: events, NextCursor: r.NextCursor, HasMore: r.HasMore}, nil
 }
 
 // transportCause strips the URL net/http attaches to a failed request.

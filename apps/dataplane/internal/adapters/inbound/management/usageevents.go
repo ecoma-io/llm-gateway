@@ -5,12 +5,16 @@ import (
 	stdhttp "net/http"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/application"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/usagefacts"
 )
 
-// maxCursorLength is the bound api/openapi/shared/usage-facts.yaml declares on a
-// cursor (`maxLength: 512`).
+// maxCursorLength is the bound the page shape declares on a cursor — the same
+// 512 the façade contracts, because the two hops carry one page and a bound that
+// differed between them would be a page one of them admits and the other does
+// not (docs/architecture/cross-plane-protocols.md).
 //
 // The bound is enforced here and the cursor's *content* is not, and the
 // difference is the whole point. A cursor is opaque: this surface produced it,
@@ -20,10 +24,25 @@ import (
 // store query whose own limits are a later PR's business, and that a value
 // outside the contract's declared shape is refused as such instead of failing
 // somewhere deeper with a message nobody can act on.
+//
+// It is a count of characters and not of bytes, and that is what the contract
+// says: `maxLength` in JSON Schema bounds a string's length in code points, so
+// counting bytes here would refuse a cursor this feed is entitled to issue and
+// the façade is entitled to serve. The disagreement would not be visible for an
+// ASCII cursor, which is what a query parameter will almost always be — it
+// would appear as a page that one hop refuses and the other accepts, which is
+// the failure this constant's first paragraph exists to prevent. The bytes a
+// caller can make this process carry are bounded by four times this number,
+// which is still a bound.
 const maxCursorLength = 512
 
-// usageEvent is one fact as this surface puts it on the wire, mirroring the
-// UsageEvent schema field for field.
+// usageEvent is one fact as this surface puts it on the wire: the five fields
+// the private protocol's page declares, which are the façade's `UsageEvent`
+// schema field for field. The two hops carry one page and this end is where it
+// is written, so the shape is stated here and only mirrored at the façade — a
+// field added on this side alone would be dropped at the façade's decoder, and
+// the protocol tests on both sides exist to make that a build failure rather
+// than a page that quietly loses a column.
 //
 // It is a transport type and not the port's Event for the usual reason: the
 // port's vocabulary is Go's and this one's is JSON's, and the day the wire
@@ -113,17 +132,22 @@ var errNoCursor = factQueryError("the fact source returned a page with no positi
 // readFactQuery turns the query string into the use case's arguments, and is the
 // only place in this package that looks at a caller-supplied value.
 //
-// It enforces the contract's declared *shape* — `after` is an optional string of
-// bounded length, `limit` is an optional integer of at least one — and nothing
-// about what either one means. `after` is passed through byte for byte; parsing
-// it would be interpreting a value this surface called opaque. `limit` travels
-// as the caller wrote it, including a value above the maximum, which the
-// application serves at the maximum: that caller's intent is legible, a smaller
-// page than asked for is unambiguous against `has_more`, and failing a
-// reconciliation run over a page size would trade a slightly smaller answer
-// against a consumer that never advances. A value below the minimum is the
-// opposite case — there is no intent behind "minus one facts" to honour — and it
-// is refused rather than quietly upgraded to a default.
+// It enforces the contract's declared *shape* and nothing about what either
+// parameter means. `after` is an optional string of bounded length and is passed
+// through byte for byte; parsing it would be interpreting a value this surface
+// called opaque. `limit` is an optional integer, defaulted and bounded here, and
+// the bounds are the port's own constants — so the page size is chosen once, at
+// the surface the caller reached, and the use case below relays a value that is
+// already a legal page.
+//
+// A `limit` outside the bounds is refused rather than clamped, and that is a
+// decision about honesty rather than about strictness. Clamping answers a
+// question the caller did not ask and hides that it asked an invalid one: a
+// consumer that sized a page to fit what it can hold in memory would receive a
+// smaller page, see `has_more` still true, and have nothing anywhere telling it
+// that its own number was ignored. Both this surface and the façade in front of
+// it refuse the same values with the same status, so a caller cannot discover
+// the bounds by walking up the chain.
 //
 // A parameter supplied twice is refused rather than resolved. There is no
 // defensible rule for which of two cursors a caller meant, and answering with
@@ -137,6 +161,15 @@ var errNoCursor = factQueryError("the fact source returned a page with no positi
 // believing it worked. The message names the accepted parameters rather than
 // echoing what arrived — a caller-supplied string has no business travelling
 // back out of this process, however harmless it looks.
+//
+// An `after` that is present and empty is refused too, and it is the one case
+// where a value is refused for what it would otherwise be taken to mean. The
+// protocol defines the beginning by the parameter's *absence*; a caller that
+// sent `after=` has a position, and a broken one, and answering it as a request
+// for everything retained would hide exactly the bug it is evidence of. The
+// façade in front of this listener refuses the same value for the same reason,
+// so the two ends of one protocol agree about every input rather than about all
+// but one.
 func readFactQuery(r *stdhttp.Request) (string, int, error) {
 	query := r.URL.Query()
 	for name := range query {
@@ -150,14 +183,17 @@ func readFactQuery(r *stdhttp.Request) (string, int, error) {
 	case 0:
 	case 1:
 		after = cursors[0]
-		if len(after) > maxCursorLength {
+		if after == "" {
+			return "", 0, factQueryError("after must be a cursor from a previous page; omit it to read from the beginning")
+		}
+		if utf8.RuneCountInString(after) > maxCursorLength {
 			return "", 0, factQueryError("after must be at most " + strconv.Itoa(maxCursorLength) + " characters")
 		}
 	default:
 		return "", 0, factQueryError("after must be supplied at most once")
 	}
 
-	limit := 0
+	limit := usagefacts.DefaultLimit
 	switch limits := query["limit"]; len(limits) {
 	case 0:
 	case 1:
@@ -165,8 +201,8 @@ func readFactQuery(r *stdhttp.Request) (string, int, error) {
 		if err != nil {
 			return "", 0, factQueryError("limit must be an integer")
 		}
-		if parsed < 1 {
-			return "", 0, factQueryError("limit must be at least 1")
+		if parsed < 1 || parsed > usagefacts.MaxLimit {
+			return "", 0, factQueryError("limit must be an integer between 1 and " + strconv.Itoa(usagefacts.MaxLimit))
 		}
 		limit = parsed
 	default:

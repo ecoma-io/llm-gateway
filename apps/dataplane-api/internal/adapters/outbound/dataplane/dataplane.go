@@ -2,6 +2,15 @@
 // listener over HTTP: the call this façade makes so it has something to answer
 // with, and the only network dependency in the module.
 //
+// The listener it calls is not the surface this application contracts. The
+// façade answers a caller under api/openapi/dataplane.yaml; the process behind
+// it serves a private protocol, defined in
+// docs/architecture/cross-plane-protocols.md, that no caller outside this
+// repository reaches and that is deliberately not a fourth OpenAPI document.
+// The two hops carry the same page and do not share a failure vocabulary, so
+// what this package does with a status is translate it into a classification
+// this application can answer from — never relay it.
+//
 // The adapter is handed an open *http.Client, the listener's origin and the
 // service credential rather than reading any of them itself. Which client,
 // which address and which secret are deployment decisions made once in
@@ -9,12 +18,18 @@
 // timeouts and proxy configuration out of the composition root's hands, and the
 // credential would be a second thing reading the environment.
 //
-// It is a relay and nothing else. It forwards `after` and `limit` — the cursor
-// as the opaque string it received, never parsed, never trimmed, never
-// remembered — and returns the page exactly as the Data Plane wrote it. There
-// is no cache and no buffer here: a cached page would be this process answering
-// from state it does not own, which is the one thing a management façade may
-// not do (ADR 0006 §9, §11).
+// It carries values across and nothing else. `after` and `limit` reach the
+// listener as the parameters the caller sent — the cursor as the opaque string
+// it is, never parsed, never trimmed, never remembered — and every field of the
+// page has to come back for the caller to get it at all, because this adapter
+// reads the answer into the port's values and the inbound adapter writes the
+// caller's body from those. So the page is re-issued rather than copied: the
+// two bodies coincide today and no line here assumes they must. There is no
+// cache and no buffer, and that is the part worth separating from the
+// re-encoding: re-writing a page from values this call just read is
+// statelessness, while answering from a page read earlier would be this process
+// holding a position it does not own, which is the one thing a management
+// façade may not do (ADR 0006 §9, §11).
 package dataplane
 
 import (
@@ -25,16 +40,41 @@ import (
 	"net/url"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/ports/outbound/dataplane"
 )
 
-// usageEventsPath is the operation this adapter calls, spelled as
-// api/openapi/dataplane.yaml declares it. It is a constant rather than an
-// argument because this adapter serves one operation: the day the management
-// surface fronts a second one, that is a new method and a visible second path
-// here, not a parameter every call site has to get right.
+// usageEventsPath is the operation this adapter calls on the private listener
+// behind this façade, and it is the private protocol's path rather than the
+// façade's. The two are the same string on purpose: the façade sends the values
+// it was given and names the path itself, rather than handing on the request
+// object it received, so the path a caller published is a path the façade calls
+// rather than one this hop re-derives. A path rewritten hop by hop would be a
+// translation step the protocol would have to describe and could get wrong. It
+// is therefore pinned here by
+// protocol_test.go and in the listener's own package by its own copy of that
+// test, not by api/openapi/dataplane.yaml — that document is this application's
+// contract with its caller, and this line is the application's own call out
+// (docs/architecture/cross-plane-protocols.md).
+//
+// It is a constant rather than an argument because this adapter serves one
+// operation: the day the façade fronts a second one, that is a new method and a
+// visible second path here, not a parameter every call site has to get right.
 const usageEventsPath = "/internal/usage-events"
+
+// usageCursorMaxLength is the bound the façade's contract puts on a cursor
+// (`shared/usage-facts.yaml`, UsageCursor: `maxLength: 512`), and it is applied
+// to what the private listener answers rather than only to what a caller sends.
+// The private protocol carries the same bound, so the two agreeing is the
+// expected case; the check exists for the case where they do not, and the cost
+// of it is one comparison against a body that has already been read. See page
+// for why keeping this promise belongs here rather than at the consumer.
+//
+// Characters and not bytes, because `maxLength` is the number of code points:
+// both ends of this hop count the same quantity, so a cursor one of them issues
+// is one the other accepts.
+const usageCursorMaxLength = 512
 
 // Client is the Data Plane management listener seen as the usage-fact port.
 type Client struct {
@@ -100,16 +140,28 @@ func (c *Client) ReadUsageEvents(ctx context.Context, after string, limit int) (
 	case stdhttp.StatusOK:
 		return c.page(response)
 	case stdhttp.StatusGone:
-		// The Data Plane refuses a position it can no longer replay. Relaying
-		// the refusal is the whole job: this process may not resume from a
-		// newer position, because that would skip facts between the two and a
-		// skipped fact is unsettled money.
+		// The Data Plane refuses a position it can no longer replay, and this
+		// process is forbidden from resuming from a newer one: that would skip
+		// the facts between the two, and a skipped fact is unsettled money. So
+		// the refusal is carried, and it is *decided* here rather than relayed —
+		// the façade builds its own envelope from this classification, and not
+		// one byte of the private listener's body reaches the caller. The two
+		// hops happen to spell this one the same way, which is a consequence of
+		// the translation and not a substitute for it.
 		return dataplane.Page{}, fmt.Errorf("%w: the data plane no longer retains that position", dataplane.ErrCursorExpired)
 	default:
-		// Everything else — including the Data Plane refusing this process's
-		// own credential — is one condition to a caller: the answer is unknown.
+		// Everything else is one condition from a caller's point of view: the
+		// answer is unknown, and this process holds nothing it could answer
+		// with instead. That includes the Data Plane refusing *this process's*
+		// own credential, which is a deployment fault and not to be reported as
+		// the caller's — a caller shown 401 for a secret it never sent would go
+		// and rotate the wrong one.
+		//
 		// The status is named because it is the one fact that tells an operator
-		// which side to look at, and a status code is not an address.
+		// which side to look at, and a status code is not an address. It is the
+		// private listener's status and not a contracted one: nothing here is
+		// relayed, so the façade's own answer is chosen above in the inbound
+		// adapter from the sentinel, not from this number.
 		return dataplane.Page{}, fmt.Errorf("%w: the data plane answered %d", dataplane.ErrUpstreamUnavailable, response.StatusCode)
 	}
 }
@@ -158,10 +210,32 @@ func (c *Client) request(ctx context.Context, after string, limit int) (*stdhttp
 // truncated page or an unparseable timestamp is ErrUpstreamUnavailable, because
 // answering with part of a page would be this process deciding which facts a
 // consumer gets to see.
+//
+// A page whose `next_cursor` is missing or over-long is refused for the same
+// reason and not a different one, and the reason is worth stating where the
+// check sits rather than where it is documented. The façade contracts
+// `next_cursor` — required, at least one character, at most 512 — so a body
+// that carries none, or carries one longer than the contract's own bound, is a
+// body this application cannot write out without contradicting the document it
+// answers under. The check is the façade keeping its own promise, which is why
+// it is here and not delegated to the consumer: the consumer has its own
+// promise to keep, about the position it stores, and one of the two keeping it
+// does not excuse the other.
+//
+// Nothing here reads the cursor. An admissible value crosses byte for byte;
+// what is decided is only whether a value this façade may put on the wire
+// exists at all.
 func (c *Client) page(response *stdhttp.Response) (dataplane.Page, error) {
 	var body pageBody
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
 		return dataplane.Page{}, fmt.Errorf("%w: the data plane answered with a body this facade cannot read", dataplane.ErrUpstreamUnavailable)
+	}
+
+	switch {
+	case body.NextCursor == "":
+		return dataplane.Page{}, fmt.Errorf("%w: the data plane answered with a page carrying no next_cursor, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
+	case utf8.RuneCountInString(body.NextCursor) > usageCursorMaxLength:
+		return dataplane.Page{}, fmt.Errorf("%w: the data plane answered with a next_cursor of %d characters, past the %d this surface contracts", dataplane.ErrUpstreamUnavailable, utf8.RuneCountInString(body.NextCursor), usageCursorMaxLength)
 	}
 
 	page := dataplane.Page{
@@ -181,11 +255,19 @@ func (c *Client) page(response *stdhttp.Response) (dataplane.Page, error) {
 	return page, nil
 }
 
-// pageBody and eventBody are the wire shapes of the Data Plane's answer,
-// mirroring UsageFactPage in api/openapi/shared/usage-facts.yaml field for
-// field. They are private to this adapter because they are the one place in
-// this module that knows the persistence-side JSON: the port above speaks in
-// values, and the inbound adapter owns the JSON this application writes.
+// pageBody and eventBody are the wire shapes of the private listener's answer,
+// as docs/architecture/cross-plane-protocols.md defines it: the same fields, in
+// the same spellings, as UsageFactPage in api/openapi/shared/usage-facts.yaml.
+// The two agree because the page is one page and the hops are two; they are
+// written twice because they are two sides of a boundary, and the protocol test
+// in this package and its counterpart in the listener's package are what hold
+// them together.
+//
+// They are private to this adapter because they are the one place in this module
+// that knows the persistence-side JSON: the port above speaks in values, and the
+// inbound adapter owns the JSON this application writes. That separation is what
+// makes the façade's answer a re-encoding of what it read rather than a relay of
+// it — the two shapes coincide today, and the code does not assume they must.
 //
 // OccurredAt is a time.Time so that encoding/json parses the contract's
 // RFC 3339 itself. A timestamp the runtime could not write is then a decode

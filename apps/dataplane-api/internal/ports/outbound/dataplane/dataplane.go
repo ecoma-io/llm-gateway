@@ -50,7 +50,7 @@ type Event struct {
 	// X-Request-Id: one correlates a call, the other identifies the business
 	// event, and confusing them would make a retry look like a second charge.
 	RequestID string
-	// Kind is the terminal outcome the fact records. This application relays it
+	// Kind is the terminal outcome the fact records. This application carries it
 	// without an opinion: which kinds it recognises is a property of the
 	// consumer's schema version, not of the transport in between.
 	Kind string
@@ -68,17 +68,18 @@ type Event struct {
 	Payload json.RawMessage
 }
 
-// Page is one replayable slice of the feed: the facts, the position
-// immediately after the last of them, and whether more exist. It is exactly
-// what the Data Plane answered, and this port attaches no meaning to any part
-// of it.
+// Page is one replayable slice of the feed: the facts, the position of the last
+// of them, and whether more exist. It is exactly what the Data Plane answered,
+// and this port attaches no meaning to any part of it.
 type Page struct {
 	// Events are the facts in ascending append order, strictly after the
 	// requested position.
 	Events []Event
-	// NextCursor is the position a consumer stores and sends back as `after`
-	// once every fact above it is applied. When the page is empty it is the
-	// position the request carried.
+	// NextCursor is the position of the last fact above, which a consumer stores
+	// and sends back as `after` once every one of them is applied — the next read
+	// resumes strictly after it. It is never empty: when the page carried no
+	// facts it is the position the request was read from, and the Data Plane
+	// answers with one even for a first read that carried no `after`.
 	NextCursor string
 	// HasMore reports whether facts exist beyond this page. False means the
 	// consumer has reached the end of what the Data Plane has committed so far,
@@ -106,7 +107,7 @@ type UsageFacts interface {
 	// after names and at most limit facts long. An empty after means "from the
 	// beginning of what is retained".
 	//
-	// The implementation forwards after and limit and returns what the Data
+	// The implementation sends after and limit and returns what the Data
 	// Plane said. This port has no position of its own, and an implementation
 	// that remembered one — a cached cursor, a buffered last page, a
 	// next_cursor computed locally — would be the façade holding state it must

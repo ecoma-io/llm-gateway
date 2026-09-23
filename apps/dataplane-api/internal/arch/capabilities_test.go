@@ -113,7 +113,12 @@ var capabilities = []capability{
 		imports: "http",
 		// Outbound reaching into the inbound tree: a client that could call
 		// this application's own surface instead of the Data Plane's.
-		permitted: "internal/adapters/inbound/http",
+		//
+		// The permitted side is the composition root and not the inbound package
+		// the import lives in. That is the rule's actual claim — an adapter is
+		// entered by the package that constructs it and by nothing else — and the
+		// case says so by naming cmd, which is the only entry the allow-list has.
+		permitted: "cmd/dataplane-api",
 		refused:   "internal/adapters/outbound/dataplane",
 	},
 	{
@@ -122,7 +127,7 @@ var capabilities = []capability{
 		// Inbound reaching into the outbound tree — the crossing that builds
 		// and works, and that puts the one cross-plane call this module makes
 		// somewhere the port cannot be substituted.
-		permitted: "internal/adapters/outbound/dataplane",
+		permitted: "cmd/dataplane-api",
 		refused:   "internal/adapters/inbound/http",
 	},
 	{

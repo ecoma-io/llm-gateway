@@ -1,7 +1,7 @@
 // Package config loads the dataplane-api's small, typed runtime configuration.
 //
 // Bootstrap configuration is process-level: it is read once before the server
-// starts, and a change requires a restart. There are five values today, so a
+// starts, and a change requires a restart. There are six values today, so a
 // hand-written loader keeps defaults, parsing and validation visible instead of
 // buying a configuration framework to hide them.
 //
@@ -11,10 +11,10 @@
 // configuring the management surface — or of changing what the runtime does by
 // being read in the wrong process.
 //
-// Two of the five have no default and never will. The Data Plane's address and
-// the service credential are facts about the deployment this process runs in:
-// there is no convention to guess an address from, and a default credential is
-// either a published secret or a silent hole. An absent one fails startup,
+// Three of the six have no default and never will. The Data Plane's address and
+// the two service credentials are facts about the deployment this process runs
+// in: there is no convention to guess an address from, and a default credential
+// is either a published secret or a silent hole. An absent one fails startup,
 // which is the only moment at which the operator can still fix it.
 package config
 
@@ -64,12 +64,25 @@ type Config struct {
 	// decided.
 	DataPlaneURL string
 
-	// ServiceCredential is the shared secret a management caller presents, and
-	// the one this process presents to the Data Plane in return. It is read
-	// here, handed to the route table and to the outbound adapter, and written
-	// nowhere: not into a log line, not into an error, not into a response.
-	// Deployment supplies it — a mounted secret, not a literal in a manifest.
+	// ServiceCredential is the shared secret a management caller presents to
+	// *this* process, and it is the credential the inbound guard compares
+	// against. It is read here, handed to the route table, and written nowhere:
+	// not into a log line, not into an error, not into a response. Deployment
+	// supplies it — a mounted secret, not a literal in a manifest.
 	ServiceCredential string
+
+	// DataPlaneCredential is the separate shared secret this process presents to
+	// the Data Plane's private management listener, and it is deliberately not
+	// ServiceCredential. One value serving both directions would make the
+	// credential a Control Plane caller is entitled to hold a key to the Data
+	// Plane's private surface: whoever reads the caller-facing secret — a
+	// compromised Control Plane, a leaked manifest — could reach the private
+	// listener directly and read its untranslated status vocabulary past the
+	// façade. Two hops are two trust relationships, so they are two values, and
+	// Load refuses a deployment that sets both to the same string rather than
+	// leaving the separation as a convention nobody checks
+	// (docs/architecture/cross-plane-protocols.md).
+	DataPlaneCredential string
 }
 
 // Defaults returns the configuration used when no supported environment
@@ -119,12 +132,13 @@ func Load(lookup LookupEnv) (Config, error) {
 		cfg.ReadHeaderTimeout = duration
 	}
 
-	// The two required values, read together because they are one decision:
-	// where the Data Plane is and what this process says to it. Presence rather
-	// than a default is the whole check — an absent variable is `ok == false`
-	// here and an empty one is caught below, and the two are distinguished
-	// because an empty value in a deployment template is a mistake while an
-	// absent one is an incomplete deployment. Both stop the process.
+	// The three required values, read together because they are one decision:
+	// where the Data Plane is, what this process says to it, and what it accepts
+	// from the caller in front of it. Presence rather than a default is the whole
+	// check — an absent variable is `ok == false` here and an empty one is caught
+	// below, and the two are distinguished because an empty value in a deployment
+	// template is a mistake while an absent one is an incomplete deployment. Both
+	// stop the process.
 	//
 	// The variable names stutter — DATAPLANE_API_DATAPLANE_URL prefixes the
 	// process with the name of its peer — and the stutter is deliberate: the
@@ -149,6 +163,30 @@ func Load(lookup LookupEnv) (Config, error) {
 		return Config{}, fmt.Errorf("DATAPLANE_API_SERVICE_CREDENTIAL must not be empty")
 	}
 	cfg.ServiceCredential = credential
+
+	// And the other half of the same decision: what this process presents when it
+	// is the caller. The two are read in the same place so the difference between
+	// them is visible in one screen rather than being a property of a deployment
+	// nobody reads twice.
+	//
+	// The inequality is checked rather than merely documented. The protocol page
+	// states that each hop checks its own secret and neither accepts the other's,
+	// and that sentence is true of the code — the two guards compare different
+	// variables — but a deployment that sets both variables to one string makes it
+	// false again in a way no test could see. It is cheap to refuse here, and the
+	// failure names both variables, so an operator who did it deliberately knows
+	// what to change.
+	dataPlaneCredential, ok := lookup("DATAPLANE_API_DATAPLANE_CREDENTIAL")
+	if !ok {
+		return Config{}, fmt.Errorf("DATAPLANE_API_DATAPLANE_CREDENTIAL must be set: this process presents a credential of its own to the Data Plane's management listener, and the two hops do not share one")
+	}
+	if dataPlaneCredential == "" {
+		return Config{}, fmt.Errorf("DATAPLANE_API_DATAPLANE_CREDENTIAL must not be empty")
+	}
+	if dataPlaneCredential == credential {
+		return Config{}, fmt.Errorf("DATAPLANE_API_DATAPLANE_CREDENTIAL must differ from DATAPLANE_API_SERVICE_CREDENTIAL: one secret serving both hops is a key every management caller holds to the Data Plane's private listener")
+	}
+	cfg.DataPlaneCredential = dataPlaneCredential
 
 	if err := validateAddr(cfg.Addr); err != nil {
 		return Config{}, err

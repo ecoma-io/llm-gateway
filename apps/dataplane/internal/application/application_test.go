@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -56,27 +57,32 @@ func TestReadUsageEventsPassesTheCursorThroughUntouched(t *testing.T) {
 	}
 }
 
-func TestReadUsageEventsAppliesThePortsPageSizeBounds(t *testing.T) {
-	tests := []struct {
-		name      string
-		limit     int
-		wantLimit int
-	}{
-		{name: "an unspecified limit uses the port's default", limit: 0, wantLimit: usagefacts.DefaultLimit},
-		{name: "a limit within the bounds is passed on unchanged", limit: 250, wantLimit: 250},
-		{name: "a limit above the maximum is reduced to it", limit: usagefacts.MaxLimit + 1, wantLimit: usagefacts.MaxLimit},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+// TestReadUsageEventsPassesThePageSizeItIsGiven is the page-size half of the
+// boundary claim, and its shape is the decision: the use case neither defaults
+// nor clamps, because the management surface has already applied the contract's
+// default and its bounds before calling in. A use case that adjusted the value
+// here would be a second place a page size is decided, and the adjustment would
+// be invisible to the caller it was made for.
+//
+// The out-of-range rows are the ones that make this a test of "neither defaults
+// nor clamps" rather than of arithmetic. An in-range table alone is satisfied by
+// a use case that clamps, or that substitutes the default whenever the value
+// looks wrong: every row it feeds in is one a clamp would leave alone, so the
+// clamp is invisible. Values the contract refuses are exactly the ones where
+// those rewrites would show, and the answer here is that they travel to the port
+// unchanged — the surface above refuses them before this code runs, and this
+// code's part of that sentence is to have no opinion about them.
+func TestReadUsageEventsPassesThePageSizeItIsGiven(t *testing.T) {
+	for _, limit := range []int{1, 250, usagefacts.DefaultLimit, usagefacts.MaxLimit, 0, -1, usagefacts.MaxLimit + 1} {
+		t.Run(strconv.Itoa(limit), func(t *testing.T) {
 			facts := &stubFacts{}
 			app := New("v0.1.0", facts)
 
-			if _, err := app.ReadUsageEvents(context.Background(), "", tt.limit); err != nil {
+			if _, err := app.ReadUsageEvents(context.Background(), "", limit); err != nil {
 				t.Fatalf("ReadUsageEvents() error = %v", err)
 			}
-			if facts.limit != tt.wantLimit {
-				t.Errorf("the port was read with limit %d, want %d", facts.limit, tt.wantLimit)
+			if facts.limit != limit {
+				t.Errorf("the port was read with limit %d, want %d unchanged", facts.limit, limit)
 			}
 		})
 	}
@@ -100,7 +106,7 @@ func TestReadUsageEventsReturnsThePortsPageUnchanged(t *testing.T) {
 	}
 
 	app := New("v0.1.0", &stubFacts{page: page})
-	got, err := app.ReadUsageEvents(context.Background(), "", 0)
+	got, err := app.ReadUsageEvents(context.Background(), "", usagefacts.DefaultLimit)
 	if err != nil {
 		t.Fatalf("ReadUsageEvents() error = %v", err)
 	}
@@ -120,7 +126,7 @@ func TestReadUsageEventsReportsASourceFailureRatherThanAnEmptyPage(t *testing.T)
 	// recorded nothing — a claim no adapter is entitled to make.
 	app := New("v0.1.0", &stubFacts{err: usagefacts.ErrSourceUnavailable})
 
-	_, err := app.ReadUsageEvents(context.Background(), "", 0)
+	_, err := app.ReadUsageEvents(context.Background(), "", usagefacts.DefaultLimit)
 
 	if !errors.Is(err, usagefacts.ErrSourceUnavailable) {
 		t.Errorf("ReadUsageEvents() error = %v, want ErrSourceUnavailable", err)

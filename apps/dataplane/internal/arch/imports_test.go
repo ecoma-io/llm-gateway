@@ -35,10 +35,10 @@ type rule struct {
 	forbidden []string
 }
 
-// rules is the dependency rule, one line per boundary. Each is deliberately
-// coarse: an allow-list naming a tree (`internal/adapters/inbound`) rather than
-// the one package that imports the library today is a rule about a boundary
-// instead of a rule about a moment.
+// rules is the dependency rule, one line per boundary. Several are deliberately
+// coarse: an allow-list naming a tree rather than the one package that imports
+// the library today is a rule about a boundary instead of a rule about a
+// moment.
 //
 // The runtime's table holds eight lines, and the two adapter rules are two
 // lines rather than one because the direction between the two adapter trees is
@@ -48,6 +48,15 @@ type rule struct {
 // reach into the database driver's tree and an outbound one may call the
 // runtime's own HTTP surface". The split states the two arrows, and neither
 // one exists.
+//
+// Those two are also the two rules here that name a package rather than a tree,
+// and this is the module where that distinction is load-bearing: it has two
+// inbound adapters, so an allow-list covering `internal/adapters/inbound` would
+// have permitted the management listener to import the runtime's request
+// surface — a sentence the rule's own rationale forbids in the same breath. An
+// adapter is a leaf; only the composition root enters or constructs one. The
+// allow-list says that, and an intra-adapter subpackage is refused along with
+// everything else, which is a deliberate edit away if one is ever wanted.
 //
 // For this application two of the rules carry the weight the split exists for:
 // no package here may reach the Control Plane or a management surface by
@@ -87,12 +96,12 @@ func rules(self string) []rule {
 		},
 		{
 			why:       "an inbound adapter is entered by the composition root and by nothing else: another inbound adapter is a route delegating to a route — a second surface with its own request shape and nobody's name on it — and an outbound adapter that calls one has made the transport it implements part of the use case",
-			allowed:   []string{"cmd", "internal/adapters/inbound"},
+			allowed:   []string{"cmd"},
 			forbidden: []string{self + "/internal/adapters/inbound/"},
 		},
 		{
 			why:       "an outbound adapter is constructed at the composition root and by nothing else: an inbound adapter that imports one has put concrete infrastructure behind a route with no port to substitute, and the application that imports one has stopped depending on the port, which is what made the infrastructure replaceable",
-			allowed:   []string{"cmd", "internal/adapters/outbound"},
+			allowed:   []string{"cmd"},
 			forbidden: []string{self + "/internal/adapters/outbound/"},
 		},
 		{
@@ -236,11 +245,21 @@ func TestEveryRuleGovernsSomething(t *testing.T) {
 // package here reaches the Control Plane or a management surface" is a check
 // rather than a sentence.
 //
-// The forged list is every forbidden prefix with the module path folded back
-// to `<module>`, sorted. Adding a boundary is therefore two edits — the rule
-// and this line — and removing one is two edits and a sentence of reasoning in
-// the diff. Both are deliberate acts, which is the whole claim the table makes
-// about itself.
+// Each entry pins the whole rule and not only its forbidden prefix: the
+// allowance is on the right of the arrow. Pinning the prefix alone caught a
+// boundary being deleted and missed the quieter and likelier edit, which is a
+// boundary being widened — one package appended to an allow-list, and a
+// crossing the rule's own sentence forbids is open with every test green. The
+// capability table next door does not catch it either: each case names one
+// package the rule permits and one it refuses, so an allowance granted to some
+// third package is invisible to both. Stated as a pair, the rule is the pair,
+// and an allow-list cannot drift without this failing.
+//
+// The forged list is every forbidden prefix with the module path folded back to
+// `<module>` and its allow-list beside it, sorted. Adding a boundary is
+// therefore two edits — the rule and this line — and so is widening one, and
+// removing one is two edits and a sentence of reasoning in the diff. All three
+// are deliberate acts, which is the whole claim the table makes about itself.
 func TestTheRuleRosterIsTheDeclaredOne(t *testing.T) {
 	self := modulePath(t)
 
@@ -250,25 +269,31 @@ func TestTheRuleRosterIsTheDeclaredOne(t *testing.T) {
 			// Already reported by TestEveryRuleGovernsSomething; nothing to pin.
 			continue
 		}
+		// "nobody" rather than an empty tail, because a blanket prohibition is a
+		// statement about the whole module and should read as one in the diff.
+		allowance := "nobody"
+		if len(r.allowed) > 0 {
+			allowance = strings.Join(r.allowed, ", ")
+		}
 		for _, prefix := range r.forbidden {
-			forged = append(forged, strings.Replace(prefix, self, "<module>", 1))
+			forged = append(forged, fmt.Sprintf("%s <- %s", strings.Replace(prefix, self, "<module>", 1), allowance))
 		}
 	}
 	sort.Strings(forged)
 
 	want := []string{
-		"<module>/internal/adapters/inbound/",
-		"<module>/internal/adapters/outbound/",
-		"<module>/internal/application",
-		"<module>/internal/config",
-		"<module>/internal/ports",
-		"database/sql",
-		"github.com/valkey-io/valkey-go",
-		"net/http",
+		"<module>/internal/adapters/inbound/ <- cmd",
+		"<module>/internal/adapters/outbound/ <- cmd",
+		"<module>/internal/application <- cmd, internal/adapters/inbound",
+		"<module>/internal/config <- cmd",
+		"<module>/internal/ports <- cmd, internal/application, internal/adapters, internal/ports",
+		"database/sql <- cmd, internal/ports, internal/adapters/outbound",
+		"github.com/valkey-io/valkey-go <- internal/adapters/outbound/valkey",
+		"net/http <- cmd, internal/adapters/inbound",
 	}
 	sort.Strings(want)
 
 	if !slices.Equal(forged, want) {
-		t.Errorf("the rule table forges %v, want %v — a rule was added or removed, which is a change to the dependency rule itself", forged, want)
+		t.Errorf("the rule table forges %v, want %v — a rule was added, removed or widened, which is a change to the dependency rule itself", forged, want)
 	}
 }

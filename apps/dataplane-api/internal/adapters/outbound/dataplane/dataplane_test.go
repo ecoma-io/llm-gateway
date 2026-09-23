@@ -272,6 +272,21 @@ func TestReadUsageEventsClassifiesEveryFailureTheSeamCanProduce(t *testing.T) {
 			wantErr: dataplane.ErrUpstreamUnavailable,
 		},
 		{
+			// The façade contracts next_cursor as required and at least one
+			// character. A page that carries none is one this application cannot
+			// write out without contradicting its own document.
+			name:    "a page with no position at all is not a page this façade may serve",
+			status:  stdhttp.StatusOK,
+			body:    `{"events":[],"next_cursor":"","has_more":false}`,
+			wantErr: dataplane.ErrUpstreamUnavailable,
+		},
+		{
+			name:    "a page whose position is longer than the contract allows is not one either",
+			status:  stdhttp.StatusOK,
+			body:    `{"events":[],"next_cursor":"` + strings.Repeat("c", 513) + `","has_more":false}`,
+			wantErr: dataplane.ErrUpstreamUnavailable,
+		},
+		{
 			name:    "a listener that is not there is the Data Plane being unavailable",
 			closed:  true,
 			wantErr: dataplane.ErrUpstreamUnavailable,
@@ -308,4 +323,47 @@ func TestReadUsageEventsClassifiesEveryFailureTheSeamCanProduce(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestThePositionBoundIsCountedInCharactersAndNotBytes pins which side of the
+// contract's bound this adapter stands on when the answer carries a multi-byte
+// cursor.
+//
+// The row above refuses a 513-character ASCII cursor, and it would pass just as
+// happily against a byte count, because for ASCII the two are the same number.
+// They diverge the moment a cursor contains a code point that costs more than
+// one byte, and the contract's `maxLength` counts code points. Counting bytes
+// here would refuse a page the Data Plane is entitled to issue and the façade's
+// own document permits — and it would refuse it as `502 upstream_unavailable`,
+// which says the Data Plane is down and sends an operator to the wrong process.
+func TestThePositionBoundIsCountedInCharactersAndNotBytes(t *testing.T) {
+	// 512 code points, 1024 bytes: legal by the contract, and over any byte
+	// count of the same bound.
+	multiByteAtLimit := strings.Repeat("é", usageCursorMaxLength)
+	if len(multiByteAtLimit) <= usageCursorMaxLength {
+		t.Fatalf("the fixture is %d bytes for %d characters; it does not exercise the difference at all", len(multiByteAtLimit), usageCursorMaxLength)
+	}
+
+	t.Run("a cursor at the bound in characters but past it in bytes is served unchanged", func(t *testing.T) {
+		up := &upstream{body: `{"events":[],"next_cursor":"` + multiByteAtLimit + `","has_more":false}`}
+		client := up.server(t)
+
+		page, err := client.ReadUsageEvents(context.Background(), opaqueCursor, 100)
+		if err != nil {
+			t.Fatalf("ReadUsageEvents() error = %v, want a page the contract permits", err)
+		}
+		if page.NextCursor != multiByteAtLimit {
+			t.Errorf("NextCursor = %d characters, want the %d-character cursor unchanged", len([]rune(page.NextCursor)), usageCursorMaxLength)
+		}
+	})
+
+	t.Run("a cursor past the bound in characters is refused", func(t *testing.T) {
+		up := &upstream{body: `{"events":[],"next_cursor":"` + multiByteAtLimit + `é","has_more":false}`}
+		client := up.server(t)
+
+		_, err := client.ReadUsageEvents(context.Background(), opaqueCursor, 100)
+		if !errors.Is(err, dataplane.ErrUpstreamUnavailable) {
+			t.Fatalf("ReadUsageEvents() error = %v, want it to wrap %v", err, dataplane.ErrUpstreamUnavailable)
+		}
+	})
 }

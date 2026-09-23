@@ -263,5 +263,59 @@ func TestTheManagementTransportHoldsNoState(t *testing.T) {
 			}
 			t.Errorf("%s holds Go files: the only thing this application may place under %s is the usage-fact seam %v — anything else is state this application does not own (ADR 0006 §9, §11)", dir, root, usageFactSeam)
 		}
+		// The use-case layer is one package, not a tree, and it is the last
+		// place a path rule can still see state arrive. A package below it —
+		// `internal/application/projection` holding a page or a map of them,
+		// say — is a cache with a mundane name, and it would be sanctioned by
+		// the root list above, by the domain rule, and by both adapter rules.
+		// Naming the one package rather than the tree is what makes it an
+		// edit somebody has to argue for.
+		if under(dir, "internal/application") && dir != "internal/application" {
+			t.Errorf("%s holds Go files: the management transport's use-case layer is one package, internal/application — anything below it is state or logic this application does not own (ADR 0006 §9, §11)", dir)
+		}
+	}
+}
+
+// TestTheModuleRequiresNothing is the mechanical half of the sentence go.mod
+// states in prose: this module "has no dependencies at all, and that is a
+// statement rather than an accident".
+//
+// The blanket prohibition next door names three import paths, and a scan of
+// this module's own `.go` files is all it can see. That leaves two ways across
+// a boundary the rule is written to hold: a wrapper that reaches SQL without
+// ever spelling `database/sql` — `github.com/jmoiron/sqlx`, `github.com/uptrace/bun`,
+// `github.com/golang-migrate/migrate/v4/database/postgres`, the last of which is
+// literally a schema written from outside the Data Plane's migration lane — and
+// the dependency itself, which no file changes when it is added.
+//
+// The manifest is the one place a third-party dependency must appear however it
+// is spelled, so the strongest statement available is also the cheapest: this
+// module requires nothing, and the day it requires anything the diff has to say
+// why. That is not a rule against libraries; it is the reason the management
+// transport is a separate module rather than a second surface on the runtime.
+func TestTheModuleRequiresNothing(t *testing.T) {
+	data, err := os.ReadFile(goModPath)
+	if err != nil {
+		t.Fatalf("reading %s: %v", goModPath, err)
+	}
+
+	directives := 0
+	for number, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "//") {
+			continue
+		}
+		directives++
+		if strings.HasPrefix(line, "module ") || strings.HasPrefix(line, "go ") {
+			continue
+		}
+		t.Errorf("%s:%d carries %q: this module has no dependencies at all, and every one it ever gains is a boundary decision — the management transport reaches the Data Plane over a port, not through a library (ADR 0006 §9, §11)", goModPath, number+1, line)
+	}
+
+	// The guard that keeps this from passing on a file it stopped understanding:
+	// a go.mod whose directives were all skipped would make the loop above
+	// assert nothing at all.
+	if directives < 2 {
+		t.Fatalf("%s yielded %d non-comment lines; the module and go directives were not both found, so the check above proves nothing", goModPath, directives)
 	}
 }

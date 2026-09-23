@@ -30,6 +30,36 @@ func factEvent(requestID, kind string) dataplane.Event {
 	}
 }
 
+// TestThePageSizeTheFlowAsksForIsOneTheContractAnswers is the one rule
+// FactPageSize has to satisfy, and it is a rule about the wire rather than about
+// this flow.
+//
+// The constant is a consumer's choice — how much one pass can hold — and not a
+// copy of the contract's default, so this test deliberately does not assert that
+// it equals 100. What it asserts is that the choice lies inside the range the
+// contract will answer: `limit` below 1 or above 1000 is refused with
+// `400 invalid_request` by the façade, so a page size that drifted outside those
+// bounds would not be a consumer paging differently, it would be a consumer
+// whose every pass fails — and it would fail as a rejected request, with nothing
+// anywhere saying the number was the reason.
+//
+// The bounds are spelled as literals here, and they are the contract's rather
+// than this package's: the same two numbers are read out of
+// api/openapi/shared/usage-facts.yaml by
+// internal/adapters/outbound/dataplane/contract_test.go, which is what holds
+// them to the document. A bound that moved there fails there, loudly, instead of
+// being silently accommodated here.
+func TestThePageSizeTheFlowAsksForIsOneTheContractAnswers(t *testing.T) {
+	const (
+		contractMinimum = 1
+		contractMaximum = 1000
+	)
+
+	if FactPageSize < contractMinimum || FactPageSize > contractMaximum {
+		t.Errorf("FactPageSize is %d and the contract's limit is %d..%d; a page size outside that range is refused on every pass rather than answered", FactPageSize, contractMinimum, contractMaximum)
+	}
+}
+
 // TestAFirstPageIsAppliedBeforeTheCursorAdvances is the happy path and the
 // ordering claim in one assertion: the position is read, the page is fetched,
 // every fact is applied, the cursor advances to the page's next_cursor, and the
@@ -336,6 +366,42 @@ func TestAnExpiredCursorReachesTheCallerAndOpensNoUnitOfWork(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), position) {
 		t.Errorf("the error %q carries the cursor value; an opaque position must not be echoed into a log line", err)
+	}
+}
+
+// TestAPageWithNoPositionIsRefusedBeforeAnythingIsWritten is the second gate on
+// the malformed page, and it is deliberately not a duplicate of the adapter's.
+//
+// The adapter refuses the wire as it arrives; this asserts the property that
+// matters to the durable state the Control Plane owns — a page the flow cannot
+// advance from must leave that state exactly as it was. The reader here breaks
+// its port's contract and returns such a page anyway, which is the only way to
+// reach this path at all, and the pass must refuse it rather than store a
+// position that is really "never applied anything": an empty position is
+// indistinguishable from the state a consumer starts in, so the flow would
+// re-read the same page on every cycle and never advance — a stall with nothing
+// to observe and nothing to alert on.
+func TestAPageWithNoPositionIsRefusedBeforeAnythingIsWritten(t *testing.T) {
+	world := newWorld()
+	world.position = "a-position"
+	world.pages["a-position"] = dataplane.Page{
+		Events:     []dataplane.Event{factEvent("req-1", "settled")},
+		NextCursor: "",
+	}
+
+	_, err := newIngestion(world).Replay(context.Background())
+	if !errors.Is(err, dataplane.ErrMalformedPage) {
+		t.Fatalf("Replay() error = %v, want it to wrap %v", err, dataplane.ErrMalformedPage)
+	}
+
+	if got, want := world.position, "a-position"; got != want {
+		t.Errorf("position = %q, want %q unchanged: a malformed page must not move the consumer's position", got, want)
+	}
+	if len(world.effects) != 0 {
+		t.Errorf("the applier recorded %d effect(s), want 0: a page that cannot be advanced from must not be applied either", len(world.effects))
+	}
+	if len(world.order) != 0 {
+		t.Errorf("the flow observed %v, want nothing: the refusal happens before the unit of work opens", world.order)
 	}
 }
 

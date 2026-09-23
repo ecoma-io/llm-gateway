@@ -22,9 +22,16 @@
 // caller that has not identified itself as a service must not reach use-case
 // code even by accident.
 //
-// The public contract is api/openapi/dataplane.yaml, which this surface and the
-// management façade both implement: it changes before this package does, never
-// after.
+// This listener is not the surface api/openapi/dataplane.yaml contracts. That
+// document is the management façade's — dataplane-api — and this package is the
+// process behind it; the hop between the two is a private protocol rather than a
+// fourth contract, defined in docs/architecture/cross-plane-protocols.md and
+// pinned on each side by a protocol test. The distinction is not bookkeeping:
+// the façade answers a caller with its own statuses and its own envelope, and
+// this listener's answers are what the façade translates those from. A reader
+// who treats this file as the contract's implementation will look for the
+// façade's `upstream_unavailable` here and will not find it, because this
+// process has no upstream to blame (ADR 0006 §9, §11).
 package management
 
 import (
@@ -70,18 +77,20 @@ func New(app *application.App, credential string) stdhttp.Handler {
 	}
 
 	// The fallback every other path lands on. An unmatched path is not an
-	// operation in api/openapi/dataplane.yaml, but its response is contracted
-	// in the descriptions there: JSON, the management envelope, and the request
-	// ID in the header.
+	// operation of the private protocol either, but its response shape is the
+	// same one: JSON, the management envelope, and the request ID in the header.
+	// The façade maps it to its own answer, so what a Control Plane finally sees
+	// is decided there and not here.
 	mux.HandleFunc("/", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		writeFailure(w, r, notFoundFailure())
 	})
 
 	// ServeMux rewrites a non-canonical path — a doubled slash, a "." or ".."
 	// segment — into an HTML 301/307 before routing, a response shape the
-	// contract does not have. The path as requested matches no operation, so
-	// the transport answers it here instead of letting the redirect through,
-	// and every reachable response stays inside api/openapi/dataplane.yaml.
+	// private protocol does not have. The path as requested matches no
+	// operation, so the transport answers it here instead of letting the
+	// redirect through, and every reachable response stays the one JSON shape
+	// the protocol declares.
 	handler := stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if r.URL.Path != cleanPath(r.URL.Path) {
 			writeFailure(w, r, notFoundFailure())

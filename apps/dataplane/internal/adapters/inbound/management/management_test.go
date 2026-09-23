@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	stdhttp "net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -97,19 +99,45 @@ func TestTheFactFeedReturnsThePageThePortGave(t *testing.T) {
 }
 
 func TestTheFactFeedPassesTheCursorThroughUntouched(t *testing.T) {
-	// The cursor is opaque: this surface is where it was minted, and even here
-	// the handler does not look inside it. A value with spaces and slashes in it
-	// is exactly the kind of string a format-aware implementation would mangle.
-	const cursor = "opaque position 42/not-a-number"
+	tests := []struct {
+		name   string
+		cursor string
+	}{
+		{
+			// A value with spaces and slashes in it is exactly the kind of string
+			// a format-aware implementation would mangle.
+			name:   "a cursor with characters a format-aware implementation would escape",
+			cursor: "opaque position 42/not-a-number",
+		},
+		{
+			// The bound is a count of characters, and the schema says so: a
+			// cursor of exactly maxCursorLength code points is one this feed is
+			// entitled to issue, whatever it costs in bytes. Counting bytes here
+			// would refuse it — and the refusal would be invisible for the ASCII
+			// cursor above, which is why this row exists.
+			name:   "a cursor of the declared length in characters and more than that in bytes",
+			cursor: strings.Repeat("é", maxCursorLength),
+		},
+	}
 
-	facts := &stubFacts{}
-	serve(t, facts, authed(t, "/internal/usage-events?after="+strings.ReplaceAll(cursor, " ", "%20")))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			facts := &stubFacts{}
+			serve(t, facts, authed(t, "/internal/usage-events?after="+url.QueryEscape(tt.cursor)))
 
-	if facts.after != cursor {
-		t.Errorf("the port was read after %q, want %q unchanged", facts.after, cursor)
+			if facts.after != tt.cursor {
+				t.Errorf("the port was read after %q, want %q unchanged", facts.after, tt.cursor)
+			}
+		})
 	}
 }
 
+// TestTheFactFeedAppliesThePageSizeBounds pins the accepting half of the
+// contract's `limit` rule (shared/usage-facts.yaml): an omitted parameter is the
+// declared default, and every value between the minimum and the maximum travels
+// to the port exactly as the caller wrote it. The refusing half is in the table
+// below, and the two together are the whole rule — a page size is either served
+// as asked or refused, never adjusted.
 func TestTheFactFeedAppliesThePageSizeBounds(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -117,8 +145,9 @@ func TestTheFactFeedAppliesThePageSizeBounds(t *testing.T) {
 		wantLimit int
 	}{
 		{name: "an omitted limit is served at the port's default", query: "", wantLimit: usagefacts.DefaultLimit},
+		{name: "the smallest limit the contract allows is passed on", query: "?limit=1", wantLimit: 1},
 		{name: "a limit within the bounds is passed on", query: "?limit=250", wantLimit: 250},
-		{name: "a limit above the maximum is served at the maximum", query: "?limit=1000000", wantLimit: usagefacts.MaxLimit},
+		{name: "the largest limit the contract allows is passed on", query: "?limit=" + strconv.Itoa(usagefacts.MaxLimit), wantLimit: usagefacts.MaxLimit},
 	}
 
 	for _, tt := range tests {
@@ -141,9 +170,29 @@ func TestMalformedQueryParametersAreRefused(t *testing.T) {
 		{name: "a limit that is not a number", query: "?limit=lots"},
 		{name: "a limit below the declared minimum", query: "?limit=0"},
 		{name: "a negative limit", query: "?limit=-1"},
+		{name: "a limit above the declared maximum", query: "?limit=" + strconv.Itoa(usagefacts.MaxLimit+1)},
+		{name: "a limit far above the declared maximum", query: "?limit=1000000"},
+		{name: "a limit larger than an integer", query: "?limit=99999999999999999999"},
 		{name: "a limit supplied twice", query: "?limit=10&limit=20"},
 		{name: "a cursor supplied twice", query: "?after=one&after=two"},
 		{name: "a cursor past the declared length", query: "?after=" + strings.Repeat("c", maxCursorLength+1)},
+		{
+			// The length is counted in characters and this value is over it
+			// whichever way you count — but it is the row that fails if the
+			// count becomes bytes in the other direction: two bytes per code
+			// point here meant a 256-character cursor would have been refused
+			// as if it were 512.
+			name:  "a cursor past the declared length in characters",
+			query: "?after=" + url.QueryEscape(strings.Repeat("é", maxCursorLength+1)),
+		},
+		{
+			// Present and empty is the one value refused for what it would
+			// otherwise be read as. The protocol defines the beginning by the
+			// parameter's absence, so `after=` is a caller with a broken
+			// position, not a caller asking for everything retained.
+			name:  "a cursor supplied empty",
+			query: "?after=",
+		},
 		{name: "a parameter this operation does not declare", query: "?position=abc"},
 		{name: "a parameter the caller capitalised differently", query: "?After=abc"},
 	}

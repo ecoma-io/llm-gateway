@@ -62,10 +62,15 @@ func routes(app *application.App) []route {
 			},
 		},
 		// The fact feed: the one cross-plane operation that exists today, and
-		// the only one on this surface that a caller authenticates for. It is
-		// declared in api/openapi/dataplane.yaml and its protocol — opaque
-		// cursor, replay instead of acknowledgement, consumer-owned position —
-		// in api/openapi/shared/usage-facts.yaml.
+		// the only one on this surface that a caller authenticates for. The
+		// path string is the one the façade contracts, and it is the same
+		// string here on purpose rather than by coincidence — the façade names
+		// the path itself rather than rewriting one it was given, so there is
+		// no translation step for the two ends to disagree about. What the
+		// façade does rewrite is the answer: it builds its own envelope and its
+		// own statuses from what this listener said. The protocol itself,
+		// and the reason it is a page in a document rather than a fourth
+		// OpenAPI file, are in docs/architecture/cross-plane-protocols.md.
 		//
 		// It is deliberately the only authenticated row: a second one arrives
 		// with a second operation, and the guard is written so that adding it

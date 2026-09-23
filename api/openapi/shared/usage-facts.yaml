@@ -1,5 +1,7 @@
-# The shape of the Data Plane's usage-fact feed: the page a management caller
-# reads to learn what the runtime observed.
+# The shape of the usage-fact feed the Control Plane reads: the page it gets
+# back, and the two query parameters it may send. It is what a caller of the
+# façade may rely on, and it is contracted at the façade because the façade is
+# where a contracted caller arrives.
 #
 # This is a fragment like its siblings — a `components:` tree `dataplane.yaml`
 # references by relative path — and it states the one cross-plane contract the
@@ -7,6 +9,13 @@
 # everything else in `dataplane.yaml`: the other operations are the Control
 # Plane asking the Data Plane to change something the Data Plane owns, and this
 # one is the Control Plane reading what the Data Plane already recorded.
+#
+# The process behind the façade serves the same page over a private protocol —
+# same field names, same types, same cursor — and that agreement is pinned by a
+# protocol test on each side rather than by this document describing both ends
+# (docs/architecture/cross-plane-protocols.md). The difference between the two
+# hops is not the page; it is who authenticates whom and which surface the
+# apology comes from.
 #
 # The delivery model is **pull with replay**, and it is chosen rather than
 # inherited (ADR 0006 §5):
@@ -66,14 +75,20 @@ components:
         because a shorter page is also what a concurrent writer produces.
 
 
-        Bounds are enforced in the direction that lets a consumer make
-        progress. A value above the maximum is served at the maximum rather
-        than refused: the caller's intent is legible, a smaller page than asked
-        for is unambiguous against `has_more`, and failing a reconciliation run
-        over a page size would trade a slightly smaller answer against a
-        consumer that has stopped advancing. A value below the minimum, or one
-        that is not an integer, is refused with `400 invalid_request`, because
-        there is no intent behind "minus one facts" to honour.
+        The bounds are enforced rather than approximated, and enforced
+        identically by every hop that receives the parameter: omitted means the
+        default below, a value below `minimum` or above `maximum` — and a value
+        that is not an integer at all — is refused with `400 invalid_request`,
+        and a value inside the bounds is served as asked. Nothing is clamped.
+
+        A caller that asked for a larger page than this operation will return
+        has asked a question the contract does not answer, and the smaller page
+        it would otherwise get is one it cannot tell apart from a page capped by
+        the feed itself: `has_more` reports that facts exist beyond the page,
+        not that this caller's own page size was ignored. A consumer sizing a
+        page to fit what it can hold in memory would learn about the mismatch
+        nowhere, which is why the answer is a refusal it can act on rather than
+        a number it did not ask for.
       schema:
         type: integer
         minimum: 1
@@ -167,10 +182,21 @@ components:
           allOf:
             - $ref: "#/components/schemas/UsageCursor"
           description: >-
-            The position immediately after the last fact in this page. Store it
-            and send it back as `after` once every fact above is applied. When
-            the page is empty it is the position the request carried, so a
-            consumer that has caught up keeps the cursor it had.
+            The position of the last fact in this page, and therefore where the
+            next read resumes: strictly after it. Store it and send it back as
+            `after` once every fact above is applied, and the facts above it are
+            not returned again — the same range may be re-read by sending the
+            previous cursor, which is what makes a crash between applying and
+            storing safe rather than lossy.
+
+
+            It is never empty, including when the page carries no facts. A
+            consumer that has caught up gets back the position it sent; a
+            consumer reading from the beginning of retained history — no
+            `after` — gets the position the Data Plane assigns to it. An empty
+            `next_cursor` would be a page with no position to resume from, and a
+            consumer that stored one would ask from the beginning of retained
+            history on every cycle and never advance.
         has_more:
           type: boolean
           description: >-

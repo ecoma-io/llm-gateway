@@ -82,17 +82,8 @@ func main() {
 	// deadline and by that caller going away; a second, invented deadline at
 	// this layer would be a number chosen without any latency to measure it
 	// against, and it would compound with the caller's rather than replace it.
-	stdhttpClient := &stdhttp.Client{}
-	usageFacts := dataplane.New(stdhttpClient, cfg.DataPlaneURL, cfg.ServiceCredential)
-
-	// The credential reaches two places and no others: the adapter presents it
-	// to the Data Plane, and the authenticator compares it against what callers
-	// present here. Both are handed the same configured value, so there is no
-	// second copy of a secret to drift, and neither logs it.
-	authenticator := http.NewServiceAuthenticator(cfg.ServiceCredential)
-
 	server := &stdhttp.Server{
-		Handler: http.New(application.New(version, usageFacts), authenticator),
+		Handler: newHandler(cfg, &stdhttp.Client{}),
 		// ReadHeaderTimeout guards against a peer that connects and says
 		// nothing — a slowloris costs a goroutine forever without it. The
 		// read/write body and idle timeouts wait until there is real traffic
@@ -115,6 +106,33 @@ func main() {
 	}
 
 	log.Printf("dataplane-api %s stopped", version)
+}
+
+// newHandler composes the management surface from configuration: the outbound
+// adapter that reaches the Data Plane, the use case over it, and the inbound
+// handler that authenticates a caller before either runs.
+//
+// It is a function rather than five lines inside main because of what the
+// assignment of the two credentials has to be able to fail on. The two hops get
+// two credentials, and the sentence that keeps them apart is the argument order
+// below: the adapter presents DataPlaneCredential to the Data Plane's private
+// listener, and the authenticator compares ServiceCredential against what
+// callers present here. Handing both the same value is what this code did before
+// the split, and it made the secret a Control Plane caller is entitled to hold a
+// key to the private listener — which is precisely the defect internal/config's
+// "must differ" check cannot catch, because that check proves the two values are
+// unequal and never which one went where.
+//
+// So the wiring has to be reachable from a test, and this is what makes it so:
+// chain_test.go calls this function with two distinct credentials and asserts
+// the direction of each, which turns a swapped pair into a red test rather than
+// a deployment where the caller-facing secret opens the private surface. A copy
+// of these four lines inside a test would prove nothing about this code and
+// would keep passing after the arguments here were exchanged.
+func newHandler(cfg config.Config, client *stdhttp.Client) stdhttp.Handler {
+	usageFacts := dataplane.New(client, cfg.DataPlaneURL, cfg.DataPlaneCredential)
+	authenticator := http.NewServiceAuthenticator(cfg.ServiceCredential)
+	return http.New(application.New(version, usageFacts), authenticator)
 }
 
 // run serves until the process is asked to stop, then drains.

@@ -24,38 +24,15 @@ import (
 // applied to every consumer at once, in the process that serves traffic, where
 // the latency is paid by an LLM caller.
 //
-// What it does own is the contract's bounds: the page size is clamped to what
-// the port allows, because `limit` arrives from a caller and an application
-// that passed it through verbatim would let that caller ask for the whole
-// history in one response.
+// The page size is not decided here, and its absence from this file is the
+// decision. The contract's bounds and its default are applied by the surface
+// that receives the parameter, before this use case is called, so a limit
+// arriving here is one the contract allows and there is nothing left to enforce
+// — while a limit this function quietly adjusted would be a page the caller
+// never asked for, silently delivered. What the use case does own is the
+// contract's *shape* for `after`: an empty string means the port's own "from
+// the beginning of what is retained", and a non-empty one is passed through
+// byte for byte, because a cursor is opaque here as it is everywhere else.
 func (app *App) ReadUsageEvents(ctx context.Context, after string, limit int) (usagefacts.Page, error) {
-	return app.facts.Read(ctx, after, clampLimit(limit))
-}
-
-// clampLimit applies the port's page-size bounds to a caller-supplied limit.
-//
-// Zero means "unspecified" rather than "none", and it is the value the
-// management listener passes for a limit the caller omitted: an absent query
-// parameter and a parsed zero are indistinguishable by the time they arrive
-// here, and a caller asking for zero facts — the only other reading — is asking
-// for nothing and would get an empty page forever. A negative never arrives: the
-// listener refuses it, because unlike a limit that is merely too large there is
-// no intent behind it to honour. Anything above the port's maximum is reduced
-// rather than refused: the caller's intent is legible, the answer is still
-// correct, and failing a reconciliation run over a page size would trade a
-// request that is slightly smaller than asked for against a consumer that has
-// stopped advancing.
-//
-// The bounds themselves are declared by the port — DefaultLimit and MaxLimit are
-// its constants — and this is the function that applies them, so there is one
-// place a page size can be decided and no second one a future caller could find
-// instead.
-func clampLimit(limit int) int {
-	if limit <= 0 {
-		return usagefacts.DefaultLimit
-	}
-	if limit > usagefacts.MaxLimit {
-		return usagefacts.MaxLimit
-	}
-	return limit
+	return app.facts.Read(ctx, after, limit)
 }

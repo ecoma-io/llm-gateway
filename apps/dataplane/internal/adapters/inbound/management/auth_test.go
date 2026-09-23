@@ -20,6 +20,17 @@ func TestOnlyTheConfiguredCredentialAuthenticates(t *testing.T) {
 		{name: "the credential with no scheme", header: []string{serviceCredential}},
 		{name: "the credential presented twice", header: []string{credentialScheme + " " + serviceCredential, credentialScheme + " " + otherCredential}},
 		{name: "the scheme alone", header: []string{credentialScheme + " "}},
+		// The three length cases are here because the comparison must not decide
+		// them by their length alone. A prefix, an extension and a same-length
+		// wrong guess are all refused, and they are refused by the same
+		// fixed-width comparison: both secrets are digested before they are
+		// compared, so `subtle.ConstantTimeCompare` never sees two different
+		// lengths and never returns early on one. The façade's hop has its own
+		// copy of these rows, because the property is the boundary's and not one
+		// hop's.
+		{name: "a credential that is a prefix of the deployment's", header: []string{credentialScheme + " " + serviceCredential[:len(serviceCredential)-1]}},
+		{name: "a credential one character longer than the deployment's", header: []string{credentialScheme + " " + serviceCredential + "x"}},
+		{name: "a same-length variation in the last byte", header: []string{credentialScheme + " " + serviceCredential[:len(serviceCredential)-1] + "z"}},
 	}
 
 	for _, tt := range tests {

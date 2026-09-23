@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	stdhttp "net/http"
 	"strings"
@@ -86,13 +87,56 @@ func NewServiceAuthenticator(credential string) dataplane.Authenticator {
 // credential verified against a key set — receives it here without a change to
 // the port or to any caller.
 func (a serviceAuthenticator) Authenticate(_ context.Context, credential string) (dataplane.ServiceCaller, bool) {
-	if credential == "" || a.credential == "" {
+	// The one case decided without comparing anything: this deployment has no
+	// configured secret, so no presentation is the right one. It is refused
+	// before the comparison rather than by it, because comparing an empty
+	// configured secret with an empty presented one would be the single
+	// fail-open state this file may not have. It branches on the deployment's
+	// own configuration and not on anything the caller supplied, so it tells an
+	// attacker nothing they could measure.
+	if a.credential == "" {
 		return dataplane.ServiceCaller{}, false
 	}
-	if subtle.ConstantTimeCompare([]byte(credential), []byte(a.credential)) != 1 {
+	// Everything else — including an empty presented credential, and including
+	// one of a different length — goes through the same fixed-width comparison,
+	// so the path a refusal takes is the same whichever way the caller was
+	// wrong.
+	if !constantTimeEqual(credential, a.credential) {
 		return dataplane.ServiceCaller{}, false
 	}
 	return dataplane.ServiceCaller{Name: serviceCallerName}, true
+}
+
+// constantTimeEqual compares two secrets without letting their lengths be the
+// thing that decides how long the answer took.
+//
+// subtle.ConstantTimeCompare is constant-time only in the length of what it is
+// given, and it returns immediately — before comparing anything — when the two
+// slices differ in length. Handed the two secrets directly, it would therefore
+// make the *length* of the configured credential measurable by anyone who can
+// time a refusal, and length is a meaningful part of a shared secret's search
+// space: an attacker who learns it has narrowed the guessing from every string
+// to the strings of one size, silently, without ever seeing a byte of the
+// answer. Hashing both sides first removes the distinction: SHA-256 produces
+// exactly 32 bytes for any input, so every comparison this function makes is
+// between two equal-length slices, and no timing difference between "wrong
+// length" and "wrong content" survives the digest.
+//
+// The digest is not a weaker comparison than the plain bytes would have been.
+// Equality of digests is equality of preimages for every pair of values this
+// function can be handed — the only way two distinct inputs collide is a
+// SHA-256 collision — and what it compares is still the whole secret, not a
+// prefix of it.
+//
+// This is the same comparison the Data Plane's management listener applies to
+// the credential it is presented with, and the two hops having it in the same
+// shape is not a coincidence to be maintained by hand: both ends of the chain
+// that starts at a caller and ends at the Data Plane must refuse in a time that
+// says nothing about the secret, or the weaker end is the one that is attacked.
+func constantTimeEqual(presented, configured string) bool {
+	presentedSum := sha256.Sum256([]byte(presented))
+	configuredSum := sha256.Sum256([]byte(configured))
+	return subtle.ConstantTimeCompare(presentedSum[:], configuredSum[:]) == 1
 }
 
 // requireServiceCaller wraps a handler in the check, so that a route which

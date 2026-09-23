@@ -17,10 +17,22 @@ type requestIDContextKey struct{}
 // requestID chooses the one identifier a request carries through this surface.
 // It sets the response header before the next handler can commit a status, then
 // puts the same safe, bounded value in the request context for handlers and the
-// error envelope. A caller gets to preserve a valid identifier — which is what
-// makes one call traceable across the three hops from the Control Plane through
-// the management façade to here — never to make a log line carry an
-// arbitrary-sized or control-character value.
+// error envelope. A caller gets to preserve a valid identifier, so a value an
+// operator already has in hand survives into this process's logs alongside this
+// process's own answer — never to make a log line carry an arbitrary-sized or
+// control-character value.
+//
+// One identifier, one hop. Nothing in either outbound adapter sends
+// `X-Request-Id` today, so the identifier a Control Plane caller sees in the
+// façade's error envelope is the façade's own and does not appear in this
+// listener's logs; an operator holding one of the two cannot yet look up the
+// other. Forwarding the header hop to hop is the change that would join them,
+// and it is deliberately not made here: it is new cross-plane behaviour with
+// its own privacy question — a caller-supplied string crossing one more trust
+// boundary — and it belongs with the consumer loop that will be the first code
+// to make this read on a schedule, and so the first to hold an identifier worth
+// correlating (docs/architecture/cross-plane-protocols.md, "What this page does
+// not decide").
 //
 // This is a copy of the runtime surface's middleware, and the copy is
 // deliberate; server.go says why the inbound kit is per-surface. It is worth

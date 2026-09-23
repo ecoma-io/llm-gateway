@@ -99,7 +99,12 @@ var capabilities = []capability{
 		imports: "http",
 		// Outbound reaching into the inbound tree: an adapter that answers
 		// requests as a side effect of being called.
-		permitted: "internal/adapters/inbound/http",
+		//
+		// The permitted side is the composition root and not the inbound package
+		// the import lives in, because that is the rule: an adapter is entered by
+		// the package that constructs it and by nothing else, which now includes
+		// another adapter in its own tree.
+		permitted: "cmd/console-api",
 		refused:   "internal/adapters/outbound/dataplane",
 	},
 	{
@@ -108,7 +113,7 @@ var capabilities = []capability{
 		// Inbound reaching into the outbound tree — the crossing that builds
 		// and works, and that puts this application's one cross-plane call
 		// behind a route instead of behind the port.
-		permitted: "internal/adapters/outbound/valkey",
+		permitted: "cmd/console-api",
 		refused:   "internal/adapters/inbound/http",
 	},
 	{

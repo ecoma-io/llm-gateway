@@ -92,13 +92,22 @@ type Event struct {
 
 // Page is one replayable slice of the fact feed.
 //
-// NextCursor is the position immediately after the last event, and it is the
-// Data Plane's to compute: a consumer stores it and sends it back as the next
-// `after`, and never derives one. When the page is empty it is the position the
-// request carried, so a consumer that has caught up keeps the cursor it had.
+// NextCursor is the position of the last event in the page, and it is the Data
+// Plane's to compute: a consumer stores it and sends it back as the next
+// `after`, which resumes strictly after that event, and never derives one. When
+// the page is empty it is the position the request carried, so a consumer that
+// has caught up keeps the cursor it had; a first read that carried no `after`
+// still receives one, because a page with no position is not a page this seam
+// can use.
 // HasMore answers whether the feed has more facts *right now*, which is why a
 // page shorter than the requested limit does not mean the feed is drained — a
 // concurrent writer produces a short page too.
+//
+// NextCursor is non-empty on every page the contract allows, and a page that
+// carries none is not a page this seam can use: an implementation of UsageFacts
+// must refuse it rather than return it, and a consumer holding an empty
+// position would ask from the beginning of retained history on every cycle —
+// re-reading the same facts forever behind a position that never moves.
 type Page struct {
 	Events     []Event
 	NextCursor string
@@ -114,6 +123,25 @@ type Page struct {
 // consumer that treated the two alike would either retry forever or silently
 // resume past facts it never applied, and the second quietly loses money.
 var ErrCursorExpired = errors.New("usage fact cursor is no longer replayable")
+
+// ErrMalformedPage reports that the Data Plane answered with a page that is not
+// one the contract describes — no position to advance to, or a position longer
+// than a cursor can be.
+//
+// It is separate from the other failures because it is a different kind of
+// event: the answer arrived, and it is wrong. A transport failure says the
+// answer is unknown and the read will be retried; this says the peer broke the
+// contract, and the consumer must not act on what it sent. The distinction
+// matters most for the position: a consumer that stored a page's cursor anyway
+// would move its durable position on the strength of a response it could not
+// trust, and a position moved wrongly is facts skipped.
+//
+// What is checked is the page's declared shape and only that. A cursor may not
+// be parsed, decoded, compared or ordered here or anywhere else, which is why
+// the check is a length and not a reading: "is this a cursor" is a question the
+// Data Plane answers, and "is this field present and of a legal size" is the
+// most a consumer may ask without taking over that answer.
+var ErrMalformedPage = errors.New("the data plane answered with a malformed usage fact page")
 
 // UsageFacts is the fact half of the cross-plane seam, beside Management's
 // configuration half. One package, both directions.
@@ -146,8 +174,15 @@ type UsageFacts interface {
 	// drained — HasMore is what says that.
 	//
 	// It returns ErrCursorExpired when the position can no longer be replayed,
+	// ErrMalformedPage when the answer is not a page the contract describes,
 	// and a transport failure as itself. It must never skip forward to what is
 	// available: a consumer that has fallen behind has to be told, because
 	// resuming silently would lose the facts in between.
+	//
+	// A Page returned here is one the consumer may act on, which puts the
+	// page's shape — a non-empty position, bounded in length — inside this
+	// method's contract rather than in its caller's. An implementation that
+	// handed back a page it had not checked would be delegating a wire
+	// question to code that does not read the wire.
 	ReadUsageEvents(ctx context.Context, after string, limit int) (Page, error)
 }

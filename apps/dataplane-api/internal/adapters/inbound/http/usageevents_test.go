@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/ports/outbound/dataplane"
@@ -60,6 +61,25 @@ func TestTheUsageEventFeedRefusesAnUntrustedCaller(t *testing.T) {
 			authorization: []string{"Bearer " + "bad secret"},
 		},
 		{
+			// The two length cases are here because the comparison must not
+			// decide them by their length alone: a prefix and an extension are
+			// both refused, and they are refused by the same fixed-width
+			// comparison that refuses a same-length wrong guess.
+			name:          "a credential that is a prefix of the deployment's",
+			configured:    testCredential,
+			authorization: []string{"Bearer " + testCredential[:len(testCredential)-1]},
+		},
+		{
+			name:          "a credential one character longer than the deployment's",
+			configured:    testCredential,
+			authorization: []string{"Bearer " + testCredential + "x"},
+		},
+		{
+			name:          "a much longer credential",
+			configured:    testCredential,
+			authorization: []string{"Bearer " + strings.Repeat("s", 4096)},
+		},
+		{
 			name:          "the header given twice",
 			configured:    testCredential,
 			authorization: []string{"Bearer " + testCredential, "Bearer another-deployment-secret"},
@@ -104,7 +124,7 @@ func TestTheUsageEventFeedRefusesAnUntrustedCaller(t *testing.T) {
 	}
 }
 
-// TestTheCursorAndPageSizeTravelUntouched pins the relay's own behaviour
+// TestTheCursorAndPageSizeTravelUntouched pins this surface's own behaviour
 // without a socket: what the caller sent is what the port is asked for, and
 // what the port answered is what the caller gets. The cursor is the point of
 // the test — this façade has no idea what it means, and the moment it starts
@@ -318,6 +338,172 @@ func TestAnEmptyCursorIsRefusedRatherThanReadAsTheBeginning(t *testing.T) {
 	if len(usage.calls) != 1 || usage.calls[0].after != "" {
 		t.Errorf("the port was asked for %+v, want one call with no cursor", usage.calls)
 	}
+}
+
+// TestAParameterThisOperationDoesNotDeclareIsRefused pins the façade's half of
+// the one input where the two hops of this protocol could disagree. The private
+// listener refuses an undeclared name; before this check existed the façade
+// forwarded one, so `?position=abc` was a request the public surface accepted
+// and the process behind it rejected — and the caller would have learnt that as
+// a 502, which says the Data Plane is down.
+//
+// It is a 400 rather than a forward-and-hope for the reason shared/errors.yaml
+// gives the code: a caller who named their starting point and got a 200 would
+// believe it was honoured, and the whole retained history would arrive as if it
+// were the answer to their question.
+func TestAParameterThisOperationDoesNotDeclareIsRefused(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{name: "a plausible name for the position", query: "?position=abc"},
+		{name: "the same name capitalised differently", query: "?After=abc"},
+		{name: "an undeclared name beside a declared one", query: "?limit=5&position=abc"},
+		{name: "a name the caller invented", query: "?foo=1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			usage := &fakeUsageFacts{}
+			handler := testHandler(application.New("test", usage))
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath+tt.query, nil)
+			req.Header.Set("Authorization", "Bearer "+testCredential)
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != stdhttp.StatusBadRequest {
+				t.Fatalf("GET %s status = %d, want %d (body %q)", usageEventsPath+tt.query, rec.Code, stdhttp.StatusBadRequest, rec.Body.String())
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, `"code":"invalid_request"`) {
+				t.Errorf("GET %s body = %q, want code invalid_request", usageEventsPath+tt.query, body)
+			}
+			// The refused name is not echoed, for the reason every refusal on
+			// this surface withholds the value: it is a string the caller wrote.
+			if strings.Contains(body, "position") || strings.Contains(body, "foo") {
+				t.Errorf("body = %q, echoes the name the caller sent", body)
+			}
+			if usage.called() {
+				t.Errorf("an undeclared parameter still reached the Data Plane: %+v", usage.calls)
+			}
+		})
+	}
+}
+
+// TestTheCursorLengthBoundIsTheContracts pins the other end of the cursor's
+// declared shape: a value exactly as long as the contract allows is a cursor
+// like any other and crosses untouched, and one character more is refused
+// before the Data Plane is asked anything at all.
+//
+// The refusal is a 400 rather than the 502 the caller would otherwise see, and
+// that is the reason the check is here. A cursor the contract cannot describe
+// is a fact about the caller's request, and answering it as "the Data Plane is
+// unavailable" would send an operator to look at the wrong process. Nothing
+// about the value's content is examined either way: length is not meaning, and
+// a bound this surface applies is still not a parser.
+func TestTheCursorLengthBoundIsTheContracts(t *testing.T) {
+	atLimit := strings.Repeat("c", maxUsageEventsCursorLength)
+	overLimit := strings.Repeat("c", maxUsageEventsCursorLength+1)
+
+	// A cursor of the same declared length in *code points* and twice that in
+	// bytes. This is the row that fails if the bound is counted with Go's
+	// `len()`, and it is the reason the bound is `utf8.RuneCountInString`: the
+	// schema's `maxLength` counts characters, so a byte count would refuse a
+	// cursor this feed is entitled to issue, at the one hop a consumer cannot
+	// route around.
+	multiByteAtLimit := strings.Repeat("é", maxUsageEventsCursorLength)
+	multiByteOverLimit := strings.Repeat("é", maxUsageEventsCursorLength+1)
+	if len(multiByteAtLimit) <= maxUsageEventsCursorLength {
+		t.Fatalf("the fixture is %d bytes for %d characters; it does not exercise the bytes-versus-characters difference at all",
+			len(multiByteAtLimit), maxUsageEventsCursorLength)
+	}
+
+	t.Run("a cursor of the declared maximum length in characters but more in bytes crosses untouched", func(t *testing.T) {
+		usage := &fakeUsageFacts{page: dataplane.Page{NextCursor: cursor}}
+		handler := testHandler(application.New("test", usage))
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath+"?after="+url.QueryEscape(multiByteAtLimit), nil)
+		req.Header.Set("Authorization", "Bearer "+testCredential)
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != stdhttp.StatusOK {
+			t.Fatalf("status = %d, want %d for a cursor the contract permits (body %q)", rec.Code, stdhttp.StatusOK, rec.Body.String())
+		}
+		if len(usage.calls) != 1 {
+			t.Fatalf("the port was called %d time(s), want 1", len(usage.calls))
+		}
+		// The lengths are named rather than the values: a 512-character cursor is
+		// not a useful thing to read in a failure message, and the two numbers are
+		// the whole assertion — a value that reached the port as fewer characters
+		// was truncated, and one that reached it as more was re-encoded on the way.
+		if got := usage.calls[0].after; got != multiByteAtLimit {
+			t.Errorf("the port was asked for a cursor of %d character(s) and %d byte(s), and what it was sent was a cursor of %d character(s) and %d byte(s); a value that differs at all is a cursor this surface did not receive unchanged, which is the one thing it may not do with one",
+				utf8.RuneCountInString(multiByteAtLimit), len(multiByteAtLimit), utf8.RuneCountInString(got), len(got))
+		}
+	})
+
+	t.Run("a cursor past the declared maximum length in characters is refused", func(t *testing.T) {
+		usage := &fakeUsageFacts{}
+		handler := testHandler(application.New("test", usage))
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath+"?after="+url.QueryEscape(multiByteOverLimit), nil)
+		req.Header.Set("Authorization", "Bearer "+testCredential)
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != stdhttp.StatusBadRequest {
+			t.Fatalf("status = %d, want %d (body %q)", rec.Code, stdhttp.StatusBadRequest, rec.Body.String())
+		}
+		if usage.called() {
+			t.Errorf("an over-long cursor still reached the Data Plane: %+v", usage.calls)
+		}
+	})
+
+	t.Run("a cursor of the declared maximum length crosses untouched", func(t *testing.T) {
+		usage := &fakeUsageFacts{page: dataplane.Page{NextCursor: cursor}}
+		handler := testHandler(application.New("test", usage))
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath+"?after="+url.QueryEscape(atLimit), nil)
+		req.Header.Set("Authorization", "Bearer "+testCredential)
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != stdhttp.StatusOK {
+			t.Fatalf("status = %d, want %d (body %q)", rec.Code, stdhttp.StatusOK, rec.Body.String())
+		}
+		if len(usage.calls) != 1 || usage.calls[0].after != atLimit {
+			t.Errorf("the port was asked for %+v, want the cursor unchanged", usage.calls)
+		}
+	})
+
+	t.Run("a cursor past the declared maximum length is refused before the feed is touched", func(t *testing.T) {
+		usage := &fakeUsageFacts{}
+		handler := testHandler(application.New("test", usage))
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath+"?after="+url.QueryEscape(overLimit), nil)
+		req.Header.Set("Authorization", "Bearer "+testCredential)
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != stdhttp.StatusBadRequest {
+			t.Fatalf("status = %d, want %d (body %q)", rec.Code, stdhttp.StatusBadRequest, rec.Body.String())
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, `"code":"invalid_request"`) {
+			t.Errorf("body = %q, want code invalid_request", body)
+		}
+		if !strings.Contains(body, "after") {
+			t.Errorf("body = %q, want it to name the parameter", body)
+		}
+		if strings.Contains(body, overLimit) {
+			t.Errorf("body = %q, echoes the value the caller sent", body)
+		}
+		if usage.called() {
+			t.Errorf("an over-long cursor still reached the Data Plane: %+v", usage.calls)
+		}
+	})
 }
 
 // TestExtraWhitespaceBetweenSchemeAndCredentialIsAccepted pins the RFC 6750

@@ -1,6 +1,20 @@
-# The Data Plane management API contract: the Data Plane's administrative
-# surface, which is internal. It is reachable from the Control Plane and from
-# nobody else (ADR 0006 §11).
+# The Data Plane management façade contract: the administrative surface the
+# Control Plane reaches, which is internal. It is reachable from the Control
+# Plane and from nobody else (ADR 0006 §11).
+#
+# This document is the contract of **dataplane-api**, the façade — the process a
+# contracted caller actually opens a socket to. It is not the contract of
+# `dataplane`. That application's process is the domain and persistence authority
+# and it serves a listener of its own behind this one; the hop between the two is
+# a private protocol between two processes of the same product, defined in
+# docs/architecture/cross-plane-protocols.md and pinned on each side by a
+# protocol test. It is deliberately not a fourth OpenAPI document: a document
+# exists to state what a caller outside this repository may rely on, and nothing
+# outside this repository reaches that hop. The distinction is load-bearing
+# rather than pedantic — the two hops answer in the same envelope and do not
+# share a failure vocabulary, and `502 upstream_unavailable` below is the clearest
+# proof: it is this façade's word for "the Data Plane did not answer", which is
+# not a sentence the Data Plane could say about itself.
 #
 # There is no generated client for this document and no browser is meant to
 # see it. It is written down anyway, and for the same reason the other two are:
@@ -24,13 +38,13 @@
 # there too.
 openapi: 3.1.0
 info:
-  title: Ecoma LLM Gateway — Data Plane management API
+  title: Ecoma LLM Gateway — Data Plane management façade API
   version: 0.1.0
   description: >-
     Health and readiness probes, the usage-fact feed, and the common HTTP
-    boundary of the Ecoma LLM Gateway's Data Plane management API. This surface
-    is internal: it is called by the Control Plane and is not published to
-    callers of the gateway. Every response returns X-Request-Id, and every
+    boundary of the Ecoma LLM Gateway's Data Plane management façade. This
+    surface is internal: it is called by the Control Plane and is not published
+    to callers of the gateway. Every response returns X-Request-Id, and every
     failure — including the ones no operation declares, a 404 for an unmatched
     path and a 500 for an unclassifiable implementation failure — returns the
     ErrorEnvelope. A management call identifies itself as a service; a browser
@@ -38,6 +52,11 @@ info:
     Data Plane's administrative endpoints beyond the fact feed are not designed
     yet; this document carries the surface that exists and the process every
     later endpoint follows.
+
+    This is a façade contract and not the Data Plane's own surface. The process
+    behind it serves a private protocol that is not contracted here; what a
+    caller of this document sees is the façade's answer, produced by the façade
+    from what it could read, and never a byte relayed from the process behind it.
 servers:
   - url: /
 tags:
@@ -88,10 +107,13 @@ paths:
         - probes
       summary: Readiness of the Data Plane management service
       description: >-
-        Returns 200 when the service may receive traffic. The scaffold has no
-        dependencies, so it is always ready. This application holds no state of
-        its own and reads no database, so its readiness check is about reaching
-        the Data Plane it manages — not about a connection this process owns.
+        Returns 200 when the service may receive traffic. It answers 200
+        unconditionally today: the scaffold has no dependencies to check, and
+        this application holds no state of its own and reads no database, so
+        there is nothing yet for the probe to report on. When the façade reaches
+        the Data Plane for management state, this is the probe that should carry
+        that check — a question about reaching the Data Plane it manages, never
+        about a database connection this process owns.
       security: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
@@ -166,8 +188,14 @@ paths:
 
         A management caller authenticates as a service — see the
         `serviceCredential` scheme below. The Control Plane reaches this
-        operation through the Data Plane's own private management listener; the
-        runtime's public surface (`runtime.yaml`) does not carry it, and the LLM
+        operation, and this operation only, on the façade; the process behind
+        the façade is reached in turn over a private protocol that is not
+        contracted here, and it authenticates the façade with its own credential
+        rather than the caller's. So the 401 below is about *this* caller, and
+        the 502 is what a caller sees when the hop behind the façade did not
+        answer — two different hops, two different secrets, and a caller that
+        held one could not present it to the other. The runtime's public surface
+        (`runtime.yaml`) does not carry this operation at all, and the LLM
         request path never touches it.
       security:
         - serviceCredential: []
@@ -210,3 +238,9 @@ components:
         security model is stated in ADR 0006 §9, and the transport is expected
         to be replaced by one that proves the identity cryptographically (mTLS
         or a signed credential) without changing this contract.
+
+        This names the credential a caller presents **to the façade**. The
+        façade presents a different one to the process behind it, and neither
+        hop accepts the other's: a credential is per hop because a hop is where
+        it is checked, and a single shared secret across two processes would
+        multiply whatever one of them leaked by two.
