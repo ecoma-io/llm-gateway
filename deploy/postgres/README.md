@@ -19,15 +19,27 @@ runtime's; the Control Plane's database is relational tables only
 **One cluster, two databases.** `control` belongs to the Control Plane API
 (`apps/console-api`) and `dataplane` to the runtime (`apps/dataplane`) — the
 split [ADR 0006 §7](../../docs/adr/0006-control-plane-and-data-plane.md)
-decides. It is not filing: PostgreSQL has no cross-database query, so "neither
-application reads the other plane's tables" is enforced by the engine rather
-than by review, and there is no query anyone could write to break it. The two
-migration lanes mirror the two databases exactly, and the lane directory is
-the database name — `migrations/control/`, `migrations/dataplane/` — so a
-file's directory is also the deployment decision about where it runs; only the
-Data Plane's lane exists so far, and `migrations/README.md` states the rule
-that ties the two together and why an empty Control Plane lane would be worse
-than a missing one. Both databases are created by
+decides. It is not filing: it is a **database ownership boundary** — which
+tables exist where, and which process may read them, is decided by which
+database they are in — and that is a different thing from a **security /
+credential boundary**, which this fixture does not have. What two databases do
+and do not give, stated once so nothing below has to imply more:
+
+```text
+Two databases give:  separate namespaces · separate connection targets ·
+                     independent transactions · independent migration history ·
+                     no ordinary cross-database SQL reference
+
+They do NOT give:    separate credentials · no privileged cross-database access ·
+                     no FDW/dblink-style access · production-grade least privilege
+```
+
+The two migration lanes mirror the two databases exactly, and the lane
+directory is the database name — `migrations/control/`, `migrations/dataplane/`
+— so a file's directory is also the deployment decision about where it runs;
+only the Data Plane's lane exists so far, and `migrations/README.md` states the
+rule that ties the two together and why an empty Control Plane lane would be
+worse than a missing one. Both databases are created by
 [`initdb/`](initdb/10-create-plane-databases.sh), on the first start of an
 empty volume.
 
@@ -220,6 +232,11 @@ docker compose -f deploy/postgres/compose.yaml exec postgres \
   psql -U gateway -d dataplane
 ```
 
+Both commands reach the same role, and that is the fixture's convenience rather
+than a security property: these are two ownership boundaries, not two
+credential boundaries — ["What is deliberately not here"](#what-is-deliberately-not-here)
+states the production guidance.
+
 The database also listens on `127.0.0.1:5432` (`GATEWAY_POSTGRES_HOST` and
 `GATEWAY_POSTGRES_PORT` to move either) for a local psql or a GUI client.
 
@@ -230,11 +247,11 @@ bash deploy/postgres/verify.sh
 ```
 
 Runs the whole integration suite — startup, both databases answering,
-migration application, validation, the two lanes proving out as two
-databases, transaction behaviour, a migration that fails mid-file (proved to
-roll back whole, record itself dirty, refuse further runs, and recover
-through `force`), clean rollback — against the real database, and leaves the
-database migrated and running. CI runs this exact
+migration application, validation, the two lanes proving out as two databases
+and one role opening both, transaction behaviour, a migration that fails
+mid-file (proved to roll back whole, record itself dirty, refuse further
+runs, and recover through `force`), clean rollback — against the real
+database, and leaves the database migrated and running. CI runs this exact
 command: the `Verify (persistence)` job in
 [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) executes it on
 a runner whose preinstalled Docker and compose plugin meet the
@@ -248,11 +265,22 @@ definition of green, for a contributor and for the pipeline alike.
   migrations in the lane that owns them; the Data Plane's bootstrap
   migration enables the `timescaledb` extension and nothing else, and the
   Control Plane's lane has no file yet.
-- No per-plane roles. One role owns both databases, which makes the
-  database split the enforcement — not the credential. A deployment that
-  wants the second layer (a role per plane, with `CONNECT` revoked on the
-  other's database) decides it where credentials are decided, and this
-  fixture does not pre-answer that.
+- No per-plane roles, and no claim that this fixture demonstrates credential
+  isolation — it does not. One convenient role (`gateway`) owns and opens both
+  databases, which is a local-development fixture and not a security property:
+  the database ownership boundary above is real, the credential boundary is
+  absent. `verify.sh` asserts that the one role opens both databases, so the
+  absence is a fact the suite proves rather than prose that can drift back into
+  a stronger claim. The guidance:
+
+  ```text
+  local development fixture: one convenient role may be used (today's `gateway`)
+  production:                a dedicated role per plane, least-privilege
+                             CONNECT/database privileges, appropriate connection
+                             and database access controls, and no privileged
+                             cross-plane mechanism (FDW/dblink)
+  ```
+
 - No production deployment. This compose project is a development database;
   how the store runs in production is a deployment decision that has not
   been made yet, and this file will not pre-make it.

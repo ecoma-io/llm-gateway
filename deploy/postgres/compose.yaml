@@ -5,10 +5,14 @@
 # fork.
 #
 # One cluster, two databases: `control` for the Control Plane API and
-# `dataplane` for the runtime (ADR 0006 §7). The separation is the point —
-# PostgreSQL has no cross-database query, so "an application reads only its
-# own plane's tables" is enforced by the engine rather than by review — and
-# the two migration lanes under `migrations/` mirror it exactly.
+# `dataplane` for the runtime (ADR 0006 §7). The separation is a database
+# ownership boundary — separate namespaces, separate connection targets,
+# independent transactions and migration history, and no ordinary SQL statement
+# spanning the two — and it is not a security/credential boundary: this
+# fixture's single role opens both databases, which verify.sh asserts so the
+# difference stays a proven fact. The README states what two databases do and
+# do not give, and the production guidance for per-plane roles. The two
+# migration lanes under `migrations/` mirror the pair exactly.
 #
 # Usage (from the repository root — the -f path below is relative to it; the
 # integration suite computes its own absolute path):
@@ -46,9 +50,10 @@ services:
       # entrypoint would otherwise create whichever database this variable
       # names, and one plane would be built by a default while the other was
       # built by a script. Both are built by `initdb/`, in one file a reviewer
-      # reads. The role is the cluster's owner and owns both databases; per-
-      # plane roles are a production question this fixture does not pre-answer
-      # (deploy/postgres/README.md, "What is deliberately not here").
+      # reads. The role is the cluster's owner and owns both databases — a
+      # fixture convenience, not a security property: per-plane roles and their
+      # least-privilege grants are the production decision the README states,
+      # and this fixture does not pre-answer it.
       POSTGRES_DB: postgres
       POSTGRES_USER: gateway
       POSTGRES_PASSWORD: ${GATEWAY_POSTGRES_PASSWORD:-gateway-dev-only}

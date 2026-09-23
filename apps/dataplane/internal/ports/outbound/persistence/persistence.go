@@ -12,11 +12,19 @@
 // code that asks for a Store.
 //
 // This port belongs to the Data Plane, and reaches the `dataplane` database:
-// the runtime's own state, which the Control Plane never reads. The Control
-// Plane has its own copy of this port in its own module, because the two
-// planes own disjoint databases (ADR 0006 §7) — the duplicate is what makes a
-// query reaching across that line impossible to write rather than merely
-// forbidden.
+// the runtime's own state, which the Control Plane reads only as facts over
+// the management chain, never by connecting to it (ADR 0006 §5). The
+// Control Plane has its own copy of this port in its own module, because the
+// two planes own disjoint databases (ADR 0006 §7): separate namespaces,
+// separate connection targets, independent transactions and independent
+// migration history, so the ordinary query that would join this plane's rows
+// to the other's is not a statement PostgreSQL will parse. Each copy is wired
+// to its own plane's database, which keeps the crossing out of the code rather
+// than merely forbidding it in review — and that is the whole of it. It is an
+// ownership boundary and not a credential one: it does not stop a privileged
+// role, a foreign data wrapper or a dblink-style path from reaching both
+// databases, and the credential boundary is the authenticated management
+// surface of ADR 0006 §9.
 //
 // The port is deliberately small. It carries what the service has a consumer
 // for today — a reachability check, a transaction-scoped unit of work, and

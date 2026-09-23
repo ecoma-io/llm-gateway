@@ -216,10 +216,11 @@ func TestTheScanSeesTheModule(t *testing.T) {
 
 // usageFactSeam names the one package pair this application may hold under the
 // outbound trees, and it is listed by full path rather than by tree on purpose.
-// The port answers "how does this application read Data Plane state" — ADR 0006
-// §9's open question — with a call to the Data Plane, and a call is transport.
-// A second package beside it is a different answer to the same question: a
-// persistence port, a cache, a projection of Data Plane rows kept locally.
+// The port answers how this application reads Data Plane state — the
+// composition ADR 0006 §9 decided — with a call to the Data Plane, and a call
+// is transport. A second package beside it is a different answer to a question
+// §9 has already answered: a persistence port, a cache, a projection of Data
+// Plane rows kept locally.
 //
 // The distinction the arch suite can draw is a path; the distinction that
 // matters is whether the package holds state. They line up here because the
@@ -233,8 +234,8 @@ var usageFactSeam = []string{
 // TestTheManagementTransportHoldsNoState is this application's own structural
 // claim, and it is the one ADR 0006 §11 makes: the management transport is a
 // transport. It holds no state of its own, so it has no persistence, no cache
-// and no domain layer — everything it will eventually answer comes from the
-// Data Plane over the usage-fact seam, which is the answer §9 left open.
+// and no domain layer — everything it answers comes from the Data Plane over
+// the usage-fact seam, which is the composition §9 decided.
 //
 // The rule narrowed when the seam arrived. It used to forbid the outbound
 // trees outright, which was the right rule while they were empty and would be
@@ -247,10 +248,10 @@ var usageFactSeam = []string{
 //     is the Data Plane's to define (api/openapi/shared/usage-facts.yaml) and
 //     this module's copy of it is a wire type in the adapter, deliberately the
 //     thinnest thing that can carry the page across.
-//   - anything under the outbound trees that is not the seam is a second
-//     answer to §9, and the ordinary way one appears is that someone needs a
-//     row locally, finds a query short, and the management API quietly becomes
-//     a second owner of Data Plane data.
+//   - anything under the outbound trees that is not the seam is a second owner
+//     of Data Plane data — the thing §9's composition decides against — and
+//     the ordinary way one appears is that someone needs a row locally, finds
+//     a query short, and the management API quietly becomes that owner.
 func TestTheManagementTransportHoldsNoState(t *testing.T) {
 	for _, dir := range packageDirs(t) {
 		if under(dir, "internal/domain") {

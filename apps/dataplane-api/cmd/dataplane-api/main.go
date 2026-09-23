@@ -13,10 +13,13 @@
 // than a database or a cache connection, and that difference is the rule rather
 // than a detail — this process owns no data, so what it answers with comes from
 // the Data Plane over a management call the Data Plane can refuse (ADR 0006 §9,
-// §11). ADR 0006 §9 records how this application reaches Data Plane state as
-// the split's open question; this is the answer for the usage-fact feed — a
-// network call through the port in internal/ports/outbound — and it leaves the
-// separate question of a shared domain core where the ADR left it.
+// §11). That composition is the one ADR 0006 §9 decided rather than a choice
+// made here: the façade reaches the Data Plane through an outbound port of its
+// own, over the Data Plane's private management listener, never through a
+// shared core module both transports depend on and never by reading the Data
+// Plane's tables. The usage-fact feed is that seam in use — the port lives in
+// internal/ports/outbound, and the HTTP adapter behind it is the one outbound
+// adapter composed below.
 package main
 
 import (

@@ -60,9 +60,9 @@ func routes(app *application.App) []route {
 			handler: func(w stdhttp.ResponseWriter, _ *stdhttp.Request) { writeStatus(w) },
 		},
 		// Readiness: the scaffold has no dependencies, so it is always ready.
-		// When this application does reach Data Plane state (ADR 0006 §9), the
-		// check for that reaches the Data Plane — it does not read a database
-		// from here.
+		// When this application reads Data Plane state (ADR 0006 §9), the check
+		// for that reaches the Data Plane — it does not read a database from
+		// here.
 		{
 			method:  stdhttp.MethodGet,
 			path:    "/readyz",

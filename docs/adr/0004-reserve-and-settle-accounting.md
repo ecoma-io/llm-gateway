@@ -123,15 +123,16 @@ revision snapshot, capture method)`. Capture method is `reported` when the
 > everything above about the formal projections, the guards and the adjustment
 > algebra still describes that row exactly. Separately, the **Data Plane** holds
 > a _quota projection_ — the lockable capacity row the runtime's admission
-> conditionally updates in the same transaction as its reservation and hold
-> legs. The projection is not a balance: it is the enforcement ceiling for one
-> entitlement cycle or PAYG balance, seeded from Control-Plane grants and
-> updated only by the runtime. Settlement of record happens in the Control Plane
-> from the runtime's usage facts. The projection converges to the ledger by
-> reconciliation, and **the ledger, never the projection, is the source of truth
-> for money**. The projection exists because the runtime must be able to refuse
-> an over-budget request with the Control Plane switched off; it is the price of
-> that, paid in a convergence step that did not previously exist.
+> conditionally updates in the same transaction as its reservation and
+> allocation legs. The projection is not a balance: it is the enforcement
+> ceiling for one entitlement cycle or PAYG balance, seeded from Control-Plane
+> grants and updated only by the runtime. Settlement of record happens in the
+> Control Plane from the runtime's usage facts. The projection converges to the
+> ledger by reconciliation, and **the ledger, never the projection, is the
+> source of truth for money**. The projection exists because the runtime must
+> be able to refuse an over-budget request with the Control Plane switched off;
+> it is the price of that, paid in a convergence step that did not previously
+> exist.
 
 ### Formal balance projections
 

@@ -23,7 +23,8 @@
 #      dirty;
 #   5. re-applying is a no-op, not an error;
 #   6. the two lanes are two databases — the Data Plane's applied history is
-#      in the Data Plane's database and nowhere else;
+#      in the Data Plane's database and nowhere else — and one fixture
+#      credential opens both;
 #   7. PostgreSQL transaction semantics hold (rolled-back work leaves
 #      nothing behind, committed work survives);
 #   8. a migration that fails mid-file rolls back whole, records its target
@@ -183,21 +184,30 @@ step "5/10 re-applying is a no-op, not an error"
 migrate_lane "$dataplane_db" up
 assert_equals "version is unchanged after a no-op apply" "$(recorded_version "$dataplane_db")" "$newest"
 
-step "6/10 the two lanes are two databases"
-# What enforces "no application reads the other plane's tables" is
-# PostgreSQL's own inability to run a cross-database query (ADR 0006 §7), and
-# an engine cannot be argued with. What this step adds is that the
-# configuration actually puts the lanes in two databases: the Data Plane's
-# applied history is recorded in the Data Plane's database and the other
-# lane's database has been migrated by nobody. The control-side assertion is
-# deliberately shaped as an absence, and that is what it pins until the
-# Control Plane's lane lands its first migration — the day that file exists,
-# this line is the one that says so, and it gets replaced rather than
-# silenced.
+step "6/10 the two lanes are two databases, and one credential opens both"
+# Two databases are a database ownership boundary (ADR 0006 §7): separate
+# namespaces, separate connection targets, independent transactions and
+# independent migration history, with no ordinary SQL statement spanning them.
+# They are not a security/credential boundary — that is a production decision
+# the README states, and this fixture does not demonstrate it. What this step
+# pins, and all it pins, is that the configuration actually puts the lanes in
+# two databases: the Data Plane's applied history is recorded in the Data
+# Plane's database and the other lane's database has been migrated by nobody.
+# The control-side assertion is deliberately shaped as an absence, and that is
+# what it pins until the Control Plane's lane lands its first migration — the
+# day that file exists, this line is the one that says so, and it gets
+# replaced rather than silenced.
 assert_equals "the Data Plane's applied history is in the Data Plane's database" \
 	"$(psql_scalar "$dataplane_db" "SELECT to_regclass('public.schema_migrations') IS NOT NULL")" "t"
 assert_equals "the Control Plane's database has no applied history" \
 	"$(psql_scalar "$control_db" "SELECT to_regclass('public.schema_migrations') IS NULL")" "t"
+# The credential side of that boundary, asserted rather than described: this
+# fixture's one role reaches both databases, so "the fixture does not
+# demonstrate credential isolation" is a fact the suite proves and the
+# documentation cannot drift back into a stronger claim.
+assert_equals "one fixture credential opens both plane databases" \
+	"$(psql_scalar "$control_db" 'SELECT current_user')|$(psql_scalar "$dataplane_db" 'SELECT current_user')" \
+	"gateway|gateway"
 
 step "7/10 PostgreSQL transaction semantics hold"
 # Two probes, because the migration safety model rests on both: DDL rolled

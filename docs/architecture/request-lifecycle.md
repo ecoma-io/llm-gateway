@@ -108,6 +108,50 @@ buffered, [routing](routing.md)). The remaining semantics hold unchanged:
   by the settlement's uniqueness constraint — which is a Control-Plane
   constraint, and the reason a redelivered usage fact costs nothing.
 
+## Post-request fact delivery — a separate path
+
+The runtime's journey ends at step 11. What happens to the usage fact afterwards
+is a different path with a different schedule, and it is not a step 12: nothing
+on the list above waits for it, and a Control Plane that is down when the fact
+commits changes nothing about the request that produced it.
+
+```text
+UsageEvent committed durably (step 10)
+        │
+        ▼
+dataplane private listener        ── the management surface, not the runtime surface
+        ▲
+dataplane-api management façade   ── forwards the page; owns no cursor and no fact
+        ▲
+console-api poller                ── owns the position it has applied through
+        │
+        ▼
+Control Plane settlement          ── derived from the fact, idempotent by request_id
+```
+
+- **Pull, not push.** The runtime never notifies anyone and never calls the
+  Control Plane; the consumer asks for facts at its own pace, over the
+  authenticated management chain in [planes](planes.md). The fact is durable in
+  the meantime, so a Control Plane outage loses nothing and delays nothing.
+- **The cursor belongs to the consumer.** The Data Plane issues an opaque
+  position and the Control Plane stores the `next_cursor` of the last page it
+  applied, in the same local transaction that records the effects of those
+  facts. The runtime never learns that position, and no consumer may parse it.
+- **Redelivery is the norm, not an error.** There is no acknowledgement, no
+  consume-and-delete and no completion signal: the same page may be read any
+  number of times, and applying a fact twice is a no-op because `request_id` is
+  the idempotency key. That is what makes a retry free and a crash between
+  applying and advancing safe.
+- **The client never sees any of it.** The response ended at step 11. The
+  Control Plane's settlement is a second write, and it is invisible from the
+  outside: the console reads the ledger, and the runtime does not wait for it.
+
+The protocol, its ordering guarantee and its failure model are
+[cross-plane protocols](cross-plane-protocols.md); the layering that carries it
+is [ports and adapters](ports.md). The delivery model is ADR 0006 §5, and it is
+why step 10 could be split across the plane boundary without the request path
+noticing.
+
 ## The console management path — the other disjoint path
 
 The console's work is a different journey with a different shape, and the two
@@ -129,8 +173,9 @@ browser → console-api ──┬── control database (identity, commerce, th
   `console-api application → DataPlaneManagementPort → HTTP adapter →
 dataplane-api`, and the runtime is not involved
   ([ADR 0006](../adr/0006-control-plane-and-data-plane.md) §5). The port is
-  where the boundary is legible in code, and the adapter that implements it
-  does not exist yet.
+  where the boundary is legible in code; the fact half of it has an adapter
+  spoken today ([above](#post-request-fact-delivery--a-separate-path)), while
+  the management half has none until the first management operation lands.
 - **It runs at a different tempo.** This path is human-paced and low-volume;
   the runtime's is latency-bound and the product's availability. Neither
   shares a process, a deploy or a database with the other.
