@@ -155,7 +155,7 @@ Rules that follow:
   defined failure behaviour, never a two-phase commit.
 - **The console never talks to `dataplane-api`.** When the console needs a Data
   Plane operation, the call is:
-  `console-api application → DataPlaneManagementPort → HTTP adapter → dataplane-api`.
+  `console-api application → dataplane.Management → HTTP adapter → dataplane-api`.
   The application layer depends on the port; the port is where the plane
   boundary is legible in code.
 
@@ -343,7 +343,7 @@ deliberately smaller than `console-api`'s — an architecture test asserts both.
 The composition is decided, not open:
 
 ```text
-console → console-api → DataPlaneManagementPort → HTTP adapter → dataplane-api
+console → console-api → ports/outbound/dataplane → HTTP adapter → dataplane-api
                                                                       │ outbound port
                                                                       ▼ HTTP adapter
                                                             dataplane private listener
@@ -369,6 +369,28 @@ console → console-api → DataPlaneManagementPort → HTTP adapter → datapla
   with a fourth version and would fuse the two transports' release cadence
   again; a copy of routing or provider logic in the façade would be the second
   owner this section exists to prevent.
+- **The contracted surface is the façade, not the process behind it.**
+  `api/openapi/dataplane.yaml` is `dataplane-api`'s contract: it is what a
+  caller opening a socket to the façade may rely on, and it is the document
+  that application's route table is compared against in both directions. The
+  listener in `dataplane` is not that surface and does not implement that
+  document. The hop between the two is a **private protocol** between two
+  processes of the same product, defined in full in
+  [docs/architecture/cross-plane-protocols.md](../architecture/cross-plane-protocols.md),
+  pinned on each side by its own protocol test, and deliberately not a fourth
+  OpenAPI document (AGENTS.md rule 2). The naming follows from this: an
+  operation is "contracted" if the façade serves it, and "in the protocol" if
+  the listener does.
+- **The façade translates; it does not relay.** The two hops carry the same
+  page and hold different failure vocabularies. A private failure is classified
+  at the façade into one this application can answer from — `410` for a position
+  that can no longer be replayed, `502` for anything that leaves the answer
+  unknown, including the Data Plane refusing the façade's own credential — and
+  the caller's answer is built there. No byte of the listener's body reaches a
+  Control Plane caller, which is what keeps `502 upstream_unavailable` meaning
+  "no answer came back from the Data Plane" — unreachable, or reachable and
+  unusable, with the caller unable to tell which — rather than "something went
+  wrong somewhere".
 
 **The open question this section used to record is closed.** It read: the Data
 Plane domain is empty, so a shared core module would be an abstraction with
@@ -388,10 +410,28 @@ explicit and fail-closed:
 - **One shared-secret service credential per hop**, supplied by deployment
   configuration: `console-api` presents one to `dataplane-api`, and
   `dataplane-api` presents one to the Data Plane's private listener. The two
-  ends of a hop are handed the same configured value, so there is no second
-  copy of a secret to drift.
-- **Compared in constant time**, so how long a refusal takes is not a function
-  of how much of the credential the caller guessed right.
+  ends of a hop read their own variable — a process names the variables it
+  reads — and deployment sets both to one value, so a hop has one secret and
+  there is no second copy of it to drift. The two hops do not share theirs:
+  `dataplane-api` reads a caller-facing credential and a separate
+  Data-Plane-facing one, and refuses to start when the two are equal, because a
+  single secret serving both would be a key every management caller holds to
+  the Data Plane's private listener.
+- **Compared in constant time, at a fixed width, on both hops.** How long a
+  refusal takes is not a function of how much of the credential the caller
+  guessed right — and, just as importantly, not a function of how long the
+  configured secret is. `subtle.ConstantTimeCompare` returns early when its two
+  arguments differ in length, so a direct comparison of the presented string
+  against the configured one leaks the secret's length before examining a byte
+  of it. Both surfaces therefore digest each side through SHA-256 and compare
+  the digests, which are the same width whatever was presented; the property
+  belongs to the boundary, so both ends of it keep it, and each has its own test
+  for it.
+- **Fail-closed at every step.** An unconfigured credential, a header presented
+  twice, a credential under a scheme this surface does not accept, a token
+  carrying whitespace: all refuse. The verification runs before routing and
+  before any argument is read, so a caller that has not identified itself cannot
+  learn which methods a path accepts or reach use-case code by any route.
 - **An unconfigured credential authenticates nobody.** An absent or empty
   configured secret refuses every caller, including one presenting nothing, and
   the composition root refuses to start rather than serving an administrative
@@ -449,7 +489,12 @@ wire. `X-Request-Id` stays on every runtime response for correlation.
 `{"error": {"code", "message"}, "request_id"}` — and a code is added to it only
 where a real response produces one: `invalid_request`, `unauthenticated`,
 `cursor_expired` and `upstream_unavailable` are on the wire because the
-management surface returns them, not because they were imagined for it.
+management surface returns them, not because they were imagined for it. That
+document is the **façade's**; the private hop behind it answers in the same
+envelope with its own closed code set and none of the façade-only codes, and the
+façade classifies those answers into the codes above rather than passing them
+along (section 9, and the mapping table in
+[docs/architecture/cross-plane-protocols.md](../architecture/cross-plane-protocols.md)).
 Internal application errors stay separate from wire serialization: a caller can
 act on the status and the request ID, and cannot act on a stack frame, a query
 or a provider message.

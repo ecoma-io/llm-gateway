@@ -89,15 +89,16 @@ dataplane-api application                   UsageEvents — a pass-through; the 
 dataplane-api ports/outbound/dataplane      UsageFacts — this application's own copy
    │                                        of the seam, not an import of the runtime
    ▼
-dataplane-api adapters/outbound/dataplane   Client — forwards after and limit and
+dataplane-api adapters/outbound/dataplane   Client — sends after and limit and
    │                                        returns what the Data Plane said
    ▼
 dataplane adapters/inbound/management       the Data Plane's private listener:
    │                                        the service-credential check runs before
-   │                                        any use-case code
+   │                                        any use-case code, and the contract's page
+   │                                        size is defaulted and bounded here
    ▼
-dataplane application                       ReadUsageEvents — clamps the page size and
-   │                                        does nothing else to the page
+dataplane application                       ReadUsageEvents — returns the page and the
+   │                                        page size and does nothing else to either
    ▼
 dataplane ports/outbound/usagefacts         Reader — the port to the runtime's own
    │                                        recorded facts
@@ -119,8 +120,8 @@ the way it is:
   decides it should.
 - **The cursor travels verbatim.** Every package on the chain passes it through
   without looking inside — including the two that could parse it and must not.
-  `console-api` stores it, `dataplane-api` forwards it, and the Data Plane both
-  issues it and reads it.
+  `console-api` stores it, `dataplane-api` carries it across without reading it,
+  and the Data Plane both issues it and reads it.
 - **No layer holds state it was not given.** `dataplane-api` has no cursor, no
   cache and no last page; `console-api`'s adapter has no position of its own;
   the runtime's application adds no rule to the feed. A cached page or a

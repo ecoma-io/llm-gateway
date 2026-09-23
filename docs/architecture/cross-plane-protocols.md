@@ -50,7 +50,7 @@ Three properties hold for every call in this direction:
   accident (ADR 0006 §8).
 
 The transport is the chain
-`console-api application → DataPlaneManagementPort → HTTP adapter → dataplane-api → outbound port → HTTP adapter → dataplane private listener`
+`console-api application → dataplane.Management → HTTP adapter → dataplane-api → outbound port → HTTP adapter → dataplane private listener`
 (ADR 0006 §9).
 
 ## Data → Control: facts, replayed
@@ -81,15 +81,150 @@ latency for the read (ADR 0006 §4, §5).
 
 The hop from `dataplane-api` to the Data Plane's private listener is the one
 message between the planes that nothing outside this repository reaches. It is
-an implementation protocol between two processes of the same product, pinned on
-each side by a literal route test, and it is deliberately not a fourth OpenAPI
-document: `api/openapi/` holds the surfaces something outside this repository
-talks to, and a document exists to state what such a caller may rely on. What a
-caller does rely on is contracted where that caller's surface is —
-`dataplane.yaml` declares `GET /internal/usage-events` on the façade, and
-`shared/usage-facts.yaml` is the fragment both ends implement against. Changing
-the private hop is therefore a change to two route tests and this page, and no
-generated client moves (AGENTS.md rule 2).
+an implementation protocol between two processes of the same product, and it is
+deliberately not a fourth OpenAPI document: `api/openapi/` holds the surfaces
+something outside this repository talks to, and a document exists to state what
+such a caller may rely on. What a caller does rely on is contracted where that
+caller's surface is — `dataplane.yaml` declares `GET /internal/usage-events` on
+the **façade**, and `shared/usage-facts.yaml` carries the page it may expect.
+
+The distinction is the one thing about this hop that is easy to get wrong, so it
+is worth stating flatly: **`dataplane.yaml` is dataplane-api's contract.** The
+listener in `dataplane` is not that surface and does not implement that document.
+A reader looking for "does this process serve what the contract says" is asking
+about `apps/dataplane-api`; the question about `apps/dataplane`'s listener is
+"does it serve what the protocol below declares", and it is answered by that
+package's own route test and its own protocol test.
+
+The two hops do carry the same page and do not share a failure vocabulary. That
+asymmetry is the reason the hop is defined rather than assumed, and the sections
+below are the whole of it. Changing it is a change to the two protocol tests
+(`apps/dataplane-api/internal/adapters/outbound/dataplane/protocol_test.go` and
+`apps/dataplane/internal/adapters/inbound/management/protocol_test.go`) and to
+this page, and no generated client moves (AGENTS.md rule 2).
+
+### The private protocol, in full
+
+|                |                                                                                                                                                                                                                                                                                                                                                                    |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Endpoint       | `GET /internal/usage-events`                                                                                                                                                                                                                                                                                                                                       |
+| Methods        | `GET`, with `HEAD` answered from the same registration. Every other verb is `405` with `Allow: GET, HEAD` once the caller is authenticated — an unauthenticated one is `401` first, which is the note under this table                                                                                                                                             |
+| Authentication | `Authorization: Bearer <credential>`, RFC 6750 shape — exactly one header, exactly two fields, case-insensitive scheme, token carrying no whitespace. The credential is a **separate shared secret** from the caller-facing one; each hop checks its own, and neither hop accepts the other's                                                                      |
+| Parameters     | `after` — optional, opaque, at most 512 characters; omitted means "from the beginning of what is retained". `limit` — optional integer, `1`–`1000`, absent means `100`. Supplying either twice is refused. Any other parameter name is refused                                                                                                                     |
+| Success        | `200`, body `{"events":[…],"next_cursor":"…","has_more":true\|false}`, the three keys and the five event keys spelled exactly as `shared/usage-facts.yaml` spells them                                                                                                                                                                                             |
+| Failure        | `{"error":{"code":"…","message":"…"},"request_id":"…"}`, the same envelope shape the façade uses, with this listener's own code set: `invalid_request` (400), `unauthenticated` (401), `not_found` (404), `method_not_allowed` (405), `cursor_expired` (410), `internal` (500). Every response, including the ones produced before routing, carries `X-Request-Id` |
+
+Two notes about the table, then the four properties that are load-bearing and
+are stated here rather than derived from the code.
+
+`405` is a statement about an authenticated caller. Authentication runs before
+routing on both hops, so `DELETE /internal/usage-events` with no credential is
+`401`, not `405`, and so is one carrying a credential this listener does not
+accept — the answer to "may I speak here" is never dependent on which verb was
+used. ADR 0006 §9 gives the reason: the surface is invisible to a caller the
+deployment does not trust, and a method probe that answered differently would
+map it for a caller with no business knowing it exists. The façade's inbound
+adapter orders the two the same way, which is what makes the two hops
+indistinguishable on this point rather than merely similar.
+
+A read of the table also shows what the two hops do **not** share: the status
+codes and the six-code failure vocabulary are this listener's own, and neither is
+this listener's to pass along. The envelope is the one thing they do share — the
+shape `{"error":{…},"request_id":"…"}` is the same on both — and even there each
+hop writes it from its own values rather than copying the other's. The next
+section is the mapping.
+
+- **The path string is the same on both hops, on purpose.** The façade carries
+  the caller's values across rather than forwarding the request object, so the
+  path it calls is one it names itself — and it names the one it published. A
+  path rewritten hop by hop would be a translation step the protocol has to
+  describe and could get wrong. Both ends assert the literal against
+  `dataplane.yaml`, so the sameness is pinned from two directions instead of
+  being a coincidence someone eventually edits apart.
+- **The cursor is minted here and nowhere else.** This listener is the only
+  component that may produce one, compare two, or order by one. It accepts an
+  absent `after` as "the beginning" and never an empty one: a caller that sends
+  `after=` has a broken position, and answering it as a request for the whole
+  retained history would hide that. A value this Data Plane cannot place is
+  `410 cursor_expired` and is never silently rounded to a neighbouring position.
+- **The listener refuses a page it cannot describe.** A fact source that answers
+  without a position is this process's own failure and is reported as `500
+internal` — not as a page, because a consumer that stored an empty position
+  would re-read the same facts forever behind one that never moves.
+- **Its failures are its own.** `upstream_unavailable` is the façade's word for
+  "the Data Plane did not answer", which is not a sentence this process could say
+  about itself; it does not appear in the listener's vocabulary at all. The
+  protocol test on that side asserts the vocabulary is closed, so the code cannot
+  be introduced by accident.
+
+### What the façade does with those failures
+
+`dataplane-api` translates; it does not relay. The table below is the whole
+mapping, and the rule behind it is that the façade answers its caller in the
+caller's vocabulary:
+
+| The private listener answered                         | The façade answers the caller                                     | Why                                                                                                                                                                                                                                                                                                                               |
+| ----------------------------------------------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `200` with a page                                     | `200` with **that page, re-encoded** from the façade's own values | Success. The façade writes the body; it does not copy one                                                                                                                                                                                                                                                                         |
+| `410 cursor_expired`                                  | `410 cursor_expired`                                              | The one refusal a consumer must act on rather than retry — it has to re-establish a position, and skipping forward would lose settlement. The façade decides this from the status class and builds its own envelope; the two hops happening to spell it the same way is a consequence of the translation, not a substitute for it |
+| `400`, `401`, `404`, `405`, `500`, any other status   | `502 upstream_unavailable`                                        | The façade validated its caller's request at its own boundary, so every one of these is the façade's problem or the deployment's, and never the caller's. `401` here means _this process's_ credential was refused — reporting it to a caller that sent no credential would send an operator to rotate the wrong secret           |
+| A transport failure, or a body the façade cannot read | `502 upstream_unavailable`                                        | The answer is unknown and the façade holds nothing it could answer with instead                                                                                                                                                                                                                                                   |
+| A page that carries no usable position                | `502 upstream_unavailable`                                        | The façade contracts `next_cursor` as required and bounded, so answering with it would contradict the façade's own document. Refusing here is the façade keeping _its_ promise; the consumer keeps its own, separately, about the position it stores                                                                              |
+| A failure the façade's own port does not describe     | `500 internal`                                                    | This process's bug, reported as this process's bug                                                                                                                                                                                                                                                                                |
+
+The consequence to hold on to: **no byte of the private listener's body reaches
+a Control Plane caller.** The façade's 502 means it produced no answer from the
+Data Plane — unreachable, or reachable and unusable — and the caller cannot tell
+which. It keeps meaning that because the façade has no other status to answer
+these cases with: the one other refusal in the table, `500 internal`, is the
+façade reporting its own bug rather than the hop.
+
+It also means something else, and the cost is worth stating where the mapping is
+written rather than discovered by an operator. A `502` covers both a transient
+outage and a mismatch between the façade and the process behind it — a page
+whose position is missing, longer than the contract's 512 characters, or shaped
+in a way this build's decoder cannot read. The first is retried and the second
+is not, and a caller cannot tell them apart from the answer. The consumer
+therefore has to bound its own retries: a permanent mismatch retried forever
+looks exactly like an outage retried forever, and the distinguishing signal —
+how many times the same page has now failed — lives in the loop that reads the
+position, which is the loop this page defers to the schema PR ("What this page
+does not decide"). Nothing in the façade can produce that signal, because
+producing it would mean the façade remembering how many times it had answered
+the same way, which is state it may not hold.
+
+### The two protocol tests
+
+Each side carries one, and neither can import the other — the applications are
+separate Go modules (ADR 0006 §1) — so each states the same literals and each
+fails when its own side moves away from them. The listener's asserts the path
+against `dataplane.yaml`, the envelope's key set, and that its failure
+vocabulary is exactly the six codes above and contains no façade-only word. The
+façade's asserts the path against the same document, that the request carries
+exactly the protocol's two parameters, and that no body the listener could send
+survives into the façade's error text.
+
+They also pin the numbers of the table, by reading them out of
+`api/openapi/shared/usage-facts.yaml` rather than repeating them, and the
+division is worth spelling out because it is not symmetrical. The listener's
+protocol test and the façade's inbound route test each read all five out of the
+document — the page size's minimum, maximum and default, and the cursor's
+maximum and minimum length — because each of those surfaces enforces all five.
+The façade's **outbound** adapter pins only the cursor's 512, which is the one
+of them it reads; and the Control Plane's outbound adapter pins the five as
+well, so the bound it refuses a stored position against and the bounds its own
+requested page size has to sit inside are both tied to the file. Four packages
+across three modules hold copies of these numbers, and each is checked against
+the document by the package that owns it; a pin that compared a constant to
+itself would let one hop widen its bound and quietly disagree with the hop in
+front of it, which is the failure the numbers are there to prevent.
+
+The limits are `1`, `1000` and `100`, and the cursor is 512 characters rather
+than 512 bytes: `maxLength` counts code points, so every hop counts them with
+`utf8.RuneCountInString` and each has a test that fails if it stops. The page
+size a consumer **asks for** is not one of the five — it is the consumer's own
+choice, which the contract only bounds — so the Control Plane's is held to
+`1..1000` rather than to the default, by a test in the flow that asks.
 
 ### The cursor is opaque
 
@@ -100,9 +235,32 @@ The encoding is the Data Plane's to change, and treating the value as
 meaningful is what would make that change breaking
 (`api/openapi/shared/usage-facts.yaml`).
 
+One property of the position is fixed even though the value is not, and the two
+are not in tension: **`next_cursor` is the position of the last fact in the
+page, and a read resumes strictly after the position it is given.** An empty
+page therefore returns the position it was read from, and a first read that
+carried no `after` still returns one.
+
+The convention matters because the alternative — a cursor naming the position
+_immediately after_ the last fact delivered — round-trips differently at the one
+boundary that is hard to see. Under that reading a read of the position that is
+also the first unread fact's own position yields that fact; under this one it
+yields the facts after it. Both are self-consistent, and the two differ only for
+a consumer that constructs a position itself instead of storing one it was
+given — which is forbidden anyway. What is not a matter of taste is which way a
+mistake fails: this convention re-delivers a fact at worst, and re-delivery is a
+no-op the applier already handles, whereas the other can drop one, and a dropped
+fact is settlement that never happens.
+
 The Control Plane stores the `next_cursor` of the last page it applied. An
-empty stored position means "from the beginning of what is retained" — it is
-the consumer's own convention and never a value the Data Plane issued.
+empty stored position means "from the beginning of what is retained" — that is
+the consumer's own convention for having no position, and it is why the Data
+Plane may never answer with one. The two would collide: a consumer that stored
+an empty `next_cursor` would read it back as "start again", ask for the whole
+retained history on every cycle, and never advance, with nothing anywhere saying
+so. Both hops refuse such a page rather than serve it — the listener as `500
+internal`, the façade as `502 upstream_unavailable` — and the contract states
+the requirement the two are enforcing.
 
 ### Replay and retries
 
@@ -186,3 +344,24 @@ position; the fourth is why nothing in the derivation needs a lock.
 - **mTLS or signed service credentials.** The mechanism today is a shared secret
   per hop, and either replacement proves the same identity cryptographically
   without changing application semantics (ADR 0006 §9).
+- **A bound on how much of an answer either hop will read.** Both outbound
+  adapters decode the peer's body with `json.NewDecoder(response.Body)` and no
+  size cap, so a peer — or anything able to answer in a peer's place — decides
+  how much memory a read costs. It is left as it is because the number has to
+  come from the contract rather than from an adapter: neither `events` nor
+  `payload` carries a `maxItems` or a `maxLength` today, so any cap written now
+  would be a guess that refuses pages the contract admits, which is the one
+  failure this page spends its length avoiding. The change is small and belongs
+  with the fact schema, when `payload`'s columns and their sizes are decided:
+  an `io.LimitReader` at each decode, one above the largest page the contract
+  permits, and a test that feeds a body past it and watches the read fail
+  instead of the process grow. Recorded rather than fixed because guessing the
+  number would be worse than not having one.
+- **`X-Request-Id` forwarding across the hops.** Every surface here issues and
+  returns one, and a caller may supply a well-formed one, but no outbound
+  adapter sends the header onward — so the identifier in the façade's error
+  envelope is the façade's own and does not identify the request in the
+  listener's logs. Spanning the hops is a small change with a real question
+  attached, since a caller-supplied string would then cross a second trust
+  boundary, and it belongs with the consumer loop that will have a request worth
+  correlating.

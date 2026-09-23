@@ -161,7 +161,7 @@ and nothing below serves a completion.
 ```text
 browser → console-api ──┬── control database (identity, commerce, the ledger)
                         │
-                        └── DataPlaneManagementPort → HTTP → dataplane-api
+                        └── dataplane.Management → HTTP → dataplane-api
                                                               (Data Plane configuration)
 ```
 
@@ -170,7 +170,7 @@ browser → console-api ──┬── control database (identity, commerce, th
   console client ([planes](planes.md)).
 - **Data Plane operations are delegated, never performed.** Where the console
   needs one — publishing an alias, rotating a key — the call is
-  `console-api application → DataPlaneManagementPort → HTTP adapter →
+  `console-api application → dataplane.Management → HTTP adapter →
 dataplane-api`, and the runtime is not involved
   ([ADR 0006](../adr/0006-control-plane-and-data-plane.md) §5). The port is
   where the boundary is legible in code; the fact half of it has an adapter

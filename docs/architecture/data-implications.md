@@ -165,6 +165,18 @@ Notes for the schema designer:
 | `requests`                      | `dataplane` | forever                              | One row per request — the anchor joining charges to usage and attempts; volume is already implied by the ledger.            |
 | `request_attempts`              | `dataplane` | archivable (aggregate, then age out) | Provider telemetry, not customer billing; nothing references it for accounting.                                             |
 
+"Forever" is a statement about policy rather than a promise about every value a
+read can carry. Nothing in this design ages a fact out, and the ingestion cursor
+is expected to keep up with the append sequence rather than lag behind it — but
+`cursor_expired` (410) exists all the same, because retention is only one of the
+ways a stored position can become unplaceable. A position written by another
+deployment, one held across a restore from an older backup, or one whose
+encoding a future Data Plane has changed all fail the same way, and the answer is
+the same in every case: refuse, and make a human re-establish a position rather
+than skip forward. Retention being indefinite is what keeps that refusal rare; it
+is not what makes it impossible
+([cross-plane protocols](cross-plane-protocols.md)).
+
 ## Transaction map
 
 The four cross-context coordinated transactions (ADR 0001, rule 6), each now

@@ -103,7 +103,7 @@ what it observed.
 | Idempotency key | the entity's own identifier                                                                                                       | `request_id`                                                                                                |
 
 Both flows use one chain, and it is the only one across the boundary:
-`console-api application → DataPlaneManagementPort → HTTP adapter → dataplane-api → outbound port → HTTP adapter → the Data Plane's private management listener`
+`console-api application → ports/outbound/dataplane → HTTP adapter → dataplane-api → outbound port → HTTP adapter → the Data Plane's private management listener`
 (ADR 0006, section 9). The difference is what is on the other end of it: a
 command the Data Plane applies, or a page of facts it hands back. The protocol
 the second one keeps — cursor, replay, retry, reconciliation — is
