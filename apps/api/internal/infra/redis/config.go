@@ -12,15 +12,15 @@ import (
 
 // Defaults for every Config field. They are valkey-go's own defaults stated
 // once, here, so a reader sees the behaviour they get without opening the
-// library: the dial timeout is the library's DefaultDialTimeout, and each I/O
-// timeout is the library's derived connection deadline (TCP keepalive 1s ×
-// 10). Inventing tighter numbers now would be guessing with a straight face —
+// library: the dial timeout is the library's DefaultDialTimeout, and the
+// connection timeout is the deadline the library derives when none is set
+// (TCP keepalive 1s × 10 — Linux's 9 keepalive probes plus one interval).
+// Inventing tighter numbers now would be guessing with a straight face —
 // the workload that would tune them does not exist yet.
 const (
 	defaultAddress           = "127.0.0.1:6379"
 	defaultDialTimeout       = 5 * time.Second
-	defaultReadTimeout       = 10 * time.Second
-	defaultWriteTimeout      = 10 * time.Second
+	defaultConnTimeout       = 10 * time.Second
 	defaultPipelineMultiplex = 2
 	maxPipelineMultiplex     = 4
 	defaultBlockingPoolSize  = 1
@@ -50,13 +50,12 @@ type Config struct {
 	// DialTimeout bounds establishing a TCP connection.
 	DialTimeout time.Duration
 
-	// ReadTimeout and WriteTimeout bound command I/O. valkey-go applies one
-	// connection deadline for both directions, so the smaller configured value
-	// is used internally; retaining both typed fields makes the external
-	// configuration explicit and compatible with the operating model callers
-	// already expect from Redis clients.
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
+	// ConnTimeout bounds the read/write deadline of each connection. valkey-go
+	// applies one deadline to both directions and exposes it as
+	// ClientOption.ConnWriteTimeout, so the contract is a single positive value
+	// mapped through unchanged: a read/write split would be collapsed by the
+	// library anyway, and one name states what the deadline actually governs.
+	ConnTimeout time.Duration
 
 	// PipelineMultiplex bounds connections that multiplex ordinary commands:
 	// the client opens 2^m pipes, 4 at the default of 2.
@@ -86,11 +85,8 @@ func (c Config) Validate() error {
 	if c.DialTimeout <= 0 {
 		return fmt.Errorf("dial timeout %s must be positive", c.DialTimeout)
 	}
-	if c.ReadTimeout <= 0 {
-		return fmt.Errorf("read timeout %s must be positive", c.ReadTimeout)
-	}
-	if c.WriteTimeout <= 0 {
-		return fmt.Errorf("write timeout %s must be positive", c.WriteTimeout)
+	if c.ConnTimeout <= 0 {
+		return fmt.Errorf("conn timeout %s must be positive", c.ConnTimeout)
 	}
 	if c.PipelineMultiplex < 0 || c.PipelineMultiplex > maxPipelineMultiplex {
 		return fmt.Errorf("pipeline multiplex %d must be between 0 and %d", c.PipelineMultiplex, maxPipelineMultiplex)
@@ -118,11 +114,7 @@ func FromEnv() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	readTimeout, err := envDuration("REDIS_READ_TIMEOUT", defaultReadTimeout)
-	if err != nil {
-		return Config{}, err
-	}
-	writeTimeout, err := envDuration("REDIS_WRITE_TIMEOUT", defaultWriteTimeout)
+	connTimeout, err := envDuration("REDIS_CONN_TIMEOUT", defaultConnTimeout)
 	if err != nil {
 		return Config{}, err
 	}
@@ -140,8 +132,7 @@ func FromEnv() (Config, error) {
 		Password:          os.Getenv("REDIS_PASSWORD"),
 		Database:          database,
 		DialTimeout:       dialTimeout,
-		ReadTimeout:       readTimeout,
-		WriteTimeout:      writeTimeout,
+		ConnTimeout:       connTimeout,
 		PipelineMultiplex: multiplex,
 		BlockingPoolSize:  blockingPoolSize,
 	}
@@ -163,8 +154,7 @@ func (c Config) LogValue() slog.Value {
 		slog.String("password", "[redacted]"),
 		slog.Int("database", c.Database),
 		slog.Duration("dial_timeout", c.DialTimeout),
-		slog.Duration("read_timeout", c.ReadTimeout),
-		slog.Duration("write_timeout", c.WriteTimeout),
+		slog.Duration("conn_timeout", c.ConnTimeout),
 		slog.Int("pipeline_multiplex", c.PipelineMultiplex),
 		slog.Int("blocking_pool_size", c.BlockingPoolSize),
 	)

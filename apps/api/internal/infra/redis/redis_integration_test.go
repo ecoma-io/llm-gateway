@@ -37,8 +37,7 @@ func integrationConfig(t *testing.T) Config {
 		Password:          os.Getenv("REDIS_PASSWORD"),
 		Database:          0,
 		DialTimeout:       2 * time.Second,
-		ReadTimeout:       2 * time.Second,
-		WriteTimeout:      2 * time.Second,
+		ConnTimeout:       2 * time.Second,
 		PipelineMultiplex: 1,
 		BlockingPoolSize:  1,
 	}
