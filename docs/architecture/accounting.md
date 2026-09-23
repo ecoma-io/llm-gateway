@@ -5,13 +5,20 @@ and the ledger. The decisions are [ADR 0004](../adr/0004-reserve-and-settle-acco
 — in particular the **ten invariants**, which this page assumes and does not
 restate. Entity fields are in [overview](overview.md).
 
+The model is two layers, and [ADR 0006](../adr/0006-control-plane-and-data-plane.md)
+is why. **The ledger is the Control Plane's**: a funding bucket, the settlement
+of record and its legs. **The capacity the runtime enforces is a quota
+projection in the Data Plane**: a ceiling, not a balance, seeded from
+Control-Plane grants and written only by the runtime. The two converge by
+reconciliation, and only one of them is authoritative for money.
+
 ## Reservation lifecycle
 
 ```text
         admission (one transaction)                  execution
               │                                            │
               ▼                                            │  lease renewed by the
-        ┌──────────┐   settle: Settlement + legs          │  live executor while the
+        ┌──────────┐   close: usage fact; settlement      │  live executor while the
         │   open   │─────────────────────────────────▶   │  request runs
         └────┬─────┘   ┌───────────┐                     │
              │         │  settled  │                     │
@@ -28,23 +35,29 @@ restate. Entity fields are in [overview](overview.md).
                                                └───────────┘
 ```
 
-- `open` — capacity is held; a request has exactly one reservation, ever
-  (uniqueness on the request is total), and at most that one can be `open`
-  (invariant 6).
-- `settled` — closed by the settlement transaction with actual usage.
-- `released` — closed by explicit compensation (no candidate could serve).
-- `expired` — closed by the reaper because nothing closed it in time; the
-  reaper acts only when `expires_at` has passed **and the execution lease is
-  dead**. The lease is renewable and strictly outlives the maximum accepted
+- `open` — capacity is held, against the runtime's own quota projection, all
+  of it in the Data Plane (ADR 0006); a request has exactly one reservation,
+  ever (uniqueness on the request is total), and at most that one can be
+  `open` (invariant 6).
+- `settled` — closed by the runtime: one Data-Plane transaction writes the
+  usage fact and flips the state, and the Control Plane's Settlement is
+  derived from that fact afterwards, idempotently by `request_id` (ADR 0006).
+- `released` — closed by explicit compensation (no candidate could serve), in
+  the Data Plane; the Control Plane learns of it as a fact.
+- `expired` — closed by the runtime's reaper because nothing closed it in
+  time; the reaper acts only when `expires_at` has passed **and the execution
+  lease is dead**. The lease is renewable and strictly outlives the maximum accepted
   request duration, so a live stream cannot be expired under itself.
 
 Settlement after `expired` does not exist: the released capacity may already
 be serving a newer request. An orphaned completion proven by attempt
 telemetry is recorded as an `unbillable_orphaned` usage event — written by
-the **reaper in the same transaction as its release legs** when the proof
-exists at expiry, or appended later by reconciliation when it surfaces only
-afterwards (appending an unbillable fact late is safe; settling late is
-not). It is a reconciliation fact, never a customer charge (ADR 0004).
+the **reaper in the same Data-Plane transaction that closes the reservation**
+when the proof exists at expiry (the Control Plane's release legs then follow
+from that terminal state), or appended later by reconciliation when it
+surfaces only afterwards (appending an unbillable fact late is safe; settling
+late is not). It is a reconciliation fact, never a customer charge (ADR
+0004).
 
 ### Reservation sizing — a hard ceiling
 
@@ -65,19 +78,39 @@ canonically (the capture method records which).
 
 ## Settlement
 
-Settlement is one transaction that does, in this order:
+Settlement is **two transactions in two databases**, and the plane boundary is
+why it can no longer be one: these rows do not all live in the same database,
+so no transaction can write them all (ADR 0006).
+
+**In the Data Plane**, the runtime closes the reservation — one transaction
+here, and it is the half that observes what happened:
+
+1. append the `UsageEvent` (immutable fact: committed attempt, normalized
+   token counts, price revision snapshot, capture method). The fact is the
+   **authority the charge is derived from**, not a side effect of it;
+2. close the reservation (`settled`), state-guarded so exactly one writer
+   closes it.
+
+**In the Control Plane**, settlement runs from that fact, idempotently by
+`request_id`, in this order:
 
 1. create the **Settlement** — unique by `request_id`; the exactly-once
    boundary. It carries `request_id`, a `settled_total` equal to the sum of
    its consume legs, and `created_at`. A competing finalizer hits the unique
    constraint and stops.
-2. append the `UsageEvent` (immutable fact: committed attempt, normalized
-   token counts, price revision snapshot, capture method);
-3. append **one consume leg per allocated bucket**, drawing the
-   reservation's allocation legs in their stored waterfall order, then the
-   **release legs** for the unconsumed tail of each allocation;
-4. update each affected funding bucket's projections;
-5. close the reservation (`settled`).
+2. append **one consume leg per allocated bucket**, then the **release legs**
+   for the unconsumed tail of each allocation — the amounts come from the
+   fact, which carries what was held and what was delivered;
+3. update each affected funding bucket's projections.
+
+The fact's carrying the held and delivered amounts is what lets the Control
+Plane settle without so much as a reference to the runtime's reservation rows:
+it knows the request by ID and nothing else (ADR 0006 §5). Exactly-once
+survives twice over — the runtime's close is state-guarded locally, and the
+Control Plane's unique settlement per request is unchanged — while the
+atomicity between the charge and the fact it derives from is gone,
+deliberately: what replaces it is a fact that already exists, a retry that is
+safe, and a convergence property that is named (ADR 0006).
 
 Concretely, a hold split S1: 20 + S2: 40 (S1 expires sooner) settling at 30
 writes: `Settlement S` → consume S1: 20, consume S2: 10, release S2: 30 —
@@ -106,21 +139,24 @@ The method travels on the usage event, so analytics can price confidence.
 
 ## Ledger legs and balance projections
 
-`LedgerEntry` rows are **bucket legs** — one funding bucket, one kind, one
-positive amount, a per-bucket `sequence` (allocated by incrementing a counter
-on the bucket row inside the same transaction, giving each bucket's history a
-total order), and a price snapshot **required on `consume` legs** (null
-elsewhere — the other kinds move money without consuming tokens),
-referencing their reservation or settlement:
+This section is the Control Plane's half of the picture, and the half that
+decides what money is owed. `LedgerEntry` rows are **bucket legs** — one
+funding bucket, one kind, one positive amount, a per-bucket `sequence`
+(allocated by incrementing a counter on the bucket row inside the same
+transaction, giving each bucket's history a total order), and a price snapshot
+**required on `consume` legs** (null elsewhere — the other kinds move money
+without consuming tokens), referencing their settlement or, across the plane
+boundary, their reservation **by ID alone** — no foreign key exists in either
+direction (ADR 0006 §7):
 
-| Kind         | Written when                                         | Bucket             | Meaning                                                                     |
-| ------------ | ---------------------------------------------------- | ------------------ | --------------------------------------------------------------------------- |
-| `grant`      | a subscription's grant cycle rolls                   | entitlement cycle  | capacity issued for the cycle                                               |
-| `topup`      | operator today, payment provider later (webhook)     | PAYG               | funding added                                                               |
-| `hold`       | admission                                            | entitlement / PAYG | capacity occupied by a reservation                                          |
-| `release`    | settlement tail, candidate exhaustion, reaper expiry | entitlement / PAYG | occupied capacity returned                                                  |
-| `consume`    | settlement                                           | entitlement / PAYG | capacity actually spent                                                     |
-| `adjustment` | explicit operator correction only                    | entitlement / PAYG | compensating pair with reason, original ref, and stated settled/held deltas |
+| Kind         | Written when                                     | Bucket             | Meaning                                                                     |
+| ------------ | ------------------------------------------------ | ------------------ | --------------------------------------------------------------------------- |
+| `grant`      | a subscription's grant cycle rolls               | entitlement cycle  | capacity issued for the cycle                                               |
+| `topup`      | operator today, payment provider later (webhook) | PAYG               | funding added                                                               |
+| `hold`       | admission, from the reservation as a fact        | entitlement / PAYG | capacity occupied by a reservation                                          |
+| `release`    | settlement tail, exhaustion, reaper expiry       | entitlement / PAYG | occupied capacity returned                                                  |
+| `consume`    | settlement                                       | entitlement / PAYG | capacity actually spent                                                     |
+| `adjustment` | explicit operator correction only                | entitlement / PAYG | compensating pair with reason, original ref, and stated settled/held deltas |
 
 **Formal projections** per funding bucket (G = grants/topups, C = consumes,
 H = holds, R = releases, A = adjustment `(settled_delta, held_delta)` pairs):
@@ -143,18 +179,26 @@ held      = 12 − 5 − 7     =  0
 available = 93 − 0         = 93
 ```
 
-Each bucket's funding-bucket row caches these three numbers **inside the
-same transaction** that writes legs; the cache exists for contention control
-(conditional updates) and is rebuildable from legs — if cache and legs ever
-disagree, the legs win and the cache is wrong. The funding bucket is an
-**Accounting aggregate** (ADR 0001): its row is written only by the
-accounting flows — the four coordinated transactions' capacity updates, and
-the context-local `topup`/`adjustment` refills — while the Commerce
-entitlement cycle or PAYG flag it projects references it by identifier.
-`adjustment` is an operator
-correction that states its settled/held deltas explicitly; it is never an
-automatic overdraw path (the reservation ceiling means automatic debt cannot
-arise).
+Each funding-bucket row in the Control Plane caches these three numbers
+**inside the same transaction** that writes its legs; the cache exists for
+contention control (conditional updates) and is rebuildable from legs — if
+cache and legs ever disagree, the legs win and the cache is wrong. The funding
+bucket is an **Accounting aggregate** (ADR 0001) and it lives in the Control
+Plane: its row is written only by the accounting flows of that plane — the
+Control-Plane halves of the four coordinated transactions (settlement, and the
+cycle roll's grant), the `hold`/`release` legs derived from the reservation's
+facts, and the context-local `topup`/`adjustment` refills — while the Commerce
+entitlement cycle or PAYG flag it projects references it by identifier. `adjustment` is an operator correction that states its
+settled/held deltas explicitly; it is never an automatic overdraw path (the
+reservation ceiling means automatic debt cannot arise).
+
+**The Data Plane holds no copy of this row.** What the runtime conditionally
+draws down is the _quota projection_: the lockable capacity row for one
+entitlement cycle or PAYG balance, seeded from a Control-Plane grant, updated
+only by the runtime, and converged to the ledger by reconciliation. It is not
+a balance and not a second ledger — it is the ceiling admission enforces, and
+the ledger, never the projection, is the source of truth for money (ADR
+0006).
 
 ### Worked ledger sequences
 
@@ -209,16 +253,20 @@ in exactly this crash case; over-billing is not. The asymmetry is deliberate.
 ## Concurrency and time
 
 - **No locks across provider calls** (ADR 0001, rule 7). Admission,
-  settlement, release/compensation, and cycle roll — the four cross-context
-  coordinated transactions (ADR 0001, rule 6) — are short transactions; the
-  in-flight hold is data plus a renewable lease, not a lock.
-- **Bucket guards**: every capacity drawdown is a conditional update on the
-  funding bucket (`available >= take`) inside one of those four coordinated
-  transactions — the same mechanism for entitlement buckets and the PAYG
-  bucket, so concurrent admissions cannot jointly overdraw either. Refills
-  are ledger-backed writes outside the admission path: grant legs from the
-  cycle roll, and `topup`/`adjustment` legs (ADR 0004), each carrying its
-  own uniqueness guards.
+  settlement, release/compensation and cycle roll — the four cross-context
+  coordinated transactions (ADR 0001, rule 6), each scoped to one plane
+  (ADR 0006) — are short transactions; the in-flight hold is data plus a
+  renewable lease, not a lock, and settlement is now two of them rather than
+  one.
+- **Capacity guards**: every drawdown is a conditional update
+  (`available >= take`) on the capacity row it guards, inside its plane's own
+  transaction — the runtime's quota projection at admission, the Control
+  Plane's funding bucket at settlement and at the cycle roll. It is the same
+  mechanism for entitlement capacity and the PAYG balance, so concurrent
+  admissions cannot jointly overdraw either. Refills are ledger-backed writes
+  outside the admission path: grant legs from the cycle roll, and
+  `topup`/`adjustment` legs (ADR 0004), each carrying its own uniqueness
+  guards.
 - **Time**: cycle membership and price-revision selection use the database
   clock (`transaction_timestamp()` at admission), never gateway node clocks;
   admission and the cycle roll serialise on the subscription row, so a

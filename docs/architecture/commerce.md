@@ -6,6 +6,14 @@ entity fields are in [overview](overview.md); balance formulas are formalised
 in [ADR 0004](../adr/0004-reserve-and-settle-accounting.md) and summarised
 below.
 
+Commerce is a **Control Plane** context: plans, subscriptions and entitlements
+are owned by `apps/console-api` and their rows live in the `control` database,
+alongside Accounting's, and in no other
+([ADR 0006](../adr/0006-control-plane-and-data-plane.md) §§3, 7). Nothing on
+the request path reads them directly. What the runtime enforces is its own
+projection of the capacity these rules grant (below), and the Control Plane
+settles from the usage facts the runtime writes back.
+
 ## The shape being supported
 
 ```text
@@ -62,7 +70,12 @@ enabled".
   the database clock and performs the roll. At each roll the plan's grant
   definitions materialise **new** entitlements (quota does not roll over)
   against whatever alias-group versions are current at that roll — each cycle
-  re-snapshots group membership, and grants never expand retroactively.
+  re-snapshots group membership, and grants never expand retroactively. An
+  entitlement cycle's capacity is what the runtime's **quota projection**
+  enforces for that cycle; the Control Plane's funding bucket is the ledger
+  side of the same capacity, and the two are reconciled rather than merged
+  ([ADR 0006](../adr/0006-control-plane-and-data-plane.md);
+  [accounting](accounting.md)).
 
 ### The cycle roll is a transaction
 
@@ -71,12 +84,24 @@ append `grant` ledger legs → advance cycle fields — is **one** transaction:
 the grant-cycle-roll member of ADR 0001's four cross-context coordinated
 transactions (rule 6) — cross-context because the entitlement is Commerce's
 and the bucket it creates is an Accounting aggregate (ADR 0001), with its
-`grant` legs — keyed by `(subscription_id, cycle_number)`. A worker
-retry after a crash cannot grant a cycle twice; a partial roll cannot exist.
-Admission and the roll serialise on the subscription row: an admission either
-sees the old cycle or the new one, never a half-rolled state, and cycle
-membership is decided by the database clock (`transaction_timestamp()`), not
-by any gateway node's clock.
+`grant` legs — keyed by `(subscription_id, cycle_number)`. It is also
+entirely **Control-local**: both contexts it writes are in the Control Plane,
+so no plane boundary is crossed and the single write survives intact
+([ADR 0006](../adr/0006-control-plane-and-data-plane.md)'s rule above ADR
+0001's rule 6 — no transaction crosses a plane). What crosses the
+boundary is the roll's result: it **publishes the new capacity to the
+runtime's quota projection**, and that publication is the only way new
+capacity reaches the hot path. Like every Control → Data message it is keyed
+by the entity's own identifier, so a redelivered publication is a no-op. A
+worker retry after a crash cannot grant a cycle twice; a partial roll cannot
+exist, and the new cycle's capacity cannot reach the runtime twice.
+
+The guarantee the single transaction used to carry across both sides survives
+as two facts instead of one: admission draws down one cycle's ceiling row in
+one Data-Plane transaction, so a request lands wholly in one cycle, and the
+new cycle's capacity arrives as an idempotent publication rather than as a
+row both planes can lock. Cycle membership is decided by the database clock
+(`transaction_timestamp()`), not by any gateway node's clock.
 
 ## Entitlement scope and the allocation waterfall
 
@@ -97,14 +122,23 @@ For a reservation of `n` on alias `a` at admission:
    (4) `entitlement_id` ascending. The last tie-break makes the order total
    and replay-stable.
 3. **Reserve** — in that order, take `min(available, still-needed)` from each
-   bucket via a conditional update on its funding-bucket capacity (ADR 0004),
-   inside the admission transaction. A reservation may split across buckets;
-   the split's legs keep an ordinal.
+   bucket via a conditional update on its capacity (ADR 0004), inside the
+   admission transaction. A reservation may split across buckets; the split's
+   legs keep an ordinal.
 4. **Spill to PAYG** — only after all matching entitlements: if PAYG is
    enabled **and** its available balance covers the entire shortfall, reserve
    the shortfall there; otherwise reject `insufficient_entitlement`. A
    reservation is fully secured or the request is rejected whole — there is
    no partial admission and no automatic debt.
+
+Steps 3 and 4 are the runtime's own transaction, and the rows they guard are
+its **quota projections** — one ceiling per entitlement cycle, one for the
+PAYG balance. The Control Plane's funding buckets record the same movement
+from the runtime's facts, keyed by `request_id` and written outside the
+admission transaction, so the runtime never holds ledger write authority and
+the waterfall order above is unchanged
+([ADR 0006](../adr/0006-control-plane-and-data-plane.md);
+[accounting](accounting.md)).
 
 Worked example:
 
@@ -125,9 +159,9 @@ it identically.
 Two requests racing the last capacity of a bucket each run the guarded
 conditional update; exactly one wins a given unit of capacity, and the loser
 continues down the waterfall (or to PAYG, or to rejection). PAYG's capacity is
-guarded by the same mechanism as entitlements — its funding bucket is a
+guarded by the same mechanism as entitlements — its quota projection is a
 lockable row, so two admissions cannot jointly reserve more PAYG than the
-account holds. No in-memory balance, no read-modify-write outside the
+projection makes available. No in-memory balance, no read-modify-write outside the
 transaction, no lock beyond the transaction (ADR 0001, rule 7).
 
 ### Settlement of split holds
@@ -194,11 +228,20 @@ the bound. Consequences:
   rule is validated at configuration write time, ADR 0003).
 - **Two balances** (ADR 0004): **settled** = grants/topups − consumes (what
   statements show); **available** = settled − held (what admission checks).
-  The waterfall spills to PAYG only against available.
+  The waterfall spills to PAYG only against available. This balance is what
+  the runtime's quota projection enforces at admission; the ledger remains the
+  source of truth for money, and the projection converges to it
+  ([ADR 0006](../adr/0006-control-plane-and-data-plane.md);
+  [accounting](accounting.md)).
 - **No expiry, no cycles**: PAYG is a balance, not a subscription; it never
   appears as "the current plan" because no such field exists.
 
 ## Insufficient entitlement — decision table
+
+Every row below is a decision made at admission, which is the runtime's: it
+enforces the outcome against its quota projection, and the Control Plane's
+ledger is settled from the usage fact the runtime writes for the requests it
+did serve.
 
 | Situation at admission                                                       | PAYG off                          | PAYG on, balance short            | PAYG on, balance covers |
 | ---------------------------------------------------------------------------- | --------------------------------- | --------------------------------- | ----------------------- |
