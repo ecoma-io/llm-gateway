@@ -33,11 +33,15 @@ and every row follows.
 Three consequences do most of the work:
 
 - **A projection is not a second owner.** Where the runtime needs data the
-  Control Plane decides — aliases, key state, capacity grants, prices — it holds
-  a projection it can read with the Control Plane down. The projection is the
+  Control Plane decides — key state and capacity grants — it holds a
+  projection it can read with the Control Plane down. The projection is the
   runtime's row because reading it on the hot path is the runtime's job; the
   authority and the record of it are different things, and nothing is owned
-  twice.
+  twice. Not every row the runtime reads is a projection: the catalogue and the
+  client price list are the runtime's **own** configuration, stored where it
+  reads them and administered through the management surface (ADR 0006,
+  section 3) — the rows, not copies of them. The matrix below is where the two
+  cases are told apart, row by row.
 - **The runtime writes no money.** Ledger legs, settlements and funding buckets
   are Control-Plane records, and the runtime's transactions do not touch them
   (ADR 0006, section 2). Where admission used to write a `hold` leg beside its

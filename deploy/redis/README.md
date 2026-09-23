@@ -13,10 +13,11 @@ Valkey persistence is deliberately disabled (`--save "" --appendonly no`): it
 is an implementation boundary for the policy that Redis-compatible state is
 never authoritative. Two PostgreSQL databases in one TimescaleDB cluster own
 the durable state instead, and they own it separately: `control` holds the
-Control Plane's users, keys, subscriptions, entitlements, wallets, ledgers and
-payments, and `dataplane` holds the runtime's catalog, routing and provider
-configuration, its quota and key projections, and its request and usage
-history (ADR 0006 §7). Neither
+Control Plane's accounts, users and key ownership records, plans,
+subscriptions and entitlements, and the accounting working set — funding
+buckets, settlements and their ledger legs — while `dataplane` holds the
+runtime's catalog and provider configuration, its quota and key projections,
+and its request and usage history (ADR 0006 §7). Neither
 application reads the other's database.
 
 ## Decision record

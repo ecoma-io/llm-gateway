@@ -8,9 +8,10 @@
 
 ADRs 0001–0005 design five bounded contexts, four coordinated transactions, a
 reserve-execute-settle accounting model and a two-family storage layout — and
-never say how many processes carry them. The repository ships one Go service
-(`apps/api`), one Vue console and one OpenAPI document, so the implicit answer
-today is "one process, one schema, one contract".
+never say how many processes carry them. At the time of this decision the
+repository shipped one Go service (`apps/api`), one Vue console and one OpenAPI
+document, so the implicit answer was "one process, one schema, one contract" —
+which is the answer this record replaces.
 
 That answer is wrong for what is being built, for reasons that have nothing to
 do with team size:
@@ -275,10 +276,24 @@ console response. Secrets are write-only and opaque wherever they cross a
 boundary. The exact network exposure is a deployment decision; the
 architectural contract is that the management surface is internal.
 
-## Amendments to ADRs 0001, 0004 and 0005
+## Amendments to ADRs 0001, 0003, 0004 and 0005
 
 These ADRs are amended, not superseded. Their domain reasoning stands; what
 changes is the scope of the transactions and which plane owns which row.
+
+**ADR 0003.** Its commerce model — concurrent subscriptions, the allocation
+waterfall, PAYG spilling, the Client PriceList — is untouched. Two of its
+sentences name rows whose plane moved, and both are corrected in place: the
+waterfall's **Reserve** step no longer conditionally updates the funding bucket
+(the bucket is the Control Plane's; admission draws down the runtime's
+projection of it, and the `hold` legs follow from the reservation as a fact),
+and a PAYG spill reads that balance's projection for the same reason. The cycle
+roll is now additionally plane-local rather than only context-local: almost
+every row it writes was already the Control Plane's, and the capacity it grants
+reaches the runtime as a published fact. Its uniqueness key and its
+all-or-nothing property are unchanged, as is the Client PriceList's placement —
+ADR 0003 already called it Catalog-owned, which is why it is a Data-Plane row
+in the matrix.
 
 **ADR 0001.** Rule 1's distinction between aggregate ownership and explicitly
 authorised coordinated transactions is unchanged (issue
@@ -312,7 +327,7 @@ the same transaction as ledger legs" — becomes a two-row statement:
 > values are still maintained in the same transaction as its ledger legs and
 > remain rebuildable from them. Separately, the **Data Plane** holds a _quota
 > projection_ — the lockable capacity row the runtime's admission conditionally
-> updates in the same transaction as its reservation and hold legs. The
+> updates in the same transaction as its reservation and allocation legs. The
 > projection is not a balance: it is the enforcement ceiling for one entitlement
 > cycle or PAYG balance, seeded from Control-Plane grants and updated only by
 > the runtime. Settlement of record happens in the Control Plane from the

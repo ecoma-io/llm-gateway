@@ -130,10 +130,11 @@ Notes for the schema designer:
 ## Transaction map
 
 The four cross-context coordinated transactions (ADR 0001, rule 6), each now
-scoped to a single plane — and nothing else spans contexts. **No transaction
-spans the two databases**: each row below writes one database only, and the
-planes converge through idempotent facts keyed by ID, not through a
-distributed commit (ADR 0006 §5, §7).
+local to a single plane — settlement being two rows, one per side, because it
+is the one the split divides — and nothing else spans contexts. **No
+transaction spans the two databases**: each row below writes one database
+only, and the planes converge through idempotent facts keyed by ID, not
+through a distributed commit (ADR 0006 §5, §7).
 
 | Transaction                           | Plane                 | Tables written                                                                                                                                                                                                           | Guarded invariants     |
 | ------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------- |
@@ -152,7 +153,7 @@ bounded property, and the unique settlement per request is unchanged — the
 customer is charged exactly once (ADR 0006). Admission and release are
 Data-Plane transactions for the same reason, and their `hold` and `release`
 legs are Control-Plane rows written from the reservation as a fact: the
-runtime writes no ledger row at all (ADR 0006 §2).
+runtime writes no ledger row at all (ADR 0006 §3, §7).
 
 Catalog configuration activation (aliases, group versions, price revisions)
 is a coordinated transaction internal to the Catalog context (ADR 0003) —

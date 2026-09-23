@@ -54,8 +54,9 @@ change (contract first, see below), never as scaffolding someone left around.
    nowhere else: the Data Plane never calls the Control Plane, never imports
    its module, never reads its database, and never requires it to be running.
    The Control Plane reaches the Data Plane only through a management call the
-   Data Plane can refuse. `internal/arch` in each Go module fails the build
-   when this is broken — the rule is enforced, not asked for.
+   Data Plane can refuse. `internal/arch` in each Go module fails its `test`
+   target when this is broken — the rule is enforced, not asked for, and the
+   target is part of the required checks.
 5. **Infrastructure stays behind explicit boundaries.** Database access,
    external providers, queues: each lives behind a port in
    `internal/ports/outbound/`, named for what it does, not for what it is, and

@@ -100,8 +100,12 @@ reservations (+ allocation legs)    settlements (+ ledger legs)
   what today's configuration says (invariant 10).
 - The ledger lives here, not in the event family: append-only is a write
   pattern, but the placement rule follows the **consistency requirement** —
-  it must be transactional with bucket capacity and reservations. Its volume
-  is request-rate, not token-rate.
+  it must be transactional with the bucket capacity it moves. Its volume is
+  request-rate, not token-rate. (Before the plane split this clause read "with
+  bucket capacity and reservations"; the requirement is unchanged, but
+  `reservations` are the runtime's rows and now sit in the other database, so
+  what the ledger is transactional with is the bucket it draws down
+  — ADR 0006, and the amendments below.)
 - `reservations` are mutable lifecycle rows (`open → settled | released |
 expired`) with a renewable lease.
 - The list above splits across the two databases, because the plane that writes
@@ -134,8 +138,9 @@ requests        request_attempts        usage_events
   first moment. The row is finalised exactly once (status, timing, the
   committed attempt).
 - Events are never part of an admission or settlement **read** dependency;
-  they are facts written by those transactions (usage events) or by execution
-  (attempts, request finalisation) in the same cluster.
+  they are facts written by the runtime's transactions (usage events, in the
+  Data Plane) or by execution (attempts, request finalisation), all of them in
+  the one cluster the plane they belong to owns.
 - Analytical queries and continuous aggregates read these tables, never the
   relational working set.
 
@@ -187,7 +192,9 @@ is two tables, and the design is wrong, not the rule.
   cluster); if it is unavailable, the event tables are plain time-partitioned
   tables and nothing in the domain model changes.
 - Analytics scale independently of the working set — a slow dashboard query
-  cannot contend with admission — while accounting stays single-transaction.
+  cannot contend with admission — while accounting stays single-transaction
+  **per plane**: the runtime's close is one Data-Plane transaction, and the
+  Control Plane's settlement from that fact is another (ADR 0006).
 - Cross-family references are by ID within the same database — in **both**
   directions: event rows point at relational state (an attempt names its
   candidate's backend), and relational rows point at event rows (a settlement

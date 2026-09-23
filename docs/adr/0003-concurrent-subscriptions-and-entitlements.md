@@ -3,6 +3,8 @@
 - Status: Accepted
 - Date: 2026-09-23
 - Issue: [#5](https://github.com/ecoma-io/llm-gateway/issues/5)
+- Amended by: [ADR 0006](0006-control-plane-and-data-plane.md) — the cycle
+  roll, and the capacity admission reserves, are plane-scoped
 
 ## Context
 
@@ -61,6 +63,13 @@ what concurrent requests can reserve, and when PAYG may be spent.
   account creation (balance zero); enabling is only the spending flag.
   Disabling blocks **new** spills at admission — open holds already secured
   against the bucket still settle normally against it.
+
+  > **Amended by [ADR 0006](0006-control-plane-and-data-plane.md).** The
+  > bucket is a Control-Plane row; what admission spills against is the
+  > runtime's PAYG **quota projection**, seeded from it (ADR 0001, rule 5).
+  > The flag, the blocking rule and the settlement of already-open holds are
+  > unchanged — only the row the spill reads moved planes.
+
 - **Client PriceList** — Catalog-owned price revision that gives exactly one
   input and output unit price to **every active alias**. It is deliberately
   alias-exact, never group-priced, so price selection has no precedence rule
@@ -131,10 +140,19 @@ Cycle arithmetic is fixed so no implementation invents it:
 A subscription cycle roll is one of the four cross-context coordinated
 transactions of ADR 0001 (rule 6): lock the
 subscription; verify state/time/renewal; create each unique entitlement;
-create its funding-capacity projection; append its `grant` ledger legs; update
+create its funding bucket; append its `grant` ledger legs; update
 the cycle fields. It is keyed by `(subscription_id, cycle_number)` and commits
 all of those changes or none. Thus two workers cannot grant a cycle twice, and
 a crash cannot leave quota without its grant history.
+
+> **Amended by [ADR 0006](0006-control-plane-and-data-plane.md).** All of
+> those rows are the Control Plane's, so the roll is now entirely
+> Control-Plane-local — it always was one context's transaction, and the split
+> only pinned it to one **plane** as well. The capacity it grants reaches the
+> runtime as a published fact, seeded into that cycle's quota projection
+> (ADR 0001, rule 5); the projection, not this transaction, is what admission
+> draws down. The uniqueness key and the all-or-nothing property are
+> unchanged.
 
 ### Admission and the allocation waterfall
 
@@ -153,8 +171,20 @@ clock, decides both cycle membership and the effective price revision.
 3. **Reserve** from funding buckets in that order using a conditional update
    on each bucket's materialised available capacity (ADR 0004). A reservation
    may split across several entitlement buckets. The matching rows,
-   allocation rows, hold audit legs, and reservation are one admission
-   transaction — no provider call occurs in it.
+   allocation rows, and reservation are one admission transaction — no
+   provider call occurs in it.
+
+   > **Amended by [ADR 0006](0006-control-plane-and-data-plane.md).** The
+   > conditional update is no longer on the bucket: the bucket is a
+   > Control-Plane row, and the capacity admission draws down is the
+   > runtime's **quota projection** of it, in the Data Plane's database,
+   > inside this same admission transaction (ADR 0001, rule 5). The `hold`
+   > legs and the bucket projections are written in the Control Plane
+   > instead, from the committed reservation as a fact. The waterfall, its
+   > ordering and its all-or-nothing behaviour are unchanged — what changed
+   > is which row the conditional update guards, and which plane writes the
+   > audit legs this step used to write.
+
 4. **Spill to PAYG** only after all matching entitlements: if PAYG is enabled
    **and its available balance covers the whole shortfall**, reserve that
    shortfall there. Otherwise reject the request as `insufficient_entitlement`.

@@ -153,7 +153,7 @@ direction (ADR 0006 §7):
 | ------------ | ------------------------------------------------ | ------------------ | --------------------------------------------------------------------------- |
 | `grant`      | a subscription's grant cycle rolls               | entitlement cycle  | capacity issued for the cycle                                               |
 | `topup`      | operator today, payment provider later (webhook) | PAYG               | funding added                                                               |
-| `hold`       | admission, from the reservation as a fact        | entitlement / PAYG | capacity occupied by a reservation                                          |
+| `hold`       | after admission, from the reservation as a fact  | entitlement / PAYG | capacity occupied by a reservation                                          |
 | `release`    | settlement tail, exhaustion, reaper expiry       | entitlement / PAYG | occupied capacity returned                                                  |
 | `consume`    | settlement                                       | entitlement / PAYG | capacity actually spent                                                     |
 | `adjustment` | explicit operator correction only                | entitlement / PAYG | compensating pair with reason, original ref, and stated settled/held deltas |
@@ -254,10 +254,9 @@ in exactly this crash case; over-billing is not. The asymmetry is deliberate.
 
 - **No locks across provider calls** (ADR 0001, rule 7). Admission,
   settlement, release/compensation and cycle roll — the four cross-context
-  coordinated transactions (ADR 0001, rule 6), each scoped to one plane
-  (ADR 0006) — are short transactions; the in-flight hold is data plus a
-  renewable lease, not a lock, and settlement is now two of them rather than
-  one.
+  coordinated transactions (ADR 0001, rule 6) — are short transactions, and
+  each is now local to one plane, settlement being two of them rather than one
+  (ADR 0006). The in-flight hold is data plus a renewable lease, not a lock.
 - **Capacity guards**: every drawdown is a conditional update
   (`available >= take`) on the capacity row it guards, inside its plane's own
   transaction — the runtime's quota projection at admission, the Control

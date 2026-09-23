@@ -54,8 +54,8 @@ Reference pages: [planes and ownership](planes.md) · [routing](routing.md) ·
 One request's journey through them is specified step by step in
 [request lifecycle](request-lifecycle.md); the four cross-context coordinated
 transactions (admission, settlement, release/compensation, grant-cycle roll)
-are ADR 0001, rule 6, and each is now scoped to one plane — settlement is two
-transactions, one per side (ADR 0006).
+are ADR 0001, rule 6; each is now local to one plane, and settlement — the one
+the split divides — is two transactions, one per side (ADR 0006).
 
 ## Entity catalog
 

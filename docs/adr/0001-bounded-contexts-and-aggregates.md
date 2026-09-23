@@ -34,7 +34,7 @@ identifier only, never by shared tables or shared rows.
 | Identity   | **Account**, **User**, **APIKey**                                                                                              | Who may call the gateway at all.                                        |
 | Catalog    | **ModelAlias** (with its ordered candidates), **Backend**                                                                      | What can be requested and where it can be served from.                  |
 | Execution  | **Request** and its **RequestAttempt** records (append-oriented history, not a mutable aggregate root)                         | What actually happened on the wire, per logical request.                |
-| Commerce   | **Plan**, **Subscription**, **Entitlement**, **PriceList**                                                                     | What an account is allowed and expected to consume, at what price.      |
+| Commerce   | **Plan** (its version carries the recurring price), **Subscription**, **Entitlement**                                          | What an account is allowed and expected to consume, at what price.      |
 | Accounting | **Reservation**, **FundingBucket**, **LedgerEntry**, **UsageEvent** (UsageEvent is an immutable fact, not a mutable aggregate) | How consumption is held, recorded, and settled without double-counting. |
 
 Aggregate rules:
@@ -99,7 +99,7 @@ Aggregate rules:
 
    In the **Data Plane**, the same cycle has a **quota projection**: the
    lockable capacity row the runtime's admission conditionally draws down in
-   the same transaction as its reservation and hold legs. It is not a
+   the same transaction as its reservation and allocation legs. It is not a
    balance, and it is not Accounting-owned — it is the **enforcement
    ceiling** for one cycle or PAYG balance, seeded from Control-Plane grants,
    written only by the runtime, and converging to the ledger by
@@ -109,8 +109,10 @@ Aggregate rules:
 6. **Exactly four cross-context coordinated transactions exist.** They are
    authorised here by name; each writes rows owned by more than one context
    in one short database transaction, and no other database transaction
-   crosses a context boundary. Each is also scoped to a single plane, which
-   is the one thing ADR 0006 changed about them:
+   crosses a context boundary. Three of them are additionally scoped to a
+   single plane, and the fourth — settlement — is the one the split turns
+   into two, one per side. That re-scoping is the one thing ADR 0006 changed
+   about them:
    - **Admission** — create the `Request` shell and its intake record,
      insert the `Reservation` with its allocation legs, conditionally
      reserve quota-projection capacity, start the execution lease. One
@@ -190,7 +192,7 @@ Each term has exactly one owning context (full glossary in
 [../architecture/overview.md](../architecture/overview.md)):
 
 - _request_, _attempt_, _commitment_ — Execution;
-- _alias_, _candidate_, _backend_, _adapter_, _egress_ — Catalog;
+- _alias_, _candidate_, _backend_, _adapter_, _egress_, _price list_ — Catalog;
 - _subscription_, _entitlement_, _plan_, _PAYG_ — Commerce;
 - _reservation_, _settlement_, _usage event_, _ledger entry_, _funding
   bucket_ — Accounting;
@@ -222,7 +224,8 @@ A document or schema using a synonym where a glossary term exists is a defect.
   context boundary inside one plane is still a local transaction while a
   message that crosses a plane boundary is never one.
 - The rules above are now **mechanically enforced**, which is what makes them
-  unusually safe to have moved. Each application's build fails on a domain
+  unusually safe to have moved. Each application's test gate fails — under
+  `go test`, in `internal/arch`, before the build is any use — on a domain
   package reaching for a driver or a framework client, on an application
   package importing a concrete adapter, and on one module requiring
   another's; each application's route table is compared against its own
