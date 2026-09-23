@@ -192,9 +192,13 @@ Runs the whole integration suite — startup, connectivity, migration
 application, validation, transaction behaviour, a migration that fails
 mid-file (proved to roll back whole, record itself dirty, refuse further
 runs, and recover through `force`), clean rollback — against the real
-database, and leaves the database migrated and running. CI's persistence
-lane, when the workflow-owning change wires it in, runs exactly this
-script.
+database, and leaves the database migrated and running. CI runs this exact
+command: the `Verify (persistence)` job in
+[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) executes it on
+a runner whose preinstalled Docker and compose plugin meet the
+[requirements](#requirements) above, and `ci-gate` — the required check a
+branch ruleset enforces — fails unless that job passed. One script, one
+definition of green, for a contributor and for the pipeline alike.
 
 ## What is deliberately not here
 
@@ -204,8 +208,5 @@ script.
 - No production deployment. This compose project is a development database;
   how the store runs in production is a deployment decision that has not
   been made yet, and this file will not pre-make it.
-- No CI workflow changes. The suite is written to be that lane verbatim
-  (`bash deploy/postgres/verify.sh`), but `.github/workflows/` is owned by
-  another change — wiring it in is one step, documented here, not done here.
 - No host-installed tools. Everything runs from pinned images, so the only
   version that matters is the one written in `compose.yaml`.

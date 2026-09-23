@@ -273,6 +273,24 @@ jobs:
           REDIS_ADDRESS: 127.0.0.1:6379
         run: pnpm exec moon run api:test-integration
 
+  verify-persistence:
+    name: Verify (persistence)
+    # The database foundation's one definition of green, run verbatim: the
+    # same `bash deploy/postgres/verify.sh` a contributor runs, against the
+    # same pinned TimescaleDB — startup, migration application and rollback,
+    # transaction semantics, dirty-state refusal and recovery. What the suite
+    # proves and why each step exists: deploy/postgres/README.md. Docker and
+    # the compose plugin are preinstalled on the runner, so the job needs no
+    # toolchain setup beyond the checkout — no Node, no Go, no full history.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: bash deploy/postgres/verify.sh
+
   ci-gate:
     name: ci-gate
     # The single check name a branch ruleset requires, on pull requests and in
@@ -280,7 +298,7 @@ jobs:
     # while the job list is not: add a job to `needs` and the gate tightens
     # without anyone editing repository settings — and forgetting to add it is
     # the only way to widen what green means, which is visible in this file.
-    needs: [verify-web, verify-api]
+    needs: [verify-web, verify-api, verify-persistence]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
