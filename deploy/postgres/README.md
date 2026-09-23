@@ -11,7 +11,10 @@ for the OLTP domains, hypertables for the time-series workloads. Which
 tables belong to which family is not decided here —
 [ADR 0005](../../docs/adr/0005-relational-and-event-storage-split.md) set
 the placement rule, and every future migration applies it. Not every table
-becomes a hypertable.
+becomes a hypertable. The extension and the hypertables belong to the
+`dataplane` database, because the high-volume time-series facts are the
+runtime's; the Control Plane's database is relational tables only
+([ADR 0006 §7](../../docs/adr/0006-control-plane-and-data-plane.md)).
 
 **One cluster, two databases.** `control` belongs to the Control Plane API
 (`apps/console-api`) and `dataplane` to the runtime (`apps/dataplane`) — the
@@ -19,9 +22,12 @@ split [ADR 0006 §7](../../docs/adr/0006-control-plane-and-data-plane.md)
 decides. It is not filing: PostgreSQL has no cross-database query, so "neither
 application reads the other plane's tables" is enforced by the engine rather
 than by review, and there is no query anyone could write to break it. The two
-migration lanes under [`migrations/`](../../migrations) mirror the two
-databases exactly, and `migrations/README.md` states the rule that ties them
-together. Both databases are created by
+migration lanes mirror the two databases exactly, and the lane directory is
+the database name — `migrations/control/`, `migrations/dataplane/` — so a
+file's directory is also the deployment decision about where it runs; only the
+Data Plane's lane exists so far, and `migrations/README.md` states the rule
+that ties the two together and why an empty Control Plane lane would be worse
+than a missing one. Both databases are created by
 [`initdb/`](initdb/10-create-plane-databases.sh), on the first start of an
 empty volume.
 

@@ -54,16 +54,17 @@ change (contract first, see below), never as scaffolding someone left around.
    nowhere else: the Data Plane never calls the Control Plane, never imports
    its module, never reads its database, and never requires it to be running.
    The Control Plane reaches the Data Plane only through a management call the
-   Data Plane can refuse. `internal/arch` in each Go module fails the build
-   when this is broken — the rule is enforced, not asked for.
+   Data Plane can refuse. `internal/arch` in each Go module fails its `test`
+   target when this is broken — the rule is enforced, not asked for, and the
+   target is part of the required checks.
 5. **Infrastructure stays behind explicit boundaries.** Database access,
    external providers, queues: each lives behind a port in
    `internal/ports/outbound/`, named for what it does, not for what it is, and
    is implemented under `internal/adapters/outbound/`. A change that reaches
    for an infrastructure client from application code widens that boundary —
    widen it on purpose, in the diff, or not at all.
-6. **Behavioural changes arrive with tests.** A change to what the service or
-   the console does lands with a test that fails without it. A green suite
+6. **Behavioural changes arrive with tests.** A change to what an application
+   or the console does lands with a test that fails without it. A green suite
    that cannot go red is not coverage.
 7. **Database changes are migrations.** Schema arrives as a file in the lane
    of the plane that owns it — `migrations/control/` or
@@ -98,8 +99,9 @@ on commit, tests and the graph on push, commitlint on the message.
 ## Commits
 
 [Conventional Commits](https://www.conventionalcommits.org/), with the scope
-naming where the change lands (`console`, `api`, `openapi`, `workspace`, `docs`,
-`deps`, `ci` — optional when the change owns no surface). The pull request
+naming where the change lands (`console`, `console-api`, `dataplane`,
+`dataplane-api`, `openapi`, `workspace`, `docs`, `deps`, `ci` — optional when
+the change owns no surface). The pull request
 title becomes the squash commit's subject, so it is held to the same rule.
 AI-assisted commits carry a trailer — `Assisted-by: <tool>` or
 `Generated-by: <tool>` — one per pull request, on the last commit.
@@ -107,7 +109,7 @@ AI-assisted commits carry a trailer — `Assisted-by: <tool>` or
 ## Execution order for coding agents
 
 1. Read this file, then CONTRIBUTING.md, then the files your change touches.
-2. Make the change: contract first when the API surface moves, tests beside
+2. Make the change: contract first when an API surface moves, tests beside
    the behaviour, migrations for schema.
 3. Run the gates — `pnpm format:check && pnpm lint && pnpm test && pnpm typecheck && pnpm build` — and the Go
    tests directly if you touched a Go module (`cd apps/console-api && go test ./...`,

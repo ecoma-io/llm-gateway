@@ -24,11 +24,14 @@ that is not recorded as an ADR has not been made.
 ## Architecture pages
 
 Reference pages for the designed domain model the ADRs produce — the picture
-an engineer needs before writing migrations or the API contract. They describe
-the design, not shipped behaviour: the domains they cover are not built yet.
+an engineer needs before writing migrations or a contract under `api/openapi/`.
+They describe the design, not shipped behaviour: the domains they cover are
+not built yet.
 
 - [Overview](architecture/overview.md) — the five bounded contexts; what
   exists, what owns what, and what words mean
+- [Planes and ownership](architecture/planes.md) — the four applications, and
+  the record-by-record ownership matrix the two planes are built from
 - [Routing](architecture/routing.md) — the routing pipeline, its policy inputs
   and egress ownership
 - [Request lifecycle](architecture/request-lifecycle.md) — what happens to one

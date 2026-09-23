@@ -30,6 +30,14 @@ Every pass through ③ is one `RequestAttempt` row; retries inside ③ append
 additional attempt rows against the **same** candidate. ⑤ never happens once
 a response is committed.
 
+Steps ①–⑥ run inside `apps/dataplane`, the Data Plane runtime, and nowhere
+else. Alias resolution and the configuration it reads — aliases, candidates,
+backend and egress policy — come from the runtime's own persistence and
+cache, never from a per-request call to a management API: an LLM request
+reaches the runtime and the provider behind it, and the Control Plane being
+down does not make a `/v1/*` request fail
+([ADR 0006](../adr/0006-control-plane-and-data-plane.md) §4).
+
 ## Layer ownership
 
 ```text
@@ -41,6 +49,18 @@ a response is committed.
 │ Egress        proxy pools, rotation, health; invisible above this line           │
 └───────────────────────────────────────────────────────────────┘
 ```
+
+All three layers live in one place. `apps/dataplane` — the Data Plane runtime
+— is their only home: the runtime is the process that serves `/v1/*`, so there
+is no second implementation of the router, the adapters or egress, and no
+plane for one to drift into. `console-api` owns the Control Plane — identity,
+commerce, the console's orchestration — and never gains a routing type; when
+the console needs a Data Plane operation it goes through the management
+surface, `dataplane-api`, which configures this domain rather than
+re-implementing it ([ADR 0006](../adr/0006-control-plane-and-data-plane.md)
+§§3, 9). The separation is mechanical rather than conventional: each backend
+is its own Go module, so a routing type here does not compile into the Control
+Plane, and architecture tests assert the rest (§4).
 
 Hard rules (ADR 0002):
 
@@ -119,10 +139,16 @@ The router may consider, in addition to candidate order (all derivable from
 the model as it stands, or explicitly deferred):
 
 - candidate/backend state (`active` \| `disabled`) — a disabled backend is
-  skipped, not removed. (Quota is not a selection input: the reservation is
+  skipped, not removed. Quota is not a selection input: the reservation is
   sized and secured at admission, before any candidate is chosen —
   [request lifecycle](request-lifecycle.md) — so every candidate of an
-  admitted request is servable.)
+  admitted request is servable. That admission is **Data-Plane-local**: the
+  runtime conditionally draws down its own **quota projection**, the
+  enforcement ceiling for the entitlement cycle or PAYG balance the request
+  lands in, seeded from Control-Plane grants and updated only by the runtime
+  — while the ledger bucket it will eventually settle against is the Control
+  Plane's, and remains the source of truth for money
+  ([ADR 0006](../adr/0006-control-plane-and-data-plane.md); [accounting](accounting.md)).
 
 Deliberately **not** in the model yet: weights, cost-based load balancing,
 latency-based scoring, per-candidate traffic splits, and cooldowns

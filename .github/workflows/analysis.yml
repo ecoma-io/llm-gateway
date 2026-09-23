@@ -122,8 +122,8 @@ jobs:
       # pass beside this one, and the scaffold's honesty is the reason this
       # workflow does not pretend that day has come.
       #
-      # `p/javascript` for the console, `p/golang` for the API, and
-      # `p/github-actions` for the half that runs CI.
+      # `p/javascript` for the console, `p/golang` for the three Go
+      # applications, and `p/github-actions` for the half that runs CI.
       - name: Scan
         run: >-
           semgrep scan --config p/javascript --config p/golang

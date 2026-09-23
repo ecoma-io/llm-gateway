@@ -30,19 +30,19 @@ is because that step was skipped. Do not skip it.
 
 ## The commands
 
-| Command                  | What it does                                                                                           |
-| ------------------------ | ------------------------------------------------------------------------------------------------------ |
-| `pnpm format`            | Prettier, in place                                                                                     |
-| `pnpm format:check`      | Prettier, read-only — what CI runs                                                                     |
-| `pnpm lint`              | Every project's `lint` target through Moon — ESLint for the console, gofmt + golangci-lint for the API |
-| `pnpm test`              | Every project's `test` target through Moon — Vitest for the console, `go test` for the API             |
-| `pnpm typecheck`         | Every project's `typecheck` target through Moon — `vue-tsc --noEmit` and `go build ./...`              |
-| `pnpm build`             | Every project's `build` target through Moon — `vite build` and the gateway binary                      |
-| `pnpm check-projects`    | Asserts every `apps/*` and `packages/*` directory is a project Moon can see, with the four targets     |
-| `pnpm dev:console`       | The console's Vite dev server                                                                          |
-| `pnpm dev:console-api`   | The Control Plane API (`go run ./cmd/console-api` on :8080)                                            |
-| `pnpm dev:dataplane`     | The Data Plane runtime (`go run ./cmd/dataplane` on :8081)                                             |
-| `pnpm dev:dataplane-api` | The Data Plane management API (`go run ./cmd/dataplane-api` on :8082)                                  |
+| Command                  | What it does                                                                                                       |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `pnpm format`            | Prettier, in place                                                                                                 |
+| `pnpm format:check`      | Prettier, read-only — what CI runs                                                                                 |
+| `pnpm lint`              | Every project's `lint` target through Moon — ESLint for the console, gofmt + golangci-lint for the Go applications |
+| `pnpm test`              | Every project's `test` target through Moon — Vitest for the console, `go test` for the Go applications             |
+| `pnpm typecheck`         | Every project's `typecheck` target through Moon — `vue-tsc --noEmit` and `go build ./...`                          |
+| `pnpm build`             | Every project's `build` target through Moon — `vite build` and the Go binaries                                     |
+| `pnpm check-projects`    | Asserts every `apps/*` and `packages/*` directory is a project Moon can see, with the four targets                 |
+| `pnpm dev:console`       | The console's Vite dev server                                                                                      |
+| `pnpm dev:console-api`   | The Control Plane API (`go run ./cmd/console-api` on :8080)                                                        |
+| `pnpm dev:dataplane`     | The Data Plane runtime (`go run ./cmd/dataplane` on :8081)                                                         |
+| `pnpm dev:dataplane-api` | The Data Plane management API (`go run ./cmd/dataplane-api` on :8082)                                              |
 
 A `Makefile` at the root spells the same commands as `make` targets
 (`make lint`, `make go-test`, …) — aliases, not a second definition. And a
@@ -100,11 +100,12 @@ commitlint.
 `ci`, `chore`, `revert`.
 
 **Scope is optional**, and when used it names where the change lands: `console`
-(the Vue app), `api` (the Go service), `openapi` (the contract), `workspace`
-(the repository and its tooling), `docs`, `deps`, `ci`.
+(the Vue app), `console-api`, `dataplane`, `dataplane-api` (the three Go
+applications, one scope each), `openapi` (the contracts), `workspace` (the
+repository and its tooling), `docs`, `deps`, `ci`.
 
 ```
-feat(api): proxy a completion request to a provider
+feat(dataplane): proxy a completion request to a provider
 fix(console): keep the token field masked after a failed submit
 chore(workspace): scaffold llm gateway monorepo
 ```

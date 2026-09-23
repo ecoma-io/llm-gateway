@@ -8,9 +8,10 @@
 
 ADRs 0001–0005 design five bounded contexts, four coordinated transactions, a
 reserve-execute-settle accounting model and a two-family storage layout — and
-never say how many processes carry them. The repository ships one Go service
-(`apps/api`), one Vue console and one OpenAPI document, so the implicit answer
-today is "one process, one schema, one contract".
+never say how many processes carry them. At the time of this decision the
+repository shipped one Go service (`apps/api`), one Vue console and one OpenAPI
+document, so the implicit answer was "one process, one schema, one contract" —
+which is the answer this record replaces.
 
 That answer is wrong for what is being built, for reasons that have nothing to
 do with team size:
@@ -123,6 +124,15 @@ client port in the runtime, no management route literals in the runtime).
 | -------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------- |
 | Control → Data | Configuration and grants: aliases, backends, price revisions, entitlements, key projections | the entity's own identifier — idempotent |
 | Data → Control | Usage facts and quota consumption: what was delivered, what was held                        | `request_id` — idempotent                |
+
+The first row crosses in two different senses, and the difference matters.
+Catalog configuration — aliases, candidates, backends, price revisions — is
+**stored where the runtime reads it**, in the Data Plane's own database, and
+crosses as an instruction written through the management surface (section 3).
+Entitlements and key projections cross as records, because the Control Plane is
+their authority. The row states a direction, not where a record lives; the
+record-by-record answer is the matrix in
+[../architecture/planes.md](../architecture/planes.md).
 
 Rules that follow:
 
@@ -266,10 +276,24 @@ console response. Secrets are write-only and opaque wherever they cross a
 boundary. The exact network exposure is a deployment decision; the
 architectural contract is that the management surface is internal.
 
-## Amendments to ADRs 0001, 0004 and 0005
+## Amendments to ADRs 0001, 0003, 0004 and 0005
 
 These ADRs are amended, not superseded. Their domain reasoning stands; what
 changes is the scope of the transactions and which plane owns which row.
+
+**ADR 0003.** Its commerce model — concurrent subscriptions, the allocation
+waterfall, PAYG spilling, the Client PriceList — is untouched. Two of its
+sentences name rows whose plane moved, and both are corrected in place: the
+waterfall's **Reserve** step no longer conditionally updates the funding bucket
+(the bucket is the Control Plane's; admission draws down the runtime's
+projection of it, and the `hold` legs follow from the reservation as a fact),
+and a PAYG spill reads that balance's projection for the same reason. The cycle
+roll is now additionally plane-local rather than only context-local: almost
+every row it writes was already the Control Plane's, and the capacity it grants
+reaches the runtime as a published fact. Its uniqueness key and its
+all-or-nothing property are unchanged, as is the Client PriceList's placement —
+ADR 0003 already called it Catalog-owned, which is why it is a Data-Plane row
+in the matrix.
 
 **ADR 0001.** Rule 1's distinction between aggregate ownership and explicitly
 authorised coordinated transactions is unchanged (issue
@@ -278,19 +302,23 @@ and this ADR adds one rule above it: **no transaction crosses a plane
 boundary**. Rule 6's four coordinated transactions are re-scoped to the plane
 that owns their rows:
 
-| Transaction          | Scope now                                                                                                                                                                                                          |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Admission            | **Data-Plane-local**: request shell and intake, reservation with allocation legs, conditional drawdown of the runtime's quota projection, hold legs, execution lease                                               |
-| Settlement           | **Split by plane**: the runtime writes the usage fact and closes its reservation; the Control Plane writes the settlement, its ledger legs and its bucket projections from that fact, idempotently by `request_id` |
-| Release/compensation | **Data-Plane-local** against the runtime's projection; the Control Plane learns of it as a fact                                                                                                                    |
-| Grant-cycle roll     | Unchanged — already Control-local (Commerce + Accounting) — and it additionally publishes the new capacity to the runtime's projection                                                                             |
+| Transaction          | Scope now                                                                                                                                                                                                                                                           |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Admission            | **Data-Plane-local**: request shell and intake, reservation with allocation legs, conditional drawdown of the runtime's quota projection, execution lease; the hold legs and bucket projections follow in the Control Plane, derived from the committed reservation |
+| Settlement           | **Split by plane**: the runtime writes the usage fact and closes its reservation; the Control Plane writes the settlement, its ledger legs and its bucket projections from that fact, idempotently by `request_id`                                                  |
+| Release/compensation | **Data-Plane-local** against the runtime's projection; the Control Plane learns of it as a fact                                                                                                                                                                     |
+| Grant-cycle roll     | Unchanged — already Control-local (Commerce + Accounting) — and it additionally publishes the new capacity to the runtime's projection                                                                                                                              |
 
 Rule 5 is amended the same way: the **ledger's** bucket is Accounting's and
 lives in `control`; the **capacity the runtime enforces** is a Data-Plane-owned
 projection whose only writer is the runtime, seeded by Control-Plane grants.
-Rule 7 ("no transaction open while a provider call is in flight") and rule 8
-("Catalog and Identity are read-mostly on the hot path") are unchanged, and rule
-8 becomes literal: the runtime reads a snapshot it holds, not a table it shares.
+Rule 7 ("no transaction open while a provider call is in flight") is unchanged.
+Rule 8 ("Catalog and Identity are read-mostly on the hot path") is unchanged in
+its conclusion and sharpened in its reasoning: the catalog the runtime resolves
+against is its own configuration, stored where it reads it (section 3), and
+Identity reaches the hot path as a projection of key state the runtime holds
+(section 8). Neither is a cross-plane read, and neither needs this plane to be
+up.
 
 **ADR 0004.** Its load-bearing atomicity sentence — "the cache is maintained in
 the same transaction as ledger legs" — becomes a two-row statement:
@@ -299,7 +327,7 @@ the same transaction as ledger legs" — becomes a two-row statement:
 > values are still maintained in the same transaction as its ledger legs and
 > remain rebuildable from them. Separately, the **Data Plane** holds a _quota
 > projection_ — the lockable capacity row the runtime's admission conditionally
-> updates in the same transaction as its reservation and hold legs. The
+> updates in the same transaction as its reservation and allocation legs. The
 > projection is not a balance: it is the enforcement ceiling for one entitlement
 > cycle or PAYG balance, seeded from Control-Plane grants and updated only by
 > the runtime. Settlement of record happens in the Control Plane from the
@@ -319,8 +347,10 @@ rejecting a split "because it forces a transactional outbox between a charge
 and its usage fact":
 
 > **Amended by ADR 0006.** The event family (`requests`, `request_attempts`,
-> `usage_events`) lives in the Data Plane's database; the relational working set
-> lives in the Control Plane's. The outbox objection is answered by inverting
+> `usage_events`) lives in the Data Plane's database, beside the runtime's own
+> relational rows — `request_intake`, `reservations`, the API-key records — while
+> the Control Plane's relational working set stays in its own. The outbox
+> objection is answered by inverting
 > the dependency rather than by ignoring it: the usage fact is not downstream of
 > the charge, it is the **authority the charge is derived from**, written by the
 > process that observed it, and the Control Plane settles from it idempotently
