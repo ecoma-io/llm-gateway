@@ -16,13 +16,14 @@ Closes #
 
 ## Contract impact
 
-<!-- The OpenAPI document (api/openapi/openapi.yaml) is the contract. Say what
-a consumer of the API sees after this change — and which consumer, because the
-document describes more than one surface today and will describe three
-separate ones. Write "none" explicitly rather than leaving it out. -->
+<!-- The OpenAPI documents under api/openapi/ are the contract, one per
+boundary. Say what a consumer sees after this change — and which consumer,
+because the three describe different surfaces: the console's API, the Data
+Plane's management API, and the OpenAI-compatible runtime. Write "none"
+explicitly rather than leaving it out. -->
 
 - [ ] No API surface changes
-- [ ] The API surface changes, and the change is described above and reflected in `api/openapi/openapi.yaml`
+- [ ] The API surface changes, and the change is described above and reflected in the contract that owns it (`api/openapi/{console,dataplane,runtime}.yaml`)
 
 ## How this was verified
 

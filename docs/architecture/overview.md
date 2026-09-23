@@ -1,8 +1,8 @@
 # Gateway domain model — overview
 
 This is the reference model of the gateway's business domains. It is the
-picture an engineer needs before writing `migrations/` or
-`api/openapi/openapi.yaml`: what exists, what owns what, and what words mean.
+picture an engineer needs before writing `migrations/` or a contract under
+`api/openapi/`: what exists, what owns what, and what words mean.
 The decisions behind it are recorded as ADRs and cited throughout; when this
 page and an ADR ever disagree, the ADR wins and this page is wrong.
 

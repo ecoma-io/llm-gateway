@@ -1,0 +1,80 @@
+# The error envelope every one of the gateway's three contracts returns, and
+# the 405 response built from it.
+#
+# Like its sibling `probes.yaml`, this is a fragment: a `components:` tree the
+# three contracts reference by relative path. The envelope is shared because it
+# is the one thing a caller of any surface handles identically — and because
+# the console's generated client parses the Control Plane's errors with the
+# same type the runtime's callers will parse its own.
+#
+# The `code` enum is deliberately one list for all three documents. A code
+# exists in the contract before it can be returned: `not_implemented` is
+# declared here, and today exactly one operation can produce it — the runtime's
+# `POST /v1/chat/completions`, which is contracted and not built. A code that
+# appeared only in the document where it is returned would be a code the other
+# surfaces' clients could not name.
+components:
+  responses:
+    MethodNotAllowed:
+      description: The resource exists but does not accept the request method.
+      headers:
+        Allow:
+          description: The methods supported by this resource.
+          required: true
+          schema:
+            type: string
+            example: GET, HEAD
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    NotImplemented:
+      description: >-
+        The endpoint is part of the contract and is not implemented. The
+        gateway answers it rather than leaving it unrouted, so a caller can
+        tell "not built yet" apart from "not a path" — the first is a 501 with
+        this code, the second a 404 with `not_found`.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required:
+        - error
+        - request_id
+      properties:
+        error:
+          $ref: "#/components/schemas/Error"
+        request_id:
+          $ref: "./probes.yaml#/components/schemas/RequestId"
+      additionalProperties: false
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          enum:
+            - not_found
+            - method_not_allowed
+            - not_implemented
+            - internal
+          description: >-
+            A stable machine-readable category for the failure. The list is
+            shared by all three contracts; `not_implemented` is returned only
+            by the runtime's contracted-but-unbuilt endpoint.
+        message:
+          type: string
+          description: >-
+            A human-readable explanation safe to present to a client. Internal
+            implementation details and stack traces never appear here.
+      additionalProperties: false

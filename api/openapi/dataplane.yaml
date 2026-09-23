@@ -1,0 +1,99 @@
+# The Data Plane management API contract: the Data Plane's administrative
+# surface, which is internal. It is reachable from the Control Plane and from
+# nobody else (ADR 0006 §11).
+#
+# There is no generated client for this document and no browser is meant to
+# see it. It is written down anyway, and for the same reason the other two are:
+# a surface without a contract is a surface whose shape is decided by whichever
+# implementation touches it last. What the contract buys here is narrower than
+# on the console's side — no public consumer, no published client — but it is
+# the same thing in kind: an answer to "what does this application serve",
+# stated once, ahead of the code.
+#
+# The runtime is not here. `POST /v1/chat/completions` and the rest of the
+# OpenAI-compatible surface belong to `runtime.yaml` and to a different
+# process: a management API sized for administrative traffic must never be on
+# the LLM request path, and a contract that carried both would be the first
+# place that assumption stopped being visible.
+openapi: 3.1.0
+info:
+  title: Ecoma LLM Gateway — Data Plane management API
+  version: 0.1.0
+  description: >-
+    Health and readiness probes plus the common HTTP boundary of the Ecoma LLM
+    Gateway's Data Plane management API. This surface is internal: it is called
+    by the Control Plane and is not published to callers of the gateway. Every
+    response returns X-Request-Id. An unmatched path returns the ErrorEnvelope
+    with HTTP 404; a method unsupported by a known path returns it with HTTP
+    405. The Data Plane's administrative endpoints are not designed yet; this
+    document carries the surface that exists and the process every later
+    endpoint follows.
+servers:
+  - url: /
+paths:
+  /healthz:
+    get:
+      operationId: getHealth
+      summary: Liveness of the Data Plane management process
+      description: >-
+        Returns 200 while the process is able to serve. Anything more than
+        "is the process alive" belongs to /readyz, not here.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The process is alive.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/probes.yaml#/components/schemas/HealthStatus"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+  /readyz:
+    get:
+      operationId: getReadiness
+      summary: Readiness of the Data Plane management service
+      description: >-
+        Returns 200 when the service may receive traffic. The scaffold has no
+        dependencies, so it is always ready. This application holds no state of
+        its own and reads no database, so its readiness check is about reaching
+        the Data Plane it manages — not about a connection this process owns.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The service is ready to receive traffic.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/probes.yaml#/components/schemas/HealthStatus"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+  /version:
+    get:
+      operationId: getVersion
+      summary: Build version of the Data Plane management service
+      description: >-
+        Returns the version stamped into the dataplane-api binary at build time.
+        It is the repository release version when the release lane supplies
+        one, and "dev" for an unstamped local build.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The build version of the Data Plane management service.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/probes.yaml#/components/schemas/Version"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"

@@ -50,7 +50,7 @@ single project's targets run directly:
 
 ```bash
 pnpm exec moon run console:lint console:test console:typecheck console:build
-pnpm exec moon run api-client:lint api-client:test api-client:typecheck api-client:build
+pnpm exec moon run console-api-client:lint console-api-client:test console-api-client:typecheck console-api-client:build
 pnpm exec moon run console-api:lint console-api:test console-api:typecheck console-api:build
 pnpm exec moon run dataplane:lint dataplane:test dataplane:typecheck dataplane:build
 pnpm exec moon run dataplane-api:lint dataplane-api:test dataplane-api:typecheck dataplane-api:build
@@ -144,11 +144,18 @@ red. A test nobody has seen fail is a test nobody knows can.
 
 ## The contract
 
-`api/openapi/openapi.yaml` is the API contract, and it moves first: a new
-endpoint's shape is written there and reviewed before (or with) the
-implementation, never discovered in code review after it. Where practical, the
-console binds to types generated from the document rather than hand-written
-copies of it — see [AGENTS.md](AGENTS.md), "The rules".
+There are three contracts under `api/openapi/`, one per boundary:
+`console.yaml` for the console's API, `dataplane.yaml` for the Data Plane's
+management API, and `runtime.yaml` for the OpenAI-compatible runtime. The
+wire shapes all three return — the error envelope, the request ID, the probe
+schemas — live once in `shared/` and are referenced by relative `$ref`, so a
+caller who learns a shape on one surface has learned it on all of them.
+
+The owning contract moves first: a new endpoint's shape is written there and
+reviewed before (or with) the implementation, never discovered in code review
+after it. Where practical, the console binds to types generated from
+`console.yaml` rather than hand-written copies of it — see
+[AGENTS.md](AGENTS.md), "The rules".
 
 Database schema lands as migrations in the lane that owns it —
 `migrations/control/` or `migrations/dataplane/`, one directory per

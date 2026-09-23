@@ -241,9 +241,9 @@ importers:
 
   apps/console:
     dependencies:
-      '@ecoma-io/llm-gateway-api-client':
+      '@ecoma-io/llm-gateway-console-api-client':
         specifier: workspace:*
-        version: link:../../packages/api-client
+        version: link:../../packages/console-api-client
       '@ecoma-io/loom':
         specifier: ^0.8.3
         version: 0.8.3(@lucide/vue@1.47.0(vue@3.5.43(typescript@6.0.3)))(vue@3.5.43(typescript@6.0.3))
@@ -260,7 +260,7 @@ importers:
         specifier: ^5.3.1
         version: 5.3.1(@vue/compiler-sfc@3.5.43)(pinia@4.0.3(@vue/devtools-api@8.2.1)(typescript@6.0.3)(vue@3.5.43(typescript@6.0.3)))(rolldown@1.2.9)(vite@8.3.0(@types/node@26.6.2)(jiti@2.6.1)(yaml@2.9.1))(vue@3.5.43(typescript@6.0.3))
 
-  packages/api-client:
+  packages/console-api-client:
     devDependencies:
       '@hey-api/openapi-ts':
         specifier: 0.99.0
@@ -3963,7 +3963,7 @@ snapshots:
       dotenv: 17.4.2
       exsolve: 1.1.1
       giget: 3.3.1
-      jiti: 2.6.1
+      jiti: 2.7.0
       ohash: 2.0.12
       pathe: 2.0.3
       perfect-debounce: 2.1.0

@@ -1,0 +1,101 @@
+# The Console API contract: the Control Plane's public surface, and the only
+# one of the gateway's three contracts a browser reaches.
+#
+# This document is the whole of what a console client can see. Nothing on the
+# Data Plane's runtime appears here, deliberately: an inference request is not
+# a browser call, and a client generated from this document has no type for one
+# to be made with (ADR 0006 §4, §5). The Data Plane's management API is absent
+# for the same reason in the other direction — it is internal, and a public
+# contract that described it would be describing a surface nobody outside the
+# deployment may call (§11).
+#
+# `packages/console-api-client` is generated from this file and from nothing
+# else, so the boundary between the two planes is legible in the client's type
+# surface rather than only in this comment.
+#
+# The gateway's product domains (accounts, keys, subscriptions, usage) are not
+# designed yet. When one arrives, its contract changes here first and the
+# implementation follows it, never the reverse — see AGENTS.md, "The API
+# contract is the OpenAPI document".
+openapi: 3.1.0
+info:
+  title: Ecoma LLM Gateway — Console API
+  version: 0.1.0
+  description: >-
+    Health and readiness probes plus the common HTTP boundary of the Ecoma LLM
+    Gateway's Control Plane API, which serves the console. Every response
+    returns X-Request-Id. An unmatched path returns the ErrorEnvelope with HTTP
+    404; a method unsupported by a known path returns it with HTTP 405. The
+    Control Plane's product endpoints are not designed yet; this document
+    carries the surface that exists and the process every later endpoint
+    follows.
+servers:
+  - url: /
+paths:
+  /healthz:
+    get:
+      operationId: getHealth
+      summary: Liveness of the Control Plane API process
+      description: >-
+        Returns 200 while the process is able to serve. Anything more than
+        "is the process alive" belongs to /readyz, not here.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The process is alive.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/probes.yaml#/components/schemas/HealthStatus"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+  /readyz:
+    get:
+      operationId: getReadiness
+      summary: Readiness of the Control Plane API service
+      description: >-
+        Returns 200 when the service may receive traffic. The scaffold has no
+        dependencies, so it is always ready; the Control Plane's own dependency
+        checks — its database, its cache — hang off this endpoint. The Data
+        Plane is not among them: this service is ready when it can serve the
+        console, whether or not the runtime is reachable.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The service is ready to receive traffic.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/probes.yaml#/components/schemas/HealthStatus"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+  /version:
+    get:
+      operationId: getVersion
+      summary: Build version of the Control Plane API service
+      description: >-
+        Returns the version stamped into the console-api binary at build time.
+        It is the repository release version when the release lane supplies
+        one, and "dev" for an unstamped local build.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The build version of the Control Plane API service.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/probes.yaml#/components/schemas/Version"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"

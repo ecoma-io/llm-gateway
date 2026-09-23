@@ -25,7 +25,7 @@
 // repository carries are handwritten with a stable two-space shape, and the
 // scan below asserts the four task keys at that indent plus an `id:` matching
 // the directory's name — which is what the CI rosters (`console:*`,
-// `console-api:*`, `dataplane:*`, `dataplane-api:*`, `api-client:*`) and the
+// `console-api:*`, `dataplane:*`, `dataplane-api:*`, `console-api-client:*`) and the
 // workspace globs in `.moon/workspace.yml` route on. A
 // real YAML parser would be a dependency bought to re-state those two facts.
 

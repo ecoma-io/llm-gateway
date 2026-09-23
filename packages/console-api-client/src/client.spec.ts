@@ -1,7 +1,7 @@
 // These tests are the seam between the contract and the console: they pin
 // what the generated client actually does (request shape, URL composition,
 // result semantics) and what the generated types actually are. If
-// api/openapi/openapi.yaml drifts and the client is regenerated, the type
+// api/openapi/console.yaml drifts and the client is regenerated, the type
 // assertions below are what turns the drift red before the console compiles
 // against a shape the service no longer produces.
 import { describe, expect, expectTypeOf, it, vi } from "vitest";

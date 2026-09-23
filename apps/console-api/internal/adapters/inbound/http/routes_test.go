@@ -23,10 +23,16 @@ var inferenceSurface = []string{
 }
 
 // TestTheSurfaceIsTheDeclaredSet pins what this application serves. It fails
-// on an endpoint added without a decision: the table, this list and
-// api/openapi/openapi.yaml move together, and a new row is one edit in each.
-// It is deliberately an equality rather than a subset — a route silently
-// dropped is as much a defect as one silently added.
+// on an endpoint added without a decision: the table and this list move
+// together, and a new row is one edit in each. It is deliberately an equality
+// rather than a subset — a route silently dropped is as much a defect as one
+// silently added.
+//
+// The document is the other half of that decision and is checked by
+// contract_test.go, which compares this same table against
+// api/openapi/console.yaml in both directions. This list makes adding an
+// endpoint a deliberate act; that test is what notices the document moving
+// alone.
 func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 	got := []string{}
 	for _, rt := range routes(application.New("test")) {

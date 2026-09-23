@@ -13,9 +13,9 @@
 #
 # `build` is not a bundler pass — the package ships committed source. It is
 # the freshness gate: regenerate src/generated from the contract and fail if
-# the committed copy differs, so an openapi.yaml edit cannot land with a
-# stale client (CONTRIBUTING.md, "The contract").
-id: api-client
+# the committed copy differs, so a console.yaml edit cannot land with a stale
+# client (CONTRIBUTING.md, "The contract").
+id: console-api-client
 language: javascript
 tasks:
   lint:
@@ -46,7 +46,13 @@ tasks:
       - "**/*"
       # The contract is an input to the client: change it and the freshness
       # gate re-runs rather than replaying a stale green from cache.
-      - "/api/openapi/openapi.yaml"
+      - "/api/openapi/console.yaml"
+      # The fragments the console contract references are inputs on the same
+      # terms. Listing only the document would be the subtle route to a stale
+      # green: a change to a shared schema — the error envelope, the
+      # correlation header — would re-generate this client and the gate would
+      # never run.
+      - "/api/openapi/shared/**/*"
       - "/package.json"
       - "/pnpm-lock.yaml"
       # The gate diffs Prettier-formatted bytes, so the config that formatted
