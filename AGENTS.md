@@ -15,14 +15,16 @@ below), never as scaffolding someone left around.
 
 ## Layout
 
-| Path                       | What lives there                                                                     |
-| -------------------------- | ------------------------------------------------------------------------------------ |
-| `apps/api`                 | The Go service. `cmd/gateway` is the entry point; `internal/` is the implementation. |
-| `apps/web`                 | The Vue 3 console.                                                                   |
-| `api/openapi/openapi.yaml` | The API contract.                                                                    |
-| `migrations/`              | Database migrations. Empty until a database exists.                                  |
-| `scripts/`                 | Repository gates.                                                                    |
-| `.github/workflows/`       | `ci.yml`, `analysis.yml`, `release.yml`.                                             |
+| Path                       | What lives there                                                                                                                                                                |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apps/api`                 | The Go service. `cmd/gateway` is the entry point; `internal/` is the implementation.                                                                                            |
+| `apps/web`                 | The Vue 3 console.                                                                                                                                                              |
+| `api/openapi/openapi.yaml` | The API contract.                                                                                                                                                               |
+| `migrations/`              | Database migrations — ordered, reviewed `.up.sql`/`.down.sql` pairs (the bootstrap pair enables TimescaleDB).                                                                   |
+| `deploy/`                  | Local development and integration fixtures for the backing infrastructure: `postgres/` (compose, migration runner, `verify.sh` suite) and `redis/` (disposable Valkey fixture). |
+| `docs/`                    | Long-form documentation — `adr/` decision records and `architecture/` reference pages, indexed in `docs/README.md`.                                                             |
+| `scripts/`                 | Repository gates.                                                                                                                                                               |
+| `.github/workflows/`       | `ci.yml`, `analysis.yml`, `release.yml`.                                                                                                                                        |
 
 ## The rules
 

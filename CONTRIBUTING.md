@@ -39,7 +39,7 @@ is because that step was skipped. Do not skip it.
 | `pnpm build`          | Every project's `build` target through Moon — `vite build` and the gateway binary                      |
 | `pnpm check-projects` | Asserts every `apps/*` and `packages/*` directory is a project Moon can see, with the four targets     |
 | `pnpm dev:web`        | The console's Vite dev server                                                                          |
-| `pnpm dev:api`        | The API server (`go run ./cmd/gateway`, serves `/healthz` and `/readyz` on :8080)                      |
+| `pnpm dev:api`        | The API server (`go run ./cmd/gateway`, serves `/healthz`, `/readyz` and `/version` on :8080)          |
 
 A `Makefile` at the root spells the same commands as `make` targets
 (`make lint`, `make go-test`, …) — aliases, not a second definition. And a
@@ -145,8 +145,11 @@ implementation, never discovered in code review after it. Where practical, the
 console binds to types generated from the document rather than hand-written
 copies of it — see [AGENTS.md](AGENTS.md), "The rules".
 
-Database schema — when a database arrives — lands as migrations under
-`migrations/`, never as out-of-band edits.
+Database schema lands as migrations under `migrations/` — ordered
+`.up.sql`/`.down.sql` pairs a reviewer reads, applied by the golang-migrate
+runner and proven against a real database by the suite in
+[`deploy/postgres/README.md`](deploy/postgres/README.md), never as
+out-of-band edits.
 
 ## Opening a pull request
 
