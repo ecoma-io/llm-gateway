@@ -131,8 +131,9 @@ shell and its intake record and, atomically:
 4. updates the corresponding bucket projections; and
 5. begins the execution lease.
 
-No provider call is inside that transaction. The adapter enforces the canonical
-output ceiling, so client-billable actual usage is at most the reservation.
+No provider call is inside that transaction (ADR 0001, rule 7). The adapter
+enforces the canonical output ceiling, so client-billable actual usage is at
+most the reservation.
 Actual usage often differs from the reservation by being lower; settlement
 returns the unused portion. Provider-reported use beyond the enforced limit is
 an upstream cost anomaly, not customer debt.
@@ -207,8 +208,8 @@ this path because its lease is renewed.
    reversals are compensating legs, never updates/deletes.
 3. **Entitlements cannot be double-spent.** Every FundingBucket allocation is
    a conditional, lock/version-guarded update inside one of the four
-   coordinated transactions (ADR 0001, rule 6); no code path changes capacity
-   outside them.
+   cross-context coordinated transactions (ADR 0001, rule 6); no code path
+   changes capacity outside them.
 4. **Reservation and settlement are distinct.** Hold and consume are different
    ledger legs; one unique Settlement per request makes settlement exactly-once.
 5. **Logical requests and provider attempts are distinct.** One Request owns

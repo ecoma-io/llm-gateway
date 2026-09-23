@@ -204,12 +204,13 @@ in exactly this crash case; over-billing is not. The asymmetry is deliberate.
 ## Concurrency and time
 
 - **No locks across provider calls** (ADR 0001, rule 7). Admission,
-  settlement, release/compensation, and cycle roll are short transactions;
-  the in-flight hold is data plus a renewable lease, not a lock.
+  settlement, release/compensation, and cycle roll — the four cross-context
+  coordinated transactions (ADR 0001, rule 6) — are short transactions; the
+  in-flight hold is data plus a renewable lease, not a lock.
 - **Bucket guards**: every capacity change is a conditional update on the
-  funding bucket (`available >= take`) inside the coordinated transaction —
-  the same mechanism for entitlement buckets and the PAYG bucket, so
-  concurrent admissions cannot jointly overdraw either.
+  funding bucket (`available >= take`) inside one of those four coordinated
+  transactions — the same mechanism for entitlement buckets and the PAYG
+  bucket, so concurrent admissions cannot jointly overdraw either.
 - **Time**: cycle membership and price-revision selection use the database
   clock (`transaction_timestamp()` at admission), never gateway node clocks;
   admission and the cycle roll serialise on the subscription row, so a

@@ -42,9 +42,9 @@ Reference pages: [routing](routing.md) · [request lifecycle](request-lifecycle.
 ```
 
 One request's journey through them is specified step by step in
-[request lifecycle](request-lifecycle.md); the four transactions that
-coordinate contexts (admission, settlement, release, grant-cycle roll) are
-ADR 0001, rule 6.
+[request lifecycle](request-lifecycle.md); the four cross-context coordinated
+transactions (admission, settlement, release/compensation, grant-cycle roll)
+are ADR 0001, rule 6.
 
 ## Entity catalog
 

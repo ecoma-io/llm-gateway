@@ -89,8 +89,8 @@ Notes for the schema designer:
 
 ## Transaction map
 
-The four coordinated transactions (ADR 0001, rule 6) — and nothing else
-spans contexts:
+The four cross-context coordinated transactions (ADR 0001, rule 6) — and
+nothing else spans contexts:
 
 | Transaction | Tables written                                                                                                                                                               | Guarded invariants     |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
@@ -100,7 +100,8 @@ spans contexts:
 | Cycle roll  | `entitlements` + `funding_buckets` (create), `ledger_entries` (`grant` legs), `subscriptions` (cycle fields) — keyed `(subscription, cycle)`                                 | 3 (grant exactly once) |
 
 Catalog configuration activation (aliases, group versions, price revisions)
-is a Catalog-internal coordinated transaction (ADR 0003) — it never spans
+is a coordinated transaction internal to the Catalog context (ADR 0003) —
+Catalog-local, not a fifth cross-context transaction; it never spans
 contexts. Everything else is a single-aggregate transaction.
 
 ## What must be derivable from this page alone
