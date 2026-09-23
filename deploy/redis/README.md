@@ -59,8 +59,10 @@ docker compose -f deploy/redis/docker-compose.yml up -d
 # Wait until the service reports healthy.
 docker compose -f deploy/redis/docker-compose.yml ps
 
-# Run the API integration suite against it.
-(cd apps/api && REDIS_ADDRESS=127.0.0.1:6379 go test -tags=integration ./internal/infra/redis)
+# Run the API integration suite against it — the `api:test-integration` Moon
+# target, which refuses to run without REDIS_ADDRESS and fails if the tagged
+# suite would run nothing (the same target the CI verify-api job runs):
+REDIS_ADDRESS=127.0.0.1:6379 pnpm exec moon run api:test-integration
 ```
 
 The compose file pins a readable Valkey version **and** an immutable manifest

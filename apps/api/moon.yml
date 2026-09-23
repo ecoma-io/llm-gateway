@@ -72,7 +72,7 @@ tasks:
   test-integration:
     script: |
       if [ -z "${REDIS_ADDRESS:-}" ]; then
-        echo "REDIS_ADDRESS is required — start the fixture (docker compose -f deploy/redis/docker-compose.yml up -d) and set it to 127.0.0.1:6379 (see deploy/redis/README.md)"
+        echo "REDIS_ADDRESS is required — start the fixture (from the repository root: docker compose -f deploy/redis/docker-compose.yml up -d) and set it to 127.0.0.1:6379 (see deploy/redis/README.md)"
         exit 1
       fi
       status=0

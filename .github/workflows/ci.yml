@@ -119,19 +119,33 @@ jobs:
     services:
       valkey:
         image: valkey/valkey:9.1.2@sha256:418652cfb58ef879d4978c33553735d7147016032d5aefaa14c828e611eb9dfd
+        # Loopback-only, like the fixture's own `127.0.0.1:6379:6379`: the
+        # suite reaches the server at the same address the README documents,
+        # and nothing beyond the runner can dial it.
         ports:
-          - 6379:6379
+          - 127.0.0.1:6379:6379
         # The compose fixture's healthcheck, verbatim in effect (ping, 2s
         # interval, 1s timeout, 10 retries, 2s start period): a container
         # that will never answer holds a job for the same bounded time in
         # both runners, and the start period is what absorbs a cold image
         # pull rather than spending retries on it.
+        #
+        # One stated divergence from the fixture: it disables persistence on
+        # the server itself (`--save "" --appendonly no`), and a service
+        # container cannot override the image's CMD. `--tmpfs /data` buys the
+        # property, not the setting — the image writes snapshots and AOF to
+        # /data, so on this job any such write lands in memory-backed storage
+        # on a container that dies with the runner: nothing durable is
+        # written, on an instance that never outlives the job. The suite only
+        # exercises SET/GET/DEL, and no consumer may treat this instance as
+        # durable regardless.
         options: >-
           --health-cmd "valkey-cli ping"
           --health-interval 2s
           --health-timeout 1s
           --health-retries 10
           --health-start-period 2s
+          --tmpfs /data
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -154,6 +168,60 @@ jobs:
         with:
           go-version-file: apps/api/go.mod
           cache: false
+
+      # The two files that name a Valkey image — this workflow's service
+      # container and `deploy/redis/docker-compose.yml`, the fixture a
+      # developer runs — are written out by hand in both places, and nothing
+      # structural ties them together. A one-sided upgrade would leave this
+      # job green against a server version no developer has ever executed,
+      # which is exactly the drift the suite exists to prevent. This step
+      # re-derives both pins from their files at run time instead of comparing
+      # against a third hardcoded copy: a third copy is a third place to
+      # forget, and this way the compose file stays the single source.
+      #
+      # Only `image:` declaration lines are read, not the whole file: a pin
+      # string surviving in a comment must neither keep a drifted service
+      # image passing (parity would compare the comment, not what actually
+      # ran) nor fail a job that ran the right image. Absence and ambiguity
+      # fail as loudly as divergence — a pin missing from either file, or two
+      # distinct pins on either side, means the comparison would prove
+      # nothing, so it errors rather than passes. The `|| true` on each
+      # extraction keeps an unmatched pattern flowing into the explicit
+      # failure branch: `pipefail` would otherwise abort on grep's exit 1
+      # before the reason is printed.
+      #
+      # Before the expensive api checks — the linter tarball download and
+      # every suite: this is two greps, and a drifted pin should fail the
+      # job in seconds rather than after minutes of toolchain downloads.
+      - name: Assert the CI and local fixture Valkey pins agree
+        run: |
+          set -euo pipefail
+          pattern='valkey/valkey:[0-9A-Za-z._-]+@sha256:[0-9a-f]{64}'
+          compose="$(grep -E '^[[:space:]]*image:' deploy/redis/docker-compose.yml | grep -ohE "$pattern" | sort -u || true)"
+          workflow="$(grep -E '^[[:space:]]*image:' .github/workflows/ci.yml | grep -ohE "$pattern" | sort -u || true)"
+
+          require_single_pin() {
+            if [ -z "$2" ]; then
+              echo "No Valkey tag@digest pin found in $1 — both files must carry exactly one" >&2
+              exit 1
+            fi
+            if [ "$(printf '%s\n' "$2" | wc -l)" -gt 1 ]; then
+              echo "$1 carries more than one distinct Valkey pin:" >&2
+              printf '%s\n' "$2" >&2
+              exit 1
+            fi
+          }
+
+          require_single_pin "deploy/redis/docker-compose.yml" "$compose"
+          require_single_pin ".github/workflows/ci.yml" "$workflow"
+
+          if [ "$compose" != "$workflow" ]; then
+            echo "The Valkey pins diverge — upgrade both files in the same change:" >&2
+            echo "  deploy/redis/docker-compose.yml  $compose" >&2
+            echo "  .github/workflows/ci.yml         $workflow" >&2
+            exit 1
+          fi
+          echo "CI and the local fixture pin the same image: $compose"
 
       # golangci-lint is downloaded and checksum-pinned rather than taken from
       # the runner image (whose copy moves underneath every job) and rather
@@ -191,52 +259,6 @@ jobs:
       # web step above.
       - name: Lint, test, typecheck and build the api
         run: pnpm exec moon run api:lint api:test api:typecheck api:build
-
-      # The two files that name a Valkey image — this workflow's service
-      # container and `deploy/redis/docker-compose.yml`, the fixture a
-      # developer runs — are written out by hand in both places, and nothing
-      # structural ties them together. A one-sided upgrade would leave this
-      # job green against a server version no developer has ever executed,
-      # which is exactly the drift the suite exists to prevent. This step
-      # re-derives both pins from their files at run time instead of comparing
-      # against a third hardcoded copy: a third copy is a third place to
-      # forget, and this way the compose file stays the single source.
-      #
-      # Absence and ambiguity fail as loudly as divergence: a pin missing from
-      # either file, or two distinct pins on either side, means the comparison
-      # would prove nothing, so it errors rather than passes. The `|| true` on
-      # each extraction keeps an unmatched pattern flowing into the explicit
-      # failure branch — `pipefail` would otherwise abort on grep's exit 1
-      # before the reason is printed.
-      - name: Assert the CI and local fixture Valkey pins agree
-        run: |
-          set -euo pipefail
-          pattern='valkey/valkey:[0-9A-Za-z._-]+@sha256:[0-9a-f]{64}'
-          compose="$(grep -ohE "$pattern" deploy/redis/docker-compose.yml | sort -u || true)"
-          workflow="$(grep -ohE "$pattern" .github/workflows/ci.yml | sort -u || true)"
-
-          require_single_pin() {
-            if [ -z "$2" ]; then
-              echo "No Valkey tag@digest pin found in $1 — both files must carry exactly one" >&2
-              exit 1
-            fi
-            if [ "$(printf '%s\n' "$2" | wc -l)" -gt 1 ]; then
-              echo "$1 carries more than one distinct Valkey pin:" >&2
-              printf '%s\n' "$2" >&2
-              exit 1
-            fi
-          }
-
-          require_single_pin "deploy/redis/docker-compose.yml" "$compose"
-          require_single_pin ".github/workflows/ci.yml" "$workflow"
-
-          if [ "$compose" != "$workflow" ]; then
-            echo "The Valkey pins diverge — upgrade both files in the same change:" >&2
-            echo "  deploy/redis/docker-compose.yml  $compose" >&2
-            echo "  .github/workflows/ci.yml         $workflow" >&2
-            exit 1
-          fi
-          echo "CI and the local fixture pin the same image: $compose"
 
       # The integration tier against the service container above, through the
       # same target a developer runs — `api:test-integration` is the single
