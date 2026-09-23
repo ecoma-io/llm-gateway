@@ -126,8 +126,8 @@ Cycle arithmetic is fixed so no implementation invents it:
 
 ### Cycle roll is a coordinated transaction
 
-A subscription cycle roll is one of the four coordinated transactions of
-ADR 0001 (rule 6): lock the
+A subscription cycle roll is one of the four cross-context coordinated
+transactions of ADR 0001 (rule 6): lock the
 subscription; verify state/time/renewal; create each unique entitlement;
 create its funding-capacity projection; append its `grant` ledger legs; update
 the cycle fields. It is keyed by `(subscription_id, cycle_number)` and commits
@@ -246,8 +246,11 @@ removes it from service but **does not free its name**: alias identities are
 unique across active and retired alike, so historical ledger rows keep an
 unambiguous referent, and admission to a retired alias is `unknown_alias`. A
 concurrent alias or price activation serializes on that Catalog
-configuration revision. Commerce references the resulting immutable IDs; it
-does not attempt cross-context validation at runtime.
+configuration revision. The activation transaction is coordinated but stays
+entirely inside the Catalog context — Catalog-local, deliberately **not** a
+fifth cross-context transaction in ADR 0001's set (rule 6). Commerce
+references the resulting immutable IDs; it does not attempt cross-context
+validation at runtime.
 
 ## Consequences
 

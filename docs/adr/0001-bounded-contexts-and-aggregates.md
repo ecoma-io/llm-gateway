@@ -38,11 +38,17 @@ identifier only, never by shared tables or shared rows.
 
 Aggregate rules:
 
-1. **An aggregate is the unit of transactional consistency.** Every invariant
-   the gateway guarantees about a set of rows must be enforceable inside a
-   single aggregate's transaction. Cross-aggregate coordination happens
-   through explicit process (the reservation/settlement flow, ADR 0004), not
-   through transactions spanning aggregates.
+1. **An aggregate is an ownership and invariant boundary.** Each aggregate
+   exclusively owns its rows, and every invariant the gateway guarantees
+   about a set of rows must be enforceable inside a transaction on the
+   aggregate that owns them. The normal write is a **local aggregate
+   transaction** — one aggregate's rows in one short transaction.
+   Coordination across aggregates is never implicit: it exists only as two
+   named exceptions — the four cross-context coordinated transactions of
+   rule 6, and Catalog configuration activation, a coordinated transaction
+   local to the Catalog context (ADR 0003) that spans more than one
+   Catalog aggregate. Outside those named transactions, no transaction
+   spans aggregates.
 2. **Identity is three small aggregates, not one big one.** `Account` carries
    the billing relationship's identity; `User` and `APIKey` each reference the
    account and are independently mutable (a key is revoked without touching
@@ -64,9 +70,16 @@ Aggregate rules:
    execution. Nothing in Execution is a lock the business waits on.
 5. **Quota capacity is guarded state, written only by the accounting flows.**
    Each entitlement cycle and each PAYG balance has a funding-bucket
-   projection (ADR 0004) whose available capacity is changed only by
-   conditional updates inside the four coordinated transactions of rule 6.
-6. **Exactly four coordinated transactions exist in the whole system.**
+   projection (ADR 0004). Its available capacity is drawn down only by
+   conditional updates inside the four cross-context coordinated
+   transactions of rule 6; refills arrive through the ledger-backed flows
+   that grant or fund it — the grant-cycle roll of rule 6, and the
+   topup/adjustment flows of ADR 0004 — each carrying its own ledger legs
+   and uniqueness guards.
+6. **Exactly four cross-context coordinated transactions exist.** They are
+   authorised here by name; each writes rows owned by more than one context
+   in one short database transaction, and no other database transaction
+   crosses a context boundary.
    - **Admission** — create the `Request` shell and its intake record,
      insert the `Reservation` with its allocation legs, conditionally
      reserve funding-bucket capacity, append `hold` ledger legs, start the
@@ -87,14 +100,20 @@ Aggregate rules:
      transaction.
      All four are short, row-scoped, and never span a provider call. This is
      the saga: reserve → execute → settle, with release as the compensation
-     for an abandoned reservation. Configuration activation (aliases, group
-     versions, price revisions) is a coordinated transaction **inside the
-     Catalog context only** (ADR 0003); it never spans contexts.
+     for an abandoned reservation. These four are the complete set: work that
+     seems to need a new cross-context (or cross-aggregate) database
+     transaction is an amendment to this ADR first, never a new code path.
+     Configuration activation (aliases, group versions, price revisions) is
+     a coordinated transaction **inside the Catalog context only** (ADR 0003)
+     — Catalog-local, not a fifth member of the cross-context set; it never
+     spans contexts.
 7. **No transaction is open while a provider call is in flight.** Quota is
    held as committed data (a reservation and its legs), not as a held lock,
-   and an in-flight request keeps its hold alive by renewing a lease, not by
-   holding anything open. This rule exists because holding row locks across a
-   multi-second upstream call is the classic gateway deadlock/latency bug.
+   and an in-flight request keeps its hold alive by renewing its execution
+   lease — committed state updated in its own short operation, never a held
+   lock or an open transaction. This rule exists because holding row locks
+   across a multi-second upstream call is the classic gateway deadlock/latency
+   bug.
 8. **Catalog and Identity are read-mostly on the hot path.** They may be
    cached aggressively; their aggregates remain the source of truth, and
    caches are downstream of the database, never upstream of it.
@@ -122,12 +141,14 @@ A document or schema using a synonym where a glossary term exists is a defect.
 - `Request`/`RequestAttempt` become event-shaped tables (ADR 0005), which is
   what makes the Timescale split possible without re-modelling later.
 - Cross-context workflows (a request touching Identity, Catalog, Commerce,
-  Accounting in one call) are choreographies over IDs — each context's writes
-  stay in its own transactions. [../architecture/request-lifecycle.md](../architecture/request-lifecycle.md)
+  Accounting in one call) are choreographies over IDs: outside the four
+  authorised coordinated transactions of rule 6, each context's writes stay
+  in its own transactions. [../architecture/request-lifecycle.md](../architecture/request-lifecycle.md)
   specifies the choreography.
 - Adding a new invariant later means asking "which aggregate's transaction can
   enforce this?" first; an invariant that no single aggregate can enforce is
-  a design smell, not a trigger for cross-aggregate transactions.
+  a design smell, not a trigger for a new cross-aggregate transaction —
+  authoring one of those means amending this ADR (rule 6).
 
 ## Alternatives considered
 

@@ -67,8 +67,9 @@ enabled".
 ### The cycle roll is a transaction
 
 The roll — verify renewal → create each entitlement and its funding bucket →
-append `grant` ledger legs → advance cycle fields — is **one** transaction,
-keyed by `(subscription_id, cycle_number)` (ADR 0001, rule 6). A worker
+append `grant` ledger legs → advance cycle fields — is **one** transaction:
+the grant-cycle-roll member of ADR 0001's four cross-context coordinated
+transactions (rule 6), keyed by `(subscription_id, cycle_number)`. A worker
 retry after a crash cannot grant a cycle twice; a partial roll cannot exist.
 Admission and the roll serialise on the subscription row: an admission either
 sees the old cycle or the new one, never a half-rolled state, and cycle
