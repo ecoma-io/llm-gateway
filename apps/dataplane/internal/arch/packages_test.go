@@ -203,14 +203,23 @@ func TestTheScanSeesTheModule(t *testing.T) {
 // which is exactly the moment to ask whether the port leaves the plane.
 //
 // The rule holds regardless of whether an adapter is wired yet. `cache` and
-// `persistence` have adapters that no caller constructs today and that is
-// expected at scaffold stage; what is not expected is a third port naming the
-// Control Plane or the management API, now or later.
+// `persistence` have adapters that no caller constructs today — the fact
+// reader's adapter exists and refuses, which is a third state worth naming —
+// and that is expected at scaffold stage; what is not expected is a port naming
+// the Control Plane or the management API, now or later.
+//
+// `usagefacts` is the third port and the honest question is whether it breaks
+// the rule. It does not: it is this process reading back what it recorded, and
+// its adapter is this Data Plane's own storage. What would break the rule is a
+// port whose adapter dials one of the other applications, and every such port
+// would have to be added to this list first — which is why the list is written
+// out rather than derived, and why a port named for a peer application would be
+// an edit here that a reviewer cannot miss.
 func TestTheRuntimeHasNoCrossPlanePort(t *testing.T) {
 	ports := outboundPorts(t)
-	want := []string{"cache", "persistence"}
+	want := []string{"cache", "persistence", "usagefacts"}
 	if !slices.Equal(ports, want) {
-		t.Errorf("outbound ports are %v, want %v — `cache` and `persistence` are this process's own infrastructure; a third port named for the Control Plane or the management API would be a hop on the request path, and the runtime does not have one", ports, want)
+		t.Errorf("outbound ports are %v, want %v — the three are this process's own infrastructure: its cache, its database, and its own recorded history. A port named for the Control Plane or the management API would be a hop on the request path, and the runtime does not have one", ports, want)
 	}
 }
 

@@ -1,6 +1,7 @@
 package arch
 
 import (
+	"fmt"
 	"slices"
 	"sort"
 	"strings"
@@ -35,9 +36,19 @@ type rule struct {
 }
 
 // rules is the dependency rule, one line per boundary. Each is deliberately
-// coarse: an allow-list naming a tree (`internal/adapters`) rather than the
-// one package that imports the library today is a rule about a boundary
+// coarse: an allow-list naming a tree (`internal/adapters/inbound`) rather than
+// the one package that imports the library today is a rule about a boundary
 // instead of a rule about a moment.
+//
+// The two adapter rules are two lines rather than one. A single rule forbidding
+// `self/internal/adapters/` and allowing `internal/adapters` says an adapter
+// may import an adapter, which permits the one crossing this application has
+// most reason to refuse: an inbound surface that constructs the cross-plane
+// client itself, or the reverse — the management seam reached from a route
+// instead of from the port that exists to make it substitutable. Stated as two
+// rules, the direction between the trees is a decision rather than an
+// oversight. A concrete adapter remains reachable from another adapter in its
+// own tree, which is how an outbound adapter composes with a sibling.
 //
 // An import that appears in no rule is governed by none of them; this table is
 // therefore not a complete account of what this module may import, only of
@@ -52,8 +63,8 @@ func rules(self string) []rule {
 			forbidden: []string{"github.com/valkey-io/valkey-go"},
 		},
 		{
-			why:       "HTTP is a transport concern: the composition root and an inbound adapter may import it, and the application, the ports and any domain package may not — an application that speaks HTTP is an application whose use-cases cannot be called any other way",
-			allowed:   []string{"cmd", "internal/adapters/inbound"},
+			why:       "HTTP is a transport concern: the composition root and an adapter may import it — inbound because that is how a request arrives, outbound because the cross-plane seam is a call to another application's management surface, which is transport and not state — while the application, the ports and any domain package may not, because an application that speaks HTTP is an application whose use-cases cannot be called any other way",
+			allowed:   []string{"cmd", "internal/adapters/inbound", "internal/adapters/outbound"},
 			forbidden: []string{"net/http"},
 		},
 		{
@@ -62,14 +73,24 @@ func rules(self string) []rule {
 			forbidden: []string{"database/sql"},
 		},
 		{
+			why:       "the port vocabulary is what the application is written against and what the adapters implement, so it points inward from both: a domain package that imported it would have taken a dependency on infrastructure's shape, and this module has only three packages with a reason to name a port — the application, the adapters and the composition root that chooses between them",
+			allowed:   []string{"cmd", "internal/application", "internal/adapters", "internal/ports"},
+			forbidden: []string{self + "/internal/ports"},
+		},
+		{
 			why:       "configuration is read once, at the composition root: a package that reads the environment has behaviour its callers cannot see in its arguments and cannot vary in a test",
 			allowed:   []string{"cmd"},
 			forbidden: []string{self + "/internal/config"},
 		},
 		{
-			why:       "a concrete adapter is constructed at the composition root or used by another adapter; everything else depends on the port, which is what makes the infrastructure replaceable",
-			allowed:   []string{"cmd", "internal/adapters"},
-			forbidden: []string{self + "/internal/adapters/"},
+			why:       "an inbound adapter is entered by the composition root and by nothing else: another inbound adapter is a surface delegating to a surface — a second contract with nobody's name on it — and an outbound adapter that calls one has made the transport it implements part of the use case",
+			allowed:   []string{"cmd", "internal/adapters/inbound"},
+			forbidden: []string{self + "/internal/adapters/inbound/"},
+		},
+		{
+			why:       "an outbound adapter is constructed at the composition root and by nothing else, and reached from the application through the port it implements: an inbound adapter that imported one has put concrete infrastructure behind a route with no port to substitute, which on this application is the cross-plane seam arriving as a call the use case cannot see",
+			allowed:   []string{"cmd", "internal/adapters/outbound"},
+			forbidden: []string{self + "/internal/adapters/outbound/"},
 		},
 		{
 			why:       "the application is called by an inbound adapter and wired by the composition root; nothing outbound may depend on it, because an outbound adapter that knows the use-case has inverted the arrow",
@@ -94,12 +115,29 @@ func TestTheDependencyRuleHolds(t *testing.T) {
 		t.Fatal("the import scan found no packages; every rule below would pass vacuously")
 	}
 
+	for _, violation := range violations(self, graph) {
+		t.Error(violation)
+	}
+}
+
+// violations runs the rule table over an import graph and returns one sentence
+// per boundary broken, sorted so the order is the module's rather than the
+// map's.
+//
+// It is a function rather than a loop inside the test above because two tests
+// need it and they need it for opposite purposes: one runs it over the module
+// as it is and asserts it returns nothing, and the one in capabilities_test.go
+// runs it over graphs built to break exactly one boundary and asserts it
+// returns exactly that. A matcher only ever exercised on a clean tree is a
+// matcher nobody has seen work.
+func violations(self string, graph map[string][]string) []string {
 	dirs := make([]string, 0, len(graph))
 	for dir := range graph {
 		dirs = append(dirs, dir)
 	}
 	sort.Strings(dirs)
 
+	found := []string{}
 	for _, dir := range dirs {
 		for _, r := range rules(self) {
 			if allowedToImport(dir, r.allowed) {
@@ -108,12 +146,14 @@ func TestTheDependencyRuleHolds(t *testing.T) {
 			for _, imported := range graph[dir] {
 				for _, forbidden := range r.forbidden {
 					if imported == forbidden || strings.HasPrefix(imported, forbidden) {
-						t.Errorf("%s imports %s: %s", dir, imported, r.why)
+						found = append(found, fmt.Sprintf("%s imports %s: %s", dir, imported, r.why))
 					}
 				}
 			}
 		}
 	}
+	sort.Strings(found)
+	return found
 }
 
 // allowedToImport reports whether a package directory is one an allow-list
@@ -193,9 +233,11 @@ func TestTheRuleRosterIsTheDeclaredOne(t *testing.T) {
 	sort.Strings(forged)
 
 	want := []string{
-		"<module>/internal/adapters/",
+		"<module>/internal/adapters/inbound/",
+		"<module>/internal/adapters/outbound/",
 		"<module>/internal/application",
 		"<module>/internal/config",
+		"<module>/internal/ports",
 		"database/sql",
 		"github.com/valkey-io/valkey-go",
 		"net/http",

@@ -1,0 +1,180 @@
+# The shape of the Data Plane's usage-fact feed: the page a management caller
+# reads to learn what the runtime observed.
+#
+# This is a fragment like its siblings — a `components:` tree `dataplane.yaml`
+# references by relative path — and it states the one cross-plane contract the
+# Control Plane depends on for money. Its direction is the opposite of
+# everything else in `dataplane.yaml`: the other operations are the Control
+# Plane asking the Data Plane to change something the Data Plane owns, and this
+# one is the Control Plane reading what the Data Plane already recorded.
+#
+# The delivery model is **pull with replay**, and it is chosen rather than
+# inherited (ADR 0006 §5):
+#
+#   - the runtime must keep serving with the Control Plane down, so nothing on
+#     the request path may depend on a cross-plane call;
+#   - the runtime already owns the immutable facts, so the Control Plane reads
+#     them rather than being pushed at;
+#   - retry and crash recovery are trivial against a durable, ordered feed and a
+#     consumer-side position, and awkward against a push;
+#   - settlement is idempotent by `request_id`, so redelivery costs nothing.
+#
+# Three rules follow, and they are the whole protocol:
+#
+#   1. **The cursor is opaque.** It names a position in the Data Plane's fact
+#      order. No consumer may parse it, synthesise it, compare it or order by
+#      it, and nothing outside the Data Plane constructs one. Its encoding is
+#      the Data Plane's to change; treating it as a value with meaning is what
+#      makes that change breaking.
+#   2. **Replay is normal.** The same range may be requested any number of
+#      times, and repeated delivery is expected rather than an error. There is
+#      no acknowledgements endpoint, no consume-and-delete, and no way for a
+#      consumer to tell the Data Plane it has finished with anything — the
+#      facts are durable history and the consumer's position is the consumer's.
+#   3. **The consumer advances its own position, after applying.** A consumer
+#      stores the `next_cursor` it has acted on and only after the facts up to
+#      it are durably recorded; a crash between the two replays, which is safe
+#      because applying a fact twice is a no-op. The Control Plane owns
+#      `control.usage_ingestion_cursor`; the Data Plane never learns it.
+#
+# Ordering is a single monotonic append sequence assigned by the Data Plane at
+# the moment a fact commits — a gap-aware sequence, so an aborted transaction
+# leaves a hole that is skipped rather than a reordering. It is deliberately
+# not `occurred_at`, not physical row order, and not an unordered identifier:
+# replay needs a total order that survives a concurrent writer, and only an
+# append sequence gives one.
+components:
+  parameters:
+    UsageEventsAfter:
+      name: after
+      in: query
+      required: false
+      description: >-
+        An opaque cursor naming the position after which facts are wanted. Omit
+        it to begin at the oldest fact still retained. The value is not
+        interpreted by the caller or by the management API that forwards it:
+        pass back the `next_cursor` of the previous page, or nothing.
+      schema:
+        $ref: "#/components/schemas/UsageCursor"
+    UsageEventsLimit:
+      name: limit
+      in: query
+      required: false
+      description: >-
+        The largest number of facts to return. A page smaller than this does
+        not by itself mean the feed is drained — read `has_more` for that,
+        because a shorter page is also what a concurrent writer produces.
+
+
+        Bounds are enforced in the direction that lets a consumer make
+        progress. A value above the maximum is served at the maximum rather
+        than refused: the caller's intent is legible, a smaller page than asked
+        for is unambiguous against `has_more`, and failing a reconciliation run
+        over a page size would trade a slightly smaller answer against a
+        consumer that has stopped advancing. A value below the minimum, or one
+        that is not an integer, is refused with `400 invalid_request`, because
+        there is no intent behind "minus one facts" to honour.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+  schemas:
+    UsageCursor:
+      type: string
+      minLength: 1
+      maxLength: 512
+      description: >-
+        An opaque position in the Data Plane's fact order. It is safe to store
+        and to send back verbatim; it is not safe to interpret, and no consumer
+        may do so. A cursor this surface cannot place — malformed, or past the
+        retained history — is refused rather than approximated.
+    UsageEvent:
+      type: object
+      required:
+        - request_id
+        - kind
+        - schema_version
+        - occurred_at
+        - payload
+      properties:
+        request_id:
+          type: string
+          description: >-
+            The runtime request this fact is about, and the logical idempotency
+            key for everything derived from it: a settlement, a consume leg and
+            a release leg are each created at most once per `request_id`,
+            however many times this fact is delivered. It is the fact's
+            immutable business identity and is **not** the HTTP
+            `X-Request-Id`, which correlates a call and means nothing across a
+            retry.
+        kind:
+          type: string
+          enum:
+            - settled
+            - released
+            - expired
+            - unbillable_orphaned
+          description: >-
+            The terminal outcome the fact records, and what a consumer derives
+            from it: a settlement with consume and release legs for `settled`,
+            release legs alone for `released` and `expired`, and no customer
+            charge at all for `unbillable_orphaned`.
+        schema_version:
+          type: integer
+          minimum: 1
+          description: >-
+            The version of the payload shape this fact was written with. A
+            consumer that meets a version it does not know refuses the fact
+            rather than guessing, because guessing at settlement is guessing
+            with money.
+        occurred_at:
+          type: string
+          format: date-time
+          description: >-
+            When the runtime observed the outcome. Informational: it is never
+            the ordering key and never the deduplication key — clocks disagree
+            between processes and two facts can share a millisecond.
+        payload:
+          type: object
+          additionalProperties: true
+          description: >-
+            The fact's body. Its columns are the schema PR's to decide; this
+            contract fixes the envelope around them, not their shape. What the
+            envelope does fix is the requirement it must satisfy: a Control
+            Plane settlement has to be derivable from the fact alone, with no
+            synchronous call back into the Data Plane — so the body must carry
+            the allocation and bucket identities and the immutable reservation
+            figures needed to derive the consume legs, the release legs and the
+            settled total (ADR 0006, amendments to ADR 0004).
+    UsageFactPage:
+      type: object
+      required:
+        - events
+        - next_cursor
+        - has_more
+      properties:
+        events:
+          type: array
+          description: >-
+            The facts, in ascending append order, strictly after the requested
+            position. At most one settlement-relevant fact per `request_id`
+            appears in the feed, which is what makes `request_id` sufficient as
+            the consumer's idempotency key.
+          items:
+            $ref: "#/components/schemas/UsageEvent"
+        next_cursor:
+          allOf:
+            - $ref: "#/components/schemas/UsageCursor"
+          description: >-
+            The position immediately after the last fact in this page. Store it
+            and send it back as `after` once every fact above is applied. When
+            the page is empty it is the position the request carried, so a
+            consumer that has caught up keeps the cursor it had.
+        has_more:
+          type: boolean
+          description: >-
+            Whether facts exist beyond this page. `false` means the consumer has
+            reached the end of what the Data Plane has committed *so far* — not
+            that it will never have more, since the runtime keeps writing.
+      additionalProperties: false

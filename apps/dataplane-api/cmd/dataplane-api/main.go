@@ -3,16 +3,20 @@
 //
 // Everything HTTP lives in internal/adapters/inbound/http so it can be tested
 // through httptest without a process; what remains here is the version stamp,
-// the listener, and signal handling. Configuration is parsed and validated by
-// internal/config before this package sees it, so an invalid value fails the
-// process before it has accepted traffic.
+// the listener, signal handling and the one place an adapter is chosen.
+// Configuration is parsed and validated by internal/config before this package
+// sees it, so an invalid value fails the process before it has accepted
+// traffic.
 //
-// There are no outbound adapters to compose, and that is the module's shape
-// rather than an omission: a management transport owns no data. Everything
-// this application will eventually answer has to come from the Data Plane
-// over its management boundary, and how that is reached is the open question
-// ADR 0006 §9 records — deliberately unanswered here rather than answered
-// with a speculative client.
+// Exactly one outbound adapter is composed here, and the seam it crosses is the
+// one this application exists for: the Data Plane. It is an HTTP call rather
+// than a database or a cache connection, and that difference is the rule rather
+// than a detail — this process owns no data, so what it answers with comes from
+// the Data Plane over a management call the Data Plane can refuse (ADR 0006 §9,
+// §11). ADR 0006 §9 records how this application reaches Data Plane state as
+// the split's open question; this is the answer for the usage-fact feed — a
+// network call through the port in internal/ports/outbound — and it leaves the
+// separate question of a shared domain core where the ADR left it.
 package main
 
 import (
@@ -28,6 +32,7 @@ import (
 	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/adapters/inbound/http"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/adapters/outbound/dataplane"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/config"
 )
@@ -68,8 +73,23 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// The outbound client is built here rather than inside the adapter, and it
+	// carries no timeout of its own. The call it makes inherits the inbound
+	// request's context, so its lifetime is already bounded by the caller's
+	// deadline and by that caller going away; a second, invented deadline at
+	// this layer would be a number chosen without any latency to measure it
+	// against, and it would compound with the caller's rather than replace it.
+	stdhttpClient := &stdhttp.Client{}
+	usageFacts := dataplane.New(stdhttpClient, cfg.DataPlaneURL, cfg.ServiceCredential)
+
+	// The credential reaches two places and no others: the adapter presents it
+	// to the Data Plane, and the authenticator compares it against what callers
+	// present here. Both are handed the same configured value, so there is no
+	// second copy of a secret to drift, and neither logs it.
+	authenticator := http.NewServiceAuthenticator(cfg.ServiceCredential)
+
 	server := &stdhttp.Server{
-		Handler: http.New(application.New(version)),
+		Handler: http.New(application.New(version, usageFacts), authenticator),
 		// ReadHeaderTimeout guards against a peer that connects and says
 		// nothing — a slowloris costs a goroutine forever without it. The
 		// read/write body and idle timeouts wait until there is real traffic

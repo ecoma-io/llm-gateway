@@ -156,6 +156,13 @@ func siblingModules(t *testing.T) []string {
 // that set comes back empty or wrong. This pins the set to the applications
 // this repository has, so a path typo in appsRoot is a failure here rather
 // than a quiet pass there.
+//
+// All three Go modules are named, and the third is the one worth naming: the
+// rules above walk whatever `siblingModules` returns, so a module missing from
+// *that* walk is a module nothing checks — and `dataplane-api` is the sibling
+// the other two are most likely to reach for, because it is the same product's
+// management surface rather than a different product's application. A list
+// naming two of three is a list that stops noticing the newest one.
 func TestTheScanSeesTheSiblings(t *testing.T) {
 	self := modulePath(t)
 	found := map[string]bool{}
@@ -166,7 +173,11 @@ func TestTheScanSeesTheSiblings(t *testing.T) {
 	if !found[self] {
 		t.Errorf("the sibling scan did not find this module %s; both module rules would pass vacuously", self)
 	}
-	for _, want := range []string{appsPrefix + "console-api", appsPrefix + "dataplane"} {
+	for _, want := range []string{
+		appsPrefix + "console-api",
+		appsPrefix + "dataplane",
+		appsPrefix + "dataplane-api",
+	} {
 		if !found[want] {
 			t.Errorf("the sibling scan did not find %s; a module that depends on it would look clean", want)
 		}

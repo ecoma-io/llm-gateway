@@ -1,15 +1,129 @@
 package application
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"testing"
+	"time"
+
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/usagefacts"
 )
 
 func TestVersionReturnsTheBuildVersion(t *testing.T) {
-	app := New("v0.1.0")
+	app := New("v0.1.0", &stubFacts{})
 
 	if got, want := app.Version(), "v0.1.0"; got != want {
 		t.Errorf("Version() = %q, want %q", got, want)
+	}
+}
+
+// stubFacts is the fact reader the tests below drive the use case with. It
+// records the arguments it was called with, because half of what the use case
+// does is decide what reaches the port and the assertions need to see that
+// decision rather than only its result.
+type stubFacts struct {
+	page  usagefacts.Page
+	err   error
+	after string
+	limit int
+	calls int
+}
+
+// Read implements usagefacts.Reader.
+func (stub *stubFacts) Read(_ context.Context, after string, limit int) (usagefacts.Page, error) {
+	stub.calls++
+	stub.after = after
+	stub.limit = limit
+	return stub.page, stub.err
+}
+
+func TestReadUsageEventsPassesTheCursorThroughUntouched(t *testing.T) {
+	facts := &stubFacts{}
+	app := New("v0.1.0", facts)
+
+	// A cursor is opaque, so the use case must not care what is in it — an
+	// awkward string with a space in it included. A use case that trimmed,
+	// validated or re-encoded this value would be one the Data Plane's own
+	// encoding could never change.
+	const cursor = "opaque position 42/not-a-number"
+	if _, err := app.ReadUsageEvents(context.Background(), cursor, 10); err != nil {
+		t.Fatalf("ReadUsageEvents() error = %v", err)
+	}
+
+	if facts.after != cursor {
+		t.Errorf("the port was read after %q, want %q unchanged", facts.after, cursor)
+	}
+}
+
+func TestReadUsageEventsAppliesThePortsPageSizeBounds(t *testing.T) {
+	tests := []struct {
+		name      string
+		limit     int
+		wantLimit int
+	}{
+		{name: "an unspecified limit uses the port's default", limit: 0, wantLimit: usagefacts.DefaultLimit},
+		{name: "a limit within the bounds is passed on unchanged", limit: 250, wantLimit: 250},
+		{name: "a limit above the maximum is reduced to it", limit: usagefacts.MaxLimit + 1, wantLimit: usagefacts.MaxLimit},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			facts := &stubFacts{}
+			app := New("v0.1.0", facts)
+
+			if _, err := app.ReadUsageEvents(context.Background(), "", tt.limit); err != nil {
+				t.Fatalf("ReadUsageEvents() error = %v", err)
+			}
+			if facts.limit != tt.wantLimit {
+				t.Errorf("the port was read with limit %d, want %d", facts.limit, tt.wantLimit)
+			}
+		})
+	}
+}
+
+func TestReadUsageEventsReturnsThePortsPageUnchanged(t *testing.T) {
+	// The page is the store's, in the store's order, with the store's position.
+	// The use case is a boundary and not a filter: anything it did to this
+	// value would be applied to every consumer at once, from the process that
+	// serves LLM traffic.
+	page := usagefacts.Page{
+		Events: []usagefacts.Event{{
+			RequestID:     "req_1",
+			Kind:          "settled",
+			SchemaVersion: 1,
+			OccurredAt:    time.Date(2026, 9, 24, 10, 0, 0, 0, time.UTC),
+			Payload:       json.RawMessage(`{"tokens":7}`),
+		}},
+		NextCursor: "position-7",
+		HasMore:    true,
+	}
+
+	app := New("v0.1.0", &stubFacts{page: page})
+	got, err := app.ReadUsageEvents(context.Background(), "", 0)
+	if err != nil {
+		t.Fatalf("ReadUsageEvents() error = %v", err)
+	}
+
+	if len(got.Events) != 1 || got.Events[0].RequestID != "req_1" || string(got.Events[0].Payload) != `{"tokens":7}` {
+		t.Errorf("ReadUsageEvents() events = %+v, want the port's page unchanged", got.Events)
+	}
+	if got.NextCursor != page.NextCursor || got.HasMore != page.HasMore {
+		t.Errorf("ReadUsageEvents() = %q/%v, want %q/%v", got.NextCursor, got.HasMore, page.NextCursor, page.HasMore)
+	}
+}
+
+func TestReadUsageEventsReportsASourceFailureRatherThanAnEmptyPage(t *testing.T) {
+	// An empty page and an unreadable source are different answers, and the
+	// difference is a consumer's next move: advance, or retry. Collapsing the
+	// error into an empty page here would tell a consumer this Data Plane has
+	// recorded nothing — a claim no adapter is entitled to make.
+	app := New("v0.1.0", &stubFacts{err: usagefacts.ErrSourceUnavailable})
+
+	_, err := app.ReadUsageEvents(context.Background(), "", 0)
+
+	if !errors.Is(err, usagefacts.ErrSourceUnavailable) {
+		t.Errorf("ReadUsageEvents() error = %v, want ErrSourceUnavailable", err)
 	}
 }
 

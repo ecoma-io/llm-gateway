@@ -1,7 +1,7 @@
 // Package dataplane is the console-api's outbound port to the Data Plane's
-// management surface: the one seam between the two planes, and the only place
-// the Control Plane asks the Data Plane to change something the Data Plane
-// owns.
+// management surface: the one seam between the two planes, the only place the
+// Control Plane asks the Data Plane to change something the Data Plane owns,
+// and the only place it reads back what the Data Plane already recorded.
 //
 // It is a port in this module rather than a shared package on purpose. The two
 // planes are separate Go modules (ADR 0006 §1), so there is no import path
@@ -12,29 +12,43 @@
 // the day it changes, this package does not.
 //
 // The directions are not symmetric, and the asymmetry is the architecture:
-// configuration and credential decisions flow Control → Data (this port),
-// while facts flow Data → Control (usage events, which the Control Plane
-// reconciles from). Credit, quota and subscription state travel as grants, not
-// as shared tables, because neither plane may read the other's database
-// (ADR 0006 §5, §7).
+// configuration and credential decisions flow Control → Data (Management),
+// while facts flow Data → Control (UsageFacts), which the Control Plane
+// reconciles from at its own pace. Credit, quota and subscription state travel
+// as grants, not as shared tables, because neither plane may read the other's
+// database (ADR 0006 §5, §7).
 //
-// Exactly one operation is enumerated here, because it is the one the
+// Exactly two operations are enumerated here, because they are the two the
 // architecture already fixes end to end: a credential the Control Plane has
 // withdrawn must stop being accepted at the runtime, within a bounded
 // staleness window rather than the moment the withdrawal commits (ADR 0006
-// §8). The other operations a management surface will eventually need — a
-// grant, a capacity publication, a cache invalidation — are not declared here
-// as guesses: each arrives with the use case that has to make it, and a port
-// method with no caller is a shape invented twice.
+// §8); and the usage facts the runtime recorded must be readable by the
+// Control Plane, idempotently and with replay, so that settlement survives
+// either side crashing (ADR 0006 §5). The other operations a management
+// surface will eventually need — a grant, a capacity publication, a cache
+// invalidation — are not declared here as guesses: each arrives with the use
+// case that has to make it, and a port method with no caller is a shape
+// invented twice.
 //
-// No adapter implements this yet, and nothing constructs it: console-api has
-// no use case that reaches the Data Plane until the API-key lifecycle lands.
-// The port exists now because the seam has to exist before either side of it
-// is built, and because its absence would leave a future author with no
-// recorded answer to "how does the Control Plane talk to the Data Plane?".
+// The fact half is implemented and the management half is not.
+// internal/adapters/outbound/dataplane speaks the feed's HTTP contract and
+// internal/application's FactIngestion drives it through the persistence
+// port's cursor, which is what makes the Control Plane's position durable; no
+// process constructs that use case yet, because the loop that calls it arrives
+// with the schema the facts are stored in. Management still has neither an
+// adapter nor a use case, and gets both when the API-key lifecycle lands. The
+// port exists ahead of its callers because the seam has to exist before either
+// side of it is built, and because its absence would leave a future author
+// with no recorded answer to "how does the Control Plane talk to the Data
+// Plane?".
 package dataplane
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+)
 
 // Management is what the Control Plane may ask of the Data Plane.
 //
@@ -53,4 +67,87 @@ type Management interface {
 	// Plane keeps the credential's revocation pending until the Data Plane has
 	// acknowledged it.
 	WithdrawCredential(ctx context.Context, credentialID string) error
+}
+
+// Event is one immutable fact the runtime recorded, as the feed carries it.
+//
+// It is the seam's vocabulary and deliberately not the store's: the
+// application translates an Event into a persistence.Fact, so the Control
+// Plane's database never grows a column because the wire grew a field, and the
+// wire never carries a type the store invented. RequestID is the fact's
+// immutable business identity and the idempotency key for everything derived
+// from it — it is not the HTTP X-Request-Id, which correlates one call and
+// means nothing across a retry. Kind is the contract's enum as a plain string,
+// because a Go copy of an enum the Data Plane's document owns is a copy that
+// goes stale; the applier is what decides whether it recognizes one. Payload is
+// the fact's body: the contract fixes that a settlement must be derivable from
+// the fact alone, and leaves its columns to the schema the facts are stored in.
+type Event struct {
+	RequestID     string
+	Kind          string
+	SchemaVersion int
+	OccurredAt    time.Time
+	Payload       json.RawMessage
+}
+
+// Page is one replayable slice of the fact feed.
+//
+// NextCursor is the position immediately after the last event, and it is the
+// Data Plane's to compute: a consumer stores it and sends it back as the next
+// `after`, and never derives one. When the page is empty it is the position the
+// request carried, so a consumer that has caught up keeps the cursor it had.
+// HasMore answers whether the feed has more facts *right now*, which is why a
+// page shorter than the requested limit does not mean the feed is drained — a
+// concurrent writer produces a short page too.
+type Page struct {
+	Events     []Event
+	NextCursor string
+	HasMore    bool
+}
+
+// ErrCursorExpired reports that the position a consumer asked for is no longer
+// replayable — it has fallen behind the Data Plane's retention window, or the
+// value is not a position this feed ever issued. The distinction from any other
+// failure is the point: the consumer's cursor is unusable and must be
+// re-established by a decision (a re-bootstrap, an operator's intervention),
+// whereas a transport failure is retried with the cursor it already has. A
+// consumer that treated the two alike would either retry forever or silently
+// resume past facts it never applied, and the second quietly loses money.
+var ErrCursorExpired = errors.New("usage fact cursor is no longer replayable")
+
+// UsageFacts is the fact half of the cross-plane seam, beside Management's
+// configuration half. One package, both directions.
+//
+// The feed is a pull with replay, chosen in ADR 0006 §5 and declared in
+// api/openapi/shared/usage-facts.yaml: the Control Plane remembers a position,
+// asks for what follows it, and applies the answer. Three rules come with it,
+// and they are this interface's rather than any adapter's —
+//
+//   - the cursor is opaque. `after` and Page.NextCursor are values to store and
+//     to hand back verbatim, never to parse, validate, compare, order, decode
+//     or synthesise: treating one as a number makes the Data Plane's encoding a
+//     compatibility surface it never promised. The empty string is the one
+//     meaning the Control Plane assigns to a cursor — IngestionCursor.Position
+//     returns it for a consumer that has never applied anything — and it is
+//     this seam's spelling of "no position", not a value the Data Plane issued;
+//   - there is no acknowledgement, and no method here that could be one. The
+//     facts are durable history; telling the Data Plane that a fact has been
+//     consumed is not an operation this seam has, and the consumer's position
+//     is the consumer's;
+//   - ordering is the Data Plane's monotonic append sequence. A page is
+//     ascending in that order, and never in OccurredAt: clocks disagree between
+//     processes and two facts can share a millisecond.
+type UsageFacts interface {
+	// ReadUsageEvents returns the facts strictly after the position `after`, at
+	// most limit of them. `after` is passed through untouched; an empty one
+	// means from the beginning of what the Data Plane still retains, which is
+	// what a consumer with no stored position asks for. The contract's limit
+	// range is 1..1000, and a page shorter than it does not mean the feed is
+	// drained — HasMore is what says that.
+	//
+	// It returns ErrCursorExpired when the position can no longer be replayed,
+	// and a transport failure as itself. It must never skip forward to what is
+	// available: a consumer that has fallen behind has to be told, because
+	// resuming silently would lose the facts in between.
+	ReadUsageEvents(ctx context.Context, after string, limit int) (Page, error)
 }

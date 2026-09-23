@@ -18,7 +18,7 @@ import (
 const statusBody = "{\"status\":\"ok\"}\n"
 
 func TestServerServesTheContractedRoutes(t *testing.T) {
-	handler := New(application.New("v0.1.0"))
+	handler := New(application.New("v0.1.0", &fakeUsageFacts{}), NewServiceAuthenticator(testCredential))
 	tests := []struct {
 		name       string
 		method     string
@@ -76,6 +76,24 @@ func TestServerServesTheContractedRoutes(t *testing.T) {
 			wantStatus: stdhttp.StatusMethodNotAllowed,
 			wantAllow:  "GET, HEAD",
 			wantBody:   "{\"error\":{\"code\":\"method_not_allowed\",\"message\":\"method not allowed\"},\"request_id\":\"method-request\"}\n",
+		},
+		{
+			// The credential check runs before the method check, and that order
+			// is deliberate: a caller with no service credential is not told
+			// which methods this path accepts. It is told to identify itself,
+			// which it must do before any verb would have been useful. The
+			// reverse order would let an unauthenticated caller enumerate the
+			// surface one method at a time.
+			//
+			// The credentialed half of this case — the same request with the
+			// credential set, answered 405 with the Allow header — is in
+			// usageevents_test.go, where the credential belongs.
+			name:       "the usage-fact feed refuses an unauthenticated caller before examining the method",
+			method:     stdhttp.MethodPost,
+			path:       "/internal/usage-events",
+			requestID:  "usage-method-request",
+			wantStatus: stdhttp.StatusUnauthorized,
+			wantBody:   "{\"error\":{\"code\":\"unauthenticated\",\"message\":\"the caller did not identify itself as a service this deployment accepts\"},\"request_id\":\"usage-method-request\"}\n",
 		},
 	}
 
@@ -183,7 +201,7 @@ func TestTheHandlerChainKeepsStreamingInterfacesReachable(t *testing.T) {
 				flusher.Flush()
 			}
 		},
-	})
+	}, NewServiceAuthenticator(testCredential))
 	server := httptest.NewServer(requestID(mux))
 	t.Cleanup(server.Close)
 

@@ -1,12 +1,31 @@
 package application
 
 import (
+	"context"
 	"errors"
 	"testing"
+
+	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/ports/outbound/dataplane"
 )
 
+// fakeUsageFacts is the outbound port as this package's tests see it: the page
+// or failure to answer with, and the arguments the use case passed down. The
+// arguments are recorded because the use case's whole job on the way in is to
+// hand them over untouched.
+type fakeUsageFacts struct {
+	page  dataplane.Page
+	err   error
+	after string
+	limit int
+}
+
+func (f *fakeUsageFacts) ReadUsageEvents(_ context.Context, after string, limit int) (dataplane.Page, error) {
+	f.after, f.limit = after, limit
+	return f.page, f.err
+}
+
 func TestVersionReturnsTheBuildVersion(t *testing.T) {
-	app := New("v0.1.0")
+	app := New("v0.1.0", &fakeUsageFacts{})
 
 	if got, want := app.Version(), "v0.1.0"; got != want {
 		t.Errorf("Version() = %q, want %q", got, want)

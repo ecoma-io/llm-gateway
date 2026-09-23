@@ -83,6 +83,68 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			},
 			wantErr: "DATAPLANE_READ_HEADER_TIMEOUT must be a Go duration",
 		},
+		{
+			name: "serves no management surface unless one is configured",
+			env: map[string]string{
+				"DATAPLANE_ADDR": "127.0.0.1:9090",
+			},
+			want: Config{
+				Addr:              "127.0.0.1:9090",
+				ShutdownTimeout:   DefaultShutdownTimeout,
+				ReadHeaderTimeout: DefaultReadHeaderTimeout,
+			},
+		},
+		{
+			name: "configures the management listener and its credential together",
+			env: map[string]string{
+				"DATAPLANE_MANAGEMENT_ADDR":  "127.0.0.1:9091",
+				"DATAPLANE_MANAGEMENT_TOKEN": "a-service-credential",
+			},
+			want: Config{
+				Addr:              DefaultAddr,
+				ShutdownTimeout:   DefaultShutdownTimeout,
+				ReadHeaderTimeout: DefaultReadHeaderTimeout,
+				ManagementAddr:    "127.0.0.1:9091",
+				ManagementToken:   "a-service-credential",
+			},
+		},
+		{
+			name: "rejects an explicitly empty management address",
+			env: map[string]string{
+				"DATAPLANE_MANAGEMENT_ADDR": "",
+			},
+			wantErr: "DATAPLANE_MANAGEMENT_ADDR must not be empty",
+		},
+		{
+			name: "rejects a management address without a TCP port",
+			env: map[string]string{
+				"DATAPLANE_MANAGEMENT_ADDR":  "127.0.0.1",
+				"DATAPLANE_MANAGEMENT_TOKEN": "a-service-credential",
+			},
+			wantErr: "DATAPLANE_MANAGEMENT_ADDR must be a host:port address",
+		},
+		{
+			name: "refuses a management listener with no credential",
+			env: map[string]string{
+				"DATAPLANE_MANAGEMENT_ADDR": "127.0.0.1:9091",
+			},
+			wantErr: "DATAPLANE_MANAGEMENT_TOKEN is required",
+		},
+		{
+			name: "refuses an explicitly empty management credential",
+			env: map[string]string{
+				"DATAPLANE_MANAGEMENT_ADDR":  "127.0.0.1:9091",
+				"DATAPLANE_MANAGEMENT_TOKEN": "",
+			},
+			wantErr: "DATAPLANE_MANAGEMENT_TOKEN must not be empty",
+		},
+		{
+			name: "refuses a credential with no listener to read it",
+			env: map[string]string{
+				"DATAPLANE_MANAGEMENT_TOKEN": "a-service-credential",
+			},
+			wantErr: "DATAPLANE_MANAGEMENT_TOKEN is set but DATAPLANE_MANAGEMENT_ADDR is not",
+		},
 	}
 
 	for _, tt := range tests {

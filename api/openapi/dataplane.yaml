@@ -16,23 +16,28 @@
 # the LLM request path, and a contract that carried both would be the first
 # place that assumption stopped being visible.
 #
-# Errors here are the gateway's own envelope, not the runtime's: a management
-# caller is a peer application inside the deployment, and the OpenAI-compatible
-# error shape exists for a client this surface never has. See
-# `shared/errors.yaml` and ADR 0006 §11.
+# One operation here is unusual, and it is the one the Control Plane's money
+# depends on: `GET /internal/usage-events` reads facts *back* from the Data
+# Plane, where every other operation in this document asks it to change
+# something. The delivery model, its cursor, and why it is a pull rather than a
+# push are stated in `shared/usage-facts.yaml`; the shape of what crosses is
+# there too.
 openapi: 3.1.0
 info:
   title: Ecoma LLM Gateway — Data Plane management API
   version: 0.1.0
   description: >-
-    The process probes and the common HTTP boundary of the Ecoma LLM Gateway's
-    Data Plane management API. This surface is internal: it is called by the
-    Control Plane and is not published to callers of the gateway. Every response
-    returns X-Request-Id, and every failure — including the ones no operation
-    declares, a 404 for an unmatched path and a 500 for an unclassifiable
-    implementation failure — returns the ErrorEnvelope. The Data Plane's
-    administrative endpoints are not designed yet; this document carries the
-    surface that exists and the process every later endpoint follows.
+    Health and readiness probes, the usage-fact feed, and the common HTTP
+    boundary of the Ecoma LLM Gateway's Data Plane management API. This surface
+    is internal: it is called by the Control Plane and is not published to
+    callers of the gateway. Every response returns X-Request-Id, and every
+    failure — including the ones no operation declares, a 404 for an unmatched
+    path and a 500 for an unclassifiable implementation failure — returns the
+    ErrorEnvelope. A management call identifies itself as a service; a browser
+    session or a customer API key is not a service identity and is refused. The
+    Data Plane's administrative endpoints beyond the fact feed are not designed
+    yet; this document carries the surface that exists and the process every
+    later endpoint follows.
 servers:
   - url: /
 tags:
@@ -42,6 +47,11 @@ tags:
       trio, and each document declares its own copy of the tag because each
       document is read on its own; the tag is where a reader sees that they are
       one convention rather than three unrelated endpoints.
+  - name: usage
+    description: >-
+      The usage-fact feed: the one place a caller reads the Data Plane's
+      recorded facts rather than asking it to change something. Its delivery
+      model is stated in shared/usage-facts.yaml.
 paths:
   /healthz:
     get:
@@ -130,3 +140,73 @@ paths:
           $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
         "500":
           $ref: "./shared/errors.yaml#/components/responses/InternalError"
+  /internal/usage-events:
+    get:
+      operationId: listUsageEvents
+      tags:
+        - usage
+      summary: Read the Data Plane's usage facts
+      description: >-
+        Returns a page of the immutable facts the runtime recorded, in the order
+        it recorded them, for the Control Plane to derive settlement from. The
+        model — an opaque cursor, replay instead of acknowledgement, a
+        consumer-owned position, and `request_id` as the idempotency key — is
+        stated once in `shared/usage-facts.yaml` and is not repeated here.
+
+
+        Two properties of this operation are worth stating on the wire. First,
+        it is read-only: there is no operation anywhere on this surface that
+        acknowledges, consumes, deletes or marks a fact as delivered, so a
+        control-plane outage loses nothing and a redelivered fact costs
+        nothing. Second, it answers from the Data Plane and never from here:
+        this application holds no facts, no cursor and no cache of either, and
+        when the runtime cannot be reached the answer is a 502 rather than a
+        guess.
+
+
+        A management caller authenticates as a service — see the
+        `serviceCredential` scheme below. The Control Plane reaches this
+        operation through the Data Plane's own private management listener; the
+        runtime's public surface (`runtime.yaml`) does not carry it, and the LLM
+        request path never touches it.
+      security:
+        - serviceCredential: []
+      parameters:
+        - $ref: "./shared/usage-facts.yaml#/components/parameters/UsageEventsAfter"
+        - $ref: "./shared/usage-facts.yaml#/components/parameters/UsageEventsLimit"
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: A page of usage facts.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/usage-facts.yaml#/components/schemas/UsageFactPage"
+        "400":
+          $ref: "./shared/errors.yaml#/components/responses/InvalidRequest"
+        "401":
+          $ref: "./shared/errors.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "410":
+          $ref: "./shared/errors.yaml#/components/responses/CursorExpired"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+        "502":
+          $ref: "./shared/errors.yaml#/components/responses/UpstreamUnavailable"
+components:
+  securitySchemes:
+    serviceCredential:
+      type: http
+      scheme: bearer
+      description: >-
+        A service identity presented by a peer application, never by a browser
+        and never by a customer. Deployment supplies the credential; the
+        security model is stated in ADR 0006 §9, and the transport is expected
+        to be replaced by one that proves the identity cryptographically (mTLS
+        or a signed credential) without changing this contract.

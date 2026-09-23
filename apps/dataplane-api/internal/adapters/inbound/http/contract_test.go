@@ -6,8 +6,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-
-	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/application"
 )
 
 // contractPath is this application's contract document, relative to this
@@ -44,7 +42,7 @@ func TestTheRouteTableIsTheContract(t *testing.T) {
 	declared := contractOperations(t)
 
 	served := []string{}
-	for _, rt := range routes(application.New("test")) {
+	for _, rt := range routes(testApp()) {
 		served = append(served, rt.method+" "+rt.path)
 	}
 	sort.Strings(served)
