@@ -1,0 +1,24 @@
+// The Go workspace: the three modules under apps/, and nothing else.
+//
+// `go.work` exists here for one reason, and it is not convenience. Each
+// module has its own import path, so `apps/dataplane` cannot import
+// `apps/console-api/internal/...` — Go's internal rule already forbids it
+// across modules — and neither module's go.mod may require the other. The
+// workspace is what lets a developer run `go build ./...` and `go test ./...`
+// from an application directory without `go mod tidy` reaching for a sibling;
+// the boundary itself is enforced by the module paths, not by this file.
+//
+// It is committed on purpose. A workspace file is local state by default and
+// belongs in .gitignore when it only wires up a developer's machine; this one
+// states a repository-wide invariant, and CI runs the same commands a
+// contributor does against it. Should `go work sync` ever need checksums
+// beyond the modules' own go.sum files it writes `go.work.sum` beside this
+// file — that one is committed on the same terms, and the Go tasks in each
+// `moon.yml` already name it as an input.
+go 1.26
+
+use (
+	./apps/console-api
+	./apps/dataplane
+	./apps/dataplane-api
+)

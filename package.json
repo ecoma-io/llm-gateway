@@ -2,7 +2,7 @@
   "name": "llm-gateway",
   "version": "0.2.0",
   "private": true,
-  "description": "Ecoma LLM Gateway — a Vue 3 console and a Go API for routing and governing LLM traffic. Repository scaffold; the product domains are not built yet.",
+  "description": "Ecoma LLM Gateway — a Control Plane (console + console-api), a Data Plane (dataplane + dataplane-api) and the contracts between them. Repository scaffold; the product domains are not built yet.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ecoma-io/llm-gateway.git"
@@ -31,7 +31,9 @@
     "build": "pnpm exec moon run ...:build",
     "check-projects": "node scripts/check-projects.mjs",
     "dev:console": "pnpm --filter @ecoma-io/llm-gateway-console dev",
-    "dev:api": "cd apps/api && go run ./cmd/gateway"
+    "dev:console-api": "cd apps/console-api && go run ./cmd/console-api",
+    "dev:dataplane": "cd apps/dataplane && go run ./cmd/dataplane",
+    "dev:dataplane-api": "cd apps/dataplane-api && go run ./cmd/dataplane-api"
   },
   "devDependencies": {
     "@commitlint/cli": "^21.2.3",

@@ -13,9 +13,10 @@ The rules an agent or contributor is held to beyond the process are in
 ## Setting up
 
 Requirements: **Node ≥ 24** (`.node-version` pins the major) and **pnpm ≥ 11**
-(pinned via `packageManager`, so Corepack fetches the right one). The API's
-targets additionally need **Go** (the version directive in
-`apps/api/go.mod` is the floor) and **golangci-lint** for its `lint` target.
+(pinned via `packageManager`, so Corepack fetches the right one). The three Go
+modules' targets additionally need **Go** (the version directive in each
+module's `go.mod` is that module's floor) and **golangci-lint** for their
+`lint` targets.
 
 ```bash
 git clone https://github.com/ecoma-io/llm-gateway.git
@@ -29,17 +30,19 @@ is because that step was skipped. Do not skip it.
 
 ## The commands
 
-| Command               | What it does                                                                                           |
-| --------------------- | ------------------------------------------------------------------------------------------------------ |
-| `pnpm format`         | Prettier, in place                                                                                     |
-| `pnpm format:check`   | Prettier, read-only — what CI runs                                                                     |
-| `pnpm lint`           | Every project's `lint` target through Moon — ESLint for the console, gofmt + golangci-lint for the API |
-| `pnpm test`           | Every project's `test` target through Moon — Vitest for the console, `go test` for the API             |
-| `pnpm typecheck`      | Every project's `typecheck` target through Moon — `vue-tsc --noEmit` and `go build ./...`              |
-| `pnpm build`          | Every project's `build` target through Moon — `vite build` and the gateway binary                      |
-| `pnpm check-projects` | Asserts every `apps/*` and `packages/*` directory is a project Moon can see, with the four targets     |
-| `pnpm dev:console`    | The console's Vite dev server                                                                          |
-| `pnpm dev:api`        | The API server (`go run ./cmd/gateway`, serves `/healthz`, `/readyz` and `/version` on :8080)          |
+| Command                  | What it does                                                                                           |
+| ------------------------ | ------------------------------------------------------------------------------------------------------ |
+| `pnpm format`            | Prettier, in place                                                                                     |
+| `pnpm format:check`      | Prettier, read-only — what CI runs                                                                     |
+| `pnpm lint`              | Every project's `lint` target through Moon — ESLint for the console, gofmt + golangci-lint for the API |
+| `pnpm test`              | Every project's `test` target through Moon — Vitest for the console, `go test` for the API             |
+| `pnpm typecheck`         | Every project's `typecheck` target through Moon — `vue-tsc --noEmit` and `go build ./...`              |
+| `pnpm build`             | Every project's `build` target through Moon — `vite build` and the gateway binary                      |
+| `pnpm check-projects`    | Asserts every `apps/*` and `packages/*` directory is a project Moon can see, with the four targets     |
+| `pnpm dev:console`       | The console's Vite dev server                                                                          |
+| `pnpm dev:console-api`   | The Control Plane API (`go run ./cmd/console-api` on :8080)                                            |
+| `pnpm dev:dataplane`     | The Data Plane runtime (`go run ./cmd/dataplane` on :8081)                                             |
+| `pnpm dev:dataplane-api` | The Data Plane management API (`go run ./cmd/dataplane-api` on :8082)                                  |
 
 A `Makefile` at the root spells the same commands as `make` targets
 (`make lint`, `make go-test`, …) — aliases, not a second definition. And a
@@ -48,7 +51,9 @@ single project's targets run directly:
 ```bash
 pnpm exec moon run console:lint console:test console:typecheck console:build
 pnpm exec moon run api-client:lint api-client:test api-client:typecheck api-client:build
-pnpm exec moon run api:lint api:test api:typecheck api:build
+pnpm exec moon run console-api:lint console-api:test console-api:typecheck console-api:build
+pnpm exec moon run dataplane:lint dataplane:test dataplane:typecheck dataplane:build
+pnpm exec moon run dataplane-api:lint dataplane-api:test dataplane-api:typecheck dataplane-api:build
 ```
 
 Those rosters are exactly what CI runs
@@ -121,7 +126,7 @@ body of the single commit that lands, trailers and all.
 ## Tests
 
 Tests live beside the code they test: `*.spec.ts` under `apps/console/src` run on
-Vitest, `_test.go` under `apps/api` run on the standard `go test`. No mocking
+Vitest, `_test.go` under each Go module run on the standard `go test`. No mocking
 library is in the tree — the surface is small enough that tests drive real
 handlers and real stores, and the day that stops being true is the day a test
 double is justified in the diff that introduces it.

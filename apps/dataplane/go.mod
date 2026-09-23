@@ -1,0 +1,25 @@
+// The Data Plane runtime: the OpenAI-compatible gateway that serves LLM
+// traffic, and the only application on the request hot path.
+//
+// The module path is spelled in full because Go's import path IS the name;
+// living under apps/dataplane of the ecoma-io/llm-gateway monorepo is the
+// accepted cost of the monorepo decision — the same arrangement every module
+// in this organisation carries. The path is also what makes the plane
+// boundary mechanical: the Control Plane lives in a different module, so an
+// import of this one's internals from there does not compile, and this
+// module's go.mod carries no require of any sibling.
+//
+// Nothing in this module may depend on the Control Plane being reachable. A
+// runtime request is served — or refused — from state this process already
+// holds; the Control Plane is a publisher of configuration and a consumer of
+// usage facts, never a hop on the path (ADR 0006 §4).
+module github.com/ecoma-io/llm-gateway/apps/dataplane
+
+go 1.26
+
+// valkey-go is the sole RESP client. deploy/redis/README.md records why it is
+// the smallest reasonable dependency and why Valkey is selected; the Go
+// standard library has no Redis-compatible client.
+require github.com/valkey-io/valkey-go v1.0.78
+
+require golang.org/x/sys v0.47.0 // indirect

@@ -7,18 +7,26 @@ this file wins on rules and that one wins on mechanics.
 
 ## What this repository is
 
-The Ecoma LLM Gateway: a Go API service and a Vue 3 console for routing and
-governing LLM traffic, released as one unit. Today it is a scaffold — the
-foundation below is real, the product domains are not built. Do not invent
-them speculatively: a domain arrives as a designed change (contract first, see
-below), never as scaffolding someone left around.
+The Ecoma LLM Gateway: four applications in two planes, released as one unit.
+The **Control Plane** (`apps/console`, `apps/console-api`) is where people sign
+in, subscribe and inspect; the **Data Plane** (`apps/dataplane`,
+`apps/dataplane-api`) is what serves LLM traffic. The split, its rules and its
+open questions are in [ADR 0006](docs/adr/0006-control-plane-and-data-plane.md),
+which wins over any summary here.
+
+Today it is a scaffold — the foundation below is real, the product domains are
+not built. Do not invent them speculatively: a domain arrives as a designed
+change (contract first, see below), never as scaffolding someone left around.
 
 ## Layout
 
 | Path                       | What lives there                                                                                                                                                                |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `apps/api`                 | The Go service. `cmd/gateway` is the entry point; `internal/` is the implementation.                                                                                            |
-| `apps/console`             | The Vue 3 console.                                                                                                                                                              |
+| `apps/console`             | The Vue 3 console — the Control Plane's presentation layer, and the only browser-reachable application.                                                                         |
+| `apps/console-api`         | The Control Plane API. `cmd/console-api` is the entry point; `internal/` is the implementation.                                                                                 |
+| `apps/dataplane`           | The Data Plane runtime — the OpenAI-compatible gateway. `cmd/dataplane` is the entry point.                                                                                     |
+| `apps/dataplane-api`       | The Data Plane's management API. `cmd/dataplane-api` is the entry point; it holds no state of its own.                                                                          |
+| `go.work`                  | The Go workspace over the three Go modules. Committed, so CI and contributors run the same commands.                                                                            |
 | `api/openapi/openapi.yaml` | The API contract.                                                                                                                                                               |
 | `migrations/`              | Database migrations — ordered, reviewed `.up.sql`/`.down.sql` pairs (the bootstrap pair enables TimescaleDB).                                                                   |
 | `deploy/`                  | Local development and integration fixtures for the backing infrastructure: `postgres/` (compose, migration runner, `verify.sh` suite) and `redis/` (disposable Valkey fixture). |
@@ -39,15 +47,18 @@ below), never as scaffolding someone left around.
    practical, the frontend binds to types generated from the OpenAPI document
    rather than hand-writing shapes that mirror it. A hand-written copy is drift
    waiting to happen.
-4. **The Go service stays console-agnostic.** Nothing under `apps/api` imports
-   or references Vue concepts, DOM shapes, or console presentation. Coupling
-   the domain to the frontend's implementation details forecloses every other
-   client.
+4. **The planes do not talk sideways.** An LLM request goes to the runtime and
+   nowhere else: the Data Plane never calls the Control Plane, never imports
+   its module, never reads its database, and never requires it to be running.
+   The Control Plane reaches the Data Plane only through a management call the
+   Data Plane can refuse. `internal/arch` in each Go module fails the build
+   when this is broken — the rule is enforced, not asked for.
 5. **Infrastructure stays behind explicit boundaries.** Database access,
-   external providers, queues: each lives behind an interface in `internal/`,
-   named for what it does, not for what it is. A change that reaches for an
-   infrastructure client from application code widens that boundary — widen it
-   on purpose, in the diff, or not at all.
+   external providers, queues: each lives behind a port in
+   `internal/ports/outbound/`, named for what it does, not for what it is, and
+   is implemented under `internal/adapters/outbound/`. A change that reaches
+   for an infrastructure client from application code widens that boundary —
+   widen it on purpose, in the diff, or not at all.
 6. **Behavioural changes arrive with tests.** A change to what the service or
    the console does lands with a test that fails without it. A green suite
    that cannot go red is not coverage.
@@ -70,11 +81,12 @@ below), never as scaffolding someone left around.
 
 The root `package.json` is the roster; `pnpm <script>` is the form.
 `format`, `format:check`, `lint`, `test`, `typecheck`, `build`,
-`check-projects`, `dev:console`, `dev:api`. The Moon tasks behind `lint`/`test`/
-`typecheck`/`build` live in `apps/*/moon.yml` and run per project; a single
-project's targets run as `pnpm exec moon run console:lint` (or `api:...`). The
-hooks (`lefthook.yml`) run format, lint and the projects gate on commit, tests
-and the graph on push, commitlint on the message.
+`check-projects`, `dev:console`, `dev:console-api`, `dev:dataplane`,
+`dev:dataplane-api`. The Moon tasks behind `lint`/`test`/`typecheck`/`build`
+live in `apps/*/moon.yml` and run per project; a single project's targets run
+as `pnpm exec moon run console-api:lint` (every application declares the same
+four names). The hooks (`lefthook.yml`) run format, lint and the projects gate
+on commit, tests and the graph on push, commitlint on the message.
 
 ## Commits
 
@@ -91,9 +103,10 @@ AI-assisted commits carry a trailer — `Assisted-by: <tool>` or
 2. Make the change: contract first when the API surface moves, tests beside
    the behaviour, migrations for schema.
 3. Run the gates — `pnpm format:check && pnpm lint && pnpm test && pnpm typecheck && pnpm build` — and the Go
-   tests directly if you touched `apps/api` (`cd apps/api && go test ./...`).
+   tests directly if you touched a Go module (`cd apps/console-api && go test ./...`,
+   and the same in the other two; `make go-test` loops over all three).
    `go vet` is not listed: golangci-lint in `pnpm lint` already runs govet
-   (`apps/api/.golangci.yml` argues the roster).
+   (each module's `.golangci.yml` argues the roster).
 4. Commit with a conventional message, push the branch, open the pull request
    against `main`, and let the required checks judge it.
 

@@ -1,0 +1,23 @@
+# golangci-lint configuration for the Data Plane runtime.
+#
+# The default v2 linter set is the whole mandate: `errcheck` (unchecked
+# errors), `govet`, `ineffassign`, `staticcheck` and `unused`. Nothing is
+# enabled beyond it: a linter roster longer than the code it reads is noise.
+# go.mod's dependency list does not move the roster — valkey-go (the one
+# direct require) is a library like the standard library pieces, not a reason
+# to arm more analyzers; this file stays the place that argues the roster in
+# either direction.
+#
+# The hexagonal boundary is enforced by tests rather than by a linter rule:
+# `internal/arch` parses the import graph and fails the build on a violation.
+# Expressed here as a depguard denylist it would be a second, weaker statement
+# of the same rule, and the weaker one is the one that goes stale.
+#
+# `go vet` is NOT run beside golangci-lint anywhere in this repository — the
+# default roster already runs govet, and the same analyzer twice is one
+# verdict paying two CI bills.
+#
+# Formatting is deliberately NOT delegated here — `gofmt` stays the first half
+# of the `lint` task in moon.yml, which fails loudly when its output is
+# non-empty (`gofmt -l` exits 0 over findings; only emptiness means clean).
+version: "2"
