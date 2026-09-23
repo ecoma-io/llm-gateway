@@ -39,6 +39,7 @@ is because that step was skipped. Do not skip it.
 | `pnpm typecheck`         | Every project's `typecheck` target through Moon — `vue-tsc --noEmit` and `go build ./...`                          |
 | `pnpm build`             | Every project's `build` target through Moon — `vite build` and the Go binaries                                     |
 | `pnpm check-projects`    | Asserts every `apps/*` and `packages/*` directory is a project Moon can see, with the four targets                 |
+| `pnpm openapi:check`     | Spectral, read-only — validates all three `api/openapi/*.yaml` documents, resolving `shared/` by relative `$ref`   |
 | `pnpm dev:console`       | The console's Vite dev server                                                                                      |
 | `pnpm dev:console-api`   | The Control Plane API (`go run ./cmd/console-api` on :8080)                                                        |
 | `pnpm dev:dataplane`     | The Data Plane runtime (`go run ./cmd/dataplane` on :8081)                                                         |
@@ -147,10 +148,28 @@ red. A test nobody has seen fail is a test nobody knows can.
 
 There are three contracts under `api/openapi/`, one per boundary:
 `console.yaml` for the console's API, `dataplane.yaml` for the Data Plane's
-management API, and `runtime.yaml` for the OpenAI-compatible runtime. The
-wire shapes all three return — the error envelope, the request ID, the probe
-schemas — live once in `shared/` and are referenced by relative `$ref`, so a
-caller who learns a shape on one surface has learned it on all of them.
+management API, and `runtime.yaml` for the OpenAI-compatible runtime. Shapes two
+of them genuinely share — the request ID, the probe schemas — live once in
+`shared/` and are referenced by relative `$ref`, so a caller who learns one on
+one surface has learned it on the other.
+
+Errors are not shared, and that is deliberate. The console and the management
+API answer with the `ErrorEnvelope` in `shared/errors.yaml`; the runtime answers
+with the OpenAI-compatible body in `shared/runtime-errors.yaml`. The two
+vocabularies are independent, and a change to one must not reach a client of the
+other: an OpenAI-compatible client parses `error.type` and `error.message`
+because that is what the API it was written against sends, and renaming those
+keys into a gateway envelope is not a cosmetic difference — it is a client that
+can no longer read the failure ([ADR 0006](docs/adr/0006-control-plane-and-data-plane.md) §11).
+
+Two checks stand behind the contracts, and neither subsumes the other:
+
+- `pnpm openapi:check` — Spectral resolves every `$ref` and validates each
+  document against the OpenAPI specification. A dangling reference, a
+  self-contradicting schema or a malformed document fails here.
+- the `contract_test.go` in each application — a route table compared against
+  the text of its own document, in both directions. A document that is valid but
+  describes an endpoint the process does not serve (or the reverse) fails here.
 
 The owning contract moves first: a new endpoint's shape is written there and
 reviewed before (or with) the implementation, never discovered in code review

@@ -85,6 +85,18 @@ jobs:
         if: github.event_name != 'merge_group'
         run: pnpm format:check
 
+      # The semantic half of the contract gate, and it runs on every event
+      # including the merge queue — unlike the formatting check above, which is
+      # a pure function of one file's own bytes. A merge brings another pull
+      # request's documents in alongside this one's, and two documents that are
+      # each valid can still leave a `$ref` dangling across them; the route
+      # tables in each Go module check the other half (that a process serves
+      # exactly what its document declares) and neither subsumes the other.
+      # Fails at `warning` severity, so a rule this corpus breaks on purpose is
+      # a justified entry in .spectral.yaml rather than a silent pass.
+      - name: Validate the OpenAPI documents
+        run: pnpm openapi:check
+
       # Asserts every directory under `apps/` and `packages/` is a project
       # Moon can see with the four targets. Runs BEFORE the Moon step, so an
       # unreachable project fails as an error rather than passing as an

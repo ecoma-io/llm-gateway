@@ -13,7 +13,9 @@
 // Nothing here decides a business rule. A handler translates a request into a
 // call, and the application's answer or typed error back into a response; the
 // one thing this package owns outright is the shape of the wire — status,
-// envelope, headers — which is what an inbound adapter is for.
+// error body, headers — which is what an inbound adapter is for. That error
+// body is the runtime's own, not the gateway's shared envelope, and wireerrors.go
+// is where the two were separated and why.
 //
 // This is the runtime's own surface and nobody else's: the Data Plane's
 // management transport is a different application (apps/dataplane-api), and
@@ -24,7 +26,6 @@ package http
 
 import (
 	"encoding/json"
-	"errors"
 	"log"
 	stdhttp "net/http"
 	"path"
@@ -63,8 +64,9 @@ func New(app *application.App) stdhttp.Handler {
 	}
 
 	// The fallback every other path and method lands on. Unmatched paths are
-	// not an operation in api/openapi/runtime.yaml, but their envelope is
-	// contracted in its description: JSON, code "not_found", request ID.
+	// not an operation in api/openapi/runtime.yaml, but their response is
+	// contracted in the descriptions there: JSON, the runtime error body, and
+	// the request ID in the header.
 	mux.HandleFunc("/", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		writeError(w, r, notFoundError{})
 	})
@@ -114,76 +116,9 @@ func writeStatus(w stdhttp.ResponseWriter) {
 // versionResponse is the one wire shape for a version answer, mirroring the
 // shared Version schema (api/openapi/shared/probes.yaml) field for field. The
 // application returns the bare value; serialization stays on this side of the
-// boundary, exactly as it does for the error envelope below.
+// boundary, exactly as it does for the error body in wireerrors.go.
 type versionResponse struct {
 	Version string `json:"version"`
-}
-
-// errorEnvelope is the one wire shape for failures, mirroring the shared
-// ErrorEnvelope (api/openapi/shared/errors.yaml) field for field. The two
-// fragments are shared because all three contracts return the same envelope:
-// a caller who learns this shape on one surface has learned it on all of
-// them.
-type errorEnvelope struct {
-	Error     errorBody `json:"error"`
-	RequestID string    `json:"request_id"`
-}
-
-type errorBody struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
-// writeError is the one error translation point. An application error carries
-// a typed code; a transport error maps itself; anything unknown — including a
-// malformed application code — normalizes to the closed "internal" value
-// rather than letting a future implementation category escape through the
-// contract's enum.
-func writeError(w stdhttp.ResponseWriter, r *stdhttp.Request, err error) {
-	status, code, message := errorResponse(err)
-	requestID, ok := RequestIDFromContext(r.Context())
-	if !ok || requestID == "" {
-		// Unreachable through New, whose middleware installs an identifier for
-		// every request — but the envelope's contract guarantees a non-empty
-		// request ID in both body and header, so writeError upholds that on its
-		// own rather than trusting its caller.
-		requestID = newRequestID()
-		w.Header().Set(RequestIDHeader, requestID)
-	}
-	if code == string(application.CodeInternal) {
-		// The request identifier is bounded and grammar-checked by requestID;
-		// the operational cause is not, and a caller-shaped error string does
-		// not belong in an operator's log line. Log the correlation fact only.
-		log.Printf("%s request_id=%s internal error", serviceName, requestID)
-	}
-	writeJSON(w, status, errorEnvelope{
-		Error:     errorBody{Code: code, Message: message},
-		RequestID: requestID,
-	})
-}
-
-// errorResponse maps one error to its deterministic status, wire code and
-// public message. It is the whole status mapping; nothing else in the
-// package decides a status from an error.
-func errorResponse(err error) (status int, code string, message string) {
-	var transportError interface {
-		error
-		response() (int, string, string)
-	}
-	if errors.As(err, &transportError) {
-		return transportError.response()
-	}
-
-	applicationError, ok := application.As(err)
-	if !ok {
-		return stdhttp.StatusInternalServerError, string(application.CodeInternal), internalErrorMessage
-	}
-	switch applicationError.Code {
-	case application.CodeNotFound:
-		return stdhttp.StatusNotFound, string(application.CodeNotFound), applicationError.Message
-	default:
-		return stdhttp.StatusInternalServerError, string(application.CodeInternal), internalErrorMessage
-	}
 }
 
 func writeJSON(w stdhttp.ResponseWriter, status int, value any) {
@@ -194,52 +129,4 @@ func writeJSON(w stdhttp.ResponseWriter, status int, value any) {
 		// half-written response. Log the fact without echoing the payload.
 		log.Printf("%s response JSON write failed: %T", serviceName, err)
 	}
-}
-
-// notFoundError is the transport fact that no route matched. It maps itself
-// rather than passing through application, whose vocabulary is for resources
-// its use-cases own.
-type notFoundError struct{}
-
-func (notFoundError) Error() string {
-	return "resource not found"
-}
-
-func (notFoundError) response() (int, string, string) {
-	return stdhttp.StatusNotFound, string(application.CodeNotFound), "resource not found"
-}
-
-// notImplementedError is the transport fact that the path is contracted and
-// the operation behind it is not built. Like notFoundError it maps itself: the
-// application has no use-case to refuse with, because there is no use-case —
-// answering 501 is the transport telling the truth about a surface the
-// contract describes and the code does not yet provide.
-//
-// It is a transport error rather than an application one for the same reason
-// it exists: the day the runtime routes a completion, this disappears, and an
-// application error code would have to be deleted along with it. The wire code
-// `not_implemented` is declared in every contract's shared error vocabulary so
-// that a caller can tell this apart from `not_found` — "belongs to the runtime
-// and is not built" versus "is not a path here".
-type notImplementedError struct{}
-
-func (notImplementedError) Error() string {
-	return "not implemented"
-}
-
-func (notImplementedError) response() (int, string, string) {
-	return stdhttp.StatusNotImplemented, "not_implemented", "not implemented"
-}
-
-// methodNotAllowedError is the transport fact that the path exists but the
-// method does not. The Allow header is set by the companion route, which is
-// the one place that knows the methods the path accepts.
-type methodNotAllowedError struct{}
-
-func (methodNotAllowedError) Error() string {
-	return "method not allowed"
-}
-
-func (methodNotAllowedError) response() (int, string, string) {
-	return stdhttp.StatusMethodNotAllowed, "method_not_allowed", "method not allowed"
 }

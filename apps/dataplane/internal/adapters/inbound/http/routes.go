@@ -11,10 +11,10 @@ import (
 // The table in routes is that surface's single source of truth: New registers
 // from it, and routes_test.go reads it, so an endpoint cannot exist in the
 // server and be missing from the inventory a reviewer reads. The scaffold has
-// three probes and no runtime endpoint; the table is here because the shape of
-// a surface is worth stating in one place before there are twenty rows to
-// state it about, and because that is what makes the surface testable as data
-// rather than as a series of calls.
+// three probes and one inference endpoint that answers 501; the table is here
+// because the shape of a surface is worth stating in one place before there are
+// twenty rows to state it about, and because that is what makes the surface
+// testable as data rather than as a series of calls.
 //
 // For this application the table carries a second weight. The runtime's
 // surface is the one place a Control Plane or management endpoint could appear

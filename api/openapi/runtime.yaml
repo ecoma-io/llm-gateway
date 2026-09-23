@@ -9,13 +9,21 @@
 # and the two surfaces' uptime commitments are stated apart because they do not
 # move together.
 #
-# Exactly one operation exists today, and it is not implemented. It is
-# contracted anyway, as a 501 with `not_implemented`, because the alternative —
-# omitting it — would make the boundary invisible: `POST /v1/chat/completions`
-# belongs to this application, and a caller who sends one gets an answer that
-# says so rather than a 404 that says the path is nothing. The success path is
-# deliberately absent: a documented 200 this code cannot produce would be the
-# contract claiming a capability that does not exist.
+# It is also the one whose errors are somebody else's. The other two surfaces
+# answer their callers with an envelope this repository designed; this one
+# answers clients written against OpenAI, which parse `error.type` and
+# `error.message` and will not be re-taught. So the errors here come from
+# `shared/runtime-errors.yaml` and from nowhere else — the two vocabularies
+# move independently, and a change to the console's envelope cannot reach a
+# client of this surface.
+#
+# Exactly one runtime operation exists today, and it is not implemented. It is
+# contracted anyway, as a 501, because the alternative — omitting it — would
+# make the boundary invisible: `POST /v1/chat/completions` belongs to this
+# application, and a caller who sends one gets an answer that says so rather
+# than a 404 that says the path is nothing. The success path is deliberately
+# absent: a documented 200 this code cannot produce would be the contract
+# claiming a capability that does not exist.
 openapi: 3.1.0
 info:
   title: Ecoma LLM Gateway — OpenAI-compatible runtime
@@ -23,18 +31,36 @@ info:
   description: >-
     The OpenAI-compatible inference surface of the Ecoma LLM Gateway's Data
     Plane, plus the process probes this application serves. Every response
-    returns X-Request-Id. An unmatched path returns the ErrorEnvelope with HTTP
-    404; a method unsupported by a known path returns it with HTTP 405; a
-    contracted operation that is not built returns it with HTTP 501 and the
-    `not_implemented` code. The runtime's routing, provider and usage behaviour
-    is not designed yet — this document carries the surface that exists and the
-    process every later endpoint follows.
+    returns X-Request-Id. Failures are reported in the OpenAI-compatible shape
+    from shared/runtime-errors.yaml: an unmatched path returns it with HTTP 404
+    and the `not_found_error` type, a method unsupported by a known path with
+    HTTP 405 and `invalid_request_error`, and a contracted operation that is
+    not built with HTTP 501, `api_error` and the `not_implemented` code.
+    A request that fails after the response has started streaming reports the
+    failure inside the stream instead, because by then no HTTP status can be
+    revised — see the chat-completion operation. The runtime's routing,
+    provider and usage behaviour is not designed yet; this document carries the
+    surface that exists and the process every later endpoint follows.
 servers:
   - url: /
+tags:
+  - name: probes
+    description: >-
+      Process probes. All three applications in this repository serve the same
+      trio, and each document declares its own copy of the tag because each
+      document is read on its own; the tag is where a reader sees that they are
+      one convention rather than three unrelated endpoints.
+  - name: runtime
+    description: >-
+      The OpenAI-compatible inference surface. This is the only tag in any of
+      the three documents that carries a caller's traffic rather than an
+      operator's.
 paths:
   /healthz:
     get:
       operationId: getHealth
+      tags:
+        - probes
       summary: Liveness of the runtime process
       description: >-
         Returns 200 while the process is able to serve. This is the endpoint an
@@ -53,11 +79,17 @@ paths:
             application/json:
               schema:
                 $ref: "./shared/probes.yaml#/components/schemas/HealthStatus"
+        "404":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/NotFound"
         "405":
-          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+          $ref: "./shared/runtime-errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/InternalError"
   /readyz:
     get:
       operationId: getReadiness
+      tags:
+        - probes
       summary: Readiness of the runtime service
       description: >-
         Returns 200 when the service may receive traffic. The scaffold has no
@@ -77,11 +109,17 @@ paths:
             application/json:
               schema:
                 $ref: "./shared/probes.yaml#/components/schemas/HealthStatus"
+        "404":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/NotFound"
         "405":
-          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+          $ref: "./shared/runtime-errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/InternalError"
   /version:
     get:
       operationId: getVersion
+      tags:
+        - probes
       summary: Build version of the runtime service
       description: >-
         Returns the version stamped into the dataplane binary at build time. It
@@ -99,11 +137,17 @@ paths:
             application/json:
               schema:
                 $ref: "./shared/probes.yaml#/components/schemas/Version"
+        "404":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/NotFound"
         "405":
-          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+          $ref: "./shared/runtime-errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/InternalError"
   /v1/chat/completions:
     post:
       operationId: createChatCompletion
+      tags:
+        - runtime
       summary: Create a chat completion
       description: >-
         The OpenAI-compatible chat completion endpoint. It is contracted and
@@ -111,10 +155,41 @@ paths:
         it is not designed yet, and this operation answers 501 with the
         `not_implemented` code until it is.
 
+
         The request body is a pass-through — the OpenAI-compatible request
         shape, forwarded as received — and is not asserted on, because the
         scaffold neither validates nor forwards it. Whatever the caller sends
         gets the same 501.
+
+
+        **How a failure is reported depends on whether the response has been
+        committed**, which for a streamed answer happens at the first
+        content-bearing byte written to the client, and is a separate question
+        from whether a candidate has been chosen (see
+        docs/architecture/routing.md; commitment is what freezes a candidate
+        and ends fallback):
+
+
+        - *Before commitment* the failure is ordinary HTTP — a status code and
+          the error body from shared/runtime-errors.yaml. Several candidates
+          may have failed to reach this point and the caller still sees one
+          error, because pre-commitment fallback is the runtime's own business.
+
+
+        - *After commitment* no status can be revised, so the failure is
+          written into the stream: one Server-Sent Event `data:` frame whose
+          payload is the same JSON error body, then the terminal `data: [DONE]`
+          frame, then the stream closes. The client learns that the answer it
+          has already begun rendering ended in failure instead of waiting for a
+          connection that will never finish. The `type` names the class — a
+          provider failure mid-stream is an `api_error`, never an
+          `invalid_request_error`.
+
+
+        - *A client disconnect* writes nothing at all: there is no channel left
+          to report on, and a caller that has gone away cannot read a report.
+          The observation belongs to the runtime's usage facts, and the billable
+          quantity is what was already forwarded.
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
       requestBody:
@@ -128,7 +203,11 @@ paths:
               type: object
               additionalProperties: true
       responses:
-        "501":
-          $ref: "./shared/errors.yaml#/components/responses/NotImplemented"
+        "404":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/NotFound"
         "405":
-          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+          $ref: "./shared/runtime-errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/InternalError"
+        "501":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/NotImplemented"

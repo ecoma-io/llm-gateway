@@ -6,9 +6,16 @@ export type ClientOptions = {
 
 export type Error = {
   /**
-   * A stable machine-readable category for the failure. The list is shared by all three contracts; `not_implemented` is returned only by the runtime's contracted-but-unbuilt endpoint.
+   * A stable machine-readable category for the failure, shared by both surfaces that return this envelope. `cursor_expired` and `upstream_unavailable` are produced by the Data Plane management API today; they are named here rather than in that document alone so a Control Plane caller has one vocabulary for both.
    */
-  code: "not_found" | "method_not_allowed" | "not_implemented" | "internal";
+  code:
+    | "not_found"
+    | "method_not_allowed"
+    | "invalid_request"
+    | "unauthenticated"
+    | "cursor_expired"
+    | "upstream_unavailable"
+    | "internal";
   /**
    * A human-readable explanation safe to present to a client. Internal implementation details and stack traces never appear here.
    */
@@ -59,9 +66,17 @@ export type GetHealthData = {
 
 export type GetHealthErrors = {
   /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
    * The resource exists but does not accept the request method.
    */
   405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
 };
 
 export type GetHealthError = GetHealthErrors[keyof GetHealthErrors];
@@ -90,9 +105,17 @@ export type GetReadinessData = {
 
 export type GetReadinessErrors = {
   /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
    * The resource exists but does not accept the request method.
    */
   405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
 };
 
 export type GetReadinessError = GetReadinessErrors[keyof GetReadinessErrors];
@@ -121,9 +144,17 @@ export type GetVersionData = {
 
 export type GetVersionErrors = {
   /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
    * The resource exists but does not accept the request method.
    */
   405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
 };
 
 export type GetVersionError = GetVersionErrors[keyof GetVersionErrors];

@@ -1,0 +1,47 @@
+# The OpenAPI linter's configuration, and the repository's semantic gate on
+# api/openapi/*.yaml.
+#
+# Why this exists at all: the contract tests in each Go module compare a route
+# table against the *text* of its document — a line scanner reading `paths:` and
+# method keys. That answers "does this process serve exactly what the document
+# declares" and it answers it well. It cannot answer "is this document a valid
+# OpenAPI document", because it never resolves a `$ref` and never looks at
+# anything below a path key. A dangling reference, a schema that contradicts
+# itself, or a typo in a `required` list is invisible to every check in this
+# repository today. This file is the second, complementary gate; neither
+# replaces the other.
+#
+# `extends` pulls in the standard OpenAPI ruleset, which is the licensed choice
+# here rather than a set of hand-written checks: the point of a semantic gate
+# is to be somebody else's opinion about the specification, not this
+# repository's.
+extends:
+  - "spectral:oas"
+
+# The list below is every rule this corpus deliberately breaks, and it is short
+# on purpose. It was not written from the rule reference but from the linter's
+# own output: running `spectral:oas` unmodified over the three documents reports
+# exactly two classes of finding, and there are no others to silence. Every rule
+# that is *not* here is a rule this repository passes — which is what makes an
+# entry below a decision a reviewer can read, rather than a habit.
+rules:
+  # Fires on all three documents. Nothing here is published to a catalogue or a
+  # developer portal, so a `contact` object would carry this repository's URL
+  # three times and be read by nobody: the repository's own metadata is the
+  # LICENSE file and the package manifest, and the documents are opened from
+  # inside this checkout. The day one of these surfaces is published, this rule
+  # comes back on — the suppression is about publication, not about contact
+  # information.
+  info-contact: off
+
+  # Fires once, on `POST /v1/chat/completions`, which declares no 2xx response
+  # on purpose. The operation exists in the contract so a caller can tell
+  # "belongs to this application and is not built" (501) from "is not a path
+  # here" (404), and the runtime cannot produce a successful completion yet.
+  # Declaring a 200 would be the contract claiming a capability the code does
+  # not have, which is the one thing this repository's contract-first rule is
+  # meant to prevent — see AGENTS.md rule 2 and api/openapi/runtime.yaml's
+  # header. This is the suppression that should disappear first: the day the
+  # operation is implemented, the rule goes back on and the document must have
+  # gained its 200.
+  operation-success-response: off

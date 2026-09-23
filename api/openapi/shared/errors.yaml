@@ -1,18 +1,21 @@
-# The error envelope every one of the gateway's three contracts returns, and
-# the 405 response built from it.
+# The error envelope the Control Plane's console API and the Data Plane's
+# management API return, and the responses built from it.
 #
 # Like its sibling `probes.yaml`, this is a fragment: a `components:` tree the
-# three contracts reference by relative path. The envelope is shared because it
-# is the one thing a caller of any surface handles identically — and because
-# the console's generated client parses the Control Plane's errors with the
-# same type the runtime's callers will parse its own.
+# two contracts reference by relative path. It is **not** shared by all three
+# any more. The runtime's public surface answers with the OpenAI-compatible
+# error shape in `runtime-errors.yaml`, because that surface has a client it did
+# not choose: an OpenAI-compatible caller parses `error.type` and
+# `error.message`, and handing it a gateway-shaped envelope because the envelope
+# happened to exist would put this repository's vocabulary on somebody else's
+# wire. The console and the management surface share this envelope because both
+# consumers are ours.
 #
-# The `code` enum is deliberately one list for all three documents. A code
-# exists in the contract before it can be returned: `not_implemented` is
-# declared here, and today exactly one operation can produce it — the runtime's
-# `POST /v1/chat/completions`, which is contracted and not built. A code that
-# appeared only in the document where it is returned would be a code the other
-# surfaces' clients could not name.
+# The `code` enum is deliberately one list for both documents here. A code
+# exists in the contract before it can be returned, and the list is short on
+# purpose: every member below is produced by a response this document declares,
+# and a code that appeared only in the document where it is returned would be a
+# code the other surface's client could not name.
 components:
   responses:
     MethodNotAllowed:
@@ -30,12 +33,77 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorEnvelope"
-    NotImplemented:
+    NotFound:
       description: >-
-        The endpoint is part of the contract and is not implemented. The
-        gateway answers it rather than leaving it unrouted, so a caller can
-        tell "not built yet" apart from "not a path" — the first is a 501 with
-        this code, the second a 404 with `not_found`.
+        No operation is declared at the requested path. The gateway answers
+        every unmatched path this way rather than letting its router emit an
+        HTML or plain-text page, so a caller parses one shape for every failure
+        the surface can produce.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    InvalidRequest:
+      description: >-
+        The request is well-formed HTTP but a parameter does not satisfy this
+        surface's contract — an unparseable value, a value outside its declared
+        bounds, or an unknown parameter the caller cannot be allowed to believe
+        took effect.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    Unauthenticated:
+      description: >-
+        The caller did not identify itself as a service this surface accepts.
+        Management surfaces authenticate callers, not users: a browser session
+        and a customer API key are both rejected here, because neither is a
+        service identity (ADR 0006 §9).
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    CursorExpired:
+      description: >-
+        The supplied cursor is past the history this surface still retains, so
+        the range it names can no longer be replayed. The request fails rather
+        than resuming from a newer position: silently skipping facts a consumer
+        has not read would turn a retention decision into lost settlement.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    UpstreamUnavailable:
+      description: >-
+        The management API could not reach the Data Plane it fronts, so the
+        answer it would return is unknown. It reports the failure instead of
+        answering from a cache, because every value this surface serves is the
+        runtime's and this process holds none of it.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    InternalError:
+      description: >-
+        The surface failed in a way it cannot classify. Internal causes are
+        logged against the request identifier and never serialized: a caller
+        can act on the status and the request ID, and cannot act on a stack
+        frame, a query or a provider error.
       headers:
         X-Request-Id:
           $ref: "./probes.yaml#/components/headers/RequestId"
@@ -66,12 +134,17 @@ components:
           enum:
             - not_found
             - method_not_allowed
-            - not_implemented
+            - invalid_request
+            - unauthenticated
+            - cursor_expired
+            - upstream_unavailable
             - internal
           description: >-
-            A stable machine-readable category for the failure. The list is
-            shared by all three contracts; `not_implemented` is returned only
-            by the runtime's contracted-but-unbuilt endpoint.
+            A stable machine-readable category for the failure, shared by both
+            surfaces that return this envelope. `cursor_expired` and
+            `upstream_unavailable` are produced by the Data Plane management
+            API today; they are named here rather than in that document alone
+            so a Control Plane caller has one vocabulary for both.
         message:
           type: string
           description: >-

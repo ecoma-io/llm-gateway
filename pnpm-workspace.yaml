@@ -27,6 +27,14 @@ allowBuilds:
   # default already targets Vue 3, the only Vue this repository runs, so the
   # script has nothing to do here and stays blocked.
   vue-demi: false
+  # @scarf/scarf: false — a transitive dependency of @stoplight/spectral-cli,
+  # and a telemetry package rather than a build step. Its postinstall reports
+  # the install to a third-party analytics endpoint; nothing in this repository
+  # depends on its output, and a linter has no business telling anyone outside
+  # the deployment that a developer ran pnpm install. Denied for the same
+  # reason every other entry here is: an install script that runs unreviewed is
+  # the shortest path from a dependency to a compromised machine.
+  "@scarf/scarf": false
 
 minimumReleaseAgeExclude:
   - "@ecoma-io/loom@0.8.3"
