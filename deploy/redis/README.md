@@ -59,13 +59,32 @@ docker compose -f deploy/redis/docker-compose.yml up -d
 # Wait until the service reports healthy.
 docker compose -f deploy/redis/docker-compose.yml ps
 
-# Run the API integration suite against it.
-(cd apps/api && REDIS_ADDRESS=127.0.0.1:6379 go test -tags=integration ./internal/infra/redis)
+# Run the API integration suite against it — the `api:test-integration` Moon
+# target, which refuses to run without REDIS_ADDRESS and fails if the tagged
+# suite would run nothing (the same target the CI verify-api job runs):
+REDIS_ADDRESS=127.0.0.1:6379 pnpm exec moon run api:test-integration
 ```
 
 The compose file pins a readable Valkey version **and** an immutable manifest
 list digest. When upgrading it, verify the new tag's digest before changing the
-file, then update the Decision record in the same pull request.
+file, then update the Decision record in the same pull request **and** the
+matching `image:` pin on the `verify-api` job in
+`.github/workflows/ci.yml` — the workflow asserts the two pins agree and
+fails until they do.
+
+## The same suite in CI
+
+This is not only a local fixture: the `verify-api` job in
+`.github/workflows/ci.yml` starts a service container from the image pinned
+above and runs this exact suite through the `api:test-integration` Moon target
+(`apps/api/moon.yml`), with `REDIS_ADDRESS=127.0.0.1:6379` — the same address
+as the local command, so the two invocations are one run in two places. The
+tagged suite is therefore part of every `ci-gate` run, not an opt-in extra.
+
+That job also re-derives this directory's pin and its own at run time and
+fails when they diverge, so CI can never quietly upgrade to a server version
+no developer has run. The enforcement lives in the workflow; this file records
+the contract.
 
 ## Stop and remove
 

@@ -49,6 +49,40 @@ tasks:
         echo "go test ./... executed no tests — a green target here would mean nothing ran"
         exit 1
       fi
+  # The integration tier: the `//go:build integration` suite in
+  # `internal/infra/redis` against a real Redis-compatible server. One suite,
+  # two runners — a developer against `deploy/redis/docker-compose.yml` (that
+  # directory's README has the commands) and CI's `verify-api` job against its
+  # pinned service container — and this target is the single definition of the
+  # run both perform, so the tier cannot drift between them.
+  #
+  # The scope is the package that owns the tagged tests, not `./...`: with the
+  # tag applied, `./...` would recompile and re-run every unit suite a second
+  # time for nothing. The vacuity guard below is what catches that scope going
+  # stale — the tagged file moved, renamed, or lost its build constraint —
+  # because `go test -tags=…` exits 0 over a run of nothing, byte-for-byte
+  # identical to a full pass.
+  #
+  # REDIS_ADDRESS is required here rather than left to the suite's own
+  # `t.Fatal` for the same reason the missing variable fails the run at all:
+  # one line naming the fix beats four tests failing on it, and it states the
+  # tier's contract — nothing runs without an explicit server — before go test
+  # is even invoked. REDIS_USERNAME and REDIS_PASSWORD pass through untouched,
+  # as the suite itself documents.
+  test-integration:
+    script: |
+      if [ -z "${REDIS_ADDRESS:-}" ]; then
+        echo "REDIS_ADDRESS is required — start the fixture (from the repository root: docker compose -f deploy/redis/docker-compose.yml up -d) and set it to 127.0.0.1:6379 (see deploy/redis/README.md)"
+        exit 1
+      fi
+      status=0
+      output="$(go test -v -tags=integration ./internal/infra/redis 2>&1)" || status=$?
+      printf '%s\n' "$output"
+      [ "$status" -eq 0 ] || exit "$status"
+      if ! printf '%s\n' "$output" | grep -q '^=== RUN'; then
+        echo "go test -tags=integration executed no tests — a green target here would mean nothing ran"
+        exit 1
+      fi
   # The Go half of what `vue-tsc --noEmit` is for the web project. `go build`
   # over more than one package compiles and discards, writing no binary — a
   # typecheck target that dropped an executable into the package root would be
