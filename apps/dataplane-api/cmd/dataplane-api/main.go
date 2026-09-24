@@ -3,16 +3,23 @@
 //
 // Everything HTTP lives in internal/adapters/inbound/http so it can be tested
 // through httptest without a process; what remains here is the version stamp,
-// the listener, and signal handling. Configuration is parsed and validated by
-// internal/config before this package sees it, so an invalid value fails the
-// process before it has accepted traffic.
+// the listener, signal handling and the one place an adapter is chosen.
+// Configuration is parsed and validated by internal/config before this package
+// sees it, so an invalid value fails the process before it has accepted
+// traffic.
 //
-// There are no outbound adapters to compose, and that is the module's shape
-// rather than an omission: a management transport owns no data. Everything
-// this application will eventually answer has to come from the Data Plane
-// over its management boundary, and how that is reached is the open question
-// ADR 0006 §9 records — deliberately unanswered here rather than answered
-// with a speculative client.
+// Exactly one outbound adapter is composed here, and the seam it crosses is the
+// one this application exists for: the Data Plane. It is an HTTP call rather
+// than a database or a cache connection, and that difference is the rule rather
+// than a detail — this process owns no data, so what it answers with comes from
+// the Data Plane over a management call the Data Plane can refuse (ADR 0006 §9,
+// §11). That composition is the one ADR 0006 §9 decided rather than a choice
+// made here: the façade reaches the Data Plane through an outbound port of its
+// own, over the Data Plane's private management listener, never through a
+// shared core module both transports depend on and never by reading the Data
+// Plane's tables. The usage-fact feed is that seam in use — the port lives in
+// internal/ports/outbound, and the HTTP adapter behind it is the one outbound
+// adapter composed below.
 package main
 
 import (
@@ -28,6 +35,7 @@ import (
 	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/adapters/inbound/http"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/adapters/outbound/dataplane"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/config"
 )
@@ -68,8 +76,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// The outbound client is built here rather than inside the adapter, and it
+	// carries no timeout of its own. The call it makes inherits the inbound
+	// request's context, so its lifetime is already bounded by the caller's
+	// deadline and by that caller going away; a second, invented deadline at
+	// this layer would be a number chosen without any latency to measure it
+	// against, and it would compound with the caller's rather than replace it.
 	server := &stdhttp.Server{
-		Handler: http.New(application.New(version)),
+		Handler: newHandler(cfg, &stdhttp.Client{}),
 		// ReadHeaderTimeout guards against a peer that connects and says
 		// nothing — a slowloris costs a goroutine forever without it. The
 		// read/write body and idle timeouts wait until there is real traffic
@@ -92,6 +106,33 @@ func main() {
 	}
 
 	log.Printf("dataplane-api %s stopped", version)
+}
+
+// newHandler composes the management surface from configuration: the outbound
+// adapter that reaches the Data Plane, the use case over it, and the inbound
+// handler that authenticates a caller before either runs.
+//
+// It is a function rather than five lines inside main because of what the
+// assignment of the two credentials has to be able to fail on. The two hops get
+// two credentials, and the sentence that keeps them apart is the argument order
+// below: the adapter presents DataPlaneCredential to the Data Plane's private
+// listener, and the authenticator compares ServiceCredential against what
+// callers present here. Handing both the same value is what this code did before
+// the split, and it made the secret a Control Plane caller is entitled to hold a
+// key to the private listener — which is precisely the defect internal/config's
+// "must differ" check cannot catch, because that check proves the two values are
+// unequal and never which one went where.
+//
+// So the wiring has to be reachable from a test, and this is what makes it so:
+// chain_test.go calls this function with two distinct credentials and asserts
+// the direction of each, which turns a swapped pair into a red test rather than
+// a deployment where the caller-facing secret opens the private surface. A copy
+// of these four lines inside a test would prove nothing about this code and
+// would keep passing after the arguments here were exchanged.
+func newHandler(cfg config.Config, client *stdhttp.Client) stdhttp.Handler {
+	usageFacts := dataplane.New(client, cfg.DataPlaneURL, cfg.DataPlaneCredential)
+	authenticator := http.NewServiceAuthenticator(cfg.ServiceCredential)
+	return http.New(application.New(version, usageFacts), authenticator)
 }
 
 // run serves until the process is asked to stop, then drains.

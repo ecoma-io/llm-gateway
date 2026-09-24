@@ -37,7 +37,7 @@ spanning contexts, and ADR 0005's Context rejects splitting the event tables
 out of the accounting database because it "forces a transactional outbox
 between a charge and its usage fact". A plane boundary makes the first claim
 false as written and re-opens the second. Both are addressed in
-[Amendments](#amendments-to-adrs-0001-0004-and-0005).
+[Amendments](#amendments-to-adrs-0001-0003-0004-and-0005).
 
 The cost of not deciding now: the first schema PR and the first product
 endpoint decide the deployment shape silently, and
@@ -120,10 +120,18 @@ client port in the runtime, no management route literals in the runtime).
 
 ### 5. Communication rules
 
-| Direction      | What crosses                                                                                | Keyed by                                 |
-| -------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------- |
-| Control → Data | Configuration and grants: aliases, backends, price revisions, entitlements, key projections | the entity's own identifier — idempotent |
-| Data → Control | Usage facts and quota consumption: what was delivered, what was held                        | `request_id` — idempotent                |
+| Direction      | What crosses                                                                                                  | Keyed by                                 |
+| -------------- | ------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
+| Control → Data | **Configuration and projections**: aliases, backends, price revisions, entitlements, key projections          | the entity's own identifier — idempotent |
+| Data → Control | **Facts and observations**: usage facts, request-outcome facts, quota-consumption facts, reconciliation state | `request_id` — idempotent                |
+
+The directions have names, and using them is part of the rule: Control → Data
+carries **configuration** and **projections**, Data → Control carries **facts**
+and **observations**. Neither direction is "data synchronization", because
+nothing is synchronised — one side states what the Data Plane should hold, the
+other states what it observed. The operational protocol behind the second
+direction is [../architecture/cross-plane-protocols.md](../architecture/cross-plane-protocols.md);
+the wire shape of the feed is `api/openapi/shared/usage-facts.yaml`.
 
 The first row crosses in two different senses, and the difference matters.
 Catalog configuration — aliases, candidates, backends, price revisions — is
@@ -141,15 +149,105 @@ Rules that follow:
   the other direction as facts.
 - **No shared table and no cross-plane transaction.** Each plane writes its own
   database (section 7).
-- **Every cross-plane message is a fact with a key**, so redelivery is a no-op
-  and no distributed transaction is needed. Where coordination is required —
-  a key being minted, capacity being granted — it is explicit
-  request/response with a defined failure behaviour, never a two-phase commit.
+- **Every cross-plane message carries a key**, so redelivery is a no-op and no
+  distributed transaction is needed. Where coordination is required — a key
+  being minted, capacity being granted — it is explicit request/response with a
+  defined failure behaviour, never a two-phase commit.
 - **The console never talks to `dataplane-api`.** When the console needs a Data
   Plane operation, the call is:
-  `console-api application → DataPlaneManagementPort → HTTP adapter → dataplane-api`.
+  `console-api application → dataplane.Management → HTTP adapter → dataplane-api`.
   The application layer depends on the port; the port is where the plane
   boundary is legible in code.
+
+#### Control → Data: an idempotent command
+
+A management call states what the Data Plane should hold — an alias, a
+candidate order, a price revision, a key's runtime state, a capacity grant —
+and it is keyed by the entity's own identifier, so the Data Plane may apply it
+twice without the second application changing anything. It is
+request/response, it is not on the LLM request path, and the runtime does not
+need it to serve (section 4). Nothing in this direction is a push of state the
+Data Plane already owns: the Control Plane is the authority for entitlements
+and key ownership, and the Data Plane is the authority for everything it
+serves.
+
+#### Data → Control: a durable pull with replay
+
+The runtime never pushes, never calls back, and the Control Plane never asks
+the Data Plane to mark anything consumed. The canonical flow:
+
+```text
+LLM → dataplane → UsageEvent committed durably
+                        │
+                        ▼
+                 dataplane private listener        (internal, not the runtime surface)
+                        ▲
+                 dataplane-api management façade   (transport only, owns no state)
+                        ▲
+                 console-api poller                (owns its cursor)
+                        │
+                        ▼
+                 Control Plane settlement
+```
+
+Three rules follow, and they are the whole protocol:
+
+- **The cursor is opaque.** It names a position in the Data Plane's fact order.
+  No consumer may parse it, synthesise it, compare it or order by it, and
+  nothing outside the Data Plane constructs one.
+- **Replay is normal.** The same range may be requested any number of times;
+  repeated delivery is expected, not an error. There is no acknowledgement
+  endpoint, no consume-and-delete, and no way for a consumer to tell the Data
+  Plane it has finished with anything.
+- **The consumer advances its own position, after applying.** It stores the
+  `next_cursor` it has acted on, and only after the facts up to it are durably
+  recorded. A crash between the two replays; that is safe, because applying a
+  fact twice is a no-op.
+
+**Ordering** is a single monotonic, gap-aware append sequence assigned by the
+Data Plane at the moment a fact commits — so an aborted transaction leaves a
+hole that is skipped rather than a reordering. It is deliberately not
+`occurred_at`, not physical row order and not an unordered identifier: replay
+needs a total order that survives a concurrent writer, and only an append
+sequence gives one.
+
+**Idempotency.** `request_id` is the fact's immutable business identity and the
+logical idempotency key for everything derived from it. It is **not** the HTTP
+`X-Request-Id`, which correlates a call and means nothing across a retry. For
+`request_id` to be sufficient, the feed carries at most one settlement-relevant
+terminal fact per runtime request; a future multi-fact audit feed needs its own
+key and is explicitly out of scope here.
+
+**Crash safety** is one local transaction covering applier and cursor:
+
+```text
+fetch → apply → commit(applied facts + next_cursor) → crash after commit → replay is a no-op
+fetch → apply → crash before commit  → cursor unchanged → same facts refetched → safe
+process failure                      → cursor unchanged → retried
+```
+
+The cursor is a claim about work already done, so it must never move ahead of
+that work: a failure leaves the position untouched and the same page is read
+again. A position the Data Plane can no longer replay fails explicitly with
+`cursor_expired` (HTTP 410) and never silently skips forward; a malformed
+request fails with `invalid_request` (HTTP 400).
+
+**Cursor ownership.** The Data Plane owns the facts — `usage_events`, a future
+table; the Control Plane owns its consumption position —
+`control.usage_ingestion_cursor`, a future table. Neither exists yet, and the
+code says so rather than standing in for them. The Data Plane's fact reader is
+a port whose production adapter refuses with a source-unavailable error, because
+an in-memory feed would pass every test in this repository while losing every
+fact on restart. The Control Plane's position is a repository-level port
+(`apps/console-api/internal/ports/outbound/persistence`) with the future table
+documented beside it and test fakes behind it. The schema PR fills both tables
+in.
+
+This replaced the one line this section used to carry — "usage facts and quota
+consumption, keyed by `request_id` — idempotent" — which named the key and
+nothing about how a fact reaches the consumer that derives money from it.
+Transport, order, cursor, retry and crash behaviour are decisions, and they are
+recorded here rather than left to the first implementation that needs them.
 
 ### 6. Hexagonal architecture inside every backend
 
@@ -187,12 +285,22 @@ timescaledb (one cluster)
 └── dataplane   ← dataplane     (migrations/dataplane/)
 ```
 
-- `dataplane-api` is a management transport: it owns **no** database and no
-  persistence adapter. It must not become a second persistence owner.
+- `dataplane-api` is a management façade (section 9): it owns **no** database,
+  no persistence adapter and no state of its own. It must not become a second
+  persistence owner.
 - No application connects to the other plane's database, and no cross-plane
-  foreign key exists in either direction. This is enforced by the engine itself
-  — PostgreSQL cannot query across databases in one statement — rather than by
-  convention.
+  foreign key exists in either direction. Two databases give separate
+  namespaces, separate connection targets, independent transactions,
+  independent migration history, and no ordinary cross-database SQL reference —
+  a cross-plane join is not a statement PostgreSQL will parse, which is the
+  useful part and the whole of it. They do **not** give separate credentials,
+  they do not prevent a privileged role from reaching both, they do not stop an
+  FDW or `dblink`-style path from bridging them, and they produce no
+  production-grade least privilege by themselves. "Database ownership
+  boundary" and "security/credential boundary" are two different claims, and
+  this ADR makes only the first; the security boundary this decision needs is
+  the authenticated management surface of section 9, not the fact that the two
+  stores are separate databases.
 - No cross-plane transaction. Where the two planes must agree, they converge
   through idempotent facts (section 5), not through a distributed commit.
 - `migrations/` splits into the same two lanes; each database carries its own
@@ -227,28 +335,118 @@ the split creates:
 
 ### 9. Why `dataplane-api` is a management boundary and not a second domain
 
-`dataplane-api` is a **transport**: an operator-facing HTTP surface over the
-Data Plane's own configuration and state. It owns no aggregate, no database and
-no persistence adapter, and its package set is deliberately smaller than
-`console-api`'s — an architecture test asserts that.
+`dataplane-api` is a **management façade**: an operator-facing HTTP surface over
+the Data Plane's own configuration and state, and a transport. It owns no
+aggregate, no database and no persistence adapter, and its package set is
+deliberately smaller than `console-api`'s — an architecture test asserts both.
 
-The intended shape, once the Data Plane domain has content:
+The composition is decided, not open:
 
 ```text
-management HTTP adapter → Data Plane management application → Data Plane domain → repositories / runtime ports
-runtime HTTP adapter    → Data Plane runtime application    → the same Data Plane domain → the same repositories
+console → console-api → ports/outbound/dataplane → HTTP adapter → dataplane-api
+                                                                      │ outbound port
+                                                                      ▼ HTTP adapter
+                                                            dataplane private listener
+                                                                      │
+                                                            Data Plane application/domain
+                                                                      │
+                                                            Data Plane DB
 ```
 
-Both transports must sit over one domain core; duplicating routing or provider
-logic into `dataplane-api` is the failure mode this section exists to prevent.
+- **`dataplane-api` is management façade and transport.** It owns no provider
+  state, no catalogue, no routing, no quota, no reservation, no usage semantics
+  and no table of its own; it declares no `internal/domain` and no persistence
+  or cache port, and it holds no state at all. `apps/dataplane-api/internal/arch`
+  enforces the shape: the only thing that may appear under its outbound trees
+  is the seam through which it reaches the Data Plane, and a second package
+  beside that seam is a second owner of Data Plane data.
+- **`dataplane` is domain, application and persistence authority.** The Data
+  Plane's rules about what it serves live in the runtime's module, and the
+  runtime's database is the only place they are kept. A management operation is
+  a request the Data Plane can refuse, not a query the façade performs.
+- **No shared foundation library is introduced, and no Data Plane logic is
+  duplicated into the façade.** A shared core module would be a fourth artifact
+  with a fourth version and would fuse the two transports' release cadence
+  again; a copy of routing or provider logic in the façade would be the second
+  owner this section exists to prevent.
+- **The contracted surface is the façade, not the process behind it.**
+  `api/openapi/dataplane.yaml` is `dataplane-api`'s contract: it is what a
+  caller opening a socket to the façade may rely on, and it is the document
+  that application's route table is compared against in both directions. The
+  listener in `dataplane` is not that surface and does not implement that
+  document. The hop between the two is a **private protocol** between two
+  processes of the same product, defined in full in
+  [docs/architecture/cross-plane-protocols.md](../architecture/cross-plane-protocols.md),
+  pinned on each side by its own protocol test, and deliberately not a fourth
+  OpenAPI document (AGENTS.md rule 2). The naming follows from this: an
+  operation is "contracted" if the façade serves it, and "in the protocol" if
+  the listener does.
+- **The façade translates; it does not relay.** The two hops carry the same
+  page and hold different failure vocabularies. A private failure is classified
+  at the façade into one this application can answer from — `410` for a position
+  that can no longer be replayed, `502` for anything that leaves the answer
+  unknown, including the Data Plane refusing the façade's own credential — and
+  the caller's answer is built there. No byte of the listener's body reaches a
+  Control Plane caller, which is what keeps `502 upstream_unavailable` meaning
+  "no answer came back from the Data Plane" — unreachable, or reachable and
+  unusable, with the caller unable to tell which — rather than "something went
+  wrong somewhere".
 
-**Open question, recorded rather than guessed.** At this stage the Data Plane
-domain is empty, so a shared core module would be an abstraction with nothing
-in it. How `dataplane-api` reaches Data Plane state — a core module both
-transports depend on, or the runtime's module exposing public domain and
-application packages — is therefore **undecided**. The decision belongs to the
-ADR of the first management operation that needs it; until then, the rule that
-no application module requires another's stays true and enforced.
+**The open question this section used to record is closed.** It read: the Data
+Plane domain is empty, so a shared core module would be an abstraction with
+nothing in it, and how `dataplane-api` reached Data Plane state — a core module
+both transports depend on, or the runtime's module exposing public packages —
+was undecided. The answer is the diagram above: it reaches the Data Plane
+through an outbound port in its own module, over the Data Plane's private
+management listener, exactly as `console-api` reaches it, and it owns nothing
+on the way. The rule that no application module requires another's survives
+this, and it is what made the call the answer rather than a shared module.
+
+#### The management service-auth boundary
+
+Every hop into a management surface is authenticated, and the boundary is
+explicit and fail-closed:
+
+- **One shared-secret service credential per hop**, supplied by deployment
+  configuration: `console-api` presents one to `dataplane-api`, and
+  `dataplane-api` presents one to the Data Plane's private listener. The two
+  ends of a hop read their own variable — a process names the variables it
+  reads — and deployment sets both to one value, so a hop has one secret and
+  there is no second copy of it to drift. The two hops do not share theirs:
+  `dataplane-api` reads a caller-facing credential and a separate
+  Data-Plane-facing one, and refuses to start when the two are equal, because a
+  single secret serving both would be a key every management caller holds to
+  the Data Plane's private listener.
+- **Compared in constant time, at a fixed width, on both hops.** How long a
+  refusal takes is not a function of how much of the credential the caller
+  guessed right — and, just as importantly, not a function of how long the
+  configured secret is. `subtle.ConstantTimeCompare` returns early when its two
+  arguments differ in length, so a direct comparison of the presented string
+  against the configured one leaks the secret's length before examining a byte
+  of it. Both surfaces therefore digest each side through SHA-256 and compare
+  the digests, which are the same width whatever was presented; the property
+  belongs to the boundary, so both ends of it keep it, and each has its own test
+  for it.
+- **Fail-closed at every step.** An unconfigured credential, a header presented
+  twice, a credential under a scheme this surface does not accept, a token
+  carrying whitespace: all refuse. The verification runs before routing and
+  before any argument is read, so a caller that has not identified itself cannot
+  learn which methods a path accepts or reach use-case code by any route.
+- **An unconfigured credential authenticates nobody.** An absent or empty
+  configured secret refuses every caller, including one presenting nothing, and
+  the composition root refuses to start rather than serving an administrative
+  surface it cannot guard. The failure is loud and closed, never open.
+- **Service credentials only.** A browser session is never accepted on a
+  management surface and neither is a customer LLM API key; a management
+  surface authenticates peer applications, not people.
+- **No identity system exists, and none is needed.** There is no user, session,
+  role, scope, token issuance or authorisation model. The deployment trusts one
+  caller per hop, so the only decision to make is whether the credential on the
+  request is the configured one.
+- **mTLS or a signed credential is the named follow-up.** Either proves the
+  same identity cryptographically rather than by possession of a string, and
+  either replaces the mechanism without changing application semantics: the
+  verification remains a port, and the order stays verify-then-act.
 
 ### 10. Why this is not microservices proliferation
 
@@ -274,7 +472,42 @@ Administrative Data Plane operations are never exposed through the public
 runtime API, and provider credentials and API-key hashes never appear in a
 console response. Secrets are write-only and opaque wherever they cross a
 boundary. The exact network exposure is a deployment decision; the
-architectural contract is that the management surface is internal.
+architectural contract is that the management surface is internal, and the
+authentication that makes "internal" mean something is section 9's.
+
+#### Each surface answers with its own error vocabulary
+
+The three contracts do not share an error shape, and the split is a decision
+rather than an oversight. `runtime.yaml` is the runtime's own contract and
+answers with the OpenAI-compatible error object —
+`{"error": {"message", "type", "param", "code"}}` — because its callers were not
+written by this repository: an OpenAI-compatible client parses `error.type` and
+`error.message`, and handing it a gateway-shaped envelope because the envelope
+happened to exist would put this repository's vocabulary on somebody else's
+wire. `X-Request-Id` stays on every runtime response for correlation.
+`shared/errors.yaml` is the **console and management** envelope —
+`{"error": {"code", "message"}, "request_id"}` — and a code is added to it only
+where a real response produces one: `invalid_request`, `unauthenticated`,
+`cursor_expired` and `upstream_unavailable` are on the wire because the
+management surface returns them, not because they were imagined for it. That
+document is the **façade's**; the private hop behind it answers in the same
+envelope with its own closed code set and none of the façade-only codes, and the
+façade classifies those answers into the codes above rather than passing them
+along (section 9, and the mapping table in
+[docs/architecture/cross-plane-protocols.md](../architecture/cross-plane-protocols.md)).
+Internal application errors stay separate from wire serialization: a caller can
+act on the status and the request ID, and cannot act on a stack frame, a query
+or a provider message.
+
+**Streaming is defined, not implemented.** How a runtime failure is reported
+depends on whether a response has been committed, and the rule is stated in
+`runtime.yaml`: before commitment the failure is an ordinary HTTP status and
+JSON error body; after commitment no status can be revised, so the failure is
+written into the stream as `data: {…error…}` followed by `data: [DONE]`, with
+the stream closed and never a second HTTP status; a client disconnect writes no
+wire error at all, because there is no channel left to write it on and the
+observation belongs to the runtime's usage facts. The runtime's commitment
+model — first content-bearing byte — is unchanged by any of this.
 
 ## Amendments to ADRs 0001, 0003, 0004 and 0005
 
@@ -388,9 +621,16 @@ Data Plane and referenced by ID".
 - **One application with an internal package boundary**: rejected — a package
   boundary is not a credential boundary and not a failure boundary; the runtime
   would still hold the ledger's credentials and share its blast radius.
-- **One database, two schemas**: rejected — schemas separate namespaces, not
-  credentials; a runtime credential with `USAGE` on the cluster can read the
-  money tables. Two databases make the violation impossible to express.
+- **One database, two schemas**: rejected — a schema is a namespace, not an
+  ownership boundary, and it makes the accidental join easy rather than
+  impossible: a role that can read the runtime's schema can read the money
+  tables beside it unless someone remembers to separate them. Two databases
+  make the ordinary cross-plane query fail to parse and give each plane its own
+  connection target, transaction scope and migration history. That is an
+  ownership boundary and not a credential boundary (section 7) — the credential
+  boundary is the authenticated management surface of section 9 — and it is
+  worth more than the schema arrangement precisely because it does not depend
+  on a grant nobody re-derives.
 - **A shared Go foundation module for the three services**: rejected — it
   re-couples their release cadence and invents a fourth artifact whose only
   purpose is to avoid copying a few hundred lines.

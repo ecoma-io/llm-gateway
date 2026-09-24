@@ -12,6 +12,56 @@ projection in the Data Plane**: a ceiling, not a balance, seeded from
 Control-Plane grants and written only by the runtime. The two converge by
 reconciliation, and only one of them is authoritative for money.
 
+## The concepts, and who owns each
+
+A page that blurs any two of these will mislead whoever builds from it. Six are
+the Data Plane's vocabulary, three are the Control Plane's, and the line between
+them is where money is allowed to be decided.
+
+| Concept                    | Plane         | What it is                                                                                                               |
+| -------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| **Request**                | Data Plane    | the logical client request and the billing subject; created at admission, finalised once.                                |
+| **Request Attempt**        | Data Plane    | one upstream call, retries included; never bills on its own.                                                             |
+| **Reservation**            | Data Plane    | the pre-execution hold and hard execution ceiling. Opened, leased and closed by the runtime.                             |
+| **Reservation Allocation** | Data Plane    | a reservation's leg against one funding bucket, with its waterfall ordinal — the `allocation legs` the ADRs name.        |
+| **Quota Projection**       | Data Plane    | the runtime's lockable enforcement ceiling for one entitlement cycle or PAYG balance. Not a balance, and not the ledger. |
+| **Usage Event**            | Data Plane    | the immutable fact the runtime writes when it closes a reservation; the authority a charge is derived from.              |
+| **Funding Bucket**         | Control Plane | the ledger's bucket behind an entitlement or the PAYG balance. The source of truth for money.                            |
+| **Settlement**             | Control Plane | the unique-per-request accounting header, written from the usage fact; the exactly-once boundary.                        |
+| **Ledger Entry**           | Control Plane | one append-only bucket leg of a reservation or a settlement.                                                             |
+
+Two pairs in that list get collapsed, and neither collapse is allowed:
+
+- **Quota Projection ≠ Funding Bucket.** The projection is the runtime's
+  enforcement ceiling — the row admission conditionally draws down with the
+  Control Plane unreachable — while the bucket is financial authority: the
+  ledger's record of what was granted, held, consumed and released. Only the
+  bucket is authoritative for money, and only the projection can refuse a
+  request at admission. They converge by reconciliation, and the projection is
+  rebuildable from nothing except that convergence (ADR 0006's amendment to ADR
+  0004).
+- **A Reservation Allocation is not a Ledger Entry.** The allocation is the
+  runtime's record of which buckets a hold was split across and in what order;
+  the `hold`, `consume` and `release` legs are the ledger's, written in the
+  Control Plane from the fact. The order is the same and the rows are not.
+
+**Who writes what is the boundary.** The runtime never writes `ledger_entries`,
+`funding_buckets` or `settlements`; the Control Plane never provides runtime
+admission by synchronously reading them. Admission is allowed or refused against
+the runtime's own projection — with the Control Plane down, if that is how the
+deployment happens to be — and the ledger follows from the facts the runtime
+observed (ADR 0006, sections 2 and 5).
+
+**Settlement must be derivable from the fact alone.** It is derived from the
+`UsageEvent`, idempotent by `request_id`, and it has to be possible **without a
+synchronous callback into the Data Plane**: a settlement that had to ask the
+runtime a question mid-transaction would be the synchronous cross-plane call the
+split forbids. That is a requirement on the fact contract rather than on this
+page — the payload carries the allocation and bucket identities and the
+immutable reservation figures needed to derive the consume legs, the release
+legs and the settled total (`api/openapi/shared/usage-facts.yaml`; the schema PR
+fixes the columns).
+
 ## Reservation lifecycle
 
 ```text

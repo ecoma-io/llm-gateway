@@ -1,6 +1,20 @@
-# The Data Plane management API contract: the Data Plane's administrative
-# surface, which is internal. It is reachable from the Control Plane and from
-# nobody else (ADR 0006 §11).
+# The Data Plane management façade contract: the administrative surface the
+# Control Plane reaches, which is internal. It is reachable from the Control
+# Plane and from nobody else (ADR 0006 §11).
+#
+# This document is the contract of **dataplane-api**, the façade — the process a
+# contracted caller actually opens a socket to. It is not the contract of
+# `dataplane`. That application's process is the domain and persistence authority
+# and it serves a listener of its own behind this one; the hop between the two is
+# a private protocol between two processes of the same product, defined in
+# docs/architecture/cross-plane-protocols.md and pinned on each side by a
+# protocol test. It is deliberately not a fourth OpenAPI document: a document
+# exists to state what a caller outside this repository may rely on, and nothing
+# outside this repository reaches that hop. The distinction is load-bearing
+# rather than pedantic — the two hops answer in the same envelope and do not
+# share a failure vocabulary, and `502 upstream_unavailable` below is the clearest
+# proof: it is this façade's word for "the Data Plane did not answer", which is
+# not a sentence the Data Plane could say about itself.
 #
 # There is no generated client for this document and no browser is meant to
 # see it. It is written down anyway, and for the same reason the other two are:
@@ -15,29 +29,59 @@
 # process: a management API sized for administrative traffic must never be on
 # the LLM request path, and a contract that carried both would be the first
 # place that assumption stopped being visible.
+#
+# One operation here is unusual, and it is the one the Control Plane's money
+# depends on: `GET /internal/usage-events` reads facts *back* from the Data
+# Plane, where every other operation in this document asks it to change
+# something. The delivery model, its cursor, and why it is a pull rather than a
+# push are stated in `shared/usage-facts.yaml`; the shape of what crosses is
+# there too.
 openapi: 3.1.0
 info:
-  title: Ecoma LLM Gateway — Data Plane management API
+  title: Ecoma LLM Gateway — Data Plane management façade API
   version: 0.1.0
   description: >-
-    Health and readiness probes plus the common HTTP boundary of the Ecoma LLM
-    Gateway's Data Plane management API. This surface is internal: it is called
-    by the Control Plane and is not published to callers of the gateway. Every
-    response returns X-Request-Id. An unmatched path returns the ErrorEnvelope
-    with HTTP 404; a method unsupported by a known path returns it with HTTP
-    405. The Data Plane's administrative endpoints are not designed yet; this
-    document carries the surface that exists and the process every later
-    endpoint follows.
+    Health and readiness probes, the usage-fact feed, and the common HTTP
+    boundary of the Ecoma LLM Gateway's Data Plane management façade. This
+    surface is internal: it is called by the Control Plane and is not published
+    to callers of the gateway. Every response returns X-Request-Id, and every
+    failure — including the ones no operation declares, a 404 for an unmatched
+    path and a 500 for an unclassifiable implementation failure — returns the
+    ErrorEnvelope. A management call identifies itself as a service; a browser
+    session or a customer API key is not a service identity and is refused. The
+    Data Plane's administrative endpoints beyond the fact feed are not designed
+    yet; this document carries the surface that exists and the process every
+    later endpoint follows.
+
+    This is a façade contract and not the Data Plane's own surface. The process
+    behind it serves a private protocol that is not contracted here; what a
+    caller of this document sees is the façade's answer, produced by the façade
+    from what it could read, and never a byte relayed from the process behind it.
 servers:
   - url: /
+tags:
+  - name: probes
+    description: >-
+      Process probes. All three applications in this repository serve the same
+      trio, and each document declares its own copy of the tag because each
+      document is read on its own; the tag is where a reader sees that they are
+      one convention rather than three unrelated endpoints.
+  - name: usage
+    description: >-
+      The usage-fact feed: the one place a caller reads the Data Plane's
+      recorded facts rather than asking it to change something. Its delivery
+      model is stated in shared/usage-facts.yaml.
 paths:
   /healthz:
     get:
       operationId: getHealth
+      tags:
+        - probes
       summary: Liveness of the Data Plane management process
       description: >-
         Returns 200 while the process is able to serve. Anything more than
         "is the process alive" belongs to /readyz, not here.
+      security: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
       responses:
@@ -50,17 +94,27 @@ paths:
             application/json:
               schema:
                 $ref: "./shared/probes.yaml#/components/schemas/HealthStatus"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
         "405":
           $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
   /readyz:
     get:
       operationId: getReadiness
+      tags:
+        - probes
       summary: Readiness of the Data Plane management service
       description: >-
-        Returns 200 when the service may receive traffic. The scaffold has no
-        dependencies, so it is always ready. This application holds no state of
-        its own and reads no database, so its readiness check is about reaching
-        the Data Plane it manages — not about a connection this process owns.
+        Returns 200 when the service may receive traffic. It answers 200
+        unconditionally today: the scaffold has no dependencies to check, and
+        this application holds no state of its own and reads no database, so
+        there is nothing yet for the probe to report on. When the façade reaches
+        the Data Plane for management state, this is the probe that should carry
+        that check — a question about reaching the Data Plane it manages, never
+        about a database connection this process owns.
+      security: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
       responses:
@@ -73,16 +127,23 @@ paths:
             application/json:
               schema:
                 $ref: "./shared/probes.yaml#/components/schemas/HealthStatus"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
         "405":
           $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
   /version:
     get:
       operationId: getVersion
+      tags:
+        - probes
       summary: Build version of the Data Plane management service
       description: >-
         Returns the version stamped into the dataplane-api binary at build time.
         It is the repository release version when the release lane supplies
         one, and "dev" for an unstamped local build.
+      security: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
       responses:
@@ -95,5 +156,91 @@ paths:
             application/json:
               schema:
                 $ref: "./shared/probes.yaml#/components/schemas/Version"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
         "405":
           $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+  /internal/usage-events:
+    get:
+      operationId: listUsageEvents
+      tags:
+        - usage
+      summary: Read the Data Plane's usage facts
+      description: >-
+        Returns a page of the immutable facts the runtime recorded, in the order
+        it recorded them, for the Control Plane to derive settlement from. The
+        model — an opaque cursor, replay instead of acknowledgement, a
+        consumer-owned position, and `request_id` as the idempotency key — is
+        stated once in `shared/usage-facts.yaml` and is not repeated here.
+
+
+        Two properties of this operation are worth stating on the wire. First,
+        it is read-only: there is no operation anywhere on this surface that
+        acknowledges, consumes, deletes or marks a fact as delivered, so a
+        control-plane outage loses nothing and a redelivered fact costs
+        nothing. Second, it answers from the Data Plane and never from here:
+        this application holds no facts, no cursor and no cache of either, and
+        when the runtime cannot be reached the answer is a 502 rather than a
+        guess.
+
+
+        A management caller authenticates as a service — see the
+        `serviceCredential` scheme below. The Control Plane reaches this
+        operation, and this operation only, on the façade; the process behind
+        the façade is reached in turn over a private protocol that is not
+        contracted here, and it authenticates the façade with its own credential
+        rather than the caller's. So the 401 below is about *this* caller, and
+        the 502 is what a caller sees when the hop behind the façade did not
+        answer — two different hops, two different secrets, and a caller that
+        held one could not present it to the other. The runtime's public surface
+        (`runtime.yaml`) does not carry this operation at all, and the LLM
+        request path never touches it.
+      security:
+        - serviceCredential: []
+      parameters:
+        - $ref: "./shared/usage-facts.yaml#/components/parameters/UsageEventsAfter"
+        - $ref: "./shared/usage-facts.yaml#/components/parameters/UsageEventsLimit"
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: A page of usage facts.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/usage-facts.yaml#/components/schemas/UsageFactPage"
+        "400":
+          $ref: "./shared/errors.yaml#/components/responses/InvalidRequest"
+        "401":
+          $ref: "./shared/errors.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "410":
+          $ref: "./shared/errors.yaml#/components/responses/CursorExpired"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+        "502":
+          $ref: "./shared/errors.yaml#/components/responses/UpstreamUnavailable"
+components:
+  securitySchemes:
+    serviceCredential:
+      type: http
+      scheme: bearer
+      description: >-
+        A service identity presented by a peer application, never by a browser
+        and never by a customer. Deployment supplies the credential; the
+        security model is stated in ADR 0006 §9, and the transport is expected
+        to be replaced by one that proves the identity cryptographically (mTLS
+        or a signed credential) without changing this contract.
+
+        This names the credential a caller presents **to the façade**. The
+        façade presents a different one to the process behind it, and neither
+        hop accepts the other's: a credential is per hop because a hop is where
+        it is checked, and a single shared secret across two processes would
+        multiply whatever one of them leaked by two.

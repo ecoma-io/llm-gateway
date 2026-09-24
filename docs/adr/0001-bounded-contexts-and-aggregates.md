@@ -107,10 +107,11 @@ Aggregate rules:
    for money (ADR 0006).
 
 6. **Exactly four cross-context coordinated transactions exist.** They are
-   authorised here by name; each writes rows owned by more than one context
-   in one short database transaction, and no other database transaction
-   crosses a context boundary. Three of them are additionally scoped to a
-   single plane, and the fourth — settlement — is the one the split turns
+   authorised here by name; each writes rows owned by more than one context,
+   and no other database transaction crosses a context boundary. Each is now
+   plane-local as well, because no transaction crosses the plane boundary the
+   two databases draw (ADR 0006): three of the four stay one short transaction
+   within one plane, and the fourth — settlement — is the one the split turns
    into two, one per side. That re-scoping is the one thing ADR 0006 changed
    about them:
    - **Admission** — create the `Request` shell and its intake record,
@@ -229,10 +230,16 @@ A document or schema using a synonym where a glossary term exists is a defect.
   package reaching for a driver or a framework client, on an application
   package importing a concrete adapter, and on one module requiring
   another's; each application's route table is compared against its own
-  contract in both directions. "No transaction crosses a plane boundary" is the one rule
-  without a test — it is enforced by the engine instead, because two
-  databases cannot be queried in one statement, and a test asserting that
-  our code does not do something the database forbids would be ceremony.
+  contract in both directions. "No transaction crosses a plane boundary" is
+  the one rule without a test, and it is not the engine that enforces it: a
+  transaction is opened against one database, and a statement that reached
+  into the other's is not one PostgreSQL parses — which is why none is written
+  by accident, and that is the whole of what two databases buy here. They do
+  not carry separate credentials, they do not stop a privileged role from
+  reaching both, and this is an ownership boundary rather than a security one
+  (ADR 0006, section 7). A test asserting that our code does not write a
+  statement the database will not parse would be ceremony; the guards this ADR
+  does want tested are the ones named above.
 - Adding a new invariant later means asking "which aggregate's transaction can
   enforce this?" first; an invariant that no single aggregate can enforce is
   a design smell, not a trigger for a new cross-aggregate transaction —

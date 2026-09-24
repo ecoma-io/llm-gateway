@@ -1,7 +1,7 @@
 // Package config loads the dataplane's small, typed runtime configuration.
 //
 // Bootstrap configuration is process-level: it is read once before the server
-// starts, and a change requires a restart. There are three values today, so a
+// starts, and a change requires a restart. There are five values today, so a
 // hand-written loader keeps defaults, parsing and validation visible instead of
 // buying a configuration framework to hide them.
 //
@@ -38,14 +38,36 @@ const (
 )
 
 // Config is the complete bootstrap configuration of the dataplane process.
-// It deliberately carries nothing about the Control Plane: a setting this
-// process cannot act on is a setting that can only mislead, and a runtime that
-// can be misconfigured towards a management endpoint is one step from
-// depending on it.
+//
+// It deliberately carries nothing about the Control Plane. The two management
+// settings below are not an exception to that: DATAPLANE_MANAGEMENT_ADDR is an
+// *inbound* listener of this process and DATAPLANE_MANAGEMENT_TOKEN is the
+// credential a caller must present to it — neither is an address this process
+// dials, and there is no setting here that would let it dial one. A runtime that
+// can be misconfigured towards a management endpoint is one step from depending
+// on it.
 type Config struct {
 	Addr              string
 	ShutdownTimeout   time.Duration
 	ReadHeaderTimeout time.Duration
+
+	// ManagementAddr is the private listener the Data Plane's management
+	// surface is served from. An empty value means this process serves no
+	// management surface at all, which is the default: a runtime that has not
+	// been told to open an administrative port does not open one.
+	ManagementAddr string
+
+	// ManagementToken is the shared secret a management caller presents. It is
+	// a credential this process *accepts*, not one it uses to reach anyone, and
+	// it is required whenever ManagementAddr is set — a listener with no
+	// credential would authenticate nobody and answer 401 to every caller, which
+	// is a deployment mistake worth failing the process over rather than
+	// discovering from a log line.
+	//
+	// It is never logged, never echoed in an error and never serialized. The
+	// loader below reads it into exactly this field and nothing else in this
+	// process formats it.
+	ManagementToken string
 }
 
 // Defaults returns the configuration used when no supported environment
@@ -91,7 +113,36 @@ func Load(lookup LookupEnv) (Config, error) {
 		cfg.ReadHeaderTimeout = duration
 	}
 
-	if err := validateAddr(cfg.Addr); err != nil {
+	if value, ok := lookup("DATAPLANE_MANAGEMENT_ADDR"); ok {
+		if value == "" {
+			return Config{}, fmt.Errorf("DATAPLANE_MANAGEMENT_ADDR must not be empty; omit the variable to serve no management surface")
+		}
+		if err := validateAddr("DATAPLANE_MANAGEMENT_ADDR", value); err != nil {
+			return Config{}, err
+		}
+		cfg.ManagementAddr = value
+	}
+	if value, ok := lookup("DATAPLANE_MANAGEMENT_TOKEN"); ok {
+		// The two management settings are decided together, and both halves of
+		// the mistake are refused. A listener without a credential is an
+		// administrative port that answers 401 to everyone — useless, and one
+		// edit away from an administrative port that answers everyone. A
+		// credential without a listener is a setting this process cannot act
+		// on, which is the misleading kind: it looks like the fact feed is
+		// protected when in fact it is not being served at all.
+		if value == "" {
+			return Config{}, fmt.Errorf("DATAPLANE_MANAGEMENT_TOKEN must not be empty")
+		}
+		if cfg.ManagementAddr == "" {
+			return Config{}, fmt.Errorf("DATAPLANE_MANAGEMENT_TOKEN is set but DATAPLANE_MANAGEMENT_ADDR is not; a credential is only read by the listener that would present it")
+		}
+		cfg.ManagementToken = value
+	}
+	if cfg.ManagementAddr != "" && cfg.ManagementToken == "" {
+		return Config{}, fmt.Errorf("DATAPLANE_MANAGEMENT_TOKEN is required when DATAPLANE_MANAGEMENT_ADDR is set")
+	}
+
+	if err := validateAddr("DATAPLANE_ADDR", cfg.Addr); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -111,17 +162,20 @@ func parsePositiveDuration(name, value string) (time.Duration, error) {
 	return duration, nil
 }
 
-func validateAddr(addr string) error {
+// validateAddr checks one listener address. The name is a parameter rather than
+// a constant because there are two listeners now and a message that named the
+// wrong variable would send an operator to the wrong line of their deployment.
+func validateAddr(name, addr string) error {
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil || port == "" {
-		return fmt.Errorf("DATAPLANE_ADDR must be a host:port address")
+		return fmt.Errorf("%s must be a host:port address", name)
 	}
 	if strings.Contains(port, ":") {
-		return fmt.Errorf("DATAPLANE_ADDR must contain a numeric port")
+		return fmt.Errorf("%s must contain a numeric port", name)
 	}
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 0 || portNumber > 65535 {
-		return fmt.Errorf("DATAPLANE_ADDR must contain a numeric port")
+		return fmt.Errorf("%s must contain a numeric port", name)
 	}
 	return nil
 }

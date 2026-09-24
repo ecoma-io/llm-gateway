@@ -24,17 +24,26 @@ info:
   description: >-
     Health and readiness probes plus the common HTTP boundary of the Ecoma LLM
     Gateway's Control Plane API, which serves the console. Every response
-    returns X-Request-Id. An unmatched path returns the ErrorEnvelope with HTTP
-    404; a method unsupported by a known path returns it with HTTP 405. The
-    Control Plane's product endpoints are not designed yet; this document
-    carries the surface that exists and the process every later endpoint
-    follows.
+    returns X-Request-Id, and every failure — including the ones no operation
+    declares, a 404 for an unmatched path and a 500 for an unclassifiable
+    implementation failure — returns the ErrorEnvelope. The Control Plane's
+    product endpoints are not designed yet; this document carries the surface
+    that exists and the process every later endpoint follows.
 servers:
   - url: /
+tags:
+  - name: probes
+    description: >-
+      Process probes. All three applications in this repository serve the same
+      trio, and each document declares its own copy of the tag because each
+      document is read on its own; the tag is where a reader sees that they are
+      one convention rather than three unrelated endpoints.
 paths:
   /healthz:
     get:
       operationId: getHealth
+      tags:
+        - probes
       summary: Liveness of the Control Plane API process
       description: >-
         Returns 200 while the process is able to serve. Anything more than
@@ -51,11 +60,17 @@ paths:
             application/json:
               schema:
                 $ref: "./shared/probes.yaml#/components/schemas/HealthStatus"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
         "405":
           $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
   /readyz:
     get:
       operationId: getReadiness
+      tags:
+        - probes
       summary: Readiness of the Control Plane API service
       description: >-
         Returns 200 when the service may receive traffic. The scaffold has no
@@ -75,11 +90,17 @@ paths:
             application/json:
               schema:
                 $ref: "./shared/probes.yaml#/components/schemas/HealthStatus"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
         "405":
           $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
   /version:
     get:
       operationId: getVersion
+      tags:
+        - probes
       summary: Build version of the Control Plane API service
       description: >-
         Returns the version stamped into the console-api binary at build time.
@@ -97,5 +118,9 @@ paths:
             application/json:
               schema:
                 $ref: "./shared/probes.yaml#/components/schemas/Version"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
         "405":
           $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"

@@ -47,6 +47,56 @@ func TestRunDrainsAnInFlightRequestBeforeReturning(t *testing.T) {
 	}
 }
 
+// TestRunDrainsEveryListenerItWasGiven covers the two-listener process: the
+// runtime's port and the private management port are served by one run, and a
+// stop signal has to drain both. A shutdown that drained the runtime and left
+// the management listener to the process exit would drop an administrative call
+// that was already in flight — which, on the fact feed, is a read whose
+// consumer would then retry from a position it had not advanced.
+func TestRunDrainsEveryListenerItWasGiven(t *testing.T) {
+	runtimeListener := listenForTest(t)
+	managementListener := listenForTest(t)
+	runtimeServer, runtimeStarted, releaseRuntime := blockingServer(t)
+	managementServer, managementStarted, releaseManagement := blockingServer(t)
+	defer releaseRuntime()
+	defer releaseManagement()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- run(ctx, cancel, []service{
+			{name: "runtime", server: runtimeServer, listener: runtimeListener},
+			{name: "management", server: managementServer, listener: managementListener},
+		}, time.Second)
+	}()
+
+	runtimeRequest := requestForTest(t, runtimeListener)
+	managementRequest := requestForTest(t, managementListener)
+	waitForStart(t, runtimeStarted)
+	waitForStart(t, managementStarted)
+
+	cancel()
+
+	select {
+	case err := <-runErr:
+		t.Fatalf("run() returned %v with requests still in flight on both listeners", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseRuntime()
+	releaseManagement()
+
+	for name, request := range map[string]chan error{"runtime": runtimeRequest, "management": managementRequest} {
+		if err := <-request; err != nil {
+			t.Fatalf("the in-flight %s request error = %v", name, err)
+		}
+	}
+	if err := <-runErr; err != nil {
+		t.Fatalf("run() error = %v, want nil after an orderly drain of both listeners", err)
+	}
+}
+
 func TestRunReportsAShutdownThatOverrunsItsTimeout(t *testing.T) {
 	listener := listenForTest(t)
 	server, started, release := blockingServer(t)
@@ -89,7 +139,7 @@ func TestRunReportsAListenerThatFailsOnItsOwn(t *testing.T) {
 	}
 
 	server := &stdhttp.Server{Handler: stdhttp.HandlerFunc(func(_ stdhttp.ResponseWriter, _ *stdhttp.Request) {})}
-	err := run(context.Background(), func() {}, server, listener, time.Second)
+	err := run(context.Background(), func() {}, []service{{name: "runtime", server: server, listener: listener}}, time.Second)
 
 	if err == nil {
 		t.Fatal("run() error = nil, want the listener failure")
@@ -128,13 +178,14 @@ func listenForTest(t *testing.T) net.Listener {
 	return listener
 }
 
-// serveForTest starts run in the background and returns the channel its
-// outcome arrives on.
+// serveForTest starts run in the background against a single listener and
+// returns the channel its outcome arrives on. The tests that need two drive
+// run directly, because what they are checking is that one process serves both.
 func serveForTest(t *testing.T, ctx context.Context, stop context.CancelFunc, server *stdhttp.Server, listener net.Listener, timeout time.Duration) chan error {
 	t.Helper()
 	runErr := make(chan error, 1)
 	go func() {
-		runErr <- run(ctx, stop, server, listener, timeout)
+		runErr <- run(ctx, stop, []service{{name: "runtime", server: server, listener: listener}}, timeout)
 	}()
 	return runErr
 }

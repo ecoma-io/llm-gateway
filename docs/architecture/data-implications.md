@@ -11,6 +11,40 @@ the family a table belongs to and the database it lands in are two separate
 answers, and every table below states both. This page creates no migrations —
 it is the constraint the future schema PR derives from.
 
+## Three kinds of record, and the database that holds each
+
+Every table below is one of three things, and the kind decides both its
+database and who may write it:
+
+| Kind of record                         | Authority                                                                       | Database    | Examples                                                                              |
+| -------------------------------------- | ------------------------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------- |
+| Runtime-authoritative fact             | the Data Plane observed it, and nothing else can state it                       | `dataplane` | `requests`, `request_attempts`, `usage_events`, `reservations` (+ allocation legs)    |
+| Runtime projection                     | the Control Plane decided it; the Data Plane holds the copy it enforces against | `dataplane` | the API-key credential, the quota projection                                          |
+| Control-authoritative financial record | the Control Plane decides and records it                                        | `control`   | `funding_buckets`, `settlements`, `ledger_entries`, and the commerce rows behind them |
+
+The three behave differently under failure, which is why the distinction is
+worth stating before any table:
+
+- **A fact is not a copy.** Nothing else holds it, so it cannot be stale and it
+  cannot disagree with an authority — it _is_ the authority for what happened.
+  The Control Plane derives its records from facts and never rewrites one; a
+  correction is a later fact, and the same fact delivered twice is a no-op.
+- **A projection is a copy, and it is the only kind that can be wrong without
+  the other side knowing.** The runtime reads it on the hot path with the
+  Control Plane unreachable, so it is deliberately stale by a bounded window and
+  is converged to the ledger by reconciliation (ADR 0006 §8;
+  [accounting](accounting.md)).
+- **A financial record is derived, not observed.** It is written in the Control
+  Plane from the facts the Data Plane published, idempotently by `request_id`,
+  and it is the source of truth for money: the runtime's quota projection is not
+  a balance and never becomes one.
+
+The facts reach the Control Plane as a durable pull rather than a push, with an
+opaque cursor and a consumer-owned position ([cross-plane
+protocols](cross-plane-protocols.md); the wire shape is
+`api/openapi/shared/usage-facts.yaml`). That is the only path by which a
+`dataplane` row becomes a `control` row.
+
 ## The two families, in two databases
 
 ```text
@@ -31,10 +65,11 @@ timescaledb (one cluster)
       requests   request_attempts   usage_events
 ```
 
-Each family keeps the shape ADR 0005 gave it; what ADR 0006 adds is that no
-table is reachable from both sides. A plane reads what it holds — the runtime
-resolves aliases, authenticates keys and draws down capacity from its own
-database, never by reaching into the Control Plane's (ADR 0006 §4, §7).
+Each family keeps the shape ADR 0005 gave it; what ADR 0006 adds is that each
+table has one owning plane, and that no ordinary query reads across the line. A
+plane reads what it holds — the runtime resolves aliases, authenticates keys and
+draws down capacity from its own database, never by reaching into the Control
+Plane's (ADR 0006 §4, §7).
 
 ### Relational family
 
@@ -110,13 +145,16 @@ Notes for the schema designer:
 - `requests.id` is minted at admission; the shell-then-finalize shape is
   intentional (attempts and reservations reference it from birth).
 - A cross-plane reference is by ID, with **no foreign key and no join in
-  either direction** — the constraint is not a convention that review keeps,
-  it is the engine: PostgreSQL cannot query across databases in one statement,
+  either direction**. The ordinary cross-plane query is not something review
+  has to keep out — PostgreSQL cannot query across databases in one statement,
   so there is no statement to write that would join `usage_events` to the
   settlement it produced or `reservations` to the bucket they drew down
-  (ADR 0006 §7). Within one database foreign keys are enforced as before, and
-  within `control` that includes the legs' reference to their bucket and
-  settlement.
+  (ADR 0006 §7). That is an ownership boundary and not a credential one:
+  separate databases do not carry separate credentials, they do not stop a
+  privileged role from reaching both, and least privilege is not something the
+  split produces by itself. Within one database foreign keys are enforced as
+  before, and within `control` that includes the legs' reference to their
+  bucket and settlement.
 
 ### Retention
 
@@ -126,6 +164,18 @@ Notes for the schema designer:
 | `usage_events`, `reservations`  | `dataplane` | forever                              | The facts the Control Plane settles from and the holds they came from — the same audit value, retained for the same reason. |
 | `requests`                      | `dataplane` | forever                              | One row per request — the anchor joining charges to usage and attempts; volume is already implied by the ledger.            |
 | `request_attempts`              | `dataplane` | archivable (aggregate, then age out) | Provider telemetry, not customer billing; nothing references it for accounting.                                             |
+
+"Forever" is a statement about policy rather than a promise about every value a
+read can carry. Nothing in this design ages a fact out, and the ingestion cursor
+is expected to keep up with the append sequence rather than lag behind it — but
+`cursor_expired` (410) exists all the same, because retention is only one of the
+ways a stored position can become unplaceable. A position written by another
+deployment, one held across a restore from an older backup, or one whose
+encoding a future Data Plane has changed all fail the same way, and the answer is
+the same in every case: refuse, and make a human re-establish a position rather
+than skip forward. Retention being indefinite is what keeps that refusal rare; it
+is not what makes it impossible
+([cross-plane protocols](cross-plane-protocols.md)).
 
 ## Transaction map
 
@@ -198,7 +248,12 @@ decisions:
    ledger — never the runtime's quota projection — is the source of truth for
    money (ADR 0006). There is no outbox either: the usage fact is the
    authority the charge is derived from, written by the process that observed
-   it;
+   it, and it reaches the Control Plane over the replayed feed rather than by a
+   push ([cross-plane protocols](cross-plane-protocols.md)). The fact must
+   carry the allocation and bucket identities and the immutable reservation
+   figures needed to derive the consume legs, the release legs and the settled
+   total, so that a settlement needs no synchronous call back into the Data
+   Plane;
 7. that replay decisions read only `request_intake` — never the event
    family — and that amounts are integer minor units in one platform
    currency.

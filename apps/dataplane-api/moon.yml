@@ -12,10 +12,13 @@
 # cached green standing over a tree that no longer builds.
 #
 # There is no `test-integration` target here, and its absence is deliberate:
-# this application has no outbound adapter to test against a real server, and
-# a target that would run an empty suite is worse than no target — it reads as
-# coverage. It arrives with the first adapter that needs it, which is the same
-# change that answers ADR 0006 §9's open question.
+# the tier exists in the other two modules for the outbound adapters that need
+# a real backing service, and this application owns no store of its own. Its
+# one outbound adapter is the management call to the Data Plane's private
+# listener, and the chain that composes it is covered in-process — the test in
+# cmd/dataplane-api wires the real adapter into the real handler with a test
+# server standing in for the Data Plane. A target that would run an empty
+# suite is worse than no target: it reads as coverage.
 id: dataplane-api
 language: go
 tasks:

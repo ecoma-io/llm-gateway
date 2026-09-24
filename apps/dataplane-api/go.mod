@@ -12,9 +12,10 @@
 // accident. A management transport owns no data: it is not on the request
 // path, it holds no state of its own, and everything it will eventually
 // answer must come from the Data Plane it manages. The day this module needs
-// a database driver is the day the boundary has been crossed — see ADR 0006
-// §9, which records how this application reaches Data Plane state as the one
-// open question of the split.
+// a database driver is the day the boundary has been crossed — ADR 0006 §9
+// settles how this application reaches Data Plane state instead: through an
+// outbound port of its own, over the Data Plane's private management
+// listener, and never by opening a connection of its own.
 module github.com/ecoma-io/llm-gateway/apps/dataplane-api
 
 go 1.26

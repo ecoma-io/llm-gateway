@@ -1,6 +1,7 @@
 package arch
 
 import (
+	"fmt"
 	"slices"
 	"sort"
 	"strings"
@@ -35,17 +36,38 @@ type rule struct {
 }
 
 // rules is the dependency rule, one line per boundary. Each is deliberately
-// coarse: an allow-list naming a tree (`internal/adapters`) rather than the
-// one package that imports the library today is a rule about a boundary
+// coarse: an allow-list naming a tree (`internal/adapters/inbound`) rather than
+// the one package that imports the library today is a rule about a boundary
 // instead of a rule about a moment.
 //
-// Two of this application's six rules allow nobody, and they are the reason it
-// is a separate module rather than a second surface on the runtime. The
-// management transport holds no state: a cache client or a SQL handle here is
-// not a shortcut, it is the crossing ADR 0006 §9 and §11 describe — and the
-// fact that the answer to "how does this application read Data Plane state" is
-// still open is a reason to forbid reaching for one locally, not a reason to
-// defer the rule.
+// Two of this application's rules allow nobody, and they are the reason it is a
+// separate module rather than a second surface on the runtime. The management
+// transport holds no state: a cache client or a SQL handle here is not a
+// shortcut, it is the crossing ADR 0006 §9 and §11 describe — and now that §9
+// is closed, the rule says what the composition decided rather than standing in
+// for a decision nobody had made: this application reaches Data Plane state
+// through the port below, over the network, and never by opening a connection
+// of its own.
+//
+// The two adapter rules are two lines rather than one, and that is the
+// difference between a facade and a second application. A single rule
+// forbidding `self/internal/adapters/` and allowing `internal/adapters` permits
+// the inbound surface to import the outbound client directly — which builds
+// fine, works, and puts the one cross-plane call this module exists to make
+// somewhere the port cannot be substituted. Stated as two rules, the direction
+// between the trees is a decision rather than an oversight.
+//
+// Both of them allow the composition root and nobody else, and the allow-list
+// says exactly that rather than naming the tree the way the other rules here
+// do. An adapter is a leaf: nothing depends on one except the package that
+// constructs it, which is what "entered by the composition root and by nothing
+// else" means. Allowing the tree instead let one adapter import another — the
+// rule's own sentence forbade a second surface in the same breath as its
+// allow-list permitted one, and in `dataplane`, which has two inbound adapters,
+// that was a live crossing rather than a hypothetical one. An intra-adapter
+// subpackage would be refused too; none exists, and the day one is needed it is
+// a deliberate edit to the list below rather than an exemption quietly granted
+// to everything sharing a directory.
 //
 // An import that appears in no rule is governed by none of them; this table is
 // therefore not a complete account of what this module may import, only of
@@ -57,15 +79,27 @@ func rules(self string) []rule {
 			allowed:   nil,
 			forbidden: []string{"github.com/valkey-io/valkey-go"},
 		},
+		// Both adapter trees, and the symmetry is the point: whether HTTP is
+		// arriving (an inbound surface) or leaving (the usage-fact call to the
+		// Data Plane's internal surface), it is the boundary that speaks it and
+		// the boundary is where the standard library belongs. What the rule
+		// keeps out has not changed — an application that speaks HTTP is an
+		// application whose use-cases cannot be called any other way, and whose
+		// port is only reachable over a socket.
 		{
-			why:       "HTTP is a transport concern: the composition root and an inbound adapter may import it, and the application and any domain package may not — an application that speaks HTTP is an application whose use-cases cannot be called any other way",
-			allowed:   []string{"cmd", "internal/adapters/inbound"},
+			why:       "HTTP is a transport concern: the composition root and adapters on either side of the application may import it, and the application itself may not — an application that speaks HTTP is an application whose use-cases cannot be called any other way",
+			allowed:   []string{"cmd", "internal/adapters/inbound", "internal/adapters/outbound"},
 			forbidden: []string{"net/http"},
 		},
 		{
-			why:       "this application owns no data: ADR 0006 §9 records how it reaches Data Plane state as the split's one open question, and every answer to that question is a call to the Data Plane rather than a query from here",
+			why:       "this application owns no data: it reaches the Data Plane through the port below, over the network, and the composition that decided that (ADR 0006 §9) decided against a second reader of the Data Plane's tables — a SQL handle here would be a second process writing the Data Plane's schema from outside its migration lane",
 			allowed:   nil,
 			forbidden: []string{"database/sql", "github.com/jackc/pgx", "github.com/lib/pq"},
+		},
+		{
+			why:       "the port vocabulary is what the application is written against and what the adapters implement, so it points inward from both: `internal/config` and the transport kit are written against neither, and a package that named the port would be a package that had acquired an opinion about the Data Plane without a seam to state it at",
+			allowed:   []string{"cmd", "internal/application", "internal/adapters", "internal/ports"},
+			forbidden: []string{self + "/internal/ports"},
 		},
 		{
 			why:       "configuration is read once, at the composition root: a package that reads the environment has behaviour its callers cannot see in its arguments and cannot vary in a test",
@@ -73,9 +107,14 @@ func rules(self string) []rule {
 			forbidden: []string{self + "/internal/config"},
 		},
 		{
-			why:       "a concrete adapter is constructed at the composition root or used by another adapter; everything else depends on the port, which is what makes the infrastructure replaceable",
-			allowed:   []string{"cmd", "internal/adapters"},
-			forbidden: []string{self + "/internal/adapters/"},
+			why:       "an inbound adapter is entered by the composition root and by nothing else: the outbound client is the one cross-plane hop this module makes, and a surface that could import an inbound package could delegate that hop to a route — or, worse, to another application's relay that happens to look like one",
+			allowed:   []string{"cmd"},
+			forbidden: []string{self + "/internal/adapters/inbound/"},
+		},
+		{
+			why:       "an outbound adapter is constructed at the composition root and by nothing else: it is reached through the port the application declares, so an inbound surface that imported one would have made the facade read the Data Plane by a route of its own rather than through the seam the whole module is built around",
+			allowed:   []string{"cmd"},
+			forbidden: []string{self + "/internal/adapters/outbound/"},
 		},
 		{
 			why:       "the application is called by an inbound adapter and wired by the composition root; nothing outbound may depend on it, because an outbound adapter that knows the use-case has inverted the arrow",
@@ -100,12 +139,29 @@ func TestTheDependencyRuleHolds(t *testing.T) {
 		t.Fatal("the import scan found no packages; every rule below would pass vacuously")
 	}
 
+	for _, violation := range violations(self, graph) {
+		t.Error(violation)
+	}
+}
+
+// violations runs the rule table over an import graph and returns one sentence
+// per boundary broken, sorted so the order is the module's rather than the
+// map's.
+//
+// It is a function rather than a loop inside the test above because two tests
+// need it and they need it for opposite purposes: one runs it over the module
+// as it is and asserts it returns nothing, and the one in capabilities_test.go
+// runs it over graphs built to break exactly one boundary and asserts it
+// returns exactly that. A matcher only ever exercised on a clean tree is a
+// matcher nobody has seen work.
+func violations(self string, graph map[string][]string) []string {
 	dirs := make([]string, 0, len(graph))
 	for dir := range graph {
 		dirs = append(dirs, dir)
 	}
 	sort.Strings(dirs)
 
+	found := []string{}
 	for _, dir := range dirs {
 		for _, r := range rules(self) {
 			if allowedToImport(dir, r.allowed) {
@@ -113,13 +169,33 @@ func TestTheDependencyRuleHolds(t *testing.T) {
 			}
 			for _, imported := range graph[dir] {
 				for _, forbidden := range r.forbidden {
-					if imported == forbidden || strings.HasPrefix(imported, forbidden) {
-						t.Errorf("%s imports %s: %s", dir, imported, r.why)
+					if matches(imported, forbidden) {
+						found = append(found, fmt.Sprintf("%s imports %s: %s", dir, imported, r.why))
 					}
 				}
 			}
 		}
 	}
+	sort.Strings(found)
+	return found
+}
+
+// matches reports whether imported is forbidden itself, or a package below
+// it. A forbidden prefix that ends in "/" has already drawn its own boundary —
+// it names a tree, and anything starting with it is inside. Any other prefix
+// names a module or a package, and a package below it continues with "/"
+// (a subpackage) or "." (a vendored or dot-joined path); a sibling that merely
+// shares the leading text — `github.com/jackc/pgx2` against
+// `github.com/jackc/pgx` — must not count, because an import rule stated as a
+// module name is a rule about that module and its packages, not about
+// everything that begins with its spelling.
+func matches(imported, forbidden string) bool {
+	if strings.HasSuffix(forbidden, "/") {
+		return strings.HasPrefix(imported, forbidden)
+	}
+	return imported == forbidden ||
+		strings.HasPrefix(imported, forbidden+"/") ||
+		strings.HasPrefix(imported, forbidden+".")
 }
 
 // allowedToImport reports whether a package directory is one an allow-list
@@ -179,11 +255,21 @@ func TestEveryRuleGovernsSomething(t *testing.T) {
 // as a loop over its own declarations, and it is why the roster is pinned here
 // by literal.
 //
-// The forged list is every forbidden prefix with the module path folded back
-// to `<module>`, sorted. Adding a boundary is therefore two edits — the rule
-// and this line — and removing one is two edits and a sentence of reasoning in
-// the diff. Both are deliberate acts, which is the whole claim the table makes
-// about itself.
+// Each entry pins the whole rule and not only its forbidden prefix: the
+// allowance is on the right of the arrow. Pinning the prefix alone caught a
+// boundary being deleted and missed the quieter and likelier edit, which is a
+// boundary being widened — one package appended to an allow-list, and a
+// crossing the rule's own sentence forbids is open with every test green. The
+// capability table next door does not catch it either: each case names one
+// package the rule permits and one it refuses, so an allowance granted to some
+// third package is invisible to both. Stated as a pair, the rule is the pair,
+// and an allow-list cannot drift without this failing.
+//
+// The forged list is every forbidden prefix with the module path folded back to
+// `<module>` and its allow-list beside it, sorted. Adding a boundary is
+// therefore two edits — the rule and this line — and so is widening one, and
+// removing one is two edits and a sentence of reasoning in the diff. All three
+// are deliberate acts, which is the whole claim the table makes about itself.
 func TestTheRuleRosterIsTheDeclaredOne(t *testing.T) {
 	self := modulePath(t)
 
@@ -193,25 +279,33 @@ func TestTheRuleRosterIsTheDeclaredOne(t *testing.T) {
 			// Already reported by TestEveryRuleGovernsSomething; nothing to pin.
 			continue
 		}
+		// "nobody" rather than an empty tail, because a blanket prohibition is a
+		// statement about the whole module and should read as one in the diff.
+		allowance := "nobody"
+		if len(r.allowed) > 0 {
+			allowance = strings.Join(r.allowed, ", ")
+		}
 		for _, prefix := range r.forbidden {
-			forged = append(forged, strings.Replace(prefix, self, "<module>", 1))
+			forged = append(forged, fmt.Sprintf("%s <- %s", strings.Replace(prefix, self, "<module>", 1), allowance))
 		}
 	}
 	sort.Strings(forged)
 
 	want := []string{
-		"<module>/internal/adapters/",
-		"<module>/internal/application",
-		"<module>/internal/config",
-		"database/sql",
-		"github.com/jackc/pgx",
-		"github.com/lib/pq",
-		"github.com/valkey-io/valkey-go",
-		"net/http",
+		"<module>/internal/adapters/inbound/ <- cmd",
+		"<module>/internal/adapters/outbound/ <- cmd",
+		"<module>/internal/application <- cmd, internal/adapters/inbound",
+		"<module>/internal/config <- cmd",
+		"<module>/internal/ports <- cmd, internal/application, internal/adapters, internal/ports",
+		"database/sql <- nobody",
+		"github.com/jackc/pgx <- nobody",
+		"github.com/lib/pq <- nobody",
+		"github.com/valkey-io/valkey-go <- nobody",
+		"net/http <- cmd, internal/adapters/inbound, internal/adapters/outbound",
 	}
 	sort.Strings(want)
 
 	if !slices.Equal(forged, want) {
-		t.Errorf("the rule table forges %v, want %v — a rule was added or removed, which is a change to the dependency rule itself", forged, want)
+		t.Errorf("the rule table forges %v, want %v — a rule was added, removed or widened, which is a change to the dependency rule itself", forged, want)
 	}
 }

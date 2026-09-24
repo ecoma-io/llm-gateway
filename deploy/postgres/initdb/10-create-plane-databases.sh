@@ -6,7 +6,11 @@
 # names — and this deployment serves two, one per plane (ADR 0006 §7). They
 # are created here rather than left to a default because the row that matters
 # is not "which database exists" but "which database each plane owns", and a
-# script a reviewer reads states it while an image default does not.
+# script a reviewer reads states it while an image default does not. That
+# boundary is ownership, not security: both databases are created for the same
+# `--owner` and opened by the same role — a fixture convenience
+# deploy/postgres/README.md states and verify.sh asserts, not a claim that the
+# split isolates credentials.
 #
 # The template is the image's `template1`, which the timescaledb entrypoint
 # has already extended: both databases therefore carry the extension before

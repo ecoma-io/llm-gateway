@@ -2,17 +2,23 @@
 // management surface, which is internal-only. It is not reachable from a
 // browser and is never documented in the console's contract (ADR 0006 §11).
 //
-// It owns transport concerns — routing, middleware, request identifiers and
-// wire errors — then calls the application for use-case work. Product endpoints
-// do not exist yet: health and readiness remain infrastructure-level, while
-// GET /version proves the HTTP → application → response path every domain
-// endpoint will follow. The public contract is api/openapi/dataplane.yaml; it
+// It owns transport concerns — routing, middleware, request identifiers, the
+// service-caller check and wire errors — then calls the application for
+// use-case work. Health and readiness remain infrastructure-level; GET /version
+// proves the HTTP → application → response path every domain endpoint follows;
+// and GET /internal/usage-events is the first operation that answers from the
+// Data Plane rather than from this process, reached through the outbound port
+// rather than read here. The public contract is api/openapi/dataplane.yaml; it
 // changes before this package does, never after.
 //
 // Nothing here decides a business rule. A handler translates a request into a
 // call, and the application's answer or typed error back into a response; the
 // one thing this package owns outright is the shape of the wire — status,
-// envelope, headers — which is what an inbound adapter is for.
+// envelope, headers — which is what an inbound adapter is for. Two consequences
+// are worth naming, because both are easy to get wrong in a way that looks like
+// a shortcut and is not: nothing here reads Data Plane state directly (there is
+// no client in this package, only a port), and nothing here remembers a page,
+// a cursor or a fact between requests.
 //
 // Nor does anything here serve a runtime request. The OpenAI-compatible
 // surface belongs to apps/dataplane: a `/v1/...` route registered in this
@@ -28,6 +34,7 @@ import (
 	"path"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/application"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/ports/outbound/dataplane"
 )
 
 const (
@@ -52,12 +59,15 @@ const (
 //
 // The surface itself is declared in routes.go and mounted here; this function
 // owns everything around it — the middleware, the two fallbacks below, and the
-// order they are composed in.
-func New(app *application.App) stdhttp.Handler {
+// order they are composed in. The authenticator is passed through to the route
+// table rather than held here: which rows are protected is a column of that
+// table, and a mux-level check would have to decide which paths are exempt —
+// the probes — from a list kept somewhere other than the rows themselves.
+func New(app *application.App, authenticator dataplane.Authenticator) stdhttp.Handler {
 	mux := stdhttp.NewServeMux()
 
 	for _, rt := range routes(app) {
-		register(mux, rt)
+		register(mux, rt, authenticator)
 	}
 
 	// The fallback every other path and method lands on. Unmatched paths are
@@ -179,6 +189,18 @@ func errorResponse(err error) (status int, code string, message string) {
 	switch applicationError.Code {
 	case application.CodeNotFound:
 		return stdhttp.StatusNotFound, string(application.CodeNotFound), applicationError.Message
+	case application.CodeCursorExpired:
+		// 410 rather than 404 or 500: the position existed and the Data Plane
+		// has aged it out, which is a state the caller can act on — its stored
+		// cursor is unusable and reconciliation is the only way forward. The
+		// message is the application's, and it is fixed there; only the status
+		// and the machine-readable code are decided here.
+		return stdhttp.StatusGone, string(application.CodeCursorExpired), applicationError.Message
+	case application.CodeUpstreamUnavailable:
+		// 502: the gateway reached for an answer and did not get one. The
+		// alternative — a 500 — would blame this process for a failure that is
+		// not its own, and would tell the caller to look in the wrong place.
+		return stdhttp.StatusBadGateway, string(application.CodeUpstreamUnavailable), applicationError.Message
 	default:
 		return stdhttp.StatusInternalServerError, string(application.CodeInternal), internalErrorMessage
 	}
@@ -187,7 +209,19 @@ func errorResponse(err error) (status int, code string, message string) {
 func writeJSON(w stdhttp.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(value); err != nil {
+	encoder := json.NewEncoder(w)
+	// HTML escaping is off, and on this surface that is a correctness setting
+	// rather than a preference. The default rewrites `<`, `>` and `&` inside
+	// every string into < and friends — sensible for a JSON document
+	// embedded in a page, wrong for a value travelling between two services.
+	// The usage-fact cursor is opaque and must cross byte for byte, and a
+	// cursor containing an `&` is a legitimate cursor: escaping it would be
+	// this transport rewriting a value it is forbidden to interpret. The
+	// setting applies to every body this application writes, which is
+	// consistent — none of them is HTML, and valid JSON is what the contract
+	// asks for either way.
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
 		// Status and headers are already on the wire; a retry cannot repair a
 		// half-written response. Log the fact without echoing the payload.
 		log.Printf("%s response JSON write failed: %T", serviceName, err)

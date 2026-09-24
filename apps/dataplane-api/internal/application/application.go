@@ -8,13 +8,23 @@
 // No domain package exists under this module and none is planned: the Data
 // Plane's domain lives in apps/dataplane, and duplicating any part of it here
 // would create a second definition of the runtime's rules — the failure mode
-// this application's boundary is easiest to get wrong. What this package will
-// hold is the management vocabulary: the use cases a management caller may
-// invoke, each one delegating to the Data Plane rather than deciding
-// anything itself.
+// this application's boundary is easiest to get wrong. What this package holds
+// is the management vocabulary: the use cases a management caller may invoke,
+// each one delegating to the Data Plane rather than deciding anything itself.
+//
+// The first of those is the usage-fact read (usageevents.go), and it is the
+// shape every later one follows — validate what the transport hands over, call
+// an outbound port, translate the port's failure into this package's codes.
+// What it deliberately does not do is hold a position, a page or a fact: the
+// Data Plane owns the feed and the Control Plane owns the cursor, so a copy
+// here would be a third party's guess at both.
 package application
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/ports/outbound/dataplane"
+)
 
 // Code is a machine-readable application failure category.
 //
@@ -26,6 +36,21 @@ type Code string
 const (
 	// CodeNotFound says a requested application resource does not exist.
 	CodeNotFound Code = "not_found"
+
+	// CodeCursorExpired says the Data Plane can no longer replay the position a
+	// usage-fact reader asked from. It is a distinct category rather than a
+	// flavour of internal because the caller can act on it — a consumer that
+	// sees it knows its stored position is unusable and must be reconciled —
+	// and because the alternative, silently resuming from a newer position,
+	// would skip facts.
+	CodeCursorExpired Code = "cursor_expired"
+
+	// CodeUpstreamUnavailable says the answer a use case needed is unknown:
+	// the Data Plane could not be reached or could not be read. It is not a
+	// NotFound — nothing was looked up and failed to exist — and it is not an
+	// Internal, because nothing in this process is broken; the transport maps
+	// it to a 502 so the failure is not reported as this application's own.
+	CodeUpstreamUnavailable Code = "upstream_unavailable"
 
 	// CodeInternal says the application cannot complete a request safely.
 	// Its public representation is deliberately generic at the transport edge.
@@ -71,18 +96,28 @@ func Internal(cause error) *Error {
 	return &Error{Code: CodeInternal, cause: cause}
 }
 
-// App holds the use-cases this process currently exposes. It is concrete on
-// purpose: there is no infrastructure below it to substitute yet, and tests
-// drive the real handler and real application rather than a speculative mock.
+// App holds the use-cases this process currently exposes, and the ports they
+// reach. It holds no position, no cache and no page: the only state in it is
+// the version string it was handed at startup.
 type App struct {
 	version string
+	usage   dataplane.UsageFacts
 }
 
 // New constructs the dataplane-api application around the build version supplied
-// by cmd/dataplane-api. The command's package-level version variable remains the
-// one ldflags source; this package receives that value, never recreates it.
-func New(version string) *App {
-	return &App{version: version}
+// by cmd/dataplane-api and the outbound port its use cases read through. The
+// command's package-level version variable remains the one ldflags source; this
+// package receives that value, never recreates it.
+//
+// It panics on a nil port rather than storing one. The alternative is a nil
+// dereference inside the first management request this process serves, which is
+// a 500 from a handler whose wiring could not have been tested; and a use case
+// with nothing behind it is not a state the composition root can mean.
+func New(version string, usage dataplane.UsageFacts) *App {
+	if usage == nil {
+		panic("application: New requires a UsageFacts port — the management surface has nothing to answer with without one")
+	}
+	return &App{version: version, usage: usage}
 }
 
 // Version returns the build version injected into the process. It is a plain

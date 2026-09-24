@@ -2,12 +2,12 @@ package http
 
 import (
 	"os"
+	"reflect"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
-
-	"github.com/ecoma-io/llm-gateway/apps/dataplane-api/internal/application"
 )
 
 // contractPath is this application's contract document, relative to this
@@ -44,7 +44,7 @@ func TestTheRouteTableIsTheContract(t *testing.T) {
 	declared := contractOperations(t)
 
 	served := []string{}
-	for _, rt := range routes(application.New("test")) {
+	for _, rt := range routes(testApp()) {
 		served = append(served, rt.method+" "+rt.path)
 	}
 	sort.Strings(served)
@@ -101,6 +101,220 @@ func contractOperations(t *testing.T) []string {
 	}
 	sort.Strings(operations)
 	return operations
+}
+
+// usageFactsPath is the fragment this application and the Data Plane both
+// implement, relative to this package's directory. The façade's page size and
+// cursor bounds are declared there and nowhere else, so this is the document
+// the constants below are pinned against.
+const usageFactsPath = "../../../../../../api/openapi/shared/usage-facts.yaml"
+
+// TestThePageThisSurfaceWritesIsThePageTheContractDescribes pins the field names
+// this surface serializes to the ones the contract declares, and it is the half
+// of the pin the numbers test below cannot reach.
+//
+// The two are different failures. A number drifting is this surface answering a
+// question differently from the contract; a *name* drifting is this surface
+// answering a different question — the Control Plane's decoder reads the names,
+// and a renamed field does not arrive as a wrong value but as an absent one. It
+// is the worse of the two, because a Go struct tag and the document that
+// describes it are two spellings of one string that nothing compiles together,
+// and a rename in either is invisible in a diff of the other.
+//
+// The names come from the YAML rather than from a second Go literal, for the
+// reason the listener's copy of this test gives: a literal list here would be
+// updated by the same edit that renamed the tag, and the document — the thing
+// both hops claim to implement — would never be consulted.
+//
+// The Data Plane's listener carries its own copy of this pin over its own
+// response type, and neither can check the other: the applications are separate
+// Go modules (ADR 0006 §1).
+func TestThePageThisSurfaceWritesIsThePageTheContractDescribes(t *testing.T) {
+	document := scanContract(t, usageFactsPath)
+
+	tests := []struct {
+		name   string
+		path   string
+		sample any
+	}{
+		{
+			name:   "the page",
+			path:   "components.schemas.UsageFactPage.properties",
+			sample: usageEventsResponse{},
+		},
+		{
+			name:   "the event",
+			path:   "components.schemas.UsageEvent.properties",
+			sample: usageEventResponse{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			declared := document.children[tt.path]
+			if len(declared) == 0 {
+				t.Fatalf("%s declares no %s; this pin proves nothing until the scan finds it", usageFactsPath, tt.path)
+			}
+			sort.Strings(declared)
+
+			if got := jsonFieldNames(t, tt.sample); !slices.Equal(got, declared) {
+				t.Errorf("this surface serializes %v and %s declares %v; a caller decoding this response reads the contract's names, and one that is only on one side arrives as an absent field rather than a wrong one", got, usageFactsPath, declared)
+			}
+		})
+	}
+}
+
+// jsonFieldNames returns the JSON names a response type serializes, sorted.
+//
+// It is a reflection over the struct's tags rather than a reading of the encoder
+// that runs, which is the closest a test can get to the wire without calling
+// the handler — and it is enough, because `encoding/json` takes a field's name
+// from exactly this tag and from nowhere else.
+func jsonFieldNames(t *testing.T, sample any) []string {
+	t.Helper()
+	typ := reflect.TypeOf(sample)
+	if typ.Kind() != reflect.Struct {
+		t.Fatalf("jsonFieldNames was given a %s, which serializes no named fields", typ.Kind())
+	}
+
+	names := make([]string, 0, typ.NumField())
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if name == "" || name == "-" {
+			t.Fatalf("%s.%s carries no JSON name (%q); every field of a response type is one the contract declares, and an unnamed one serializes as its Go name", typ.Name(), field.Name, field.Tag.Get("json"))
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// TestTheFactContractsNumbersAreTheConstants pins the numbers this surface
+// enforces — the page size's bounds and default, and the cursor's maximum and
+// minimum length — to the document that declares them.
+//
+// It is the pin the other tests cannot provide. Every other cursor and limit
+// test in this package derives its expectations from the same Go constant it is
+// testing, so the constant could be changed to 4000 and the whole package would
+// still pass while the surface quietly disagreed with the contract it publishes.
+// Here the expectation comes from the YAML.
+//
+// Both hops carry the same numbers, and each module pins them against the same
+// file rather than importing the other: the applications are separate Go modules
+// (ADR 0006 §1), so each one's test is the only thing that can hold its own side
+// to the document.
+func TestTheFactContractsNumbersAreTheConstants(t *testing.T) {
+	numbers := scanContract(t, usageFactsPath).numbers
+
+	tests := []struct {
+		name     string
+		key      string
+		constant int
+	}{
+		{name: "the page size a caller may not go below", key: "components.parameters.UsageEventsLimit.schema.minimum", constant: minUsageEventsLimit},
+		{name: "the page size a caller may not exceed", key: "components.parameters.UsageEventsLimit.schema.maximum", constant: maxUsageEventsLimit},
+		{name: "the page size used when a caller names none", key: "components.parameters.UsageEventsLimit.schema.default", constant: defaultUsageEventsLimit},
+		{name: "the cursor's maximum length", key: "components.schemas.UsageCursor.maxLength", constant: maxUsageEventsCursorLength},
+		{name: "the cursor's minimum length, which is why `after=` is refused", key: "components.schemas.UsageCursor.minLength", constant: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			declared, ok := numbers[tt.key]
+			if !ok {
+				t.Fatalf("%s declares no %s; this pin proves nothing until the scan finds it", usageFactsPath, tt.key)
+			}
+			if declared != tt.constant {
+				t.Errorf("%s says %s is %d and this surface enforces %d; the code and the contract have drifted apart", usageFactsPath, tt.key, declared, tt.constant)
+			}
+		})
+	}
+}
+
+// contractDocument is what scanning a YAML file yields: the integer scalars it
+// declares, and the child keys of every mapping. Both are keyed by dotted path,
+// so a `minimum` under one schema and a `minimum` under another are two
+// different keys and neither is confused for the other.
+type contractDocument struct {
+	numbers  map[string]int
+	children map[string][]string
+}
+
+// scanContract reads a YAML document's indentation-nested keys.
+//
+// It is a scanner rather than a parser, for the reason contractOperations is:
+// the standard library has no YAML parser, the shape being read is narrow —
+// indentation-nested scalar keys — and this repository writes these documents by
+// hand. A document that stopped matching the scan yields nothing, and every
+// caller above treats an empty result as a failure rather than a skip, so the
+// scan going blind is loud instead of vacuous.
+//
+// Keys are pushed and popped by indentation, so `minimum` under one schema and
+// `minimum` under another are two different paths. Sequence entries and folded
+// description text fall out on their own: a line is only read as a key when it
+// reads exactly as `indent key: value` with no whitespace inside the key, and
+// prose lines containing a colon have spaces before it.
+func scanContract(t *testing.T, path string) contractDocument {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+
+	document := contractDocument{numbers: map[string]int{}, children: map[string][]string{}}
+	type frame struct {
+		indent int
+		key    string
+		path   string
+	}
+	stack := []frame{}
+
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimRight(raw, " \t")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "- ") {
+			continue
+		}
+
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		key, value, found := strings.Cut(trimmed, ":")
+		if !found || key == "" || strings.ContainsAny(key, " \t") {
+			continue
+		}
+
+		for len(stack) > 0 && stack[len(stack)-1].indent >= indent {
+			stack = stack[:len(stack)-1]
+		}
+
+		parts := make([]string, 0, len(stack)+1)
+		for _, parent := range stack {
+			parts = append(parts, parent.key)
+		}
+		parts = append(parts, key)
+		path := strings.Join(parts, ".")
+
+		parentPath := ""
+		if len(stack) > 0 {
+			parentPath = stack[len(stack)-1].path
+		}
+		document.children[parentPath] = append(document.children[parentPath], key)
+
+		if value == "" {
+			// A mapping whose children follow at a deeper indent.
+			stack = append(stack, frame{indent: indent, key: key, path: path})
+			continue
+		}
+
+		if number, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+			document.numbers[path] = number
+		}
+	}
+
+	if len(document.numbers) == 0 || len(document.children) == 0 {
+		t.Fatalf("%s yielded no keys; every pin against it would prove nothing", path)
+	}
+	return document
 }
 
 // isHTTPMethod keeps the method branch of the scan from mistaking some future

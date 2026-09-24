@@ -18,7 +18,7 @@ import (
 const statusBody = "{\"status\":\"ok\"}\n"
 
 func TestServerServesTheContractedRoutes(t *testing.T) {
-	handler := New(application.New("v0.1.0"))
+	handler := New(newTestApp(t, "v0.1.0"))
 	tests := []struct {
 		name       string
 		method     string
@@ -53,29 +53,29 @@ func TestServerServesTheContractedRoutes(t *testing.T) {
 			wantBody:   "{\"version\":\"v0.1.0\"}\n",
 		},
 		{
-			name:       "an unknown path returns the JSON not found envelope",
+			name:       "an unknown path returns the runtime error body",
 			method:     stdhttp.MethodGet,
 			path:       "/nope",
 			requestID:  "missing-request",
 			wantStatus: stdhttp.StatusNotFound,
-			wantBody:   "{\"error\":{\"code\":\"not_found\",\"message\":\"resource not found\"},\"request_id\":\"missing-request\"}\n",
+			wantBody:   notFoundBody,
 		},
 		{
-			name:       "a non-canonical path returns the JSON not found envelope instead of a redirect",
+			name:       "a non-canonical path returns the runtime error body instead of a redirect",
 			method:     stdhttp.MethodGet,
 			path:       "http://example.com//version",
 			requestID:  "double-slash-request",
 			wantStatus: stdhttp.StatusNotFound,
-			wantBody:   "{\"error\":{\"code\":\"not_found\",\"message\":\"resource not found\"},\"request_id\":\"double-slash-request\"}\n",
+			wantBody:   notFoundBody,
 		},
 		{
-			name:       "healthz refuses a non-GET method with the JSON envelope",
+			name:       "healthz refuses a non-GET method with the runtime error body",
 			method:     stdhttp.MethodPost,
 			path:       "/healthz",
 			requestID:  "method-request",
 			wantStatus: stdhttp.StatusMethodNotAllowed,
 			wantAllow:  "GET, HEAD",
-			wantBody:   "{\"error\":{\"code\":\"method_not_allowed\",\"message\":\"method not allowed\"},\"request_id\":\"method-request\"}\n",
+			wantBody:   methodNotAllowedBody,
 		},
 		{
 			// The exact bytes api/openapi/runtime.yaml contracts for the one
@@ -87,7 +87,7 @@ func TestServerServesTheContractedRoutes(t *testing.T) {
 			path:       "/v1/chat/completions",
 			requestID:  "inference-request",
 			wantStatus: stdhttp.StatusNotImplemented,
-			wantBody:   "{\"error\":{\"code\":\"not_implemented\",\"message\":\"not implemented\"},\"request_id\":\"inference-request\"}\n",
+			wantBody:   notImplementedBody,
 		},
 		{
 			name:       "the inference endpoint refuses the methods it does not accept",
@@ -96,7 +96,7 @@ func TestServerServesTheContractedRoutes(t *testing.T) {
 			requestID:  "inference-method-request",
 			wantStatus: stdhttp.StatusMethodNotAllowed,
 			wantAllow:  "POST",
-			wantBody:   "{\"error\":{\"code\":\"method_not_allowed\",\"message\":\"method not allowed\"},\"request_id\":\"inference-method-request\"}\n",
+			wantBody:   methodNotAllowedBody,
 		},
 	}
 
@@ -137,25 +137,25 @@ func TestApplicationErrorsMapToSafeHTTPResponses(t *testing.T) {
 			name:       "a not found application error keeps its client-safe message",
 			err:        application.NotFound("the requested version does not exist"),
 			wantStatus: stdhttp.StatusNotFound,
-			wantBody:   "{\"error\":{\"code\":\"not_found\",\"message\":\"the requested version does not exist\"},\"request_id\":\"error-request\"}\n",
+			wantBody:   "{\"error\":{\"message\":\"the requested version does not exist\",\"type\":\"not_found_error\",\"param\":null,\"code\":null}}\n",
 		},
 		{
 			name:       "an internal application error hides its cause",
 			err:        application.Internal(errors.New(secret)),
 			wantStatus: stdhttp.StatusInternalServerError,
-			wantBody:   "{\"error\":{\"code\":\"internal\",\"message\":\"internal error\"},\"request_id\":\"error-request\"}\n",
+			wantBody:   internalErrorBody,
 		},
 		{
 			name:       "an unknown application code normalizes to internal",
 			err:        &application.Error{Code: application.Code("unexpected"), Message: secret},
 			wantStatus: stdhttp.StatusInternalServerError,
-			wantBody:   "{\"error\":{\"code\":\"internal\",\"message\":\"internal error\"},\"request_id\":\"error-request\"}\n",
+			wantBody:   internalErrorBody,
 		},
 		{
 			name:       "an error that is not an application error normalizes to internal",
 			err:        errors.New(secret),
 			wantStatus: stdhttp.StatusInternalServerError,
-			wantBody:   "{\"error\":{\"code\":\"internal\",\"message\":\"internal error\"},\"request_id\":\"error-request\"}\n",
+			wantBody:   internalErrorBody,
 		},
 	}
 

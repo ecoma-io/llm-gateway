@@ -1,0 +1,143 @@
+# The error shape the Data Plane's OpenAI-compatible runtime returns, and the
+# two channels it uses.
+#
+# This is a fragment like its siblings — a `components:` tree `runtime.yaml`
+# references by relative path — and it is deliberately separate from
+# `errors.yaml`. The runtime's caller is an OpenAI-compatible client that this
+# repository does not get to re-teach: it was written against `error.type` and
+# `error.message`, and it will keep parsing those whatever the gateway's own
+# surfaces do. Sharing one envelope across all three contracts was convenient
+# for the gateway and wrong for that caller, which is why the two error
+# vocabularies now move independently (ADR 0006 §11).
+#
+# There are two channels, because a runtime request can fail on either side of
+# one irreversible moment — the first content-bearing byte written to the
+# client:
+#
+#   - **Before commitment.** Nothing has been sent to the client yet, so the
+#     failure is ordinary HTTP: a status code and this JSON body. A candidate
+#     that failed here may still be followed by another (ADR 0002): the
+#     runtime's fallback is a pre-commitment behaviour, and a caller sees at
+#     most one error even when several candidates failed behind it.
+#   - **After commitment.** A status line and a body have already gone out, so
+#     no HTTP status can be revised. The failure is written as a Server-Sent
+#     Event `data:` frame carrying this same JSON body, followed by the
+#     terminal `data: [DONE]` frame, and then the stream closes. A client that
+#     has already rendered content is told the stream ended in failure instead
+#     of being left to time out.
+#
+# A third case writes nothing at all: the client disconnected. There is no
+# channel left to report on, so the observation belongs to the runtime's usage
+# facts, not to the wire — see docs/architecture/request-lifecycle.md.
+#
+# The framing itself is behaviour rather than shape, so the byte layout is
+# stated in runtime.yaml's operation description and pinned by a test in
+# apps/dataplane rather than modelled as a schema here.
+components:
+  responses:
+    MethodNotAllowed:
+      description: The resource exists but does not accept the request method.
+      headers:
+        Allow:
+          description: The methods supported by this resource.
+          required: true
+          schema:
+            type: string
+            example: GET, HEAD
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimeError"
+    NotFound:
+      description: >-
+        No operation is declared at the requested path. The runtime answers
+        every unmatched path this way rather than letting its router emit an
+        HTML or plain-text page, so a client parses one shape for every failure
+        this surface can produce.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimeError"
+    NotImplemented:
+      description: >-
+        The endpoint is part of the contract and is not implemented. The
+        runtime answers it rather than leaving it unrouted, so a caller can tell
+        "not built yet" apart from "not a path" — the first is a 501 whose type
+        is `api_error` and whose code is `not_implemented` (the request was not
+        what failed); the second is a 404 whose type is `not_found_error`.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimeError"
+    InternalError:
+      description: >-
+        The runtime failed in a way it cannot classify. The internal cause is
+        logged against the request identifier and never serialized.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimeError"
+  schemas:
+    RuntimeError:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          $ref: "#/components/schemas/RuntimeErrorBody"
+      additionalProperties: false
+      description: >-
+        The body of an HTTP error from the runtime, and the body carried by a
+        `data:` frame when a committed stream fails.
+    RuntimeErrorBody:
+      type: object
+      required:
+        - message
+        - type
+      properties:
+        message:
+          type: string
+          description: >-
+            A human-readable explanation safe to present to a client. Internal
+            causes, provider payloads and stack traces never appear here.
+        type:
+          type: string
+          enum:
+            - invalid_request_error
+            - authentication_error
+            - permission_error
+            - not_found_error
+            - rate_limit_error
+            - api_error
+            - overloaded_error
+          description: >-
+            The caller-facing failure class, in the vocabulary an
+            OpenAI-compatible client already branches on. The list is the
+            compatibility surface: widening it is a change to this document,
+            and a class this runtime cannot yet produce is declared only
+            because a caller written elsewhere already handles it — the
+            gateway must not answer `api_error` for a condition the caller
+            would have retried had it been named correctly.
+        param:
+          type: [string, "null"]
+          description: >-
+            The parameter the failure concerns, when the failure is about one.
+            Null otherwise.
+        code:
+          type: [string, "null"]
+          description: >-
+            An optional machine-readable refinement of `type`, for the cases
+            this runtime can name precisely. `not_implemented` is the one code
+            in use today. Null when `type` alone is the whole story.
+      additionalProperties: false

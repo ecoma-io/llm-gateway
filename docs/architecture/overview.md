@@ -25,7 +25,9 @@ names a thing's plane wherever the plane decides who may touch it.
 Reference pages: [planes and ownership](planes.md) · [routing](routing.md) ·
 [request lifecycle](request-lifecycle.md)
 · [commerce](commerce.md) · [accounting](accounting.md) ·
-[data implications](data-implications.md)
+[data implications](data-implications.md) ·
+[cross-plane protocols](cross-plane-protocols.md) ·
+[ports and adapters](ports.md)
 
 ## The five contexts
 
@@ -182,15 +184,13 @@ it touches is built:
    metadata (ADR 0004); whether a stored completed response body may also be
    re-served is undecided (storage cost, content staleness, streaming).
 
-8. **The internal surface's authentication.** The surface an operator writes
-   accounts, plans, prices and adjustments through is the Control Plane API,
-   whose identity — account, user, session, RBAC, ownership — is the Identity
-   context's within it (ADR 0006 §3). What is **decided** is that the Data
-   Plane's administrative surface, `dataplane-api`, is internal: reachable from
-   the Control Plane and never published, with its contract written down in
-   [api/openapi/dataplane.yaml](../../api/openapi/dataplane.yaml) (ADR 0006
-   §11). What is **not** decided is how a call from `console-api` to it is
-   authenticated, and how the surface is exposed: shared identity, a service
-   credential, mTLS or something else is a deployment decision this model does
-   not make. This question was written before the split as "management-plane
-   authentication"; the split renamed the surface and left the question open.
+The question this list used to carry as "the internal surface's
+authentication" — how a call from `console-api` to `dataplane-api` is
+authenticated, and how the surface is exposed — is no longer open. The Data
+Plane's administrative surface is internal, its contract is
+[api/openapi/dataplane.yaml](../../api/openapi/dataplane.yaml), and the call is
+authenticated at every hop by a shared-secret service credential that is
+fail-closed and compared in constant time, with mTLS or a signed credential the
+named replacement (ADR 0006 §9, §11). Which operations that surface will
+eventually carry is still undesigned, and that is a question about the product
+domains rather than about this boundary.

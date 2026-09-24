@@ -26,10 +26,14 @@ read as a working lane that fails the moment anyone used it.
 A migration belongs to exactly one lane, and its lane decides the database it
 is applied to: the runner's lane argument points `-path` and `-database` at
 the same name (`deploy/postgres/compose.yaml`), so a file cannot be applied
-to the other plane's database by editing a path. That is what makes
-"no application reads the other plane's tables" a property of the deployment
-rather than a promise: PostgreSQL refuses a query that spans databases, so
-there is no query to write.
+to the other plane's database by editing a path. What that gives is a
+**database ownership boundary** — separate namespaces, separate connection
+targets, independent transactions and migration history, and no ordinary SQL
+statement spanning the two. It is not a **security / credential boundary**:
+one role owns both databases today, which is a fixture convenience and not a
+security property, and
+[`deploy/postgres/README.md`](../deploy/postgres/README.md) states the
+per-plane role guidance that is deliberately absent here.
 
 The consequence to remember when a schema change spans both planes: there
 isn't one. A fact one plane owns is written by that plane, and the other

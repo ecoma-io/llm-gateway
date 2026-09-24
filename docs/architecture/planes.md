@@ -85,24 +85,50 @@ session surface and the account identity unreachable from the runtime
 
 ## What crosses, and what must not
 
-The directions are ADR 0006, section 5: configuration and grants one way,
-usage facts and quota consumption the other, each keyed by the entity's own
-identifier or by `request_id` so that redelivery is a no-op. What follows from
-the matrix is the shape of the references:
+The directions are ADR 0006, section 5, and they have names: Control → Data
+carries **configuration and projections**, Data → Control carries **facts and
+observations**. Neither direction is "data synchronization" — nothing is
+synchronised; one side states what the Data Plane should hold, the other states
+what it observed.
+
+### The two flows
+
+|                 | Control → Data                                                                                                                    | Data → Control                                                                                              |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| What it carries | configuration and projections: catalog and routing config, egress policy, the API-key credential, entitlement and quota grants    | facts and observations: usage facts, request-outcome facts, quota-consumption facts, reconciliation state   |
+| Source of truth | the Control Plane for identity, commerce and the ledger; the Data Plane for the catalogue it serves from                          | the Data Plane, which observed the request                                                                  |
+| Projection      | the Data Plane's own row, read on the hot path — the key credential it authenticates against and the quota projection it enforces | none: the fact is not a copy of anything, it is the record                                                  |
+| Transport       | a management call the Data Plane can refuse, over the chain below                                                                 | a durable pull the consumer drives; the Data Plane never pushes and never calls back                        |
+| Cursor          | none — each command names its entity, not a position                                                                              | an opaque position in the Data Plane's fact order, issued by the Data Plane and stored by the consumer only |
+| Idempotency key | the entity's own identifier                                                                                                       | `request_id`                                                                                                |
+
+Both flows use one chain, and it is the only one across the boundary:
+`console-api application → ports/outbound/dataplane → HTTP adapter → dataplane-api → outbound port → HTTP adapter → the Data Plane's private management listener`
+(ADR 0006, section 9). The difference is what is on the other end of it: a
+command the Data Plane applies, or a page of facts it hands back. The protocol
+the second one keeps — cursor, replay, retry, reconciliation — is
+[cross-plane protocols](cross-plane-protocols.md), and the layering that makes
+the chain legible is [ports and adapters](ports.md).
+
+What follows from the matrix is the shape of the references:
 
 - **Within a database**, references between the two storage families are by ID
   and may carry an enforced foreign key at the family boundary (ADR 0005).
 - **Across the boundary**, references are by ID and carry **no** foreign key in
-  either direction. That is not a discipline anyone has to keep: PostgreSQL
-  cannot query across databases in one statement, so a cross-plane join is not a
-  rule to be broken, it is a statement that does not parse.
+  either direction. Two databases mean the ordinary cross-plane join is not a
+  statement PostgreSQL will parse rather than a rule review has to keep — but
+  that is an ownership boundary and not a credential one: separate databases do
+  not carry separate credentials, do not stop a privileged role from reaching
+  both, and do not by themselves give least privilege (ADR 0006, section 7).
+  Claims that the engine makes cross-plane access "impossible" are claims about
+  the ordinary query and about nothing else.
 - A reference that never arrives — a settlement whose usage fact is delayed — is
   what reconciliation exists to notice. It is not repaired by a distributed
   transaction, which is the thing the split rules out.
 
-The Control Plane reaches the Data Plane only through the management call
-ADR 0006 describes, and never on the request path. The console never reaches
-`dataplane-api` at all.
+The Control Plane reaches the Data Plane only through the management chain
+above, and never on the request path. The console never reaches `dataplane-api`
+at all.
 
 ## What the split costs
 
@@ -135,10 +161,15 @@ section 11).
 
 ## What this page does not decide
 
-- **How `dataplane-api` reaches Data Plane state.** A core module both
-  transports depend on, or the runtime's module exposing public packages —
-  ADR 0006, section 9 records this as open, and it stays open here. The rule
-  that no application module requires another's holds either way.
+**The question this page used to leave open is closed.** How `dataplane-api`
+reaches Data Plane state — a core module both transports depend on, or the
+runtime's module exposing public packages — was open in ADR 0006, section 9. It
+is answered there now: the façade reaches the Data Plane through an outbound
+port of its own, over the Data Plane's private management listener, and owns
+nothing on the way ([ports and adapters](ports.md)). The rule that no
+application module requires another's holds, and it is what made the call the
+answer rather than a shared module. What remains undecided is narrower:
+
 - **Any schema.** The table names above are the ones the ADRs already use; no
   column, type, index or constraint is decided by this page. That is the schema
   PR's, and it derives from ADR 0005 and the pages beside this one.

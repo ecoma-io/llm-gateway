@@ -18,7 +18,11 @@
 // is a fact published back, not a call made out (ADR 0006 §5).
 package application
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/usagefacts"
+)
 
 // Code is a machine-readable application failure category.
 //
@@ -78,15 +82,29 @@ func Internal(cause error) *Error {
 // App holds the use-cases this process currently exposes. It is concrete on
 // purpose: there is no infrastructure below it to substitute yet, and tests
 // drive the real handler and real application rather than a speculative mock.
+//
+// It is one object for one process, and that is deliberate rather than an
+// accident of the scaffold. The runtime's request path and the private
+// management listener are two surfaces of one application, with one set of
+// outbound ports between them; splitting them into two application types would
+// be a claim that they can be built, wired and run apart, and they cannot —
+// they share the store that holds the facts the runtime records.
 type App struct {
 	version string
+	facts   usagefacts.Reader
 }
 
 // New constructs the dataplane application around the build version supplied
-// by cmd/dataplane. The command's package-level version variable remains the
-// one ldflags source; this package receives that value, never recreates it.
-func New(version string) *App {
-	return &App{version: version}
+// by cmd/dataplane and the fact reader the composition root chose.
+//
+// The version argument is a plain string because the command's package-level
+// variable remains the one ldflags source; this package receives that value
+// and never recreates it. The reader is an interface because which store
+// answers behind it is the composition root's decision — and today that
+// decision resolves to an adapter whose answer is ErrSourceUnavailable, which
+// is the truth until the accounting schema exists.
+func New(version string, facts usagefacts.Reader) *App {
+	return &App{version: version, facts: facts}
 }
 
 // Version returns the build version injected into the process. It is a plain

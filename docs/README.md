@@ -32,6 +32,10 @@ not built yet.
   exists, what owns what, and what words mean
 - [Planes and ownership](architecture/planes.md) — the four applications, and
   the record-by-record ownership matrix the two planes are built from
+- [Cross-plane protocols](architecture/cross-plane-protocols.md) — what crosses
+  the plane boundary in each direction, and how a fact reaches its consumer
+- [Ports and adapters](architecture/ports.md) — the layering every Go
+  application keeps, and the fact-feed chain end to end
 - [Routing](architecture/routing.md) — the routing pipeline, its policy inputs
   and egress ownership
 - [Request lifecycle](architecture/request-lifecycle.md) — what happens to one

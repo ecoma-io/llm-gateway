@@ -140,8 +140,8 @@ surface every existing SDK already speaks. Concretely:
 This is a domain decision, not a detail: alias scoping, idempotent replay,
 and usage capture at the delivery boundary all hang off this protocol. The
 concrete OpenAPI document (paths, schemas, error bodies, status codes) is
-**derived** from it in the future contract PR; this ADR fixes the semantics,
-not the document.
+**derived** from it in `api/openapi/runtime.yaml`; this ADR fixes the
+semantics, and that document is where they reach a client.
 
 ### Egress sits below adapters
 

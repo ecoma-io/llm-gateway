@@ -46,6 +46,19 @@ change (contract first, see below), never as scaffolding someone left around.
    exists in code and not in the contract is a bug; a contract entry with no
    implementation is a bug. Each application's route table is compared against
    its own document by a test, in both directions, so neither can move alone.
+   `dataplane.yaml` is the contract of **`dataplane-api`**, the façade; the
+   listener `dataplane` opens is not that surface and does not implement that
+   document.
+   The private transport between the two is the one exception, and it is
+   deliberate: it is an **implementation protocol**, stated in full in
+   [docs/architecture/cross-plane-protocols.md](docs/architecture/cross-plane-protocols.md)
+   and pinned on each side by its own protocol test plus that package's own
+   route test, not a fourth OpenAPI document. It is a protocol between two
+   processes of the same product that no external client and no browser
+   reaches, so a document for it would be one nobody generates a client from
+   and everybody forgets to update. `api/openapi/` therefore still holds
+   exactly three documents: `console.yaml`, `dataplane.yaml` and
+   `runtime.yaml`.
 3. **The console consumes the contract, not the implementation.** Where it is
    practical, the frontend binds to types generated from the OpenAPI document
    rather than hand-writing shapes that mirror it. A hand-written copy is drift
@@ -53,10 +66,16 @@ change (contract first, see below), never as scaffolding someone left around.
 4. **The planes do not talk sideways.** An LLM request goes to the runtime and
    nowhere else: the Data Plane never calls the Control Plane, never imports
    its module, never reads its database, and never requires it to be running.
-   The Control Plane reaches the Data Plane only through a management call the
-   Data Plane can refuse. `internal/arch` in each Go module fails its `test`
-   target when this is broken — the rule is enforced, not asked for, and the
-   target is part of the required checks.
+   The Control Plane reaches the Data Plane through `dataplane-api`, the
+   management façade, which holds no state of its own: it carries each call
+   across to the Data Plane's private management listener and answers in its own
+   vocabulary rather than passing anything through — translating, not relaying
+   (ADR 0006 §9). The Control Plane also reads what the Data Plane has already
+   recorded, by pull, over that same façade.
+   Every one of those calls is a management call the Data Plane can refuse, and
+   none of them is on the runtime's request path. `internal/arch` in each Go
+   module fails its `test` target when this is broken — the rule is enforced,
+   not asked for, and the target is part of the required checks.
 5. **Infrastructure stays behind explicit boundaries.** Database access,
    external providers, queues: each lives behind a port in
    `internal/ports/outbound/`, named for what it does, not for what it is, and
@@ -88,8 +107,8 @@ change (contract first, see below), never as scaffolding someone left around.
 ## Commands
 
 The root `package.json` is the roster; `pnpm <script>` is the form.
-`format`, `format:check`, `lint`, `test`, `typecheck`, `build`,
-`check-projects`, `dev:console`, `dev:console-api`, `dev:dataplane`,
+`format`, `format:check`, `openapi:check`, `lint`, `test`, `typecheck`,
+`build`, `check-projects`, `dev:console`, `dev:console-api`, `dev:dataplane`,
 `dev:dataplane-api`. The Moon tasks behind `lint`/`test`/`typecheck`/`build`
 live in `apps/*/moon.yml` and run per project; a single project's targets run
 as `pnpm exec moon run console-api:lint` (every application declares the same
