@@ -47,7 +47,7 @@ type fakeDriver struct {
 func registerFake(t *testing.T) (*fakeDriver, *sql.DB) {
 	t.Helper()
 
-	name, f := registerNamedFake(t)
+	f, name := newFake(t)
 	db, err := sql.Open(name, "")
 	if err != nil {
 		t.Fatalf("sql.Open on the fake driver: %v", err)
@@ -56,11 +56,14 @@ func registerFake(t *testing.T) (*fakeDriver, *sql.DB) {
 	return f, db
 }
 
-// registerNamedFake is registerFake with the driver's registered name handed
-// back and no pool opened, for the tests that build their pool through the
-// adapter's own open — which takes the driver name, exactly as Open takes
-// "pgx" at the process boundary.
-func registerNamedFake(t *testing.T) (string, *fakeDriver) {
+// newFake is registerFake with the driver it registered handed back beside
+// its registered name and no pool opened, for the tests that build their pool
+// through the adapter's own open — which takes the driver name, exactly as
+// Open takes "pgx" at the process boundary. The name and shape match the
+// dataplane module's helper of the same purpose: the two modules duplicate
+// this file on purpose, and duplicated code that reads the same is the only
+// kind a maintainer diffing the copies can trust.
+func newFake(t *testing.T) (*fakeDriver, string) {
 	t.Helper()
 
 	registerMu.Lock()
@@ -70,7 +73,7 @@ func registerNamedFake(t *testing.T) (string, *fakeDriver) {
 
 	f := &fakeDriver{fail: make(map[event]error)}
 	sql.Register(name, f)
-	return name, f
+	return f, name
 }
 
 var (

@@ -414,6 +414,25 @@ func TestOpenRejectsInvalidOptions(t *testing.T) {
 			edit:    func(o *Options) { o.DSN = "postgres://gateway:unit-test-password@127.0.0.1:5432/?sslmode=disable" },
 			wantErr: "postgres: DSN must name exactly one database in its path",
 		},
+		{
+			// A keyword-value DSN parses as a URL with no scheme and the
+			// whole string for a path. The refusal must come from the scheme
+			// check, quoting nothing — an error that quoted the "database"
+			// this DSN seems to name would quote its password.
+			name: "rejects a keyword-value DSN without quoting it",
+			edit: func(o *Options) {
+				o.DSN = "host=127.0.0.1 port=5432 dbname=dataplane user=gateway password=unit-test-password"
+			},
+			wantErr: "postgres: DSN must be a postgres:// or postgresql:// URL",
+		},
+		{
+			// One leading slash is the path's separator; a second one is
+			// part of the database name this door reads, while the driver
+			// trims it away. The two readings must never both pass.
+			name:    "rejects a double-slash database path",
+			edit:    func(o *Options) { o.DSN = "postgres://gateway:unit-test-password@127.0.0.1:5432//control" },
+			wantErr: "postgres: DSN must name exactly one database in its path",
+		},
 	}
 
 	for _, tt := range tests {
@@ -440,7 +459,7 @@ func TestOpenRejectsInvalidOptions(t *testing.T) {
 }
 
 func TestOpenConfiguresThePoolAndPingsThroughTheDriver(t *testing.T) {
-	name, f := registerNamedFake(t)
+	f, name := newFake(t)
 	db, err := open(context.Background(), name, Options{
 		DSN:             openTestDSN,
 		MaxOpenConns:    7,
@@ -476,7 +495,7 @@ func TestOpenAppliesMaxIdleConnsByClosingTheExcess(t *testing.T) {
 	// depend on a janitor's tick or on goroutine timing. Four is also what
 	// makes this a proof of the setting rather than of the standard
 	// library's default of two.
-	name, f := registerNamedFake(t)
+	f, name := newFake(t)
 	db, err := open(context.Background(), name, Options{
 		DSN:             openTestDSN,
 		MaxOpenConns:    6,
@@ -513,7 +532,7 @@ func TestOpenAppliesConnMaxLifetimeByClosingExpiredConnectionsOnReturn(t *testin
 	// it: ping and exec each cost the driver one connect and one close, and
 	// nothing is ever reused. Had SetConnMaxLifetime not been applied, the
 	// stream would show two connects and no closes at all.
-	name, f := registerNamedFake(t)
+	f, name := newFake(t)
 	db, err := open(context.Background(), name, Options{
 		DSN:             openTestDSN,
 		MaxOpenConns:    2,
@@ -540,7 +559,7 @@ func TestOpenAppliesConnMaxLifetimeByClosingExpiredConnectionsOnReturn(t *testin
 }
 
 func TestOpenSurfacesAPingFailureAndClosesThePool(t *testing.T) {
-	name, f := registerNamedFake(t)
+	f, name := newFake(t)
 	refused := errors.New("connection refused")
 	f.failOn(evPing, refused)
 
@@ -567,7 +586,7 @@ func TestOpenSurfacesAPingFailureAndClosesThePool(t *testing.T) {
 }
 
 func TestOpenFailsFastOnAnAlreadyCancelledContext(t *testing.T) {
-	name, f := registerNamedFake(t)
+	f, name := newFake(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 

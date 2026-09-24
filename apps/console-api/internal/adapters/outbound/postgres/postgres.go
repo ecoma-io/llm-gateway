@@ -159,9 +159,14 @@ func open(ctx context.Context, driver string, opts Options) (*sql.DB, error) {
 // check runs at load time in internal/config against the environment's
 // variable; it is repeated here with this package's vocabulary because Open's
 // Options have callers other than the composition root's mapping, and Open is
-// where a wrong database would become a live pool. The DSN's grammar beyond
-// the path is the driver's business, not this one: the driver refuses what it
-// cannot parse, and this package refuses what it must not open.
+// where a wrong database would become a live pool. The check holds the DSN to
+// the shape the loader accepts — a postgres:// URL whose path is exactly one
+// database — because a shape the two doors disagree on would be a door a
+// foreign DSN walks through: a keyword-value string parses as a URL with the
+// whole string for a path, and the driver's reading of any such shape is the
+// one that dials. The DSN's grammar beyond scheme and path is the driver's
+// business, not this one: the driver refuses what it cannot parse, and this
+// package refuses what it must not open.
 //
 // Errors name the database and never the userinfo: the DSN carries the role's
 // password, and an error message is a log line waiting to happen.
@@ -170,7 +175,14 @@ func validateDSN(dsn string) error {
 	if err != nil {
 		// url.Parse quotes the string it rejected, credentials included, so
 		// its own text is deliberately not wrapped into this error.
-		return errors.New("postgres: DSN must be a URL")
+		return errors.New("postgres: DSN must be a postgres:// or postgresql:// URL")
+	}
+	if parsed.Scheme != "postgres" && parsed.Scheme != "postgresql" {
+		// A keyword-value DSN parses as a URL with no scheme and the whole
+		// string for a path — quoting the "database" it seems to name would
+		// quote the password — so the scheme is checked before anything is
+		// quoted, and this branch quotes nothing.
+		return errors.New("postgres: DSN must be a postgres:// or postgresql:// URL")
 	}
 	database := strings.TrimPrefix(parsed.Path, "/")
 	if database == "" || strings.Contains(database, "/") {
