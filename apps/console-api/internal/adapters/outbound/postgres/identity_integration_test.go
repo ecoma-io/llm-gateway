@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +17,9 @@ import (
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/identity"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
+	migrate "github.com/golang-migrate/migrate/v4"
+	migratepgx "github.com/golang-migrate/migrate/v4/database/pgx/v5"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -29,35 +34,34 @@ import (
 // pure SQL-level schema behaviour: deploy/postgres/verify.sh owns that tier,
 // and duplicating it would be two definitions of the same green.
 //
-// Like every integration tier in this repository, the database is required
+// Like every integration tier in this repository, the server is required
 // explicitly rather than started from go test (see valkey_integration_test.go
 // for the reasoning). deploy/postgres/compose.yaml provides the pinned
-// instance, and both lanes' migrations must be applied first:
-//
-//	docker compose -f deploy/postgres/compose.yaml up -d --wait
-//	docker compose -f deploy/postgres/compose.yaml run --rm migrate up
-//	GATEWAY_MIGRATE_LANE=control docker compose -f deploy/postgres/compose.yaml run --rm migrate up
+// instance, and the suite needs nothing else: the control database and its
+// migration history are ensured the way the port suite ensures the database
+// itself — derived from the one admin DSN the tier's contract names, created
+// if absent, then migrated through the golang-migrate library the pinned
+// runner image runs, which records the same schema_migrations history and
+// treats an already-migrated database as a no-op. A database this suite
+// prepared and one bash deploy/postgres/verify.sh prepared are
+// indistinguishable to everything that comes after.
 //
 // Run:
 //
-//	CONTROL_DATABASE_ADDRESS='postgres://gateway:gateway-dev-only@127.0.0.1:5432/control?sslmode=disable' \
+//	POSTGRES_TEST_ADMIN_DSN='postgres://gateway:gateway-dev-only@127.0.0.1:5432/postgres?sslmode=disable' \
 //	  go test -tags=integration -race ./internal/adapters/outbound/postgres
-//
-// bash deploy/postgres/verify.sh leaves the database in exactly that state.
 //
 // The pgx driver registers itself under database/sql; the adapter never names
 // it (its wiring comment records why), and this import is the module's only
 // one — the integration tier's, not the production build's.
 
-// integrationDB opens the control database the run names, or fails the test
-// with the one-line recipe for getting there.
+// integrationDB opens the control database the tier's contract names —
+// derived from POSTGRES_TEST_ADMIN_DSN, database ensured and migration
+// history applied — or fails the test with the one-line recipe for getting
+// there.
 func integrationDB(t *testing.T) *sql.DB {
 	t.Helper()
-	address := os.Getenv("CONTROL_DATABASE_ADDRESS")
-	if address == "" {
-		t.Fatal("CONTROL_DATABASE_ADDRESS is required for integration tests; start deploy/postgres, apply both lanes' migrations (bash deploy/postgres/verify.sh does exactly this), and point it at the control database")
-	}
-	db, err := sql.Open("pgx", address)
+	db, err := sql.Open("pgx", planeDSN(t))
 	if err != nil {
 		t.Fatalf("open the control database: %v", err)
 	}
@@ -67,7 +71,54 @@ func integrationDB(t *testing.T) *sql.DB {
 	if err := db.PingContext(ctx); err != nil {
 		t.Fatalf("ping the control database: %v", err)
 	}
+	ensureIdentitySchema(t, db)
 	return db
+}
+
+// migrationsDir locates the Control Plane's migration lane relative to this
+// file, so the suite applies exactly the files the repository ships — not a
+// copy, and not an embedded snapshot that could drift from
+// migrations/control/.
+func migrationsDir(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller: cannot locate this test file")
+	}
+	// postgres/ -> outbound -> adapters -> internal -> console-api -> apps ->
+	// the repository root the lane lives under.
+	return filepath.Join(filepath.Dir(thisFile),
+		"..", "..", "..", "..", "..", "..", "migrations", "control")
+}
+
+// ensureIdentitySchema applies the control lane's migrations through the
+// same golang-migrate library the pinned runner image runs. The identity
+// tests are the integration tier's first consumers of real schema — foreign
+// keys, the live-email uniqueness and the prefix grammar are their subjects
+// — so the schema is a precondition the suite ensures rather than one the
+// caller is told to arrange. The library (not a hand-rolled loop over the
+// .sql files) keeps the history bookkeeping identical to the runner's:
+// public.schema_migrations records the same versions, a second call is
+// ErrNoChange, and a database this suite prepared is one verify.sh can drive
+// on unchanged. The driver is deliberately never Close()d — closing it would
+// close the pool the tests still use; t.Cleanup owns that.
+func ensureIdentitySchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	driver, err := migratepgx.WithInstance(db, &migratepgx.Config{})
+	if err != nil {
+		t.Fatalf("migrate driver over the control database: %v", err)
+	}
+	source, err := iofs.New(os.DirFS(migrationsDir(t)), ".")
+	if err != nil {
+		t.Fatalf("read the control lane's migrations: %v", err)
+	}
+	m, err := migrate.NewWithInstance("iofs", source, "control", driver)
+	if err != nil {
+		t.Fatalf("wire the migration runner: %v", err)
+	}
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		t.Fatalf("apply the control lane's migrations: %v", err)
+	}
 }
 
 // integrationIdentity builds the three repositories over one pool, as the
