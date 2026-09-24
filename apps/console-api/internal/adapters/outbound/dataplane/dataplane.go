@@ -176,8 +176,8 @@ func (c *Client) ReadUsageEvents(ctx context.Context, after string, limit int) (
 	switch response.StatusCode {
 	case http.StatusOK:
 		// The page is decoded below; JSON is the only shape the contract
-		// declares, and a peer that answers something else fails the decode
-		// rather than being guessed at.
+		// declares, and a peer that answers something else fails the decode,
+		// which is classified as a malformed page rather than being guessed at.
 	case http.StatusGone:
 		// The stored position is no longer replayable. It is the one failure of
 		// the operation the Control Plane can act on differently from all the
@@ -193,9 +193,15 @@ func (c *Client) ReadUsageEvents(ctx context.Context, after string, limit int) (
 		return port.Page{}, fmt.Errorf("dataplane: read usage events: unexpected status %d", response.StatusCode)
 	}
 
+	// A 200 whose body will not decode is not an unknown answer: the status
+	// promised a page and the body broke the promise — truncated, another
+	// media type, or a required field carrying a value of the wrong type. The
+	// port has one name for an answer that arrived and is wrong, so this
+	// classifies with the refusals below rather than surfacing as a bare
+	// decode error, the shape a failure of transport would take.
 	var body pageResponse
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
-		return port.Page{}, fmt.Errorf("dataplane: decode the usage events page: %w", err)
+		return port.Page{}, fmt.Errorf("%w: the body would not decode as a page: %w", port.ErrMalformedPage, err)
 	}
 	page, err := body.page()
 	if err != nil {

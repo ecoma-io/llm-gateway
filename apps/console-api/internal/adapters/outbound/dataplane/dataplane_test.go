@@ -367,6 +367,64 @@ func TestReadUsageEventsRefusesAPageMissingRequiredFields(t *testing.T) {
 	}
 }
 
+// TestReadUsageEventsRefusesABodyItCannotDecode covers the other half of "not
+// a page the contract describes": a 200 whose body fails to decode at all —
+// not JSON, truncated mid-page, or a required field carrying a value of the
+// wrong type. The port's taxonomy has one name for an answer that arrived and
+// is wrong, so these classify with the absent-and-null refusals above rather
+// than surfacing as a bare decode error, the shape a failure of transport
+// would take: an unknown answer is retryable bad luck, a body that lies about
+// being a page is a peer breaking the contract.
+func TestReadUsageEventsRefusesABodyItCannotDecode(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "a body that is not JSON at all",
+			body: `<html>gateway error</html>`,
+		},
+		{
+			name: "a body truncated mid-page",
+			body: `{"events":[{"request_id":"req-1"`,
+		},
+		{
+			name: "a has_more of the wrong type",
+			body: `{"events":[],"next_cursor":"cursor-2","has_more":"true"}`,
+		},
+		{
+			name: "a schema_version of the wrong type",
+			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":"1","occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+		{
+			name: "an occurred_at that is not a timestamp",
+			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"not-a-time","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var seen *http.Request
+			client := New(capturingClient(&seen, jsonResponse(http.StatusOK, tt.body)), baseURL, credential)
+
+			page, err := client.ReadUsageEvents(context.Background(), "", 100)
+			if !errors.Is(err, port.ErrMalformedPage) {
+				t.Fatalf("ReadUsageEvents() error = %v, want it to wrap %v", err, port.ErrMalformedPage)
+			}
+			if page.NextCursor != "" || page.Events != nil || page.HasMore {
+				t.Errorf("ReadUsageEvents() returned %+v beside an error, want the zero Page — a caller that ignored the error must not find a position in it", page)
+			}
+			// The refusal is made of the response and not of the request, so it
+			// must not smuggle back the endpoint or the credential either.
+			for _, secret := range []string{baseURL, credential} {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("error %q carries %q", err.Error(), secret)
+				}
+			}
+		})
+	}
+}
+
 // TestAFactWithPresentButEmptyFieldsIsStillAPage is the boundary the table
 // above must not erode: presence is the whole check. An empty request_id, a
 // kind this build has never heard of and a schema_version of zero are values
