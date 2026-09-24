@@ -115,7 +115,7 @@ CREATE TABLE control.api_keys (
         CHECK (char_length(display_name) BETWEEN 1 AND 256),
     prefix text NOT NULL
         CONSTRAINT api_keys_prefix_shape
-        CHECK (prefix ~ '^gw_[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}_$'),
+        CHECK (prefix ~ '^gw_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}_$'),
     state text NOT NULL
         CONSTRAINT api_keys_state_valid
         CHECK (state IN ('active', 'revoked')),
@@ -128,7 +128,12 @@ CREATE TABLE control.api_keys (
 
 -- A key's id IS its public prefix material, so prefix carries no secret and
 -- needs no uniqueness of its own — it is a deterministic rendering of the
--- primary key (gw_<id>_); the shape check above pins that rendering.
+-- primary key (gw_<id>_); the shape check above pins that rendering. The
+-- nibbles tightened beyond plain hex are the UUIDv4 version (third group's
+-- first character = '4') and RFC 4122 variant (fourth group's first
+-- character in 89ab) — exactly what the domain's validateUUIDForm enforces
+-- at mint, so a row this schema accepted could never have produced a token
+-- its own parser rejects.
 
 -- Ownership and creator are the lookups the console runs (an account's keys,
 -- a user's keys). The creator edge is nullable on purpose: a key minted
