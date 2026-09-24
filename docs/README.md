@@ -46,6 +46,8 @@ not built yet.
   events, funding buckets, and the ledger
 - [Data implications](architecture/data-implications.md) — how the model maps
   onto the relational / time-series storage split
+- [Persistence](architecture/persistence.md) — the two databases, the two
+  migration lanes, and the conventions future schema work keeps
 
 These pages link; they do not restate. Where a page and an ADR disagree, the
 ADR wins and the page is wrong.

@@ -26,6 +26,7 @@ Reference pages: [planes and ownership](planes.md) · [routing](routing.md) ·
 [request lifecycle](request-lifecycle.md)
 · [commerce](commerce.md) · [accounting](accounting.md) ·
 [data implications](data-implications.md) ·
+[persistence](persistence.md) ·
 [cross-plane protocols](cross-plane-protocols.md) ·
 [ports and adapters](ports.md)
 
