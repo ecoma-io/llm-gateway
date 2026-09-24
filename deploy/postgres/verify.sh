@@ -13,8 +13,10 @@
 # the lane it acts on. Each lane proves its pipeline against its own
 # database — the Data Plane's proofs run the fuller pipeline (apply,
 # validate, fail, recover); the Control Plane's run apply, re-apply and full
-# rollback on its foundation migration — and each lane then proves the other
-# plane's database untouched.
+# rollback on their lane, whose identity step additionally exercises the
+# identity schema's own rules at the SQL level — a constraint that has never
+# refused a row is a comment, not a constraint — and each lane then proves
+# the other plane's database untouched.
 #
 # The proofs, in order:
 #   1. both lanes' directories hold exactly what the runner will read —
@@ -26,16 +28,20 @@
 #   5. the recorded version is the newest migration in that lane, and not
 #      dirty;
 #   6. re-applying is a no-op, not an error;
-#   7. the Control Plane's foundation migration applies into its own
-#      database — the ownership namespace and its comment, re-applied as a
-#      no-op — and the two lanes are two databases: no history and no schema
-#      crosses the boundary, and one fixture credential opens both;
-#   8. PostgreSQL transaction semantics hold (rolled-back work leaves
+#   7. the Control Plane's lane applies into its own database — the
+#      ownership namespace with the identity schema inside it, re-applied as
+#      a no-op — and the two lanes are two databases: no history and no
+#      schema crosses the boundary, and one fixture credential opens both;
+#   8. the Control Plane's identity schema enforces its rules: lifecycle
+#      states, the live-email uniqueness and its re-invite exception, the
+#      revocation/state pairing, the token prefix grammar, and every foreign
+#      key;
+#   9. PostgreSQL transaction semantics hold (rolled-back work leaves
 #      nothing behind, committed work survives);
-#   9. a migration that fails mid-file rolls back whole, records its target
+#  10. a migration that fails mid-file rolls back whole, records its target
 #      version dirty, refuses further runs, and is recovered with force;
-#  10. a full down roll returns both schemas to clean;
-#  11. the suite leaves both databases up and fully migrated.
+#  11. a full down roll returns both schemas to clean;
+#  12. the suite leaves both databases up and fully migrated.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -118,6 +124,32 @@ expect_failure() {
 		exit 1
 	fi
 	printf 'ok: %s (failed as required)\n' "$label"
+}
+
+# expect_constraint_failure runs one SQL batch against the Control Plane's
+# database that must fail, and by one particular constraint: the batch is
+# wrapped in an explicit transaction whose ROLLBACK a successful run would
+# reach (so even a probe that fails to fail leaves nothing behind), and the
+# captured error output must name the constraint under test. A refusal for
+# any other reason — a stale row's duplicate key, a mis-aimed seed — fails
+# the suite with psql's actual output attached, because a step that cannot
+# say which rule refused the row has not proven that rule.
+expect_constraint_failure() {
+	local label="$1" constraint="$2" batch="$3" output status=0
+	output="$(compose exec -T postgres psql -U gateway -d "$control_db" \
+		-v ON_ERROR_STOP=1 -q -c "BEGIN;
+$batch;
+ROLLBACK;" 2>&1)" || status=$?
+	if [ "$status" -eq 0 ]; then
+		printf 'FAIL: %s — the batch exited zero; the constraint never fired\n' "$label" >&2
+		exit 1
+	fi
+	if ! printf '%s' "$output" | grep -qF -- "$constraint"; then
+		printf 'FAIL: %s — the batch failed, but not by constraint %s; psql said:\n%s\n' \
+			"$label" "$constraint" "$output" >&2
+		exit 1
+	fi
+	printf 'ok: %s (refused by %s)\n' "$label" "$constraint"
 }
 
 # newest_migration_version returns the newest migration version present in
@@ -237,7 +269,7 @@ lane_drift_check() {
 newest="$(newest_migration_version "$dataplane_db")"
 control_newest="$(newest_migration_version "$control_db")"
 
-step "1/11 both lanes hold exactly what the runner will read, and nothing else"
+step "1/12 both lanes hold exactly what the runner will read, and nothing else"
 # Applied history under migrations/ is immutable, and the runner above all
 # trusts its directory: these two checks are what stands between a drifted
 # lane and a database that applies the drift. The fixture half is its own
@@ -249,7 +281,7 @@ lane_drift_check "$dataplane_db"
 assert_equals "the failing-migration fixture is in no lane" \
 	"$(find "$repo_root"/migrations -type d -name failing-migration | wc -l | tr -d ' ')" "0"
 
-step "2/11 both plane databases start and accept connections"
+step "2/12 both plane databases start and accept connections"
 # --wait blocks on the healthcheck: a container whose port answers but whose
 # PostgreSQL rejects transactions is not up, and this step refuses to call it
 # up. The two databases are created by the cluster's own initdb script
@@ -262,14 +294,14 @@ assert_equals "the cluster serves two databases" \
 assert_equals "the Control Plane's database answers" "$(psql_scalar "$control_db" 'SELECT 1')" "1"
 assert_equals "the Data Plane's database answers" "$(psql_scalar "$dataplane_db" 'SELECT 1')" "1"
 
-step "3/11 the pinned image ships the timescaledb extension"
+step "3/12 the pinned image ships the timescaledb extension"
 assert_equals "timescaledb appears in pg_available_extensions" \
 	"$(psql_scalar "$dataplane_db" "SELECT count(*) FROM pg_available_extensions WHERE name = 'timescaledb'")" "1"
 
-step "4/11 the Data Plane's migrations apply"
+step "4/12 the Data Plane's migrations apply"
 migrate_lane "$dataplane_db" up
 
-step "5/11 the recorded version is the newest migration in that lane, and clean"
+step "5/12 the recorded version is the newest migration in that lane, and clean"
 assert_equals "schema_migrations.version" \
 	"$(psql_scalar "$dataplane_db" 'SELECT version FROM schema_migrations')" \
 	"$newest"
@@ -279,11 +311,11 @@ assert_equals "schema_migrations.dirty" \
 assert_nonempty "timescaledb is installed in the database" \
 	"$(psql_scalar "$dataplane_db" "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'")"
 
-step "6/11 re-applying is a no-op, not an error"
+step "6/12 re-applying is a no-op, not an error"
 migrate_lane "$dataplane_db" up
 assert_equals "version is unchanged after a no-op apply" "$(recorded_version "$dataplane_db")" "$newest"
 
-step "7/11 the Control Plane's lane builds its namespace in its own database, and no lane crosses"
+step "7/12 the Control Plane's lane builds its namespace in its own database, and no lane crosses"
 # Two databases are a database ownership boundary (ADR 0006 §7): separate
 # namespaces, separate connection targets, independent transactions and
 # independent migration history, with no ordinary SQL statement spanning them.
@@ -307,19 +339,22 @@ assert_equals "the ownership namespace exists in the Control Plane's database" \
 assert_equals "the namespace carries the ownership comment, byte for byte" \
 	"$(psql_scalar "$control_db" "SELECT obj_description('$control_db'::regnamespace, 'pg_namespace')")" \
 	"Control Plane ownership namespace (ADR 0006 §7); owned by apps/console-api."
-assert_equals "the namespace holds no tables — foundation is a namespace, not schema" \
-	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "0"
+assert_equals "the namespace holds exactly the identity schema's three tables" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "3"
+assert_equals "the identity tables are the foundation's accounts, users and api_keys" \
+	"$(psql_scalar "$control_db" "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables WHERE schemaname = 'control'")" "accounts,api_keys,users"
 
 migrate_lane "$control_db" up
 assert_equals "re-applying the Control Plane's lane is a no-op too" \
 	"$(recorded_version "$control_db")" "$control_newest"
 
-# Isolation, asserted from both sides: the Control Plane's migration created
-# the namespace and nothing else — its own database's public schema holds the
-# migration history and no product table — the Data Plane's database carries
-# no `control` schema for the other lane to have leaked one into, and each
-# database records its own applied history, because golang-migrate writes
-# versions into the database it migrated.
+# Isolation, asserted from both sides: the Control Plane's migrations built
+# the namespace and the identity schema inside it — its own database's public
+# schema holds the migration history and no product table, because the
+# identity tables live in the `control` namespace — the Data Plane's database
+# carries no `control` schema for the other lane to have leaked one into, and
+# each database records its own applied history, because golang-migrate
+# writes versions into the database it migrated.
 assert_equals "the Control Plane's public schema holds only its migration history" \
 	"$(psql_scalar "$control_db" "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")" "schema_migrations"
 assert_equals "the Control Plane's public schema holds no second table" \
@@ -345,7 +380,128 @@ assert_equals "one fixture credential opens both plane databases" \
 	"$(psql_scalar "$control_db" 'SELECT current_user')|$(psql_scalar "$dataplane_db" 'SELECT current_user')" \
 	"gateway|gateway"
 
-step "8/11 PostgreSQL transaction semantics hold"
+step "8/12 the Control Plane's identity schema enforces its rules"
+# Every refusal below names the constraint it proves, and every probe —
+# refusal or positive — seeds what it needs inside its own explicit
+# transaction and rolls it back, so the probes are self-contained,
+# order-independent and re-runnable: no probe depends on a state a previous
+# one left, and none leaves one for the next. The probe rows use fixed
+# UUIDv4-form ids, matching the grammar the schema itself demands, and every
+# table is named in the `control` namespace the lane's foundation migration
+# built.
+
+expect_constraint_failure "an account state outside the lifecycle is refused" accounts_state_valid "
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'zombie', now(), now())"
+
+expect_constraint_failure "a user email outside the grammar is refused" users_email_shape "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+)
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+SELECT 'b0000000-0000-4000-8000-0000000000b1', id, 'not an email', 'invited', now(), now() FROM account"
+
+expect_constraint_failure "a second live user may not hold the account's email" users_account_live_email_key "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), first_user AS (
+  INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+  SELECT 'b0000000-0000-4000-8000-0000000000b1', id, 'probe@example.com', 'invited', now(), now() FROM account
+  RETURNING account_id, email
+)
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+SELECT 'b0000000-0000-4000-8000-0000000000b2', account_id, email, 'invited', now(), now() FROM first_user"
+
+# The re-invite exception is the uniqueness rule's other half, asserted
+# positively: seed, remove, re-invite, read the answer, roll back.
+assert_equals "a removed user's email may be invited again" \
+	"$(psql_scalar "$control_db" "
+BEGIN;
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now());
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-0000000000b1', 'a0000000-0000-4000-8000-0000000000a1', 'probe@example.com', 'invited', now(), now());
+UPDATE control.users SET state = 'removed' WHERE id = 'b0000000-0000-4000-8000-0000000000b1';
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-0000000000b2', 'a0000000-0000-4000-8000-0000000000a1', 'probe@example.com', 'invited', now(), now());
+SELECT count(*) FROM control.users
+WHERE account_id = 'a0000000-0000-4000-8000-0000000000a1'
+  AND email = 'probe@example.com'
+  AND state = 'invited';
+ROLLBACK;")" "1"
+
+expect_constraint_failure "an active key with a revocation stamp is refused" api_keys_revocation_consistency "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+)
+INSERT INTO control.api_keys (id, account_id, created_by, display_name, prefix, state, created_at, updated_at, revoked_at)
+SELECT 'c0000000-0000-4000-8000-0000000000c1', id, NULL, 'verify probe', 'gw_c0000000-0000-4000-8000-0000000000c1_', 'active', now(), now(), now() FROM account"
+
+expect_constraint_failure "a revoked key without a revocation stamp is refused" api_keys_revocation_consistency "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+)
+INSERT INTO control.api_keys (id, account_id, created_by, display_name, prefix, state, created_at, updated_at, revoked_at)
+SELECT 'c0000000-0000-4000-8000-0000000000c1', id, NULL, 'verify probe', 'gw_c0000000-0000-4000-8000-0000000000c1_', 'revoked', now(), now(), NULL FROM account"
+
+expect_constraint_failure "a key prefix outside the grammar is refused" api_keys_prefix_shape "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+)
+INSERT INTO control.api_keys (id, account_id, created_by, display_name, prefix, state, created_at, updated_at, revoked_at)
+SELECT 'c0000000-0000-4000-8000-0000000000c1', id, NULL, 'verify probe', 'garbage', 'active', now(), now(), NULL FROM account"
+
+expect_constraint_failure "a key prefix with non-v4 uuid nibbles is refused" api_keys_prefix_shape "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+)
+INSERT INTO control.api_keys (id, account_id, created_by, display_name, prefix, state, created_at, updated_at, revoked_at)
+SELECT 'c0000000-0000-4000-8000-0000000000c1', id, NULL, 'verify probe', 'gw_c0000000-0000-1000-8000-0000000000c1_', 'active', now(), now(), NULL FROM account"
+
+expect_constraint_failure "a user under an unknown account is refused" users_account_id_fkey "
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-0000000000b1', 'e0000000-0000-4000-8000-0000000000e1', 'orphan@example.com', 'invited', now(), now())"
+
+expect_constraint_failure "a key under an unknown account is refused" api_keys_account_id_fkey "
+INSERT INTO control.api_keys (id, account_id, created_by, display_name, prefix, state, created_at, updated_at, revoked_at)
+VALUES ('c0000000-0000-4000-8000-0000000000c1', 'e0000000-0000-4000-8000-0000000000e1', NULL, 'verify probe', 'gw_c0000000-0000-4000-8000-0000000000c1_', 'active', now(), now(), NULL)"
+
+expect_constraint_failure "a key created by an unknown user is refused" api_keys_created_by_fkey "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+)
+INSERT INTO control.api_keys (id, account_id, created_by, display_name, prefix, state, created_at, updated_at, revoked_at)
+SELECT 'c0000000-0000-4000-8000-0000000000c1', id, 'f0000000-0000-4000-8000-0000000000f1', 'verify probe', 'gw_c0000000-0000-4000-8000-0000000000c1_', 'active', now(), now(), NULL FROM account"
+
+assert_equals "a well-formed account, user and key all insert" \
+	"$(psql_scalar "$control_db" "
+BEGIN;
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now());
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-0000000000b1', 'a0000000-0000-4000-8000-0000000000a1', 'probe@example.com', 'invited', now(), now());
+INSERT INTO control.api_keys (id, account_id, created_by, display_name, prefix, state, created_at, updated_at, revoked_at)
+VALUES ('c0000000-0000-4000-8000-0000000000c1', 'a0000000-0000-4000-8000-0000000000a1', 'b0000000-0000-4000-8000-0000000000b1', 'verify probe', 'gw_c0000000-0000-4000-8000-0000000000c1_', 'active', now(), now(), NULL);
+SELECT (SELECT count(*) FROM control.accounts WHERE id = 'a0000000-0000-4000-8000-0000000000a1') || '|' ||
+       (SELECT count(*) FROM control.users WHERE id = 'b0000000-0000-4000-8000-0000000000b1') || '|' ||
+       (SELECT count(*) FROM control.api_keys WHERE id = 'c0000000-0000-4000-8000-0000000000c1');
+ROLLBACK;")" "1|1|1"
+
+step "9/12 PostgreSQL transaction semantics hold"
 # Two probes, because the migration safety model rests on both: DDL rolled
 # back leaves nothing (migrations run inside transactions and a failed one
 # must leave no half-applied schema), and DML rolled back leaves nothing
@@ -379,7 +535,7 @@ psql_script "$dataplane_db" <<'SQL'
 DROP TABLE public._verify_tx_probe;
 SQL
 
-step "9/11 a migration that fails fails whole, loudly, and stops the world"
+step "10/12 a migration that fails fails whole, loudly, and stops the world"
 # The safety model's central claims, executed rather than asserted:
 #
 #   Atomicity  — the probe pair's up file has a succeeding CREATE TABLE and
@@ -427,7 +583,7 @@ migrate_lane "$dataplane_db" force "$newest" </dev/null
 assert_equals "force restores the actually-applied version, clean" \
 	"$(psql_scalar "$dataplane_db" 'SELECT version, dirty FROM schema_migrations')" "$newest|f"
 
-step "10/11 a full down roll returns both schemas to clean"
+step "11/12 a full down roll returns both schemas to clean"
 # </dev/null pins the non-interactive contract: the suite must never depend
 # on who is holding a terminal. This is the same move a contributor makes;
 # the suite just proves it ends where the safety model promises. Each lane
@@ -444,12 +600,14 @@ assert_equals "the timescaledb extension is gone after a full roll-back" \
 migrate_lane "$control_db" down -all </dev/null
 assert_equals "the Control Plane's recorded version is zero after a full roll-back" \
 	"$(recorded_version "$control_db")" "0"
+assert_equals "the identity tables are gone after a full roll-back" \
+	"$(psql_scalar "$control_db" "SELECT to_regclass('control.accounts') IS NULL AND to_regclass('control.users') IS NULL AND to_regclass('control.api_keys') IS NULL")" "t"
 assert_equals "the ownership namespace and its comment are gone after a full roll-back" \
 	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_namespace WHERE nspname = '$control_db'")" "0"
 assert_equals "the Control Plane's public schema is back to its migration history alone" \
 	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")" "1"
 
-step "11/11 the suite leaves both databases migrated, not half-torn-down"
+step "12/12 the suite leaves both databases migrated, not half-torn-down"
 migrate_lane "$dataplane_db" up
 migrate_lane "$control_db" up
 assert_equals "final recorded version, Data Plane" "$(recorded_version "$dataplane_db")" "$newest"

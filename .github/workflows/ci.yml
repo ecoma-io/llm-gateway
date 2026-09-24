@@ -201,11 +201,14 @@ jobs:
       #   (POSTGRES_TEST_ADMIN_DSN below) before it runs — the same
       #   ensure-then-connect shape a developer's machine exercises, with the
       #   creation step made explicit instead of delegated to an entrypoint.
-      # - No migration runner: migrations are verify-persistence's subject
-      #   (`deploy/postgres/verify.sh`, the same suite a contributor runs).
-      #   The Go integration tier needs no migrated schema — the foundation
-      #   suites exercise connection, transaction and lifecycle behaviour on
-      #   probe tables they create and drop themselves.
+      # - No migration runner service: migrations are verify-persistence's
+      #   subject (`deploy/postgres/verify.sh`, the same suite a contributor
+      #   runs), and this job runs none. The foundation suites need no
+      #   migrated schema — connection, transaction and lifecycle behaviour
+      #   run on probe tables they create and drop themselves — and the
+      #   identity suite applies its own lane's migrations itself, through
+      #   the golang-migrate library the pinned runner image runs, so the
+      #   admin DSN below stays the only database fact the job supplies.
       #
       # The role is the fixture's own `gateway` role with the fixture's
       # documented development password — in a fresh container that role is

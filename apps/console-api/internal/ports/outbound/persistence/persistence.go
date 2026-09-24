@@ -33,7 +33,16 @@ package persistence
 import (
 	"context"
 	"database/sql"
+	"errors"
 )
+
+// ErrNotFound is the repositories' miss sentinel: a lookup whose subject does
+// not exist. It means a miss and only a miss — the application layer decides
+// which of its own errors a miss becomes, the way application.Error pairs with
+// the cache port's sentinel today. Distinguishable outcomes travel as
+// sentinels so callers branch with errors.Is; everything else arrives wrapped
+// with context.
+var ErrNotFound = errors.New("persistence: not found")
 
 // Pinger reports whether the backing store is answering right now. Readiness
 // is what it is for: /readyz gates on it, and nothing else should treat a

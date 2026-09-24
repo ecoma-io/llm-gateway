@@ -39,7 +39,8 @@ directory is the database name — `migrations/control/`, `migrations/dataplane/
 — so a file's directory is also the deployment decision about where it runs;
 `migrations/README.md` states the rule that ties the two together, and why the
 Control Plane's lane opens on a foundation migration — its ownership
-namespace — rather than a business table. Both databases are created by
+namespace — rather than a business table, with the identity foundation
+(000002) as the first business schema inside it. Both databases are created by
 [`initdb/`](initdb/10-create-plane-databases.sh), on the first start of an
 empty volume.
 
@@ -272,11 +273,11 @@ definition of green, for a contributor and for the pipeline alike.
 
 ## What is deliberately not here
 
-- No business schema. Tables arrive with the domains that own them, as
-  migrations in the lane that owns them; the Data Plane's bootstrap
-  migration enables the `timescaledb` extension and nothing else, and the
-  Control Plane's first migration establishes its ownership namespace and
-  nothing else — foundation, not business schema.
+- No business schema beyond identity itself. Tables arrive with the domains
+  that own them, as migrations in the lane that owns them; the Data Plane's
+  bootstrap migration enables the `timescaledb` extension and nothing else,
+  and the Control Plane's lane holds its ownership namespace plus the
+  identity foundation (accounts, users, api_keys) and nothing more.
 - No per-plane roles, and no claim that this fixture demonstrates credential
   isolation — it does not. One convenient role (`gateway`) owns and opens both
   databases, which is a local-development fixture and not a security property:

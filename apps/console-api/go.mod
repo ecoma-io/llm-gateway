@@ -20,10 +20,22 @@ require github.com/valkey-io/valkey-go v1.0.78
 // library has no PostgreSQL driver of its own, lib/pq is in maintenance mode,
 // and the port is spelled in database/sql — so pgx's stdlib wrapper is the
 // one dependency that fits. internal/adapters/outbound/postgres/postgres.go
-// states the justification in full, at the blank import that carries it.
+// states the justification in full, at the blank import that carries it. The
+// identity integration tier's real-database tests (//go:build integration)
+// import it directly for the same reason; every other import lives in a
+// _test.go file, and no other production code links pgx.
 require github.com/jackc/pgx/v5 v5.11.0
 
+// golang-migrate is the schema-change tool deploy/postgres chose (its README
+// records why, and the pinned runner image is this exact version) — required
+// here only so the identity integration tier can ensure its own lane's
+// migration history from the admin DSN, with bookkeeping identical to the
+// runner's. Test imports only (//go:build integration); no production code
+// links it, and the deploy path stays the pinned Docker image.
+require github.com/golang-migrate/migrate/v4 v4.20.1
+
 require (
+	github.com/jackc/pgerrcode v0.0.0-20220416144525-469b46aa5efa // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
