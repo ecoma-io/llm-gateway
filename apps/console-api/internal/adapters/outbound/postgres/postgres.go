@@ -3,21 +3,52 @@
 // database decided in ADR 0006 §7 (Control Plane state, and the authority for
 // everything a customer is billed from), operated per deploy/postgres/README.md.
 //
-// The adapter is handed an open *sql.DB rather than opening one itself: which
-// driver backs that handle is a wiring decision, and the import that
-// registers it is a dependency this module deliberately does not carry. The
-// change that first wires a real database into cmd/console-api adds that
-// import exactly once, at the process boundary, and nothing under internal/
-// ever sees it.
+// The driver is registered here, once, by the blank import below: pgx's
+// stdlib wrapper, the maintained database/sql driver for PostgreSQL. The
+// standard library ships no PostgreSQL driver of its own, and lib/pq is in
+// maintenance mode; the port's database/sql shape — Querier, BeginTx, the
+// driver-level fakes these tests watch — is the abstraction this repository
+// decided on, and what that shape needs is a driver the standard library can
+// load. The import lives at this package boundary and nowhere else: nothing
+// under internal/ ever sees it, and no pgx type crosses this package's API —
+// the store New hands out is the port and nothing else.
+//
+// Open is how the process boundary dials. It validates the pool settings it
+// is handed, checks that the DSN names the database this application owns,
+// opens the pool on the registered driver, and pings it before returning —
+// so a database that will not answer, or a DSN pointed at another plane's
+// database, is a startup failure and not the first request's.
 package postgres
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net/url"
+	"strings"
+	"time"
+
+	// github.com/jackc/pgx/v5/stdlib is the PostgreSQL driver, registered as
+	// "pgx" and imported here and nowhere else. The justification is AGENTS
+	// rule 11: the standard library has no PostgreSQL driver, so the port's
+	// database/sql shape needs one from outside; lib/pq is in maintenance
+	// mode; pgx's stdlib wrapper is the maintained database/sql driver. The
+	// blank import is the whole of the dependency — this package's API names
+	// only database/sql and the port, never a pgx type.
+	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
+
+// ownedDatabase is the only database this application may open — the plane
+// binding of ADR 0006 §7. It is a constant and not a setting: which database
+// is this plane's is decided by the architecture, and a deployment that wants
+// a different answer is misconfigured, not retuned. It mirrors the constant
+// of the same name in internal/config, where the environment's DSN is checked
+// against it at load time; Open repeats the check because it is the last door
+// and its Options can be built by any caller.
+const ownedDatabase = "control"
 
 // New returns the persistence port backed by db. The store holds no state of its
 // own beyond the pool, so it needs no closing: Close belongs to whoever owns
@@ -32,6 +63,136 @@ func New(db *sql.DB) persistence.Store {
 		panic("postgres: New requires a non-nil *sql.DB — open the database before building the store")
 	}
 	return &store{db: db}
+}
+
+// Options configures Open. It is the wiring half of the connection settings:
+// internal/config loads them from the environment and the composition root
+// maps them here field by field, because this package must not read the
+// environment and must not import the configuration package — one value, one
+// place it is named, and the mapping visible in the diff.
+type Options struct {
+	// DSN is the connection string, in the URL form PostgreSQL documents. It
+	// names the database this application owns and carries the role's
+	// password: no error this package returns quotes it.
+	DSN string
+
+	// MaxOpenConns bounds the pool's open connections. At least one: a pool
+	// that may not open a connection is not a pool.
+	MaxOpenConns int
+
+	// MaxIdleConns bounds the connections the pool keeps when idle. It may
+	// not be negative, and it may not exceed MaxOpenConns.
+	MaxIdleConns int
+
+	// ConnMaxLifetime bounds the total service of one pooled connection
+	// before the pool retires it.
+	ConnMaxLifetime time.Duration
+
+	// ConnMaxIdleTime bounds how long an idle connection is kept before the
+	// pool closes it.
+	ConnMaxIdleTime time.Duration
+}
+
+// Open dials the application's own plane's database and returns a validated
+// pool: one whose settings are the ones Options asked for, and one that has
+// answered a ping within ctx — startup validation, not a lazy maybe. The
+// caller owns the pool from here: Close belongs to whoever holds it, and the
+// store built over it (New) needs no closing of its own.
+//
+// A failure is a startup failure and carries no DSN: driver errors are run
+// through withoutDSN below, because a driver's parse error quotes the
+// connection string it was handed and the string carries the password.
+func Open(ctx context.Context, opts Options) (*sql.DB, error) {
+	return open(ctx, "pgx", opts)
+}
+
+// open is Open with the driver named. The name is a parameter of this one
+// function so the hand-written driver in fakedriver_test.go can stand exactly
+// where pgx stands in the process; every caller but the tests names the
+// constant Open pins.
+func open(ctx context.Context, driver string, opts Options) (*sql.DB, error) {
+	switch {
+	case opts.DSN == "":
+		return nil, errors.New("postgres: DSN is required")
+	case opts.MaxOpenConns < 1:
+		return nil, fmt.Errorf("postgres: MaxOpenConns must be greater than zero, got %d", opts.MaxOpenConns)
+	case opts.MaxIdleConns < 0:
+		return nil, fmt.Errorf("postgres: MaxIdleConns must not be negative, got %d", opts.MaxIdleConns)
+	case opts.MaxIdleConns > opts.MaxOpenConns:
+		return nil, fmt.Errorf("postgres: MaxIdleConns (%d) must not exceed MaxOpenConns (%d)", opts.MaxIdleConns, opts.MaxOpenConns)
+	case opts.ConnMaxLifetime < 0:
+		return nil, fmt.Errorf("postgres: ConnMaxLifetime must not be negative, got %s", opts.ConnMaxLifetime)
+	case opts.ConnMaxIdleTime < 0:
+		return nil, fmt.Errorf("postgres: ConnMaxIdleTime must not be negative, got %s", opts.ConnMaxIdleTime)
+	}
+	if err := validateDSN(opts.DSN); err != nil {
+		return nil, err
+	}
+
+	db, err := sql.Open(driver, opts.DSN)
+	if err != nil {
+		// sql.Open parses the DSN for drivers that support OpenConnector —
+		// pgx is one — so a malformed string can fail here rather than at
+		// the first use, with the driver's error quoting the string it was
+		// handed. The text goes through withoutDSN before it leaves.
+		return nil, fmt.Errorf("postgres: open: %w", withoutDSN(err, opts.DSN))
+	}
+
+	db.SetMaxOpenConns(opts.MaxOpenConns)
+	db.SetMaxIdleConns(opts.MaxIdleConns)
+	db.SetConnMaxLifetime(opts.ConnMaxLifetime)
+	db.SetConnMaxIdleTime(opts.ConnMaxIdleTime)
+
+	if err := db.PingContext(ctx); err != nil {
+		// Ping is the startup validation: a pool that has not answered
+		// within ctx is a process that should not have started. Close
+		// before reporting, so a failed dial leaves no pool — and no
+		// connection it did open — behind for the caller to leak.
+		_ = db.Close()
+		return nil, fmt.Errorf("postgres: connect: %w", withoutDSN(err, opts.DSN))
+	}
+	return db, nil
+}
+
+// validateDSN checks that the DSN names the database this application owns —
+// the plane binding of ADR 0006 §7 made mechanical at the last door. The same
+// check runs at load time in internal/config against the environment's
+// variable; it is repeated here with this package's vocabulary because Open's
+// Options have callers other than the composition root's mapping, and Open is
+// where a wrong database would become a live pool. The DSN's grammar beyond
+// the path is the driver's business, not this one: the driver refuses what it
+// cannot parse, and this package refuses what it must not open.
+//
+// Errors name the database and never the userinfo: the DSN carries the role's
+// password, and an error message is a log line waiting to happen.
+func validateDSN(dsn string) error {
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		// url.Parse quotes the string it rejected, credentials included, so
+		// its own text is deliberately not wrapped into this error.
+		return errors.New("postgres: DSN must be a URL")
+	}
+	database := strings.TrimPrefix(parsed.Path, "/")
+	if database == "" || strings.Contains(database, "/") {
+		return errors.New("postgres: DSN must name exactly one database in its path")
+	}
+	if database != ownedDatabase {
+		return fmt.Errorf("postgres: DSN names database %q, but this application owns only the %s database (ADR 0006 §7): it dials its own plane's database and nothing else", database, ownedDatabase)
+	}
+	return nil
+}
+
+// withoutDSN returns err with any appearance of dsn in its text struck out.
+// The driver is trusted with the DSN — it cannot connect without it — but
+// not with quoting it back at the caller: pgx's parse errors embed the
+// connection string, and an error message is a log line waiting to happen.
+// When the text carries no DSN the error is returned unchanged, wrapping
+// intact, so errors.Is keeps working on the ordinary failure paths.
+func withoutDSN(err error, dsn string) error {
+	if err == nil || dsn == "" || !strings.Contains(err.Error(), dsn) {
+		return err
+	}
+	return errors.New(strings.ReplaceAll(err.Error(), dsn, "[redacted dsn]"))
 }
 
 // store is the PostgreSQL implementation of persistence.Store. It is one field,
