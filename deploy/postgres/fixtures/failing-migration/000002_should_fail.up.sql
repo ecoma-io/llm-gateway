@@ -8,7 +8,7 @@
 -- The failure is engineered for the safety model's central claims: statement
 -- one succeeds, statement two fails — at execution, not at parse — so the
 -- single-transaction delivery must roll statement one back. If this file
--- ever applies cleanly, the suite itself fails at step 7/9.
+-- ever applies cleanly, the suite itself fails at step 9/11.
 CREATE TABLE public._verify_failed_probe (
     id integer NOT NULL PRIMARY KEY
 );

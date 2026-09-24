@@ -57,9 +57,19 @@ services:
       POSTGRES_DB: postgres
       POSTGRES_USER: gateway
       POSTGRES_PASSWORD: ${GATEWAY_POSTGRES_PASSWORD:-gateway-dev-only}
-      # A development database has no business phoning home: telemetry is
-      # off here, and a production deployment decides for itself.
-      TIMESCALEDB_TELEMETRY: "off"
+    command:
+      # Telemetry off, as a server setting rather than an environment
+      # variable. The timescaledb image ships its own initdb scripts — the
+      # only consumers of TIMESCALEDB_TELEMETRY — and this fixture mounts
+      # ./initdb over /docker-entrypoint-initdb.d, shadowing them; the
+      # variable would be set for no one. The extension itself is installed
+      # by the Data Plane's bootstrap migration, into the Data Plane's
+      # database and none other, and its telemetry is silenced here by the
+      # GUC the server itself reads. A development database has no business
+      # phoning home; a production deployment decides for itself.
+      - postgres
+      - -c
+      - timescaledb.telemetry_level=off
     ports:
       # Published for the tools a compose network cannot host: a local psql,
       # a GUI client, an ad-hoc script. The host side binds to the loopback
@@ -110,8 +120,8 @@ services:
   # That is deliberate — the two cannot be pointed at different planes by
   # editing a path here, which is what keeps "a migration is applied to the
   # database its plane owns" a property of this file rather than of whoever
-  # typed the command. The default is `dataplane`, the only lane with a
-  # migration today:
+  # typed the command. The default is `dataplane`, so the bare command keeps
+  # meaning the lane that has shipped the longest:
   #
   #   GATEWAY_MIGRATE_LANE=control ... run --rm migrate up
   migrate:

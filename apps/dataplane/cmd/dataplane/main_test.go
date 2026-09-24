@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	stdhttp "net/http"
 	"strings"
@@ -16,14 +18,30 @@ import (
 // Handler behaviour belongs to internal/adapters/inbound/http and is tested there through
 // httptest, without a process.
 
+// recordingPool stands in for the database pool run closes on its way out, and
+// records that the close happened — a process that drained its listeners and
+// left its pool open would hold database connections past the point the
+// process was told to stop. closeErr is what Close answers, so a test can
+// make the close fail and hold run to its promise of reporting it.
+type recordingPool struct {
+	closed   bool
+	closeErr error
+}
+
+func (p *recordingPool) Close() error {
+	p.closed = true
+	return p.closeErr
+}
+
 func TestRunDrainsAnInFlightRequestBeforeReturning(t *testing.T) {
 	listener := listenForTest(t)
 	server, started, release := blockingServer(t)
 	defer release()
+	pool := &recordingPool{}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	runErr := serveForTest(t, ctx, cancel, server, listener, time.Second)
+	runErr := serveForTest(t, ctx, cancel, server, listener, time.Second, pool)
 	requestErr := requestForTest(t, listener)
 
 	waitForStart(t, started)
@@ -45,6 +63,9 @@ func TestRunDrainsAnInFlightRequestBeforeReturning(t *testing.T) {
 	if err := <-runErr; err != nil {
 		t.Fatalf("run() error = %v, want nil after an orderly drain", err)
 	}
+	if !pool.closed {
+		t.Error("run() left the pool open after returning — the pool must be closed on every path out")
+	}
 }
 
 // TestRunDrainsEveryListenerItWasGiven covers the two-listener process: the
@@ -60,6 +81,7 @@ func TestRunDrainsEveryListenerItWasGiven(t *testing.T) {
 	managementServer, managementStarted, releaseManagement := blockingServer(t)
 	defer releaseRuntime()
 	defer releaseManagement()
+	pool := &recordingPool{}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -68,7 +90,7 @@ func TestRunDrainsEveryListenerItWasGiven(t *testing.T) {
 		runErr <- run(ctx, cancel, []service{
 			{name: "runtime", server: runtimeServer, listener: runtimeListener},
 			{name: "management", server: managementServer, listener: managementListener},
-		}, time.Second)
+		}, time.Second, pool)
 	}()
 
 	runtimeRequest := requestForTest(t, runtimeListener)
@@ -95,6 +117,9 @@ func TestRunDrainsEveryListenerItWasGiven(t *testing.T) {
 	if err := <-runErr; err != nil {
 		t.Fatalf("run() error = %v, want nil after an orderly drain of both listeners", err)
 	}
+	if !pool.closed {
+		t.Error("run() left the pool open after returning — the pool must be closed on every path out")
+	}
 }
 
 func TestRunReportsAShutdownThatOverrunsItsTimeout(t *testing.T) {
@@ -104,9 +129,10 @@ func TestRunReportsAShutdownThatOverrunsItsTimeout(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	pool := &recordingPool{}
 	// The drain timeout is far shorter than the request's own lifetime, so the
 	// shutdown is guaranteed to overrun it.
-	runErr := serveForTest(t, ctx, cancel, server, listener, 50*time.Millisecond)
+	runErr := serveForTest(t, ctx, cancel, server, listener, 50*time.Millisecond, pool)
 	requestErr := requestForTest(t, listener)
 
 	waitForStart(t, started)
@@ -123,6 +149,9 @@ func TestRunReportsAShutdownThatOverrunsItsTimeout(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("run() never returned after the shutdown overran its timeout")
 	}
+	if !pool.closed {
+		t.Error("run() left the pool open after returning — an overrun drain is still a return")
+	}
 
 	// The request the shutdown gave up on still has to be let go, or the
 	// connection it holds outlives the test.
@@ -137,15 +166,46 @@ func TestRunReportsAListenerThatFailsOnItsOwn(t *testing.T) {
 	if err := listener.Close(); err != nil {
 		t.Fatalf("listener.Close() error = %v", err)
 	}
+	pool := &recordingPool{}
 
 	server := &stdhttp.Server{Handler: stdhttp.HandlerFunc(func(_ stdhttp.ResponseWriter, _ *stdhttp.Request) {})}
-	err := run(context.Background(), func() {}, []service{{name: "runtime", server: server, listener: listener}}, time.Second)
+	err := run(context.Background(), func() {}, []service{{name: "runtime", server: server, listener: listener}}, time.Second, pool)
 
 	if err == nil {
 		t.Fatal("run() error = nil, want the listener failure")
 	}
 	if strings.Contains(err.Error(), "graceful shutdown") {
 		t.Errorf("run() error = %q, want the listener failure rather than a drain report", err)
+	}
+	if !pool.closed {
+		t.Error("run() left the pool open after returning — a dead listener is still a return")
+	}
+}
+
+func TestRunReportsAPoolThatWillNotCloseCleanly(t *testing.T) {
+	// A pool that fails to close after an otherwise clean drain is a defect
+	// the process must not exit green through: run reports it even though
+	// nothing else went wrong — the sibling composition root's contract, so
+	// an operator never sees exit 0 from a process whose database
+	// connections are still open.
+	listener := listenForTest(t)
+	pool := &recordingPool{closeErr: errors.New("close: still busy")}
+
+	server := &stdhttp.Server{Handler: stdhttp.HandlerFunc(func(_ stdhttp.ResponseWriter, _ *stdhttp.Request) {})}
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, stop, []service{{name: "runtime", server: server, listener: listener}}, time.Second, pool)
+	}()
+
+	stop()
+	if err := <-done; err == nil {
+		t.Fatal("run() error = nil, want the pool-close failure carried out of a clean drain")
+	} else if !strings.Contains(err.Error(), "close: still busy") {
+		t.Errorf("run() error = %q, want it to carry the close failure", err)
+	}
+	if !pool.closed {
+		t.Error("run() never closed the pool")
 	}
 }
 
@@ -181,11 +241,11 @@ func listenForTest(t *testing.T) net.Listener {
 // serveForTest starts run in the background against a single listener and
 // returns the channel its outcome arrives on. The tests that need two drive
 // run directly, because what they are checking is that one process serves both.
-func serveForTest(t *testing.T, ctx context.Context, stop context.CancelFunc, server *stdhttp.Server, listener net.Listener, timeout time.Duration) chan error {
+func serveForTest(t *testing.T, ctx context.Context, stop context.CancelFunc, server *stdhttp.Server, listener net.Listener, timeout time.Duration, pool io.Closer) chan error {
 	t.Helper()
 	runErr := make(chan error, 1)
 	go func() {
-		runErr <- run(ctx, stop, []service{{name: "runtime", server: server, listener: listener}}, timeout)
+		runErr <- run(ctx, stop, []service{{name: "runtime", server: server, listener: listener}}, timeout, pool)
 	}()
 	return runErr
 }

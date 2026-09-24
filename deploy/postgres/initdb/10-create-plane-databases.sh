@@ -12,10 +12,14 @@
 # deploy/postgres/README.md states and verify.sh asserts, not a claim that the
 # split isolates credentials.
 #
-# The template is the image's `template1`, which the timescaledb entrypoint
-# has already extended: both databases therefore carry the extension before
-# any migration runs, which is capability and not schema. What each plane's
-# lane puts inside its own database is what `migrations/` decides.
+# The template is the image's `template1`, empty of extensions: this
+# directory is mounted over /docker-entrypoint-initdb.d, which shadows the
+# timescaledb image's own init scripts, so neither database carries the
+# extension before any migration runs. Capability arrives with schema — the
+# Data Plane's bootstrap migration installs timescaledb into its own database
+# and none other (deploy/postgres/verify.sh proves both halves of that) — and
+# what each plane's lane puts inside its own database is what `migrations/`
+# decides.
 #
 # This runs only when the data directory is empty. An existing volume from
 # before the split keeps its single `gateway` database and no `dataplane`:

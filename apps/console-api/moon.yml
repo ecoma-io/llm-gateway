@@ -83,34 +83,44 @@ tasks:
       - "/api/openapi/**/*"
       - "/go.work"
       - "/go.work.sum"
-  # The integration tier: the `//go:build integration` suite in
-  # `internal/adapters/outbound/valkey` against a real Redis-compatible server.
-  # One suite, two runners — a developer against `deploy/redis/docker-compose.yml`
-  # (that directory's README has the commands) and CI's `verify-go` job against
-  # its pinned service container — and this target is the single definition of
-  # the run both perform, so the tier cannot drift between them.
+  # The integration tier: the `//go:build integration` suites against real
+  # backing servers — `internal/adapters/outbound/valkey` against a
+  # Redis-compatible server and `internal/adapters/outbound/postgres` against
+  # the PostgreSQL cluster. One tier, two runners — a developer against the
+  # compose fixtures under `deploy/` (each directory's README has the
+  # commands) and CI's `verify-go` job against its pinned service containers —
+  # and this target is the single definition of the run both perform, so the
+  # tier cannot drift between them.
   #
-  # The scope is the package that owns the tagged tests, not `./...`: with the
+  # The scope is the packages that own the tagged tests, not `./...`: with the
   # tag applied, `./...` would recompile and re-run every unit suite a second
   # time for nothing. The vacuity guard below is what catches that scope going
-  # stale — the tagged file moved, renamed, or lost its build constraint —
+  # stale — a tagged file moved, renamed, or lost its build constraint —
   # because `go test -tags=…` exits 0 over a run of nothing, byte-for-byte
   # identical to a full pass.
   #
-  # VALKEY_ADDRESS is required here rather than left to the suite's own
-  # `t.Fatal` for the same reason the missing variable fails the run at all:
-  # one line naming the fix beats four tests failing on it, and it states the
-  # tier's contract — nothing runs without an explicit server — before go test
-  # is even invoked. VALKEY_USERNAME and VALKEY_PASSWORD pass through
-  # untouched, as the suite itself documents.
+  # VALKEY_ADDRESS and POSTGRES_TEST_ADMIN_DSN are required here rather than
+  # left to the suites' own `t.Fatal` for the same reason the missing variable
+  # fails the run at all: one line naming the fix beats a dozen tests failing
+  # on it, and it states the tier's contract — nothing runs without an
+  # explicit server — before go test is even invoked. The postgres variable
+  # names an ADMIN connection (the cluster's `postgres` maintenance database,
+  # whose role may create databases); the plane database the suite runs
+  # against is derived from it, per that file's header. VALKEY_USERNAME,
+  # VALKEY_PASSWORD and any DSN query parameter pass through untouched, as
+  # the suites themselves document.
   test-integration:
     script: |
       if [ -z "${VALKEY_ADDRESS:-}" ]; then
         echo "VALKEY_ADDRESS is required — start the fixture (from the repository root: docker compose -f deploy/redis/docker-compose.yml up -d) and set it to 127.0.0.1:6379 (see deploy/redis/README.md)"
         exit 1
       fi
+      if [ -z "${POSTGRES_TEST_ADMIN_DSN:-}" ]; then
+        echo "POSTGRES_TEST_ADMIN_DSN is required — start the fixture (from the repository root: docker compose -f deploy/postgres/compose.yaml up -d --wait) and set it to postgres://gateway:gateway-dev-only@127.0.0.1:5432/postgres?sslmode=disable (see deploy/postgres/README.md)"
+        exit 1
+      fi
       status=0
-      output="$(go test -v -tags=integration ./internal/adapters/outbound/valkey 2>&1)" || status=$?
+      output="$(go test -v -tags=integration ./internal/adapters/outbound/valkey ./internal/adapters/outbound/postgres 2>&1)" || status=$?
       printf '%s\n' "$output"
       [ "$status" -eq 0 ] || exit "$status"
       if ! printf '%s\n' "$output" | grep -q '^=== RUN'; then

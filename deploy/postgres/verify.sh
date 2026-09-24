@@ -10,27 +10,32 @@
 # in here.
 #
 # The cluster holds two databases, one per plane, and every step below names
-# the lane it acts on. The Data Plane's lane is the one with migrations to
-# apply, so it carries the migration proofs; the Control Plane's lane is
-# asserted from the outside — that its database exists, that it answers, and
-# that the other plane's lane has put nothing in it.
+# the lane it acts on. Each lane proves its pipeline against its own
+# database — the Data Plane's proofs run the fuller pipeline (apply,
+# validate, fail, recover); the Control Plane's run apply, re-apply and full
+# rollback on its foundation migration — and each lane then proves the other
+# plane's database untouched.
 #
 # The proofs, in order:
-#   1. both plane databases start and accept connections;
-#   2. the image actually ships the timescaledb extension;
-#   3. the Data Plane's migrations apply;
-#   4. the recorded version is the newest migration in that lane, and not
+#   1. both lanes' directories hold exactly what the runner will read —
+#      versions 1..N, one .up.sql and one .down.sql per version, nothing
+#      else — and the failing-migration fixture is in neither lane;
+#   2. both plane databases start and accept connections;
+#   3. the image actually ships the timescaledb extension;
+#   4. the Data Plane's migrations apply;
+#   5. the recorded version is the newest migration in that lane, and not
 #      dirty;
-#   5. re-applying is a no-op, not an error;
-#   6. the two lanes are two databases — the Data Plane's applied history is
-#      in the Data Plane's database and nowhere else — and one fixture
-#      credential opens both;
-#   7. PostgreSQL transaction semantics hold (rolled-back work leaves
+#   6. re-applying is a no-op, not an error;
+#   7. the Control Plane's foundation migration applies into its own
+#      database — the ownership namespace and its comment, re-applied as a
+#      no-op — and the two lanes are two databases: no history and no schema
+#      crosses the boundary, and one fixture credential opens both;
+#   8. PostgreSQL transaction semantics hold (rolled-back work leaves
 #      nothing behind, committed work survives);
-#   8. a migration that fails mid-file rolls back whole, records its target
+#   9. a migration that fails mid-file rolls back whole, records its target
 #      version dirty, refuses further runs, and is recovered with force;
-#   9. a full down roll returns the schema to clean;
-#   10. the suite leaves the database up and fully migrated.
+#  10. a full down roll returns both schemas to clean;
+#  11. the suite leaves both databases up and fully migrated.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -148,9 +153,103 @@ recorded_version() {
 	psql_scalar "$database" 'SELECT COALESCE(max(version), 0) FROM schema_migrations'
 }
 
-newest="$(newest_migration_version "$dataplane_db")"
+# lane_drift_check proves one lane's directory holds exactly what the runner
+# will read: files named `NNNNNN_<name>.up.sql` or `NNNNNN_<name>.down.sql`
+# and nothing else, exactly one `.up.sql` and one `.down.sql` per version, and
+# versions forming 1..N with no gap and no duplicate. golang-migrate records
+# versions, not contents, and refuses neither a gap nor a stray file — a lane
+# that drifted would still apply, and nothing else in this repository would
+# notice. This check is the drift detection the pipeline relies on: the
+# accepted "no checksum" gap in deploy/postgres/README.md's safety model,
+# narrowed to what a directory listing can prove. Pure shell over
+# migrations/ — it needs no database, so it runs before the cluster starts
+# and fails before anything is pulled.
+lane_drift_check() {
+	local lane="$1"
+	local lane_dir="$repo_root/migrations/$lane"
+	local file name version count position
+	local -a ups=() downs=()
 
-step "1/10 both plane databases start and accept connections"
+	# The shape check doubles as the non-empty check: an empty (or missing)
+	# lane leaves this glob unexpanded, the literal `*` matches nothing it
+	# should, and the suite fails here rather than at the runner with
+	# `first .: file does not exist`. The direction suffix is part of the
+	# shape, not an afterthought: a bare `NNNNNN_<name>.sql` carries no
+	# direction, lands in neither list below, and would drift through every
+	# other check here while the runner's source silently skipped it.
+	for file in "$lane_dir"/*; do
+		name="$(basename "$file")"
+		case "$name" in
+		[0-9][0-9][0-9][0-9][0-9][0-9]_*.up.sql | [0-9][0-9][0-9][0-9][0-9][0-9]_*.down.sql) ;;
+		*)
+			printf 'FAIL: migrations/%s/ holds %q — a lane holds nothing but files named NNNNNN_<name>.up.sql and NNNNNN_<name>.down.sql\n' "$lane" "$name" >&2
+			exit 1
+			;;
+		esac
+	done
+
+	for file in "$lane_dir"/*.up.sql; do
+		name="$(basename "$file" .up.sql)"
+		ups+=("${name%%_*}")
+	done
+	for file in "$lane_dir"/*.down.sql; do
+		name="$(basename "$file" .down.sql)"
+		downs+=("${name%%_*}")
+	done
+
+	if [ "${#ups[@]}" -ne "${#downs[@]}" ]; then
+		printf 'FAIL: migrations/%s/ holds %d up files against %d down files — every version ships both\n' \
+			"$lane" "${#ups[@]}" "${#downs[@]}" >&2
+		exit 1
+	fi
+
+	for version in "${ups[@]}"; do
+		count=0
+		for name in "${downs[@]}"; do
+			if [ "$name" = "$version" ]; then
+				count=$((count + 1))
+			fi
+		done
+		if [ "$count" -ne 1 ]; then
+			printf 'FAIL: migrations/%s/ version %s has %d down files — exactly one pair member per direction\n' \
+				"$lane" "$version" "$count" >&2
+			exit 1
+		fi
+	done
+
+	# The sequence, not just the set: 1..N, so a gap (a hole where applied
+	# history was removed) and a duplicate (a re-used number) both land here,
+	# as a failed suite, rather than in a database.
+	position=0
+	for version in $(printf '%s\n' "${ups[@]}" | sort -n); do
+		position=$((position + 1))
+		if [ "$((10#$version))" -ne "$position" ]; then
+			printf 'FAIL: migrations/%s/ versions must run 1..%d with no gap and no duplicate — %s is where the sequence breaks\n' \
+				"$lane" "${#ups[@]}" "$version" >&2
+			exit 1
+		fi
+	done
+
+	printf 'ok: migrations/%s/ holds versions %06d..%06d, one pair per version, nothing else\n' \
+		"$lane" 1 "${#ups[@]}"
+}
+
+newest="$(newest_migration_version "$dataplane_db")"
+control_newest="$(newest_migration_version "$control_db")"
+
+step "1/11 both lanes hold exactly what the runner will read, and nothing else"
+# Applied history under migrations/ is immutable, and the runner above all
+# trusts its directory: these two checks are what stands between a drifted
+# lane and a database that applies the drift. The fixture half is its own
+# claim — the deliberately-failing pair lives in deploy/postgres/fixtures/,
+# and a copy that ever landed inside a lane would be a migration the tool
+# could apply for real.
+lane_drift_check "$control_db"
+lane_drift_check "$dataplane_db"
+assert_equals "the failing-migration fixture is in no lane" \
+	"$(find "$repo_root"/migrations -type d -name failing-migration | wc -l | tr -d ' ')" "0"
+
+step "2/11 both plane databases start and accept connections"
 # --wait blocks on the healthcheck: a container whose port answers but whose
 # PostgreSQL rejects transactions is not up, and this step refuses to call it
 # up. The two databases are created by the cluster's own initdb script
@@ -163,14 +262,14 @@ assert_equals "the cluster serves two databases" \
 assert_equals "the Control Plane's database answers" "$(psql_scalar "$control_db" 'SELECT 1')" "1"
 assert_equals "the Data Plane's database answers" "$(psql_scalar "$dataplane_db" 'SELECT 1')" "1"
 
-step "2/10 the pinned image ships the timescaledb extension"
+step "3/11 the pinned image ships the timescaledb extension"
 assert_equals "timescaledb appears in pg_available_extensions" \
 	"$(psql_scalar "$dataplane_db" "SELECT count(*) FROM pg_available_extensions WHERE name = 'timescaledb'")" "1"
 
-step "3/10 the Data Plane's migrations apply"
+step "4/11 the Data Plane's migrations apply"
 migrate_lane "$dataplane_db" up
 
-step "4/10 the recorded version is the newest migration in that lane, and clean"
+step "5/11 the recorded version is the newest migration in that lane, and clean"
 assert_equals "schema_migrations.version" \
 	"$(psql_scalar "$dataplane_db" 'SELECT version FROM schema_migrations')" \
 	"$newest"
@@ -180,27 +279,64 @@ assert_equals "schema_migrations.dirty" \
 assert_nonempty "timescaledb is installed in the database" \
 	"$(psql_scalar "$dataplane_db" "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'")"
 
-step "5/10 re-applying is a no-op, not an error"
+step "6/11 re-applying is a no-op, not an error"
 migrate_lane "$dataplane_db" up
 assert_equals "version is unchanged after a no-op apply" "$(recorded_version "$dataplane_db")" "$newest"
 
-step "6/10 the two lanes are two databases, and one credential opens both"
+step "7/11 the Control Plane's lane builds its namespace in its own database, and no lane crosses"
 # Two databases are a database ownership boundary (ADR 0006 §7): separate
 # namespaces, separate connection targets, independent transactions and
 # independent migration history, with no ordinary SQL statement spanning them.
 # They are not a security/credential boundary — that is a production decision
 # the README states, and this fixture does not demonstrate it. What this step
-# pins, and all it pins, is that the configuration actually puts the lanes in
-# two databases: the Data Plane's applied history is recorded in the Data
-# Plane's database and the other lane's database has been migrated by nobody.
-# The control-side assertion is deliberately shaped as an absence, and that is
-# what it pins until the Control Plane's lane lands its first migration — the
-# day that file exists, this line is the one that says so, and it gets
-# replaced rather than silenced.
-assert_equals "the Data Plane's applied history is in the Data Plane's database" \
-	"$(psql_scalar "$dataplane_db" "SELECT to_regclass('public.schema_migrations') IS NOT NULL")" "t"
-assert_equals "the Control Plane's database has no applied history" \
-	"$(psql_scalar "$control_db" "SELECT to_regclass('public.schema_migrations') IS NULL")" "t"
+# pins is both halves of that boundary at once: the Control Plane's lane
+# applies its foundation migration into its own database and proves the same
+# pipeline properties the Data Plane's steps proved — recorded version, clean
+# state, idempotent re-apply — and neither lane is able to put an object in
+# the other plane's database. The control-side assertions here replace the
+# absence this step used to assert (no schema_migrations table) on the day
+# the Control Plane's lane landed its first migration, exactly as that
+# assertion's comment promised: replaced, not silenced.
+migrate_lane "$control_db" up
+assert_equals "the Control Plane's recorded version is its lane's newest" \
+	"$(recorded_version "$control_db")" "$control_newest"
+assert_equals "the Control Plane's recorded state is clean" \
+	"$(psql_scalar "$control_db" 'SELECT dirty FROM schema_migrations')" "f"
+assert_equals "the ownership namespace exists in the Control Plane's database" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_namespace WHERE nspname = '$control_db'")" "1"
+assert_equals "the namespace carries the ownership comment, byte for byte" \
+	"$(psql_scalar "$control_db" "SELECT obj_description('$control_db'::regnamespace, 'pg_namespace')")" \
+	"Control Plane ownership namespace (ADR 0006 §7); owned by apps/console-api."
+assert_equals "the namespace holds no tables — foundation is a namespace, not schema" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "0"
+
+migrate_lane "$control_db" up
+assert_equals "re-applying the Control Plane's lane is a no-op too" \
+	"$(recorded_version "$control_db")" "$control_newest"
+
+# Isolation, asserted from both sides: the Control Plane's migration created
+# the namespace and nothing else — its own database's public schema holds the
+# migration history and no product table — the Data Plane's database carries
+# no `control` schema for the other lane to have leaked one into, and each
+# database records its own applied history, because golang-migrate writes
+# versions into the database it migrated.
+assert_equals "the Control Plane's public schema holds only its migration history" \
+	"$(psql_scalar "$control_db" "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")" "schema_migrations"
+assert_equals "the Control Plane's public schema holds no second table" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")" "1"
+assert_equals "the Data Plane's database has no control namespace" \
+	"$(psql_scalar "$dataplane_db" "SELECT count(*) FROM pg_namespace WHERE nspname = '$control_db'")" "0"
+# The isolation block's mirror of step 5's installed-half proof: timescaledb
+# lives in the Data Plane's database and none other. The bootstrap migration
+# is the only file in the repository that spells CREATE EXTENSION, so this
+# count stays zero unless a future migration crosses the lane boundary — the
+# exact violation migrations/README.md and persistence.md call out, caught
+# here rather than trusted to the lane's directory layout.
+assert_equals "the Control Plane's database carries no timescaledb extension" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_extension WHERE extname = 'timescaledb'")" "0"
+assert_equals "each plane records its own applied history" \
+	"$(psql_scalar "$dataplane_db" "SELECT to_regclass('public.schema_migrations') IS NOT NULL")|$(psql_scalar "$control_db" "SELECT to_regclass('public.schema_migrations') IS NOT NULL")" \
+	"t|t"
 # The credential side of that boundary, asserted rather than described: this
 # fixture's one role reaches both databases, so "the fixture does not
 # demonstrate credential isolation" is a fact the suite proves and the
@@ -209,7 +345,7 @@ assert_equals "one fixture credential opens both plane databases" \
 	"$(psql_scalar "$control_db" 'SELECT current_user')|$(psql_scalar "$dataplane_db" 'SELECT current_user')" \
 	"gateway|gateway"
 
-step "7/10 PostgreSQL transaction semantics hold"
+step "8/11 PostgreSQL transaction semantics hold"
 # Two probes, because the migration safety model rests on both: DDL rolled
 # back leaves nothing (migrations run inside transactions and a failed one
 # must leave no half-applied schema), and DML rolled back leaves nothing
@@ -243,7 +379,7 @@ psql_script "$dataplane_db" <<'SQL'
 DROP TABLE public._verify_tx_probe;
 SQL
 
-step "8/10 a migration that fails fails whole, loudly, and stops the world"
+step "9/11 a migration that fails fails whole, loudly, and stops the world"
 # The safety model's central claims, executed rather than asserted:
 #
 #   Atomicity  — the probe pair's up file has a succeeding CREATE TABLE and
@@ -291,19 +427,33 @@ migrate_lane "$dataplane_db" force "$newest" </dev/null
 assert_equals "force restores the actually-applied version, clean" \
 	"$(psql_scalar "$dataplane_db" 'SELECT version, dirty FROM schema_migrations')" "$newest|f"
 
-step "9/10 a full down roll returns the schema to clean"
+step "10/11 a full down roll returns both schemas to clean"
 # </dev/null pins the non-interactive contract: the suite must never depend
 # on who is holding a terminal. This is the same move a contributor makes;
-# the suite just proves it ends where the safety model promises.
+# the suite just proves it ends where the safety model promises. Each lane
+# rolls back through the same door against its own database, and each proof
+# mirrors its lane's up-proof: the thing the migration created is gone, and
+# the recorded version is zero. The migration-history table a full down
+# leaves behind — truncated, not dropped — is the same state both proofs
+# accept.
 migrate_lane "$dataplane_db" down -all </dev/null
-assert_equals "the recorded version is zero after a full roll-back" \
+assert_equals "the Data Plane's recorded version is zero after a full roll-back" \
 	"$(recorded_version "$dataplane_db")" "0"
 assert_equals "the timescaledb extension is gone after a full roll-back" \
 	"$(psql_scalar "$dataplane_db" "SELECT count(*) FROM pg_extension WHERE extname = 'timescaledb'")" "0"
+migrate_lane "$control_db" down -all </dev/null
+assert_equals "the Control Plane's recorded version is zero after a full roll-back" \
+	"$(recorded_version "$control_db")" "0"
+assert_equals "the ownership namespace and its comment are gone after a full roll-back" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_namespace WHERE nspname = '$control_db'")" "0"
+assert_equals "the Control Plane's public schema is back to its migration history alone" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")" "1"
 
-step "10/10 the suite leaves the database migrated, not half-torn-down"
+step "11/11 the suite leaves both databases migrated, not half-torn-down"
 migrate_lane "$dataplane_db" up
-assert_equals "final recorded version" "$(recorded_version "$dataplane_db")" "$newest"
+migrate_lane "$control_db" up
+assert_equals "final recorded version, Data Plane" "$(recorded_version "$dataplane_db")" "$newest"
+assert_equals "final recorded version, Control Plane" "$(recorded_version "$control_db")" "$control_newest"
 
-printf '\npersistence suite: green (database up and migrated on %s)\n' \
+printf '\npersistence suite: green (both plane databases up and migrated on %s)\n' \
 	"$(psql_scalar "$dataplane_db" 'SELECT version()')"

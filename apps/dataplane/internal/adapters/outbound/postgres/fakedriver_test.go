@@ -28,6 +28,7 @@ const (
 	evCommit   event = "commit"
 	evRollback event = "rollback"
 	evExec     event = "exec"
+	evClose    event = "close"
 )
 
 // fakeDriver records every call into it. There is no per-connection
@@ -39,10 +40,13 @@ type fakeDriver struct {
 	fail   map[event]error
 }
 
-// registerFake puts a fresh fake driver behind a unique name and opens a pool
-// on it. sql.Register cannot unregister, so one driver per name per test is
-// the price of isolation; names come from a counter, never reused.
-func registerFake(t *testing.T) (*fakeDriver, *sql.DB) {
+// newFake registers a fresh fake driver under a unique name and returns the
+// driver with the name it registered under. sql.Register cannot unregister,
+// so one driver per name per test is the price of isolation; names come from
+// a counter, never reused. The name is returned because open — the
+// orchestration under Open — takes the driver name it hands sql.Open, and
+// the tests that drive it need the fake's name rather than the real one.
+func newFake(t *testing.T) (*fakeDriver, string) {
 	t.Helper()
 
 	registerMu.Lock()
@@ -52,7 +56,15 @@ func registerFake(t *testing.T) (*fakeDriver, *sql.DB) {
 
 	f := &fakeDriver{fail: make(map[event]error)}
 	sql.Register(name, f)
+	return f, name
+}
 
+// registerFake puts a fresh fake driver behind a unique name and opens a pool
+// on it.
+func registerFake(t *testing.T) (*fakeDriver, *sql.DB) {
+	t.Helper()
+
+	f, name := newFake(t)
 	db, err := sql.Open(name, "")
 	if err != nil {
 		t.Fatalf("sql.Open on the fake driver: %v", err)
@@ -138,7 +150,13 @@ func (c *fakeConn) ExecContext(context.Context, string, []driver.NamedValue) (dr
 	return driver.RowsAffected(0), nil
 }
 
-func (c *fakeConn) Close() error { return nil }
+// Close is recorded, because who closes a connection is the one observable
+// that says a pool was torn down: open closes its half-built pool on failure,
+// and the close event is how the tests see that promise kept.
+func (c *fakeConn) Close() error {
+	c.f.record(evClose)
+	return nil
+}
 
 func (c *fakeConn) Begin() (driver.Tx, error) {
 	if err := c.f.outcome(evBegin); err != nil {

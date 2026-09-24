@@ -16,4 +16,18 @@ go 1.26
 // standard library has no Redis-compatible client.
 require github.com/valkey-io/valkey-go v1.0.78
 
-require golang.org/x/sys v0.47.0 // indirect
+// pgx is the PostgreSQL driver behind the persistence adapter. The standard
+// library has no PostgreSQL driver of its own, lib/pq is in maintenance mode,
+// and the port is spelled in database/sql — so pgx's stdlib wrapper is the
+// one dependency that fits. internal/adapters/outbound/postgres/postgres.go
+// states the justification in full, at the blank import that carries it.
+require github.com/jackc/pgx/v5 v5.11.0
+
+require (
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
+	golang.org/x/sync v0.22.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
+)

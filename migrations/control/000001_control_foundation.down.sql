@@ -1,0 +1,11 @@
+-- The inverse of the up migration: drop the ownership namespace, and
+-- nothing else. RESTRICT is not spelled because it is the default — it is
+-- the point: if anything ever lives in the namespace, this drop fails
+-- loudly instead of taking it with it, because a rollback that silently
+-- destroys dependent data is not a rollback, it is a second disaster.
+--
+-- The schema's COMMENT dies with the schema and needs no statement of its
+-- own. No IF EXISTS: this runs against a database whose history says the
+-- namespace was applied, so one that lacks it is an unexpected fact the
+-- rollback should fail on rather than paper over.
+DROP SCHEMA control;

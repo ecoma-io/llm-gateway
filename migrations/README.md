@@ -15,13 +15,20 @@ The split is the database split (ADR 0006 §7), not a filing convention:
 | `migrations/control/`   | `control`   | `apps/console-api` — the Control Plane API |
 | `migrations/dataplane/` | `dataplane` | `apps/dataplane` — the Data Plane runtime  |
 
-Only the Data Plane's lane exists so far, and that is the honest state of a
-scaffold whose Control Plane schema has not been designed: the Control
-Plane's database is created and empty, and its lane appears with the first
-Control Plane domain that needs a table. An empty lane directory would be
-worse than a missing one — golang-migrate refuses a lane with no files
-(`first .: file does not exist`), so an empty `migrations/control/` would
-read as a working lane that fails the moment anyone used it.
+Both lanes exist. The Control Plane's first pair establishes its ownership
+namespace, and nothing else: ADR 0006 §5 writes the Control Plane's future
+position table as `control.usage_ingestion_cursor` — schema-qualified — so
+Control Plane migrations keep their domain tables in the `control` schema,
+while the ADRs name the Data Plane's tables bare (`usage_events`,
+`request_intake`) and its lane stays on the default namespace. The namespace
+migrates first, on purpose: the schema change that lands the first Control
+Plane table should arrive on a lane the suite has already exercised end to
+end — applied, re-applied, rolled back — rather than ask an unexercised
+pipeline to prove itself while carrying real schema. (Until that first pair
+landed, the lane was absent rather than empty: golang-migrate refuses a lane
+with no files (`first .: file does not exist`), so an empty
+`migrations/control/` would have read as a working lane that failed the
+moment anyone used it.)
 
 A migration belongs to exactly one lane, and its lane decides the database it
 is applied to: the runner's lane argument points `-path` and `-database` at
@@ -33,7 +40,7 @@ statement spanning the two. It is not a **security / credential boundary**:
 one role owns both databases today, which is a fixture convenience and not a
 security property, and
 [`deploy/postgres/README.md`](../deploy/postgres/README.md) states the
-per-plane role guidance that is deliberately absent here.
+production privilege contract this fixture deliberately does not provision.
 
 The consequence to remember when a schema change spans both planes: there
 isn't one. A fact one plane owns is written by that plane, and the other

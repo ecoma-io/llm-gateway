@@ -14,9 +14,10 @@ import (
 // adapter's contract is orchestration — begin, commit, roll back, join — and
 // the only honest way to pin orchestration without a live PostgreSQL is to
 // watch the driver calls it makes. A real database proves the other half, in
-// deploy/postgres's suite. It records events, fails on demand, and refuses
-// everything else: a Prepare or query reaching this driver means the adapter
-// grew a surface this test did not agree to.
+// this package's integration_test.go and in deploy/postgres's suite. It
+// records events, fails on demand, and refuses everything else: a Prepare or
+// query reaching this driver means the adapter grew a surface this test did
+// not agree to.
 
 // event names one observable driver call.
 type event string
@@ -28,6 +29,7 @@ const (
 	evCommit   event = "commit"
 	evRollback event = "rollback"
 	evExec     event = "exec"
+	evClose    event = "close"
 )
 
 // fakeDriver records every call into it. There is no per-connection
@@ -45,6 +47,25 @@ type fakeDriver struct {
 func registerFake(t *testing.T) (*fakeDriver, *sql.DB) {
 	t.Helper()
 
+	f, name := newFake(t)
+	db, err := sql.Open(name, "")
+	if err != nil {
+		t.Fatalf("sql.Open on the fake driver: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return f, db
+}
+
+// newFake is registerFake with the driver it registered handed back beside
+// its registered name and no pool opened, for the tests that build their pool
+// through the adapter's own open — which takes the driver name, exactly as
+// Open takes "pgx" at the process boundary. The name and shape match the
+// dataplane module's helper of the same purpose: the two modules duplicate
+// this file on purpose, and duplicated code that reads the same is the only
+// kind a maintainer diffing the copies can trust.
+func newFake(t *testing.T) (*fakeDriver, string) {
+	t.Helper()
+
 	registerMu.Lock()
 	registered++
 	name := fmt.Sprintf("fake-postgres-%d", registered)
@@ -52,13 +73,7 @@ func registerFake(t *testing.T) (*fakeDriver, *sql.DB) {
 
 	f := &fakeDriver{fail: make(map[event]error)}
 	sql.Register(name, f)
-
-	db, err := sql.Open(name, "")
-	if err != nil {
-		t.Fatalf("sql.Open on the fake driver: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return f, db
+	return f, name
 }
 
 var (
@@ -138,7 +153,13 @@ func (c *fakeConn) ExecContext(context.Context, string, []driver.NamedValue) (dr
 	return driver.RowsAffected(0), nil
 }
 
-func (c *fakeConn) Close() error { return nil }
+// Close records evClose: a driver connection the pool let go is the evidence
+// that a pool Open refused to hand back was closed behind it, and not left
+// pooled for a caller who never received the handle.
+func (c *fakeConn) Close() error {
+	c.f.record(evClose)
+	return nil
+}
 
 func (c *fakeConn) Begin() (driver.Tx, error) {
 	if err := c.f.outcome(evBegin); err != nil {

@@ -8,10 +8,11 @@
 //
 // This is the only place in the module where an adapter is chosen and handed
 // to the application. Nothing above it names a concrete implementation: the
-// application depends on the outbound ports, and a port whose adapter is not
-// wired yet is simply absent — which is why the Control Plane adapters below
-// exist and are not constructed. They are wired by the change that first has a
-// query to run, not before.
+// application depends on the outbound ports. The database pool is the one
+// piece of infrastructure wired today — this process owns Control Plane state
+// (ADR 0006 §7), so the pool is opened and validated at startup — and it is
+// wired as a pool only: the persistence.Store is built by the change that
+// first gives a use case a query to run, not before.
 package main
 
 import (
@@ -21,12 +22,15 @@ import (
 	"log"
 	"net"
 	stdhttp "net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/adapters/inbound/http"
+	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/adapters/outbound/postgres"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/config"
 )
@@ -41,6 +45,13 @@ import (
 // GET /version serves it, so no endpoint ever restates it.
 var version = "dev"
 
+// postgresConnectTimeout bounds the startup dial to the database. Startup
+// validation must fail fast, not hang: a process whose database is
+// unreachable is down, and a down process that hangs on connect is a restart
+// loop an operator cannot see the shape of. The pool's own settings govern
+// every connection after this one dial.
+const postgresConnectTimeout = 5 * time.Second
+
 func main() {
 	// log without timestamps: the process has one startup line and one
 	// shutdown line, and a caller that wants to know when they happened has
@@ -52,6 +63,42 @@ func main() {
 		log.Printf("console-api configuration: %v", err)
 		os.Exit(1)
 	}
+
+	// The pool is opened before anything else can depend on it, and the
+	// process refuses to start without it: owning Control Plane state means
+	// a database this process cannot reach is not a degraded process but one
+	// that should not exist yet. The dial is bounded — postgresConnectTimeout
+	// above — so that refusal is prompt. The failure carries no DSN: Open
+	// sanitises driver errors, which are the one place a credential could
+	// otherwise be quoted back.
+	poolCtx, cancelPool := context.WithTimeout(context.Background(), postgresConnectTimeout)
+	db, err := postgres.Open(poolCtx, postgres.Options{
+		DSN:             cfg.Postgres.DSN,
+		MaxOpenConns:    cfg.Postgres.MaxOpenConns,
+		MaxIdleConns:    cfg.Postgres.MaxIdleConns,
+		ConnMaxLifetime: cfg.Postgres.ConnMaxLifetime,
+		ConnMaxIdleTime: cfg.Postgres.ConnMaxIdleTime,
+	})
+	cancelPool()
+	if err != nil {
+		log.Printf("console-api postgres: %v", err)
+		os.Exit(1)
+	}
+	// The persistence.Store is constructed here (postgres.New(db)) by the change that first gives a use case a query to run against Control Plane state.
+
+	// One startup line naming the target — host, port, database — and
+	// nothing else. The DSN carries the role's password, so the pieces are
+	// read out of it rather than the whole of it printed; url.Parse is the
+	// same shape config.Load validated, so the branch below is unreachable
+	// for a configuration that got this far. It is still handled rather than
+	// trusted, and the DSN is not printed on it: url.Parse's own error text
+	// quotes the string it rejected, credentials included.
+	target, err := url.Parse(cfg.Postgres.DSN)
+	if err != nil {
+		log.Printf("console-api postgres: unable to name the database target")
+		os.Exit(1)
+	}
+	log.Printf("console-api postgres pool ready for %s/%s", net.JoinHostPort(target.Hostname(), target.Port()), strings.TrimPrefix(target.Path, "/"))
 
 	// Binding before announcing or serving: a port already in use is a
 	// startup failure with a clear line, not a race between two goroutines.
@@ -87,6 +134,20 @@ func main() {
 	log.Printf("console-api %s listening on %s", version, listener.Addr())
 	if err := <-errCh; err != nil {
 		log.Printf("console-api error: %v", err)
+		os.Exit(1)
+	}
+
+	// The pool is closed here, after run has returned, and not before: the
+	// drain inside run may still be finishing in-flight requests, and those
+	// requests run their queries on pooled connections — closing earlier
+	// would pull the pool out from under them. The error branch above is a
+	// process exit without a drain (os.Exit runs no deferred close), so the
+	// graceful path is where closing lives.
+	if err := db.Close(); err != nil {
+		// In the same spirit as a drain that overruns its timeout: a pool
+		// that will not close cleanly after a successful drain is a defect
+		// worth reporting, and the process exits non-zero instead of green.
+		log.Printf("console-api postgres close: %v", err)
 		os.Exit(1)
 	}
 
