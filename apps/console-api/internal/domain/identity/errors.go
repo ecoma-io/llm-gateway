@@ -39,6 +39,15 @@ var (
 	// cross-account creator from bending it.
 	ErrCreatorOutsideAccount = errors.New("identity: creator belongs to another account")
 
+	// ErrCreatorRemoved reports a mint request whose creator user has been
+	// removed. A removed user owns nothing new — not because a lifecycle
+	// transition was refused (no aggregate moved), but because minting is a
+	// privilege of the living. It sits beside ErrCreatorOutsideAccount and
+	// ErrAccountNotActive as one of mint's own preconditions rather than
+	// borrowing the lifecycle sentinel a caller reads as "my suspend was
+	// refused".
+	ErrCreatorRemoved = errors.New("identity: creator user is removed")
+
 	// ErrAccountNotActive reports an attempt to attach a new principal —
 	// user or API key — to an account that is suspended or closed.
 	// Suspension freezes the account; growth stops with it.

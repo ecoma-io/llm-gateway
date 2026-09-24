@@ -49,15 +49,22 @@ type APIKey struct {
 // public prefix derived from the id. RevokedAt is nil; the
 // (state = revoked) ⇔ (revoked_at non-nil) pairing is also enforced by a
 // database check, because the two records of the pair must never disagree.
+//
+// The id must be a UUIDv4-form string — the same grammar ParseToken enforces
+// on the id segment of a presented token. A key minted with any other id
+// would carry a prefix outside the token grammar and produce a one-time
+// credential that can never authenticate: the refusals must happen here, at
+// mint, where the error fronts the developer — not at first presentation,
+// where it fronts the operator holding a broken credential.
 func NewAPIKey(id APIKeyID, accountID AccountID, createdBy UserID, displayName string, now time.Time) (*APIKey, error) {
 	displayName = trimSpace(displayName)
 	if err := validateDisplayName(displayName); err != nil {
 		return nil, err
 	}
-	if id == "" {
-		// A blank id is a programming error upstream, not a domain rule —
+	if err := validateUUIDForm(string(id)); err != nil {
+		// A malformed id is a programming error upstream, not a domain rule —
 		// no sentinel.
-		return nil, fmt.Errorf("identity: new api key: blank id")
+		return nil, fmt.Errorf("identity: new api key: %w", err)
 	}
 	if accountID == "" {
 		return nil, fmt.Errorf("identity: new api key: blank account id")

@@ -546,10 +546,13 @@ func TestIntegrationNothingPersistedCarriesSecretMaterial(t *testing.T) {
 			t.Fatalf("serialise the %s row: %v", probe.table, err)
 		}
 		if strings.Contains(serialised, token) {
-			t.Fatalf("the %s row carries the full token: %s", probe.table, serialised)
+			// The row is deliberately not printed: a failure message is
+			// output too, and this test exists precisely because the row
+			// must never carry the token anywhere.
+			t.Fatalf("the %s row carries the full token", probe.table)
 		}
 		if strings.Contains(serialised, secretSegment) {
-			t.Fatalf("the %s row carries the token's secret segment: %s", probe.table, serialised)
+			t.Fatalf("the %s row carries the token's secret segment", probe.table)
 		}
 	}
 }

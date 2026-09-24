@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 )
 
@@ -58,6 +57,13 @@ var errSecretLength = errors.New("identity: secret must decode to 32 bytes")
 // redact so a log line, an error wrap or a %v of a struct holding a Secret
 // shows "redacted" instead of credential material; MarshalText refuses so an
 // accidental JSON round-trip cannot smuggle the bytes into a snapshot.
+//
+// That redaction net has one structural limit, recorded here so the next
+// aggregate avoids it: fmt cannot invoke methods on unexported fields, so a
+// Secret stored AS A STRUCT FIELD dumps its raw bytes under %v regardless of
+// these methods. The contract above holds only while Secret values travel as
+// themselves — arguments, returns, interface values — never nested in another
+// struct. Nothing today nests one; nothing later may.
 type Secret struct {
 	bytes []byte
 }
@@ -132,17 +138,6 @@ func EqualDigests(a, b Digest) bool {
 	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
 }
 
-// CompareAgainstDummyDigest runs a full constant-time comparison of the
-// presented secret's digest against the zero digest, and returns a value
-// callers must ignore. A verifier that skips the comparison when a key id
-// has no record runs measurably faster on the miss path, which turns timing
-// into a key-id existence oracle; calling this on that path keeps the two
-// paths' work identical. See VerifyCredential for the policy that pairs it
-// with ErrUnknownCredential.
-func CompareAgainstDummyDigest(s Secret) bool {
-	return EqualDigests(s.Digest(), Digest{})
-}
-
 // TokenPrefix renders the public token prefix for a key id: brand and id,
 // no secret. It is what consoles show and what the ownership record stores.
 func TokenPrefix(id APIKeyID) string {
@@ -154,10 +149,14 @@ func TokenPrefix(id APIKeyID) string {
 // the returned string is handed to the operator exactly once. Its errors are
 // plain programming-error wraps — the arguments come from mint itself, not
 // from an untrusted presentation, so the presentation sentinels do not
-// apply.
+// apply, and detail that would arm a probing verifier is here exactly where
+// it belongs: in front of a developer. The id check is the same grammar
+// ParseToken enforces, so a token minted here is a token that parses — a
+// minted credential that could never authenticate would fail silently at
+// exactly the moment an operator is copying it somewhere safe.
 func FormatToken(id APIKeyID, s Secret) (string, error) {
-	if id == "" {
-		return "", fmt.Errorf("identity: format token: blank key id")
+	if err := validateUUIDForm(string(id)); err != nil {
+		return "", fmt.Errorf("identity: format token: %w", err)
 	}
 	if len(s.bytes) != SecretEntropyBytes {
 		return "", fmt.Errorf("identity: format token: %w", errSecretLength)
@@ -166,14 +165,21 @@ func FormatToken(id APIKeyID, s Secret) (string, error) {
 }
 
 // ParseToken is the fail-closed front door of verification. Every failure —
-// wrong brand, wrong shape, bad UUID case, bad base64, wrong secret length,
-// any whitespace anywhere in the presented value — returns ErrMalformedToken
-// and never says which check tripped, so the error cannot be turned into a
-// parser probing whether a value is "almost" a key.
+// wrong brand, wrong shape, bad UUID, non-canonical base64, wrong secret
+// length, any whitespace anywhere in the presented value — returns the
+// ErrMalformedToken sentinel itself, with no per-check detail: the sentinel's
+// text is byte-identical on every rejection path, so an error echoed to a
+// console, a log or an API response cannot be turned into a parser probing
+// which stage of the grammar a value reached. The checks themselves keep
+// their detail internally — the same grammar guards mint-time producers,
+// where the detail fronts a developer rather than a prober.
 //
 // The split is SplitN on "_" with a limit of 3 because the secret's base64url
 // alphabet itself contains underscores; the third segment may legally hold
-// any number of them.
+// any number of them. The decode is base64's strict mode: a canonical
+// encoding is required, so one credential has exactly one spelling — the
+// non-strict decoder would accept four, and four textual aliases of one
+// token defeat any audit or rate limit keyed on the presented string.
 func ParseToken(raw string) (APIKeyID, Secret, error) {
 	// Whitespace anywhere is disqualification, before anything else: a
 	// token pasted with a trailing newline must not be rescued by a trim
@@ -182,51 +188,64 @@ func ParseToken(raw string) (APIKeyID, Secret, error) {
 	if strings.IndexFunc(raw, func(r rune) bool {
 		return r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == '\v' || r == '\f'
 	}) >= 0 {
-		return "", Secret{}, fmt.Errorf("identity: parse token: %w: whitespace in token", ErrMalformedToken)
+		return "", Secret{}, ErrMalformedToken
 	}
 	parts := strings.SplitN(raw, "_", 3)
 	if len(parts) != 3 {
-		return "", Secret{}, fmt.Errorf("identity: parse token: %w: want brand, id and secret", ErrMalformedToken)
+		return "", Secret{}, ErrMalformedToken
 	}
 	if parts[0] != TokenBrand {
-		return "", Secret{}, fmt.Errorf("identity: parse token: %w: unknown brand", ErrMalformedToken)
+		return "", Secret{}, ErrMalformedToken
 	}
 	id := APIKeyID(parts[1])
 	if err := validateUUIDForm(parts[1]); err != nil {
-		return "", Secret{}, fmt.Errorf("identity: parse token: %w: %v", ErrMalformedToken, err)
+		return "", Secret{}, ErrMalformedToken
 	}
 	encoded := parts[2]
 	if len(encoded) != secretEncodedLen {
-		return "", Secret{}, fmt.Errorf("identity: parse token: %w: secret segment must be %s characters", ErrMalformedToken, strconv.Itoa(secretEncodedLen))
+		return "", Secret{}, ErrMalformedToken
 	}
-	rawSecret, err := base64.RawURLEncoding.DecodeString(encoded)
+	rawSecret, err := base64.RawURLEncoding.Strict().DecodeString(encoded)
 	if err != nil {
-		return "", Secret{}, fmt.Errorf("identity: parse token: %w: secret is not base64url", ErrMalformedToken)
+		return "", Secret{}, ErrMalformedToken
 	}
 	secret, err := NewSecretFromTokenBytes(rawSecret)
 	if err != nil {
-		return "", Secret{}, fmt.Errorf("identity: parse token: %w: %v", ErrMalformedToken, err)
+		return "", Secret{}, ErrMalformedToken
 	}
 	return id, secret, nil
 }
 
-// validateUUIDForm checks the canonical lowercase 8-4-4-4-12 hex shape. This
-// is a grammar check for token parsing — it deliberately does not accept the
-// braced or uppercase variants, because a presented token only ever contains
-// the form newUUID produced.
+// validateUUIDForm checks the canonical lowercase 8-4-4-4-12 hex shape,
+// including RFC 4122's version nibble (4) and variant bits (10 — one of
+// 8, 9, a, b). This is a grammar check for token parsing — it deliberately
+// does not accept the braced or uppercase variants, because a presented
+// token only ever contains the form newUUID produced, and newUUID sets
+// those bits. Its messages carry the detail the grammar check is allowed
+// to carry: they surface only on mint-time producers, never through
+// ParseToken, which discards them and returns the bare presentation
+// sentinel.
 func validateUUIDForm(s string) error {
 	if len(s) != 36 {
-		return errors.New("id must be 36 characters")
+		return errors.New("api key id must be 36 characters")
 	}
 	for i, r := range s {
 		switch i {
 		case 8, 13, 18, 23:
 			if r != '-' {
-				return errors.New("dashes are misplaced")
+				return errors.New("api key id dashes are misplaced")
+			}
+		case 14:
+			if r != '4' {
+				return errors.New("api key id is not a version 4 uuid")
+			}
+		case 19:
+			if r != '8' && r != '9' && r != 'a' && r != 'b' {
+				return errors.New("api key id is not an rfc 4122 variant")
 			}
 		default:
 			if !isLowerHex(r) {
-				return errors.New("id is not lowercase hex")
+				return errors.New("api key id is not lowercase hex")
 			}
 		}
 	}

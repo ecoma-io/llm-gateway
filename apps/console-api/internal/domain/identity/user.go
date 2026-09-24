@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -120,7 +121,12 @@ func normalizeEmail(email string) (string, error) {
 	if !ok || local == "" || domain == "" {
 		return "", fmt.Errorf("identity: new user: %w: need exactly one @ with content either side", ErrInvalidEmail)
 	}
-	if strings.ContainsAny(email, " \t\n\v\f\r") {
+	// The reject set here is deliberately the same set trimSpace trims at the
+	// edges: unicode.IsSpace, not an ASCII table. An interior U+00A0 or
+	// U+2028 is whitespace by the same definition the trim applies, and an
+	// address holding one would be stored, displayed and never match anything
+	// a human types or another system normalizes.
+	if strings.IndexFunc(email, unicode.IsSpace) >= 0 {
 		return "", fmt.Errorf("identity: new user: %w: whitespace is not allowed", ErrInvalidEmail)
 	}
 	if n := utf8.RuneCountInString(local); n > maxEmailLocalLen {

@@ -7,15 +7,20 @@ import (
 	"time"
 )
 
+// keyID is a fixed UUIDv4-form id: the grammar NewAPIKey derives the key's
+// public prefix from, and the same shape ParseToken enforces on presented
+// tokens.
+const keyID = APIKeyID("c0000000-0000-4000-8000-000000000001")
+
 func TestNewAPIKeyIsBornActiveWithDerivedPrefixAndNoRevocation(t *testing.T) {
-	k, err := NewAPIKey("key-1", "acc-1", "usr-1", "deploy key", clock)
+	k, err := NewAPIKey(keyID, "acc-1", "usr-1", "deploy key", clock)
 	if err != nil {
 		t.Fatalf("NewAPIKey returned error: %v", err)
 	}
 	if k.State != APIKeyActive {
 		t.Fatalf("NewAPIKey state = %q, want active", k.State)
 	}
-	if k.Prefix != "gw_key-1_" {
+	if k.Prefix != "gw_"+string(keyID)+"_" {
 		t.Fatalf("NewAPIKey prefix = %q, want derived brand+id", k.Prefix)
 	}
 	if k.RevokedAt != nil {
@@ -33,20 +38,17 @@ func TestNewAPIKeyRejectsBlankAndOversizedDisplayNames(t *testing.T) {
 		"over length": strings.Repeat("x", maxDisplayNameLen+1),
 	}
 	for name, input := range cases {
-		if _, err := NewAPIKey("key-1", "acc-1", "", input, clock); !errors.Is(err, ErrInvalidDisplayName) {
+		if _, err := NewAPIKey(keyID, "acc-1", "", input, clock); !errors.Is(err, ErrInvalidDisplayName) {
 			t.Fatalf("%s: NewAPIKey error = %v, want ErrInvalidDisplayName", name, err)
 		}
 	}
-	if _, err := NewAPIKey("", "acc-1", "", "k", clock); err == nil {
-		t.Fatalf("NewAPIKey with blank id returned no error")
-	}
-	if _, err := NewAPIKey("key-1", "", "", "k", clock); err == nil {
+	if _, err := NewAPIKey(keyID, "", "", "k", clock); err == nil {
 		t.Fatalf("NewAPIKey with blank account id returned no error")
 	}
 }
 
 func TestAPIKeyRevokeSetsStateTimestampAndStaysIdempotent(t *testing.T) {
-	k, err := NewAPIKey("key-1", "acc-1", "usr-1", "deploy key", clock)
+	k, err := NewAPIKey(keyID, "acc-1", "usr-1", "deploy key", clock)
 	if err != nil {
 		t.Fatalf("NewAPIKey returned error: %v", err)
 	}
@@ -76,7 +78,7 @@ func TestAPIKeyRevokeSetsStateTimestampAndStaysIdempotent(t *testing.T) {
 }
 
 func TestAPIKeyCannotLeaveRevoked(t *testing.T) {
-	k, err := NewAPIKey("key-1", "acc-1", "", "k", clock)
+	k, err := NewAPIKey(keyID, "acc-1", "", "k", clock)
 	if err != nil {
 		t.Fatalf("NewAPIKey returned error: %v", err)
 	}

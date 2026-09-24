@@ -56,9 +56,12 @@ const casMaxAttempts = 8
 //
 // An implementation returns the credential and true, or false when it holds
 // no record for keyID — a miss, not a failure. A miss is not an error and
-// never an empty struct with a nil flag: the use case burns a comparison on
-// the miss path precisely so the two outcomes are indistinguishable in wall
-// time.
+// never an empty struct with a nil flag: the use case runs the verification
+// pipeline against the zero Credential on the miss path, so implementation
+// side, the only difference between a hit and a miss is the lookup itself.
+// Keeping that lookup's cost flat across hits and misses is therefore this
+// interface's implementation contract — a backing store whose misses measure
+// cheaper is a key-id existence oracle waiting to be timed.
 type CredentialSource interface {
 	APIKeyCredential(ctx context.Context, keyID identity.APIKeyID) (identity.Credential, bool, error)
 }
@@ -104,6 +107,28 @@ type MintedKey struct {
 	// Digest is the recorded form of Token's secret — not secret material
 	// itself, and therefore the part that may be delivered onward.
 	Digest identity.Digest
+}
+
+// String redacts: a mint result is exactly the value a debug line prints
+// wholesale, and its Token field is the one copy of the credential anyone
+// will ever hold. Every fmt verb that renders a value (%v, %+v, %s, %q)
+// goes through here and shows the key, never the token.
+func (k MintedKey) String() string {
+	return fmt.Sprintf("minted key %s (token redacted)", k.Key.ID)
+}
+
+// GoString covers %#v with the same redaction String gives every other verb.
+func (k MintedKey) GoString() string {
+	return fmt.Sprintf("application.MintedKey{Key: %s, Token: redacted, Digest: %s}", k.Key.ID, k.Digest.Hex())
+}
+
+// MarshalJSON refuses. Serialisation is where redaction-by-Stringer stops
+// working — encoding/json reads fields, not verbs — and a mint result in a
+// JSON log, an audit file or a response body is a credential leak with a
+// retention policy. Nothing may persist this value's Token; callers who need
+// the record, not the credential, marshal MintedKey.Key.
+func (k MintedKey) MarshalJSON() ([]byte, error) {
+	return nil, fmt.Errorf("application: minted key %s refuses serialisation: the one-time token must not land in a log, file or wire format", k.Key.ID)
 }
 
 // CreateAccount opens an account: a fresh identity, a validated name, and the
@@ -189,7 +214,10 @@ func (i *Identity) transitionAccount(ctx context.Context, id identity.AccountID,
 // CreateUser invites a console identity under an account. The account must
 // exist and be active — suspension freezes the account, and growth stops with
 // it — and the (account, email) uniqueness rule surfaces as the domain's
-// ErrUserEmailTaken.
+// ErrUserEmailTaken. The active check is a read without a lock, the same
+// documented residual as MintAPIKey's: an invitation can land in the instant
+// the account suspends, and the verification policy's account-state read is
+// what keeps such a row inert.
 func (i *Identity) CreateUser(ctx context.Context, accountID identity.AccountID, email string) (identity.User, error) {
 	id, err := identity.NewUserID()
 	if err != nil {
@@ -279,6 +307,16 @@ func (i *Identity) transitionUser(ctx context.Context, id identity.UserID, apply
 // against a not-yet-delivered credential is a state that phase's
 // owned-but-inactive recovery exists for, not one this use case pretends to
 // solve today.
+//
+// One residual is documented rather than locked away: the account-active and
+// creator checks read rows without locks, so a suspension (or a removal) can
+// commit between a check and the insert, and the key lands in the same
+// instant its account froze. The window is one transaction wide, and the
+// invariant that matters is enforced downstream of it — verification
+// consults the account's state, so nothing minted into a suspended account
+// authenticates. Serialising mints against suspensions with row locks is a
+// deliberate escalation for the phase that gives suspension a hot-path
+// consequence, not a default this use case reaches for.
 func (i *Identity) MintAPIKey(ctx context.Context, accountID identity.AccountID, createdBy identity.UserID, displayName string) (MintedKey, error) {
 	secret, err := identity.GenerateSecret()
 	if err != nil {
@@ -314,7 +352,7 @@ func (i *Identity) MintAPIKey(ctx context.Context, accountID identity.AccountID,
 				return fmt.Errorf("application: mint api key: creator %s: %w", createdBy, identity.ErrCreatorOutsideAccount)
 			}
 			if creator.State == identity.UserRemoved {
-				return fmt.Errorf("application: mint api key: creator %s: %w: creator is removed", createdBy, identity.ErrInvalidTransition)
+				return fmt.Errorf("application: mint api key: creator %s: %w", createdBy, identity.ErrCreatorRemoved)
 			}
 		}
 		return i.keys.Create(txCtx, *key)
@@ -388,11 +426,16 @@ func (i *Identity) VerifyAPIKey(ctx context.Context, presentedToken string, sour
 		return identity.Principal{}, fmt.Errorf("application: verify api key: read credential: %w", err)
 	}
 	if !ok {
-		// The miss path burns the same comparison the match path runs, so
-		// wall time cannot answer whether a key id exists. The return value
-		// is meaningless by design; the verdict below is not.
-		identity.CompareAgainstDummyDigest(secret)
-		return identity.Principal{}, fmt.Errorf("application: verify api key: %w", identity.ErrUnknownCredential)
+		// A record that does not exist verifies against the zero Credential:
+		// the pipeline runs its own digest comparison — the burn that keeps
+		// wall time from answering whether a key id exists — and both this
+		// path and the mismatch path flow through the same code and return
+		// the same sentinel with byte-identical text, because error text
+		// that distinguishes them is a key-id existence oracle in exactly
+		// the way a timing difference would be. The zero digest can only
+		// match a presented secret hashing to 32 zero bytes, and even that
+		// outcome fails closed on the unknown key state that follows.
+		credential = identity.Credential{}
 	}
 	principal, err := identity.VerifyCredential(keyID, secret, credential)
 	if err != nil {

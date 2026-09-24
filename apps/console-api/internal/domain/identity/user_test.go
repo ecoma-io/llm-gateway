@@ -33,6 +33,8 @@ func TestNewUserRejectsImplausibleEmails(t *testing.T) {
 		"empty domain":     "local@",
 		"internal space":   "lo cal@example.com",
 		"interior newline": "local\n@example.com",
+		"interior nbsp":    "lo\u00a0cal@example.com",
+		"interior u+2028":  "lo\u2028cal@example.com",
 		"over length":      strings.Repeat("x", maxEmailLen) + "@example.com",
 		"long local part":  strings.Repeat("x", maxEmailLocalLen+1) + "@example.com",
 	}
@@ -103,6 +105,11 @@ func TestUserRemoveIsTerminalFromEveryState(t *testing.T) {
 	}
 	if u.State != UserRemoved {
 		t.Fatalf("repeated Remove left state %q", u.State)
+	}
+	// Terminal repetition must not churn the row: the recorded moment of
+	// removal is when the first Remove ran, not the last.
+	if !u.UpdatedAt.Equal(clock) {
+		t.Fatalf("repeated Remove moved UpdatedAt to %v", u.UpdatedAt)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // mint is the canonical round-trip used across these tests: draw a secret,
@@ -28,7 +29,10 @@ func TestSecretRoundTripsThroughTokenFormatAndParse(t *testing.T) {
 	const id = APIKeyID("019203d0-9a1b-4c2a-8f1e-3f5a6b7c8d9e")
 	secret, token, _ := mint(t, id)
 	if want := "gw_" + string(id) + "_"; !strings.HasPrefix(token, want) {
-		t.Fatalf("token %q does not carry the public prefix %q", token, want)
+		// The prefix is printed, never the token: a failure message is still
+		// output, and the whole point of the grammar is that the secret
+		// segment is nobody's output.
+		t.Fatalf("minted token does not carry the public prefix %q", want)
 	}
 	parsedID, parsedSecret, err := ParseToken(token)
 	if err != nil {
@@ -76,6 +80,8 @@ func TestParseTokenFailsClosedOnEveryMalformedShape(t *testing.T) {
 		"blank id":             TokenBrand + "__" + segments[2],
 		"non-uuid id":          TokenBrand + "_not-a-uuid_" + segments[2],
 		"uppercase uuid":       TokenBrand + "_" + strings.ToUpper(segments[1]) + "_" + segments[2],
+		"version 1 uuid":       TokenBrand + "_019203d0-9a1b-1c2a-8f1e-3f5a6b7c8d9e_" + segments[2],
+		"non-rfc 4122 variant": TokenBrand + "_019203d0-9a1b-4c2a-cf1e-3f5a6b7c8d9e_" + segments[2],
 		"short secret":         TokenBrand + "_" + segments[1] + "_" + segments[2][:secretEncodedLen-1],
 		"padded secret":        TokenBrand + "_" + segments[1] + "_" + segments[2] + "=",
 		"non-base64 secret":    TokenBrand + "_" + segments[1] + "_" + strings.Repeat("!", secretEncodedLen),
@@ -84,10 +90,44 @@ func TestParseTokenFailsClosedOnEveryMalformedShape(t *testing.T) {
 		"interior space":       TokenBrand + "_ " + segments[1] + "_" + segments[2],
 		"four underscore part": TokenBrand + "_" + segments[1] + "_" + segments[2] + "_tail",
 	}
+	text := ""
 	for name, raw := range cases {
 		_, _, err := ParseToken(raw)
 		if !errors.Is(err, ErrMalformedToken) {
 			t.Fatalf("%s: ParseToken error = %v, want ErrMalformedToken", name, err)
+		}
+		// The sentinel identity is half the contract; the other half is that
+		// the TEXT is one and the same on every rejection path. An error that
+		// varies by check is a parsing oracle the first time a transport
+		// echoes it.
+		if text == "" {
+			text = err.Error()
+			continue
+		}
+		if err.Error() != text {
+			t.Fatalf("%s: error text %q differs from the first shape's %q — the text is a parsing oracle", name, err.Error(), text)
+		}
+	}
+}
+
+func TestParseTokenRequiresACanonicalSecretSegment(t *testing.T) {
+	// The final base64url quantum of a 32-byte secret carries two unused
+	// bits, and the non-strict decoder would accept all four characters that
+	// encode them — one credential, four spellings, and every audit or rate
+	// limit keyed on the presented string defeated by a typo. Strict decoding
+	// accepts exactly the spelling FormatToken emits.
+	_, token, _ := mint(t, "019203d0-9a1b-4c2a-8f1e-3f5a6b7c8d9e")
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	segment := strings.SplitN(token, "_", 3)[2]
+	last := segment[len(segment)-1]
+	idx := strings.IndexByte(alphabet, last)
+	if idx < 0 || idx&0b11 != 0 {
+		t.Fatalf("test assumption broken: canonical last character %q does not end in zero unused bits", string(last))
+	}
+	for delta := 1; delta <= 3; delta++ {
+		alias := segment[:len(segment)-1] + string(alphabet[idx|delta])
+		if _, _, err := ParseToken(strings.Replace(token, segment, alias, 1)); !errors.Is(err, ErrMalformedToken) {
+			t.Fatalf("ParseToken accepted a non-canonical secret segment spelling")
 		}
 	}
 }
@@ -135,7 +175,7 @@ func TestSecretRedactsEveryAccidentalPrintingPath(t *testing.T) {
 	}
 	check("%v", fmt.Sprintf("%v", secret))
 	check("%+v", fmt.Sprintf("%+v", secret))
-	check("%s", fmt.Sprintf("%s", secret))
+	check("%s", fmt.Sprintf("%s", secret)) //nolint:staticcheck // the fmt dispatch, not the method call, is the subject under test
 	check("%q", fmt.Sprintf("%q", secret))
 	check("GoString", fmt.Sprintf("%#v", secret))
 	check("String method", secret.String())
@@ -185,33 +225,45 @@ func TestEqualDigestsDistinguishesOnlyEqualDigests(t *testing.T) {
 	}
 }
 
-func TestCompareAgainstDummyDigestBurnsTheComparisonWithoutMeaning(t *testing.T) {
-	// The return value is deliberately meaningless — the miss-path caller
-	// ignores it and reports ErrUnknownCredential. The only property worth
-	// pinning is that a real secret's digest never collides with the zero
-	// digest, so the dummy comparison cannot accidentally authenticate.
-	for i := 0; i < 8; i++ {
-		s, err := GenerateSecret()
-		if err != nil {
-			t.Fatalf("GenerateSecret returned error: %v", err)
-		}
-		if CompareAgainstDummyDigest(s) {
-			t.Fatalf("a real secret compared equal to the zero digest")
-		}
-	}
-}
-
-func TestFormatTokenRefusesBlankIDsAndWrongSizedSecrets(t *testing.T) {
+func TestFormatTokenRefusesIDsOutsideTheTokenGrammar(t *testing.T) {
+	// Every id FormatToken accepts must produce a token ParseToken accepts:
+	// a minted credential that could never authenticate would fail at
+	// exactly the moment an operator is copying it somewhere safe.
 	s, err := GenerateSecret()
 	if err != nil {
 		t.Fatalf("GenerateSecret returned error: %v", err)
 	}
-	if _, err := FormatToken("", s); err == nil {
-		t.Fatalf("FormatToken with blank id returned no error")
+	for name, id := range map[string]APIKeyID{
+		"blank":        "",
+		"friendly":     "key-1",
+		"uppercase":    "019203D0-9A1B-4C2A-8F1E-3F5A6B7C8D9E",
+		"version 1":    "019203d0-9a1b-1c2a-8f1e-3f5a6b7c8d9e",
+		"nil uuid":     "00000000-0000-0000-0000-000000000000",
+		"all variants": "ffffffff-ffff-4fff-ffff-ffffffffffff",
+	} {
+		if _, err := FormatToken(id, s); err == nil {
+			t.Fatalf("%s: FormatToken accepted an id outside the token grammar", name)
+		}
 	}
 	short := Secret{bytes: make([]byte, SecretEntropyBytes-1)}
 	if _, err := FormatToken("019203d0-9a1b-4c2a-8f1e-3f5a6b7c8d9e", short); err == nil {
 		t.Fatalf("FormatToken with a short secret returned no error")
+	}
+}
+
+func TestNewAPIKeyRefusesIDsOutsideTheTokenGrammar(t *testing.T) {
+	// The ownership record's prefix is derived from the id; a record minted
+	// with a non-grammar id would carry a prefix the database's own shape
+	// check refuses and a token nobody could ever present.
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	for name, id := range map[string]APIKeyID{
+		"blank":     "",
+		"friendly":  "deploy-key",
+		"version 0": "a0000000-0000-0000-8000-0000000000a1",
+	} {
+		if _, err := NewAPIKey(id, "019203d0-9a1b-4c2a-8f1e-3f5a6b7c8d9e", "", "probe", now); err == nil {
+			t.Fatalf("%s: NewAPIKey accepted an id outside the token grammar", name)
+		}
 	}
 }
 

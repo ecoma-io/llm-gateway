@@ -79,6 +79,18 @@ func TestAccountSuspendsOnlyFromActiveAndReinstatesOnlyFromSuspended(t *testing.
 			t.Fatalf("Reinstate on closed error = %v, want ErrInvalidTransition", err)
 		}
 	})
+	t.Run("active reinstate is a no-op", func(t *testing.T) {
+		a := mustAccount(t)
+		if err := a.Reinstate(clock.Add(time.Minute)); err != nil {
+			t.Fatalf("Reinstate on active returned error: %v", err)
+		}
+		if a.State != AccountActive {
+			t.Fatalf("no-op Reinstate changed state to %q", a.State)
+		}
+		if !a.UpdatedAt.Equal(clock) {
+			t.Fatalf("no-op Reinstate moved UpdatedAt to %v", a.UpdatedAt)
+		}
+	})
 }
 
 func TestAccountCloseIsTerminalAndAbsorbsRepetition(t *testing.T) {
@@ -107,6 +119,12 @@ func TestAccountCloseIsTerminalAndAbsorbsRepetition(t *testing.T) {
 		}
 		if a.State != AccountClosed {
 			t.Fatalf("after second Close: state = %q", a.State)
+		}
+		// A no-op must be indistinguishable from never having been called:
+		// closed_at's sibling updated_at must not churn on repetition, or
+		// every audit trail lies about when the account actually ended.
+		if !a.UpdatedAt.Equal(clock) {
+			t.Fatalf("repeated Close moved UpdatedAt to %v", a.UpdatedAt)
 		}
 	})
 	t.Run("closed never reactivates", func(t *testing.T) {

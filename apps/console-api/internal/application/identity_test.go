@@ -453,8 +453,8 @@ func TestMintRequiresAnActiveAccountAndAValidCreator(t *testing.T) {
 	if err := h.identity.RemoveUser(context.Background(), creator.ID); err != nil {
 		t.Fatalf("RemoveUser: %v", err)
 	}
-	if _, err := h.identity.MintAPIKey(context.Background(), a.ID, creator.ID, "k"); !errors.Is(err, identity.ErrInvalidTransition) {
-		t.Fatalf("mint with a removed creator returned %v, want ErrInvalidTransition", err)
+	if _, err := h.identity.MintAPIKey(context.Background(), a.ID, creator.ID, "k"); !errors.Is(err, identity.ErrCreatorRemoved) {
+		t.Fatalf("mint with a removed creator returned %v, want ErrCreatorRemoved", err)
 	}
 	if _, err := h.identity.MintAPIKey(context.Background(), "a0000000-0000-0000-0000-0000000000ff", "", "k"); !errors.Is(err, persistence.ErrNotFound) {
 		t.Fatalf("mint under an unknown account returned %v, want persistence.ErrNotFound", err)
@@ -554,6 +554,66 @@ func TestVerifyReportsAMissAsUnknownCredential(t *testing.T) {
 	// An empty source: the key id has no record anywhere.
 	if _, err := h.identity.VerifyAPIKey(context.Background(), minted.Token, &fakeCredentials{}); !errors.Is(err, identity.ErrUnknownCredential) {
 		t.Fatalf("VerifyAPIKey against a missing record returned %v, want ErrUnknownCredential", err)
+	}
+}
+
+func TestVerifyReportsAMissAndAMismatchWithOneIdenticalText(t *testing.T) {
+	// The two unknowns travel different code paths — the miss binds the zero
+	// Credential and verifies against it; the mismatch compares two live
+	// digests — but the observable outcome must be byte-identical. The first
+	// transport that echoes the error text would otherwise tell an attacker
+	// which key ids exist.
+	h := newIdentityHarness()
+	a := h.mustAccount(t, "Acme")
+	minted := h.mustMint(t, a.ID, "", "deploy key")
+
+	mismatch := &fakeCredentials{byID: map[identity.APIKeyID]identity.Credential{
+		minted.Key.ID: {
+			KeyID:        minted.Key.ID,
+			Digest:       identity.Digest{}, // a recorded digest that cannot match
+			KeyState:     identity.APIKeyActive,
+			AccountID:    minted.Key.AccountID,
+			AccountState: identity.AccountActive,
+		},
+	}}
+	_, missErr := h.identity.VerifyAPIKey(context.Background(), minted.Token, &fakeCredentials{})
+	_, mismatchErr := h.identity.VerifyAPIKey(context.Background(), minted.Token, mismatch)
+
+	if !errors.Is(missErr, identity.ErrUnknownCredential) || !errors.Is(mismatchErr, identity.ErrUnknownCredential) {
+		t.Fatalf("miss = %v, mismatch = %v; both want ErrUnknownCredential", missErr, mismatchErr)
+	}
+	if missErr.Error() != mismatchErr.Error() {
+		t.Fatalf("miss text %q differs from mismatch text %q — the text is a key-id existence oracle", missErr.Error(), mismatchErr.Error())
+	}
+}
+
+func TestMintedKeyRedactsEveryAccidentalPrintingPath(t *testing.T) {
+	// MintAPIKey's return value carries the one-time token. The struct's own
+	// rendering methods are the last line of defence before a caller's
+	// fmt.Sprintf turns a handover moment into a log entry.
+	h := newIdentityHarness()
+	a := h.mustAccount(t, "Acme")
+	minted := h.mustMint(t, a.ID, "", "deploy key")
+	secretSegment := strings.SplitN(minted.Token, "_", 3)[2]
+
+	check := func(name, rendered string) {
+		t.Helper()
+		if strings.Contains(rendered, secretSegment) || strings.Contains(rendered, minted.Token) {
+			t.Fatalf("%s rendered secret material: %q", name, rendered)
+		}
+		if !strings.Contains(rendered, "redacted") {
+			t.Fatalf("%s rendered %q without the redaction marker", name, rendered)
+		}
+	}
+	check("%v", fmt.Sprintf("%v", minted))
+	check("%+v", fmt.Sprintf("%+v", minted))
+	check("%s", fmt.Sprintf("%s", minted)) //nolint:staticcheck // the fmt dispatch, not the method call, is the subject under test
+	check("%q", fmt.Sprintf("%q", minted))
+	check("GoString", fmt.Sprintf("%#v", minted))
+	check("String method", minted.String())
+
+	if _, err := minted.MarshalJSON(); err == nil {
+		t.Fatalf("MarshalJSON succeeded; a serialiser smuggled the one-time token")
 	}
 }
 

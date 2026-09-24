@@ -54,6 +54,19 @@ func TestVerificationTreatsMismatchAndMissingAsTheSameUnknown(t *testing.T) {
 	}
 }
 
+func TestVerificationReportsUnknownBeforeRevocation(t *testing.T) {
+	// A wrong secret against a revoked key must be indistinguishable from a
+	// wrong secret against anything else: the state report (ErrKeyRevoked)
+	// is gated behind the digest match, so possession of the secret is the
+	// only way to learn a key's lifecycle.
+	_, recorded := verifiedFixture(t)
+	recorded.KeyState = APIKeyRevoked
+	wrong, _, _ := mint(t, "019203d0-9a1b-4c2a-8f1e-3f5a6b7c8d9e")
+	if _, err := VerifyCredential(recorded.KeyID, wrong, recorded); !errors.Is(err, ErrUnknownCredential) {
+		t.Fatalf("wrong secret on revoked key error = %v, want ErrUnknownCredential", err)
+	}
+}
+
 func TestVerificationRefusesARevokedKeyEvenWithAMatchingSecret(t *testing.T) {
 	secret, recorded := verifiedFixture(t)
 	recorded.KeyState = APIKeyRevoked
