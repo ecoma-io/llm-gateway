@@ -255,6 +255,167 @@ func TestReadUsageEventsRefusesAPageItCannotAdvanceFrom(t *testing.T) {
 	}
 }
 
+// TestReadUsageEventsRefusesAPageMissingRequiredFields is the fail-closed
+// table: every field the contract marks required — the page's three, the
+// fact's five — is refused when the body omits it or carries it as null,
+// because a page that must be filled in is not a page the contract describes.
+//
+// The danger each row stands against is the zero value: `encoding/json` used
+// to answer a missing `has_more` with false, an absent `events` with an empty
+// page, and a fact missing any field with the zero Event, and a page like that
+// is one `Replay` away from advancing a durable position across facts nobody
+// saw. Refused here, it never becomes a Page at all.
+//
+// One row per class, and each row's body differs from a valid page by the
+// single field under test, so a green run cannot come from some other refusal
+// firing instead.
+func TestReadUsageEventsRefusesAPageMissingRequiredFields(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "a page with no events field at all",
+			body: `{"next_cursor":"cursor-2","has_more":false}`,
+		},
+		{
+			name: "a page whose events field is null",
+			body: `{"events":null,"next_cursor":"cursor-2","has_more":false}`,
+		},
+		{
+			name: "a page with no next_cursor field at all",
+			body: `{"events":[],"has_more":false}`,
+		},
+		{
+			name: "a page whose next_cursor field is null",
+			body: `{"events":[],"next_cursor":null,"has_more":false}`,
+		},
+		{
+			name: "a page with no has_more field at all",
+			body: `{"events":[],"next_cursor":"cursor-2"}`,
+		},
+		{
+			name: "a page whose has_more field is null",
+			body: `{"events":[],"next_cursor":"cursor-2","has_more":null}`,
+		},
+		{
+			name: "a fact with no request_id field at all",
+			body: `{"events":[{"kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+		{
+			name: "a fact whose request_id field is null",
+			body: `{"events":[{"request_id":null,"kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+		{
+			name: "a fact with no kind field at all",
+			body: `{"events":[{"request_id":"req-1","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+		{
+			name: "a fact whose kind field is null",
+			body: `{"events":[{"request_id":"req-1","kind":null,"schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+		{
+			name: "a fact with no schema_version field at all",
+			body: `{"events":[{"request_id":"req-1","kind":"settled","occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+		{
+			name: "a fact whose schema_version field is null",
+			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":null,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+		{
+			name: "a fact with no occurred_at field at all",
+			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":1,"payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+		{
+			name: "a fact whose occurred_at field is null",
+			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":null,"payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+		{
+			name: "a fact with no payload field at all",
+			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z"}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+		{
+			name: "a fact whose payload field is null",
+			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":null}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+		{
+			name: "a fact that is an empty object",
+			body: `{"events":[{}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var seen *http.Request
+			client := New(capturingClient(&seen, jsonResponse(http.StatusOK, tt.body)), baseURL, credential)
+
+			page, err := client.ReadUsageEvents(context.Background(), "", 100)
+			if !errors.Is(err, port.ErrMalformedPage) {
+				t.Fatalf("ReadUsageEvents() error = %v, want it to wrap %v", err, port.ErrMalformedPage)
+			}
+			if page.NextCursor != "" || page.Events != nil || page.HasMore {
+				t.Errorf("ReadUsageEvents() returned %+v beside an error, want the zero Page — a caller that ignored the error must not find a position in it", page)
+			}
+			// The refusal is made of the response and not of the request, so it
+			// must not smuggle back the endpoint or the credential either.
+			for _, secret := range []string{baseURL, credential} {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("error %q carries %q", err.Error(), secret)
+				}
+			}
+		})
+	}
+}
+
+// TestAFactWithPresentButEmptyFieldsIsStillAPage is the boundary the table
+// above must not erode: presence is the whole check. An empty request_id, a
+// kind this build has never heard of and a schema_version of zero are values
+// the body carried; deciding which of them can settle is the applier's, and an
+// adapter that started refusing them would be taking that decision from it.
+func TestAFactWithPresentButEmptyFieldsIsStillAPage(t *testing.T) {
+	body := `{"events":[{"request_id":"","kind":"a-kind-nobody-knows","schema_version":0,"occurred_at":"0001-01-01T00:00:00Z","payload":[1,2]}],"next_cursor":"cursor-2","has_more":false}`
+
+	var seen *http.Request
+	client := New(capturingClient(&seen, jsonResponse(http.StatusOK, body)), baseURL, credential)
+
+	page, err := client.ReadUsageEvents(context.Background(), "", 100)
+	if err != nil {
+		t.Fatalf("ReadUsageEvents() error = %v, want nil — every required field is present", err)
+	}
+	if len(page.Events) != 1 {
+		t.Fatalf("len(Events) = %d, want 1", len(page.Events))
+	}
+	event := page.Events[0]
+	if event.RequestID != "" || event.Kind != "a-kind-nobody-knows" || event.SchemaVersion != 0 {
+		t.Errorf("event = %+v, want the values the body carried, empty or not", event)
+	}
+	if want := `[1,2]`; string(event.Payload) != want {
+		t.Errorf("Payload = %s, want %s — a present payload crosses raw whatever it holds", event.Payload, want)
+	}
+}
+
+// TestAPageMayCarryFieldsTheContractDoesNotName pins the decoder's forward
+// compatibility: the Data Plane may add a field to the envelope or to a fact
+// before this module ships, and an unfamiliar key is ignored, never refused.
+// A consumer that refused one would be a version lock on the plane it reads.
+func TestAPageMayCarryFieldsTheContractDoesNotName(t *testing.T) {
+	body := `{"events":[{"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"},"trace_id":"t-1"}],"next_cursor":"cursor-2","has_more":false,"published_at":"2026-09-24T10:11:12Z"}`
+
+	var seen *http.Request
+	client := New(capturingClient(&seen, jsonResponse(http.StatusOK, body)), baseURL, credential)
+
+	page, err := client.ReadUsageEvents(context.Background(), "", 100)
+	if err != nil {
+		t.Fatalf("ReadUsageEvents() error = %v, want nil — unknown fields are tolerated", err)
+	}
+	if got, want := page.NextCursor, "cursor-2"; got != want {
+		t.Errorf("NextCursor = %q, want %q", got, want)
+	}
+	if got, want := len(page.Events), 1; got != want {
+		t.Fatalf("len(Events) = %d, want %d", got, want)
+	}
+}
+
 // TestAnAcceptedPageKeepsItsCursorByteForByte is the other half of the
 // boundary, and the half that keeps it from becoming enforcement for its own
 // sake: every position the contract admits is still passed through untouched.
