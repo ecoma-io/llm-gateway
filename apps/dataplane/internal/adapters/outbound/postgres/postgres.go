@@ -55,14 +55,16 @@ func New(db *sql.DB) persistence.Store {
 // the registration and the lookup of it in one place.
 const driverName = "pgx"
 
-// planeDatabase is the database this adapter serves, and the only one it will
+// ownedDatabase is the database this adapter serves, and the only one it will
 // open a pool against. The port this package implements belongs to the Data
 // Plane and reaches the `dataplane` database (ADR 0006 §7); the copy of the
 // rule here is what keeps that sentence true at the last place a foreign DSN
 // could slip through — a caller that never went near the configuration
 // package, or a future wiring that built Options by hand, still cannot point
-// this adapter at another plane's database.
-const planeDatabase = "dataplane"
+// this adapter at another plane's database. It mirrors the constant of the
+// same name in internal/config, where the environment's DSN is checked
+// against it at load time; Open repeats the check because it is the last door.
+const ownedDatabase = "dataplane"
 
 // Options is the description of one pool: the DSN to open and the four
 // settings database/sql exposes on it. It is data, not policy — whether a
@@ -109,14 +111,14 @@ func (o Options) validate() error {
 // failure the half-built pool is closed before the error is returned.
 //
 // The error never quotes opts.DSN: the DSN's userinfo carries the password,
-// and an open failure is a string an operator will paste into a ticket. The
-// driver's own message underneath is pgconn's, which masks passwords on its
-// side; nothing this package adds to it carries the DSN back.
+// and an open failure is a string an operator will paste into a ticket. Every
+// failure this package builds goes through withoutDSN, and the driver's own
+// message underneath is pgconn's, which masks passwords on its side.
 //
-// Open refuses a DSN that names any database but `dataplane`: the plane
-// binding enforced by the configuration loader holds here too, because the
-// adapter is the last place a foreign DSN could pass through (see
-// planeDatabase).
+// Open refuses any DSN that is not a postgres:// URL naming the `dataplane`
+// database and nothing else: the plane binding enforced by the configuration
+// loader holds here too, because the adapter is the last place a foreign DSN
+// could pass through (see ownedDatabase and validateDSN).
 func Open(ctx context.Context, opts Options) (*sql.DB, error) {
 	return open(ctx, driverName, opts)
 }
@@ -129,22 +131,17 @@ func open(ctx context.Context, driver string, opts Options) (*sql.DB, error) {
 	if err := opts.validate(); err != nil {
 		return nil, err
 	}
-	// An ownership guard, not a shape check: the DSN is parsed only far
-	// enough to read the database it names, and a DSN that does not parse as
-	// a URL is left for the driver to judge — pgconn also accepts
-	// keyword-value strings, and the configuration loader owns the rule that
-	// the wired DSN is a URL.
-	if parsed, err := url.Parse(opts.DSN); err == nil {
-		if database := strings.Trim(parsed.Path, "/"); database != "" && database != planeDatabase {
-			return nil, fmt.Errorf(
-				"postgres: refusing to open the %q database; this adapter serves the dataplane database only — the Data Plane owns it and no other (ADR 0006 §7)",
-				database)
-		}
+	if err := validateDSN(opts.DSN); err != nil {
+		return nil, err
 	}
 
 	db, err := sql.Open(driver, opts.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: open pool: the driver rejected the DSN: %w", err)
+		// sql.Open parses the DSN for drivers that support OpenConnector —
+		// pgx is one — so a malformed string can fail here rather than at
+		// the first use, with the driver's error quoting the string it was
+		// handed. The text goes through withoutDSN before it leaves.
+		return nil, fmt.Errorf("postgres: open pool: the driver rejected the DSN: %w", withoutDSN(err, opts.DSN))
 	}
 	db.SetMaxOpenConns(opts.MaxOpenConns)
 	db.SetMaxIdleConns(opts.MaxIdleConns)
@@ -153,9 +150,61 @@ func open(ctx context.Context, driver string, opts Options) (*sql.DB, error) {
 
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("postgres: open pool: ping: %w", err)
+		return nil, fmt.Errorf("postgres: open pool: ping: %w", withoutDSN(err, opts.DSN))
 	}
 	return db, nil
+}
+
+// validateDSN checks that the DSN names the database this application owns —
+// the plane binding of ADR 0006 §7 made mechanical at the last door. It holds
+// the DSN to the shape the loader in internal/config accepts — a
+// postgres:// or postgresql:// URL whose path is exactly one database —
+// because anything else has already been refused as configuration, and a
+// shape the two doors disagree on would be a door a foreign DSN walks
+// through: a keyword-value string, a pathless URL naming its database in a
+// query parameter, or a double-slash path all parse differently at the
+// driver than a lenient trim would read them, and the driver's reading is
+// the one that dials. The DSN's grammar beyond scheme and path is the
+// driver's business, not this one: the driver refuses what it cannot parse,
+// and this package refuses what it must not open.
+//
+// Errors name the database and never the userinfo: the DSN carries the role's
+// password, and an error message is a log line waiting to happen.
+func validateDSN(dsn string) error {
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		// url.Parse quotes the string it rejected, credentials included, so
+		// its own text is deliberately not wrapped into this error.
+		return errors.New("postgres: DSN must be a postgres:// or postgresql:// URL")
+	}
+	if parsed.Scheme != "postgres" && parsed.Scheme != "postgresql" {
+		// A keyword-value DSN parses as a URL with no scheme and the whole
+		// string for a path — quoting the "database" it seems to name would
+		// quote the password — so the scheme is checked before anything is
+		// quoted, and this branch quotes nothing.
+		return errors.New("postgres: DSN must be a postgres:// or postgresql:// URL")
+	}
+	database := strings.TrimPrefix(parsed.Path, "/")
+	if database == "" || strings.Contains(database, "/") {
+		return errors.New("postgres: DSN must name exactly one database in its path")
+	}
+	if database != ownedDatabase {
+		return fmt.Errorf("postgres: DSN names database %q, but this application owns only the %s database (ADR 0006 §7): it dials its own plane's database and nothing else", database, ownedDatabase)
+	}
+	return nil
+}
+
+// withoutDSN returns err with any appearance of dsn in its text struck out.
+// The driver is trusted with the DSN — it cannot connect without it — but
+// not with quoting it back at the caller: pgx's parse errors embed the
+// connection string, and an error message is a log line waiting to happen.
+// When the text carries no DSN the error is returned unchanged, wrapping
+// intact, so errors.Is keeps working on the ordinary failure paths.
+func withoutDSN(err error, dsn string) error {
+	if err == nil || dsn == "" || !strings.Contains(err.Error(), dsn) {
+		return err
+	}
+	return errors.New(strings.ReplaceAll(err.Error(), dsn, "[redacted dsn]"))
 }
 
 // store is the PostgreSQL implementation of persistence.Store. It is one field,

@@ -38,6 +38,14 @@ const (
 	// sizes; inventing them before that is guessing with a straight face.
 	DefaultReadHeaderTimeout = 5 * time.Second
 
+	// ownedDatabase is the only database this application may be pointed at —
+	// the plane binding of ADR 0006 §7, checked in validatePostgresDSN and
+	// again by the persistence adapter (which carries a constant of the same
+	// name). It is a constant and not a setting: which database is this
+	// plane's is decided by the architecture, and a deployment that wants a
+	// different answer is misconfigured, not retuned.
+	ownedDatabase = "dataplane"
+
 	// DefaultPostgresDSN is the connection string used when
 	// DATAPLANE_POSTGRES_DSN is absent: the local development fixture from
 	// deploy/postgres/compose.yaml — one TimescaleDB cluster on this machine,
@@ -325,11 +333,11 @@ func validatePostgresDSN(name, dsn string) error {
 	if parsed.Scheme != "postgres" && parsed.Scheme != "postgresql" {
 		return fmt.Errorf("%s must use the postgres or postgresql scheme", name)
 	}
-	database := strings.Trim(parsed.Path, "/")
+	database := strings.TrimPrefix(parsed.Path, "/")
 	if database == "" || strings.Contains(database, "/") {
 		return fmt.Errorf("%s must name exactly one database in its path", name)
 	}
-	if database != "dataplane" {
+	if database != ownedDatabase {
 		return fmt.Errorf(
 			"%s names the %q database; this application owns only the dataplane database (ADR 0006 §7) and must not be configured against another plane's",
 			name, database)

@@ -341,7 +341,9 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				t.Fatalf("Load() error = %v", err)
 			}
 			if got != tt.want {
-				t.Errorf("Load() = %#v, want %#v", got, tt.want)
+				// Redacted, not %#v-raw: a dumped Config carries Postgres.DSN,
+				// and a test failure is CI output the whole world can read.
+				t.Errorf("Load() = %s, want %s", redactDSN(got), redactDSN(tt.want))
 			}
 		})
 	}
@@ -417,4 +419,11 @@ func lookup(values map[string]string) func(string) (string, bool) {
 		value, ok := values[name]
 		return value, ok
 	}
+}
+
+// redactDSN renders a Config for a test-failure message with the DSN struck
+// out: a raw %#v of the struct would quote Postgres.DSN, and a test failure
+// is CI output the whole world can read.
+func redactDSN(c Config) string {
+	return strings.ReplaceAll(fmt.Sprintf("%#v", c), c.Postgres.DSN, "<redacted dsn>")
 }

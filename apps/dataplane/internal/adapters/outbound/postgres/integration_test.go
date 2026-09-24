@@ -74,17 +74,17 @@ func integrationPlaneDSN(t *testing.T) string {
 	}
 
 	var exists bool
-	if err := adminDB.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", planeDatabase).Scan(&exists); err != nil {
-		t.Fatalf("looking up the %s database: %v", planeDatabase, err)
+	if err := adminDB.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", ownedDatabase).Scan(&exists); err != nil {
+		t.Fatalf("looking up the %s database: %v", ownedDatabase, err)
 	}
 	if !exists {
-		if _, err := adminDB.ExecContext(ctx, "CREATE DATABASE "+planeDatabase); err != nil {
-			t.Fatalf("CREATE DATABASE %s: %v — CI's admin DSN uses a role that may create databases; locally: docker compose -f deploy/postgres/compose.yaml exec postgres psql -U gateway -d postgres -c 'CREATE DATABASE %s'", planeDatabase, err, planeDatabase)
+		if _, err := adminDB.ExecContext(ctx, "CREATE DATABASE "+ownedDatabase); err != nil {
+			t.Fatalf("CREATE DATABASE %s: %v — CI's admin DSN uses a role that may create databases; locally: docker compose -f deploy/postgres/compose.yaml exec postgres psql -U gateway -d postgres -c 'CREATE DATABASE %s'", ownedDatabase, err, ownedDatabase)
 		}
 	}
 
 	plane := *admin
-	plane.Path = "/" + planeDatabase
+	plane.Path = "/" + ownedDatabase
 	return plane.String()
 }
 
@@ -103,17 +103,20 @@ func integrationPool(t *testing.T) (*sql.DB, persistence.Store) {
 		ConnMaxIdleTime: 30 * time.Second,
 	})
 	if err != nil {
-		t.Fatalf("Open() on the %s database error = %v", planeDatabase, err)
+		t.Fatalf("Open() on the %s database error = %v", ownedDatabase, err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db, New(db)
 }
 
-// integrationProbe creates the transaction probe table and drops it at
-// cleanup. The table is a test probe of the same nature as the DDL probes in
-// deploy/postgres/verify.sh — permanent, idempotent, empty of anything but
-// probe rows, and never part of the database's schema: migrations own that,
-// and this suite is not one.
+// integrationProbe creates the transaction probe table, empties it, and drops
+// it at cleanup. The table is a test probe of the same nature as the DDL
+// probes in deploy/postgres/verify.sh — permanent, idempotent, empty of
+// anything but probe rows, and never part of the database's schema:
+// migrations own that, and this suite is not one. The TRUNCATE is what makes
+// the table idempotent for concurrent runs and for the run after an aborted
+// one: a commit this suite leaves behind on a killed run is not allowed to
+// fail the next run's duplicate-key insert.
 func integrationProbe(t *testing.T, db *sql.DB) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -121,6 +124,9 @@ func integrationProbe(t *testing.T, db *sql.DB) {
 	const probe = "CREATE TABLE IF NOT EXISTS public.integration_tx_probe_dataplane (id integer NOT NULL PRIMARY KEY)"
 	if _, err := db.ExecContext(ctx, probe); err != nil {
 		t.Fatalf("creating the probe table: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "TRUNCATE public.integration_tx_probe_dataplane"); err != nil {
+		t.Fatalf("TRUNCATE public.integration_tx_probe_dataplane: %v", err)
 	}
 	dropCtx, cancelDrop := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(func() {
@@ -155,8 +161,8 @@ func TestIntegrationOpenServesThePlaneDatabase(t *testing.T) {
 	if err := store.Querier(ctx).QueryRowContext(ctx, "SELECT current_database()").Scan(&name); err != nil {
 		t.Fatalf("SELECT current_database(): %v", err)
 	}
-	if name != planeDatabase {
-		t.Errorf("current_database() = %q, want %q — the pool must point at the database this application owns", name, planeDatabase)
+	if name != ownedDatabase {
+		t.Errorf("current_database() = %q, want %q — the pool must point at the database this application owns", name, ownedDatabase)
 	}
 }
 
@@ -187,7 +193,7 @@ func TestIntegrationRefusesToStartAgainstAnotherPlanesDatabase(t *testing.T) {
 		_ = db.Close()
 		t.Fatal("Open() on the postgres database error = nil, want an ownership refusal")
 	}
-	if !strings.Contains(err.Error(), "serves the dataplane database only") {
+	if !strings.Contains(err.Error(), "owns only the dataplane database") {
 		t.Errorf("Open() error = %q, want the ownership boundary named", err)
 	}
 	if strings.Contains(err.Error(), foreignDSN) {
@@ -342,7 +348,7 @@ func TestIntegrationStartupValidationFailsFastAgainstAClosedPort(t *testing.T) {
 	// condition startup validation exists to catch.
 	closed := *admin
 	closed.Host = "127.0.0.1:1"
-	closed.Path = "/" + planeDatabase
+	closed.Path = "/" + ownedDatabase
 	closedDSN := closed.String()
 	credential, _ := admin.User.Password()
 
@@ -367,7 +373,10 @@ func TestIntegrationStartupValidationFailsFastAgainstAClosedPort(t *testing.T) {
 	if !strings.Contains(err.Error(), "ping") {
 		t.Errorf("Open() error = %q, want it wrapped as the open's ping failure", err)
 	}
-	if strings.Contains(err.Error(), closedDSN) || strings.Contains(err.Error(), credential) {
+	// The credential half needs a credential to look for: an admin DSN
+	// without a password (trust auth, a URL with no userinfo) yields an
+	// empty string, and Contains(anything, "") is always true.
+	if strings.Contains(err.Error(), closedDSN) || (credential != "" && strings.Contains(err.Error(), credential)) {
 		t.Errorf("Open() error = %q, want it to carry neither the DSN nor its credential", err)
 	}
 }

@@ -226,13 +226,12 @@ func bind(cfg config.Config) ([]service, error) {
 // every path: after the servers have drained on the stop path, so no request
 // still in flight loses its database mid-query, and immediately on the
 // listener-failed path, where nothing is being served at all. It arrives as
-// io.Closer because closing is the whole of what run does with it.
+// io.Closer because closing is the whole of what run does with it. A close
+// that fails is reported rather than buried: it is joined onto whatever run
+// is already returning, so the process exits non-zero even when the drain
+// itself was clean — the sibling composition root's contract, kept the same
+// here so the two copies read as one rule.
 func run(ctx context.Context, stop context.CancelFunc, services []service, shutdownTimeout time.Duration, pool io.Closer) error {
-	// The close's result has nothing to be reported to: the drain outcome run
-	// is about to return is the last word this process speaks, and a failed
-	// close after a successful drain would only bury it.
-	defer func() { _ = pool.Close() }()
-
 	// Buffered for the same reason as main's channel: each goroutine records
 	// its result and exits even if the select below never reads it.
 	errCh := make(chan error, len(services))
@@ -242,6 +241,7 @@ func run(ctx context.Context, stop context.CancelFunc, services []service, shutd
 		}(s)
 	}
 
+	var serveErr error
 	select {
 	case err := <-errCh:
 		// A listener failed on its own — a closed socket, a listener taken
@@ -249,14 +249,18 @@ func run(ctx context.Context, stop context.CancelFunc, services []service, shutd
 		// the listener and Serve reports it), and on this branch it cannot
 		// occur because Shutdown has not run.
 		if !errors.Is(err, stdhttp.ErrServerClosed) {
-			return err
+			serveErr = err
 		}
-		return nil
 
 	case <-ctx.Done():
 		stop()
-		return shutdown(services, shutdownTimeout)
+		serveErr = shutdown(services, shutdownTimeout)
 	}
+
+	if closeErr := pool.Close(); closeErr != nil {
+		serveErr = errors.Join(serveErr, closeErr)
+	}
+	return serveErr
 }
 
 // shutdown drains every listener and reports what went wrong, if anything did.

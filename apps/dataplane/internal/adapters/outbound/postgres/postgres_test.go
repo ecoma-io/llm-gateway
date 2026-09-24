@@ -402,7 +402,45 @@ func TestOpenValidatesItsOptionsBeforeTouchingADriver(t *testing.T) {
 				MaxOpenConns: 25, MaxIdleConns: 5,
 				ConnMaxLifetime: 30 * time.Minute, ConnMaxIdleTime: 5 * time.Minute,
 			},
-			wantErr: "this adapter serves the dataplane database only",
+			wantErr: "owns only the dataplane database",
+		},
+		{
+			// A keyword-value DSN parses as a URL with no scheme and the
+			// whole string for a path. The refusal must come from the scheme
+			// check, quoting nothing — an error that quoted the "database"
+			// this DSN seems to name would quote its password.
+			name: "refuses a keyword-value DSN without quoting it",
+			options: Options{
+				DSN:          "host=127.0.0.1 port=5432 dbname=control user=gateway password=not-the-fixture-password",
+				MaxOpenConns: 25, MaxIdleConns: 5,
+				ConnMaxLifetime: 30 * time.Minute, ConnMaxIdleTime: 5 * time.Minute,
+			},
+			wantErr: "postgres:// or postgresql:// URL",
+		},
+		{
+			// The database named in a query parameter is not the database in
+			// the path, and the path is what the binding reads: a pathless
+			// URL would otherwise let pgconn's own default — or its dbname
+			// parameter — pick the database the adapter never agreed to.
+			name: "refuses a pathless DSN naming its database as a parameter",
+			options: Options{
+				DSN:          "postgres://gateway:not-the-fixture-password@127.0.0.1:5432?dbname=control&sslmode=disable",
+				MaxOpenConns: 25, MaxIdleConns: 5,
+				ConnMaxLifetime: 30 * time.Minute, ConnMaxIdleTime: 5 * time.Minute,
+			},
+			wantErr: "must name exactly one database in its path",
+		},
+		{
+			// One leading slash is the path's separator; a second one is
+			// part of the database name this door reads, while the driver
+			// trims it away. The two readings must never both pass.
+			name: "refuses a double-slash database path",
+			options: Options{
+				DSN:          "postgres://gateway:not-the-fixture-password@127.0.0.1:5432//dataplane",
+				MaxOpenConns: 25, MaxIdleConns: 5,
+				ConnMaxLifetime: 30 * time.Minute, ConnMaxIdleTime: 5 * time.Minute,
+			},
+			wantErr: "must name exactly one database in its path",
 		},
 	}
 
@@ -419,6 +457,9 @@ func TestOpenValidatesItsOptionsBeforeTouchingADriver(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("Open() error = %q, want it to contain %q", err, tt.wantErr)
+			}
+			if strings.Contains(err.Error(), "not-the-fixture-password") {
+				t.Errorf("Open() error = %q, must not carry the DSN's password", err)
 			}
 		})
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	stdhttp "net/http"
@@ -20,14 +21,16 @@ import (
 // recordingPool stands in for the database pool run closes on its way out, and
 // records that the close happened — a process that drained its listeners and
 // left its pool open would hold database connections past the point the
-// process was told to stop.
+// process was told to stop. closeErr is what Close answers, so a test can
+// make the close fail and hold run to its promise of reporting it.
 type recordingPool struct {
-	closed bool
+	closed   bool
+	closeErr error
 }
 
 func (p *recordingPool) Close() error {
 	p.closed = true
-	return nil
+	return p.closeErr
 }
 
 func TestRunDrainsAnInFlightRequestBeforeReturning(t *testing.T) {
@@ -176,6 +179,33 @@ func TestRunReportsAListenerThatFailsOnItsOwn(t *testing.T) {
 	}
 	if !pool.closed {
 		t.Error("run() left the pool open after returning — a dead listener is still a return")
+	}
+}
+
+func TestRunReportsAPoolThatWillNotCloseCleanly(t *testing.T) {
+	// A pool that fails to close after an otherwise clean drain is a defect
+	// the process must not exit green through: run reports it even though
+	// nothing else went wrong — the sibling composition root's contract, so
+	// an operator never sees exit 0 from a process whose database
+	// connections are still open.
+	listener := listenForTest(t)
+	pool := &recordingPool{closeErr: errors.New("close: still busy")}
+
+	server := &stdhttp.Server{Handler: stdhttp.HandlerFunc(func(_ stdhttp.ResponseWriter, _ *stdhttp.Request) {})}
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, stop, []service{{name: "runtime", server: server, listener: listener}}, time.Second, pool)
+	}()
+
+	stop()
+	if err := <-done; err == nil {
+		t.Fatal("run() error = nil, want the pool-close failure carried out of a clean drain")
+	} else if !strings.Contains(err.Error(), "close: still busy") {
+		t.Errorf("run() error = %q, want it to carry the close failure", err)
+	}
+	if !pool.closed {
+		t.Error("run() never closed the pool")
 	}
 }
 
