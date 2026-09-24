@@ -326,6 +326,14 @@ assert_equals "the Control Plane's public schema holds no second table" \
 	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")" "1"
 assert_equals "the Data Plane's database has no control namespace" \
 	"$(psql_scalar "$dataplane_db" "SELECT count(*) FROM pg_namespace WHERE nspname = '$control_db'")" "0"
+# The isolation block's mirror of step 5's installed-half proof: timescaledb
+# lives in the Data Plane's database and none other. The bootstrap migration
+# is the only file in the repository that spells CREATE EXTENSION, so this
+# count stays zero unless a future migration crosses the lane boundary — the
+# exact violation migrations/README.md and persistence.md call out, caught
+# here rather than trusted to the lane's directory layout.
+assert_equals "the Control Plane's database carries no timescaledb extension" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_extension WHERE extname = 'timescaledb'")" "0"
 assert_equals "each plane records its own applied history" \
 	"$(psql_scalar "$dataplane_db" "SELECT to_regclass('public.schema_migrations') IS NOT NULL")|$(psql_scalar "$control_db" "SELECT to_regclass('public.schema_migrations') IS NOT NULL")" \
 	"t|t"
