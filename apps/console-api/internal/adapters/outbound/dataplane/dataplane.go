@@ -176,8 +176,8 @@ func (c *Client) ReadUsageEvents(ctx context.Context, after string, limit int) (
 	switch response.StatusCode {
 	case http.StatusOK:
 		// The page is decoded below; JSON is the only shape the contract
-		// declares, and a peer that answers something else fails the decode
-		// rather than being guessed at.
+		// declares, and a peer that answers something else fails the decode,
+		// which is classified as a malformed page rather than being guessed at.
 	case http.StatusGone:
 		// The stored position is no longer replayable. It is the one failure of
 		// the operation the Control Plane can act on differently from all the
@@ -193,9 +193,15 @@ func (c *Client) ReadUsageEvents(ctx context.Context, after string, limit int) (
 		return port.Page{}, fmt.Errorf("dataplane: read usage events: unexpected status %d", response.StatusCode)
 	}
 
+	// A 200 whose body will not decode is not an unknown answer: the status
+	// promised a page and the body broke the promise — truncated, another
+	// media type, or a required field carrying a value of the wrong type. The
+	// port has one name for an answer that arrived and is wrong, so this
+	// classifies with the refusals below rather than surfacing as a bare
+	// decode error, the shape a failure of transport would take.
 	var body pageResponse
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
-		return port.Page{}, fmt.Errorf("dataplane: decode the usage events page: %w", err)
+		return port.Page{}, fmt.Errorf("%w: the body would not decode as a page: %w", port.ErrMalformedPage, err)
 	}
 	page, err := body.page()
 	if err != nil {
@@ -215,66 +221,110 @@ func (c *Client) ReadUsageEvents(ctx context.Context, after string, limit int) (
 // in this repository exists: JSON tags and wire spellings are the transport's
 // vocabulary, and the port's types stay free of them.
 //
-// Of the contract's constraints, this decode checks exactly two, and the line
-// between them and everything else is the whole design. `next_cursor` must be
-// present and no longer than a cursor can be — both statements about the
-// envelope, both decidable without knowing what a cursor is. What is left
-// alone is everything that would require understanding the page: the enum of
-// kinds belongs to the applier, which is the only code that knows which ones
-// this build can settle; the payload's shape belongs to the schema that wrote
-// it; and the cursor's meaning belongs to the Data Plane that issued it. A
-// consumer that re-checked those would be interpreting a value whose only
-// promise is that it may be returned verbatim, and the one thing this side must
-// never do with a cursor is decide what a valid one looks like.
+// Every field the contract marks required is a pointer. With a plain value,
+// encoding/json answers a body that omits the field — or carries it as null —
+// with the Go zero value, and the page reads as well-formed all the way to the
+// durable position it moves; with a pointer, both shapes land on a nil, which
+// page below refuses. A field that is present decodes exactly as it did
+// before, and a field the contract does not name is still ignored, so the
+// tolerance the decoder keeps is untouched.
+//
+// Of the contract's constraints, this decode checks presence and exactly one
+// bound, and the line between them and everything else is the whole design.
+// The envelope's three fields and each fact's five must be there, and a cursor
+// may be no longer than a cursor can be — all statements about the declared
+// shape, all decidable without knowing what a cursor or a fact means. What is
+// left alone is everything that would require understanding the page: the enum
+// of kinds belongs to the applier, which is the only code that knows which
+// ones this build can settle; the payload's shape belongs to the schema that
+// wrote it; and the cursor's meaning belongs to the Data Plane that issued it.
+// A consumer that re-checked those would be interpreting a value whose only
+// promise is that it may be returned verbatim, and the one thing this side
+// must never do with a cursor is decide what a valid one looks like.
 type pageResponse struct {
-	Events     []eventResponse `json:"events"`
-	NextCursor string          `json:"next_cursor"`
-	HasMore    bool            `json:"has_more"`
+	Events     *[]eventResponse `json:"events"`
+	NextCursor *string          `json:"next_cursor"`
+	HasMore    *bool            `json:"has_more"`
 }
 
 // eventResponse is one UsageEvent on the wire. OccurredAt is decoded as a
-// time.Time because the contract types it as an RFC 3339 date-time, and a
+// *time.Time because the contract types it as an RFC 3339 date-time, and a
 // consumer that cannot parse one is looking at a response it cannot trust to
-// have carried a page at all — the decode fails loudly instead. Payload stays
-// raw: its columns belong to the schema that wrote the fact.
+// have carried a page at all — the decode fails loudly instead, and a body
+// that never carried the field is a nil rather than an instant that looks like
+// the beginning of time. Payload stays raw: its columns belong to the schema
+// that wrote the fact.
 type eventResponse struct {
-	RequestID     string          `json:"request_id"`
-	Kind          string          `json:"kind"`
-	SchemaVersion int             `json:"schema_version"`
-	OccurredAt    time.Time       `json:"occurred_at"`
-	Payload       json.RawMessage `json:"payload"`
+	RequestID     *string          `json:"request_id"`
+	Kind          *string          `json:"kind"`
+	SchemaVersion *int             `json:"schema_version"`
+	OccurredAt    *time.Time       `json:"occurred_at"`
+	Payload       *json.RawMessage `json:"payload"`
 }
 
 // page translates the wire shape into the port's, one field at a time so a
 // field added to one and not the other is a compile-time omission rather than
-// a silent zero — and refuses the two ways the answer can fail to be a page at
+// a silent zero — and refuses every way the answer can fail to be a page at
 // all.
 //
 // The refusal is a precondition on the translation rather than an extra rule
 // on top of it. Every field below is copied verbatim, and the only reason the
 // copy is conditional is that the port's Page promises a position a consumer
-// can store: a value out of the contract's declared shape would be a page that
-// broke that promise, and a caller that received it anyway would go on to
-// advance a durable cursor with it.
+// can store and facts a consumer can settle from: a page out of the contract's
+// declared shape would be a page that broke that promise, and a caller that
+// received it anyway would go on to advance a durable cursor with it. The
+// whole page is refused when one fact in it fails, so a body that cannot be
+// read whole is never applied in part.
 func (r pageResponse) page() (port.Page, error) {
-	if r.NextCursor == "" {
+	switch {
+	case r.Events == nil:
+		return port.Page{}, fmt.Errorf("%w: the page carried no events field, which the contract requires", port.ErrMalformedPage)
+	case r.NextCursor == nil:
+		return port.Page{}, fmt.Errorf("%w: the page carried no next_cursor field, which the contract requires", port.ErrMalformedPage)
+	case *r.NextCursor == "":
 		return port.Page{}, fmt.Errorf("%w: the page carried no next_cursor, so there is no position to advance to", port.ErrMalformedPage)
-	}
-	if utf8.RuneCountInString(r.NextCursor) > usageCursorMaxLength {
-		return port.Page{}, fmt.Errorf("%w: the page's next_cursor is %d characters long and the contract allows %d", port.ErrMalformedPage, utf8.RuneCountInString(r.NextCursor), usageCursorMaxLength)
+	case utf8.RuneCountInString(*r.NextCursor) > usageCursorMaxLength:
+		return port.Page{}, fmt.Errorf("%w: the page's next_cursor is %d characters long and the contract allows %d", port.ErrMalformedPage, utf8.RuneCountInString(*r.NextCursor), usageCursorMaxLength)
+	case r.HasMore == nil:
+		return port.Page{}, fmt.Errorf("%w: the page carried no has_more field, which the contract requires", port.ErrMalformedPage)
 	}
 
-	events := make([]port.Event, 0, len(r.Events))
-	for _, event := range r.Events {
-		events = append(events, port.Event{
-			RequestID:     event.RequestID,
-			Kind:          event.Kind,
-			SchemaVersion: event.SchemaVersion,
-			OccurredAt:    event.OccurredAt,
-			Payload:       event.Payload,
-		})
+	events := make([]port.Event, 0, len(*r.Events))
+	for _, event := range *r.Events {
+		one, err := event.event()
+		if err != nil {
+			return port.Page{}, err
+		}
+		events = append(events, one)
 	}
-	return port.Page{Events: events, NextCursor: r.NextCursor, HasMore: r.HasMore}, nil
+	return port.Page{Events: events, NextCursor: *r.NextCursor, HasMore: *r.HasMore}, nil
+}
+
+// event translates one fact into the port's vocabulary, refusing it when any
+// of the five fields the contract marks required is absent or null. Presence
+// is the only judgement: an empty request_id, a kind this build has never
+// heard of and a schema_version it does not know all cross — deciding which of
+// them can settle is the applier's, below the port.
+func (r eventResponse) event() (port.Event, error) {
+	switch {
+	case r.RequestID == nil:
+		return port.Event{}, fmt.Errorf("%w: the page carries a fact with no request_id, which the contract requires", port.ErrMalformedPage)
+	case r.Kind == nil:
+		return port.Event{}, fmt.Errorf("%w: the page carries a fact with no kind, which the contract requires", port.ErrMalformedPage)
+	case r.SchemaVersion == nil:
+		return port.Event{}, fmt.Errorf("%w: the page carries a fact with no schema_version, which the contract requires", port.ErrMalformedPage)
+	case r.OccurredAt == nil:
+		return port.Event{}, fmt.Errorf("%w: the page carries a fact with no occurred_at, which the contract requires", port.ErrMalformedPage)
+	case r.Payload == nil:
+		return port.Event{}, fmt.Errorf("%w: the page carries a fact with no payload, which the contract requires", port.ErrMalformedPage)
+	}
+	return port.Event{
+		RequestID:     *r.RequestID,
+		Kind:          *r.Kind,
+		SchemaVersion: *r.SchemaVersion,
+		OccurredAt:    *r.OccurredAt,
+		Payload:       *r.Payload,
+	}, nil
 }
 
 // transportCause strips the URL net/http attaches to a failed request.

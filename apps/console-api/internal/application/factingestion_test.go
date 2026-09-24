@@ -405,6 +405,57 @@ func TestAPageWithNoPositionIsRefusedBeforeAnythingIsWritten(t *testing.T) {
 	}
 }
 
+// TestAMalformedPageLeavesThePositionAndRefetchesTheSameRange is the
+// ingestion-level half of the malformed-page invariant: whatever the reader's
+// reason for refusing a page — and after the outbound adapter's hardening, a
+// 200 whose required fields are absent or null arrives as exactly this error —
+// the durable position must not move and nothing may be applied. The second
+// pass asks for the same range and, the feed now answering, applies it: a
+// refused page delays the flow, it never skips a fact.
+func TestAMalformedPageLeavesThePositionAndRefetchesTheSameRange(t *testing.T) {
+	const position = "cursor-1"
+
+	world := newWorld()
+	world.position = position
+	world.readErr = dataplane.ErrMalformedPage
+
+	_, err := newIngestion(world).Replay(context.Background())
+	if !errors.Is(err, dataplane.ErrMalformedPage) {
+		t.Fatalf("Replay() error = %v, want it to wrap %v", err, dataplane.ErrMalformedPage)
+	}
+	if got, want := world.position, position; got != want {
+		t.Errorf("position = %q, want %q unchanged: a page the reader refused must not move the consumer's position", got, want)
+	}
+	if len(world.effects) != 0 {
+		t.Errorf("the applier recorded %d effect(s), want 0: a refused page is not applied either", len(world.effects))
+	}
+	if len(world.order) != 0 {
+		t.Errorf("the flow observed %v, want nothing: no unit of work is opened for a page that could not be read", world.order)
+	}
+
+	// The next pass asks for the same range and gets a page this time, which
+	// is the whole point of not advancing: the range is still there to read.
+	world.readErr = nil
+	world.pages[position] = dataplane.Page{
+		Events:     []dataplane.Event{factEvent("req-1", "settled")},
+		NextCursor: "cursor-2",
+		HasMore:    false,
+	}
+	result, err := newIngestion(world).Replay(context.Background())
+	if err != nil {
+		t.Fatalf("second Replay() error = %v, want nil", err)
+	}
+	if got, want := result.Applied, 1; got != want {
+		t.Errorf("Applied = %d, want %d", got, want)
+	}
+	if got, want := world.position, "cursor-2"; got != want {
+		t.Errorf("position = %q, want %q after the valid page", got, want)
+	}
+	if got, want := world.reads, []string{position, position}; !slices.Equal(got, want) {
+		t.Errorf("the Data Plane was asked for %v, want %v", got, want)
+	}
+}
+
 // TestAFailedPositionReadOpensNoUnitOfWork is the same guard one step earlier:
 // if the Control Plane cannot read where it is, nothing else in the flow runs.
 func TestAFailedPositionReadOpensNoUnitOfWork(t *testing.T) {

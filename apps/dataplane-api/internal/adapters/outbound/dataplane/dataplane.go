@@ -211,16 +211,19 @@ func (c *Client) request(ctx context.Context, after string, limit int) (*stdhttp
 // answering with part of a page would be this process deciding which facts a
 // consumer gets to see.
 //
-// A page whose `next_cursor` is missing or over-long is refused for the same
-// reason and not a different one, and the reason is worth stating where the
-// check sits rather than where it is documented. The façade contracts
-// `next_cursor` — required, at least one character, at most 512 — so a body
-// that carries none, or carries one longer than the contract's own bound, is a
-// body this application cannot write out without contradicting the document it
-// answers under. The check is the façade keeping its own promise, which is why
-// it is here and not delegated to the consumer: the consumer has its own
-// promise to keep, about the position it stores, and one of the two keeping it
-// does not excuse the other.
+// It is equally intolerant of a body that is missing one of the fields the
+// contract marks required, and the wire shapes below are written so that such
+// a body is refused rather than filled in. The façade contracts `next_cursor`
+// — required, at least one character, at most 512 — so a body that carries
+// none, or carries one longer than the contract's own bound, is a body this
+// application cannot write out without contradicting the document it answers
+// under. The same holds for the page's other two envelope fields and for the
+// five fields of every fact: a `has_more` filled in as false would read as a
+// drained feed, and a fact without its request_id would be a settlement
+// derived from nothing. The check is the façade keeping its own promise, which
+// is why it is here and not delegated to the consumer: the consumer has its
+// own promise to keep, about the position it stores, and one of the two
+// keeping it does not excuse the other.
 //
 // Nothing here reads the cursor. An admissible value crosses byte for byte;
 // what is decided is only whether a value this façade may put on the wire
@@ -230,29 +233,68 @@ func (c *Client) page(response *stdhttp.Response) (dataplane.Page, error) {
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
 		return dataplane.Page{}, fmt.Errorf("%w: the data plane answered with a body this facade cannot read", dataplane.ErrUpstreamUnavailable)
 	}
+	return body.page()
+}
 
+// page validates the decoded body and translates it into the port's Page. The
+// order is the contract's: the envelope first, because a body that fails there
+// is not a page at all, then every fact — and the whole page is refused when
+// any one of them is, so a body that cannot be read whole is never answered
+// from in part.
+func (b pageBody) page() (dataplane.Page, error) {
 	switch {
-	case body.NextCursor == "":
+	case b.Events == nil:
+		return dataplane.Page{}, fmt.Errorf("%w: the data plane answered with a page carrying no events field, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
+	case b.NextCursor == nil:
+		return dataplane.Page{}, fmt.Errorf("%w: the data plane answered with a page carrying no next_cursor field, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
+	case *b.NextCursor == "":
 		return dataplane.Page{}, fmt.Errorf("%w: the data plane answered with a page carrying no next_cursor, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
-	case utf8.RuneCountInString(body.NextCursor) > usageCursorMaxLength:
-		return dataplane.Page{}, fmt.Errorf("%w: the data plane answered with a next_cursor of %d characters, past the %d this surface contracts", dataplane.ErrUpstreamUnavailable, utf8.RuneCountInString(body.NextCursor), usageCursorMaxLength)
+	case utf8.RuneCountInString(*b.NextCursor) > usageCursorMaxLength:
+		return dataplane.Page{}, fmt.Errorf("%w: the data plane answered with a next_cursor of %d characters, past the %d this surface contracts", dataplane.ErrUpstreamUnavailable, utf8.RuneCountInString(*b.NextCursor), usageCursorMaxLength)
+	case b.HasMore == nil:
+		return dataplane.Page{}, fmt.Errorf("%w: the data plane answered with a page carrying no has_more field, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
 	}
 
 	page := dataplane.Page{
-		Events:     make([]dataplane.Event, 0, len(body.Events)),
-		NextCursor: body.NextCursor,
-		HasMore:    body.HasMore,
+		Events:     make([]dataplane.Event, 0, len(*b.Events)),
+		NextCursor: *b.NextCursor,
+		HasMore:    *b.HasMore,
 	}
-	for _, event := range body.Events {
-		page.Events = append(page.Events, dataplane.Event{
-			RequestID:     event.RequestID,
-			Kind:          event.Kind,
-			SchemaVersion: event.SchemaVersion,
-			OccurredAt:    event.OccurredAt,
-			Payload:       event.Payload,
-		})
+	for _, event := range *b.Events {
+		one, err := event.event()
+		if err != nil {
+			return dataplane.Page{}, err
+		}
+		page.Events = append(page.Events, one)
 	}
 	return page, nil
+}
+
+// event translates one fact into the port's vocabulary, refusing it when any
+// of the five fields the contract marks required is absent or null. Presence
+// is the only judgement: an empty request_id, a schema_version this build does
+// not know and a payload whose shape this build does not interpret all cross —
+// which of them can settle is the consumer's decision, made below the port.
+func (e eventBody) event() (dataplane.Event, error) {
+	switch {
+	case e.RequestID == nil:
+		return dataplane.Event{}, fmt.Errorf("%w: the data plane answered with a fact carrying no request_id, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
+	case e.Kind == nil:
+		return dataplane.Event{}, fmt.Errorf("%w: the data plane answered with a fact carrying no kind, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
+	case e.SchemaVersion == nil:
+		return dataplane.Event{}, fmt.Errorf("%w: the data plane answered with a fact carrying no schema_version, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
+	case e.OccurredAt == nil:
+		return dataplane.Event{}, fmt.Errorf("%w: the data plane answered with a fact carrying no occurred_at, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
+	case e.Payload == nil:
+		return dataplane.Event{}, fmt.Errorf("%w: the data plane answered with a fact carrying no payload, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
+	}
+	return dataplane.Event{
+		RequestID:     *e.RequestID,
+		Kind:          *e.Kind,
+		SchemaVersion: *e.SchemaVersion,
+		OccurredAt:    *e.OccurredAt,
+		Payload:       *e.Payload,
+	}, nil
 }
 
 // pageBody and eventBody are the wire shapes of the private listener's answer,
@@ -269,19 +311,29 @@ func (c *Client) page(response *stdhttp.Response) (dataplane.Page, error) {
 // makes the façade's answer a re-encoding of what it read rather than a relay of
 // it — the two shapes coincide today, and the code does not assume they must.
 //
-// OccurredAt is a time.Time so that encoding/json parses the contract's
+// Every field the contract marks required is a pointer. With a plain value,
+// encoding/json answers a body that omits the field — or carries it as null —
+// with the Go zero value, and the page reads as well-formed all the way to a
+// consumer that stores or settles on it; with a pointer, both shapes land on a
+// nil, which page above refuses. A field that is present decodes exactly as it
+// did before, and a field the contract does not name is still ignored, so the
+// tolerance the decoder keeps is untouched.
+//
+// OccurredAt is a *time.Time so that encoding/json parses the contract's
 // RFC 3339 itself. A timestamp the runtime could not write is then a decode
-// failure rather than a zero value travelling onward as if it meant something.
+// failure rather than a zero value travelling onward as if it meant something,
+// and one it never wrote at all is a nil rather than an instant that looks
+// like the beginning of time.
 type pageBody struct {
-	Events     []eventBody `json:"events"`
-	NextCursor string      `json:"next_cursor"`
-	HasMore    bool        `json:"has_more"`
+	Events     *[]eventBody `json:"events"`
+	NextCursor *string      `json:"next_cursor"`
+	HasMore    *bool        `json:"has_more"`
 }
 
 type eventBody struct {
-	RequestID     string          `json:"request_id"`
-	Kind          string          `json:"kind"`
-	SchemaVersion int             `json:"schema_version"`
-	OccurredAt    time.Time       `json:"occurred_at"`
-	Payload       json.RawMessage `json:"payload"`
+	RequestID     *string          `json:"request_id"`
+	Kind          *string          `json:"kind"`
+	SchemaVersion *int             `json:"schema_version"`
+	OccurredAt    *time.Time       `json:"occurred_at"`
+	Payload       *json.RawMessage `json:"payload"`
 }

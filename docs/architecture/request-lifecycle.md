@@ -137,6 +137,10 @@ Control Plane settlement          ── derived from the fact, idempotent by re
   position and the Control Plane stores the `next_cursor` of the last page it
   applied, in the same local transaction that records the effects of those
   facts. The runtime never learns that position, and no consumer may parse it.
+  A page is acknowledged only after its required envelope and event fields have
+  been validated — a malformed page is rejected before anything is applied and
+  before the position moves, so the same range is read again rather than
+  crossed.
 - **Redelivery is the norm, not an error.** There is no acknowledgement, no
   consume-and-delete and no completion signal: the same page may be read any
   number of times, and applying a fact twice is a no-op because `request_id` is

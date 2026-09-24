@@ -38,14 +38,13 @@ const usageFactsPath = "../../../../../../api/openapi/shared/usage-facts.yaml"
 // names this adapter reads to the ones the contract declares.
 //
 // A decode is the place where a renamed field is most quietly wrong. `events`,
-// `next_cursor` and `has_more` are three strings in a struct tag; if the Data
-// Plane's side of the agreement moved and this one did not, `json` would leave
-// the field at its zero value rather than fail — an empty cursor, an empty
-// event list, a `has_more` of false — and the refusal in `page()` would be the
-// only thing standing between a silent rename and a consumer that stores an
-// empty position. That refusal is a good line and a poor substitute for knowing
-// the names, because it catches a rename only where it is dangerous and not
-// where it is merely wrong.
+// `next_cursor` and `has_more` are three strings in a struct tag, and so are
+// the five fields of a fact. The decoder refuses a required field that arrives
+// absent or null, so a rename on one side no longer lands on a usable zero
+// value — but that refusal is measured against the tags themselves, and tags
+// that moved together would agree with each other and with nothing else. What
+// follows reads the contract instead, so the one file both planes claim to
+// implement is the thing the code is measured against.
 func TestThePageThisAdapterDecodesIsThePageTheContractDescribes(t *testing.T) {
 	document := scanContract(t, usageFactsPath)
 

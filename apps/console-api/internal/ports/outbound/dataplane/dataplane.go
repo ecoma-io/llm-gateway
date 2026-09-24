@@ -125,8 +125,9 @@ type Page struct {
 var ErrCursorExpired = errors.New("usage fact cursor is no longer replayable")
 
 // ErrMalformedPage reports that the Data Plane answered with a page that is not
-// one the contract describes — no position to advance to, or a position longer
-// than a cursor can be.
+// one the contract describes — a body that would not decode as a page, a field
+// the contract requires that arrived absent or null, or a position that is
+// absent, empty or longer than a cursor can be.
 //
 // It is separate from the other failures because it is a different kind of
 // event: the answer arrived, and it is wrong. A transport failure says the
@@ -180,9 +181,10 @@ type UsageFacts interface {
 	// resuming silently would lose the facts in between.
 	//
 	// A Page returned here is one the consumer may act on, which puts the
-	// page's shape — a non-empty position, bounded in length — inside this
-	// method's contract rather than in its caller's. An implementation that
-	// handed back a page it had not checked would be delegating a wire
-	// question to code that does not read the wire.
+	// page's shape — every field the contract requires, and a non-empty
+	// position bounded in length — inside this method's contract rather than
+	// in its caller's. An implementation that handed back a page it had not
+	// checked would be delegating a wire question to code that does not read
+	// the wire.
 	ReadUsageEvents(ctx context.Context, after string, limit int) (Page, error)
 }
