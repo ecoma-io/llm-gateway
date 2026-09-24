@@ -154,15 +154,16 @@ recorded_version() {
 }
 
 # lane_drift_check proves one lane's directory holds exactly what the runner
-# will read: files named `NNNNNN_<name>.sql` and nothing else, exactly one
-# `.up.sql` and one `.down.sql` per version, and versions forming 1..N with
-# no gap and no duplicate. golang-migrate records versions, not contents, and
-# refuses neither a gap nor a stray file — a lane that drifted would still
-# apply, and nothing else in this repository would notice. This check is the
-# drift detection the pipeline relies on: the accepted "no checksum" gap in
-# deploy/postgres/README.md's safety model, narrowed to what a directory
-# listing can prove. Pure shell over migrations/ — it needs no database, so
-# it runs before the cluster starts and fails before anything is pulled.
+# will read: files named `NNNNNN_<name>.up.sql` or `NNNNNN_<name>.down.sql`
+# and nothing else, exactly one `.up.sql` and one `.down.sql` per version, and
+# versions forming 1..N with no gap and no duplicate. golang-migrate records
+# versions, not contents, and refuses neither a gap nor a stray file — a lane
+# that drifted would still apply, and nothing else in this repository would
+# notice. This check is the drift detection the pipeline relies on: the
+# accepted "no checksum" gap in deploy/postgres/README.md's safety model,
+# narrowed to what a directory listing can prove. Pure shell over
+# migrations/ — it needs no database, so it runs before the cluster starts
+# and fails before anything is pulled.
 lane_drift_check() {
 	local lane="$1"
 	local lane_dir="$repo_root/migrations/$lane"
@@ -172,13 +173,16 @@ lane_drift_check() {
 	# The shape check doubles as the non-empty check: an empty (or missing)
 	# lane leaves this glob unexpanded, the literal `*` matches nothing it
 	# should, and the suite fails here rather than at the runner with
-	# `first .: file does not exist`.
+	# `first .: file does not exist`. The direction suffix is part of the
+	# shape, not an afterthought: a bare `NNNNNN_<name>.sql` carries no
+	# direction, lands in neither list below, and would drift through every
+	# other check here while the runner's source silently skipped it.
 	for file in "$lane_dir"/*; do
 		name="$(basename "$file")"
 		case "$name" in
-		[0-9][0-9][0-9][0-9][0-9][0-9]_*.sql) ;;
+		[0-9][0-9][0-9][0-9][0-9][0-9]_*.up.sql | [0-9][0-9][0-9][0-9][0-9][0-9]_*.down.sql) ;;
 		*)
-			printf 'FAIL: migrations/%s/ holds %q — a lane holds nothing but files named NNNNNN_<name>.sql\n' "$lane" "$name" >&2
+			printf 'FAIL: migrations/%s/ holds %q — a lane holds nothing but files named NNNNNN_<name>.up.sql and NNNNNN_<name>.down.sql\n' "$lane" "$name" >&2
 			exit 1
 			;;
 		esac

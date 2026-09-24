@@ -20,9 +20,11 @@
 -- first time.
 --
 -- No IF NOT EXISTS, unlike the Data Plane's bootstrap: nothing pre-creates
--- this schema — the timescaledb image extends `template1` with an extension,
--- not with a namespace — so there is no honest no-op to record here. An
--- existing `control` schema would be an unexpected fact about this database,
--- and the migration fails loudly on it rather than adopting it.
+-- this schema. The cluster's initdb builds two empty plane databases and
+-- nothing else in them — the timescaledb extension is installed by the Data
+-- Plane's own bootstrap migration, into that lane's database and none other —
+-- so there is no honest no-op to record here. An existing `control` schema
+-- would be an unexpected fact about this database, and the migration fails
+-- loudly on it rather than adopting it.
 CREATE SCHEMA control;
 COMMENT ON SCHEMA control IS 'Control Plane ownership namespace (ADR 0006 §7); owned by apps/console-api.';
