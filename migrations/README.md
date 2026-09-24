@@ -15,20 +15,23 @@ The split is the database split (ADR 0006 §7), not a filing convention:
 | `migrations/control/`   | `control`   | `apps/console-api` — the Control Plane API |
 | `migrations/dataplane/` | `dataplane` | `apps/dataplane` — the Data Plane runtime  |
 
-Both lanes exist. The Control Plane's first pair establishes its ownership
-namespace, and nothing else: ADR 0006 §5 writes the Control Plane's future
-position table as `control.usage_ingestion_cursor` — schema-qualified — so
-Control Plane migrations keep their domain tables in the `control` schema,
-while the ADRs name the Data Plane's tables bare (`usage_events`,
-`request_intake`) and its lane stays on the default namespace. The namespace
-migrates first, on purpose: the schema change that lands the first Control
-Plane table should arrive on a lane the suite has already exercised end to
-end — applied, re-applied, rolled back — rather than ask an unexercised
-pipeline to prove itself while carrying real schema. (Until that first pair
-landed, the lane was absent rather than empty: golang-migrate refuses a lane
-with no files (`first .: file does not exist`), so an empty
-`migrations/control/` would have read as a working lane that failed the
-moment anyone used it.)
+Both lanes exist. The Control Plane's lane opens with its ownership
+namespace — `000001_control_foundation` creates the `control` schema and
+nothing else, because ADR 0006 §5 writes the Control Plane's future position
+table as `control.usage_ingestion_cursor` — schema-qualified — so Control
+Plane migrations keep their domain tables in the `control` schema, while the
+ADRs name the Data Plane's tables bare (`usage_events`, `request_intake`)
+and its lane stays on the default namespace. The namespace migrated first,
+on purpose: the schema change that lands the first Control Plane table
+arrived on a lane the suite had already exercised end to end — applied,
+re-applied, rolled back — rather than ask an unexercised pipeline to prove
+itself while carrying real schema. It is followed by
+`000002_identity_foundation`, the ownership root (ADR 0001) every later
+control-side migration stands on and the lane's first business schema,
+landed in the namespace the first pair created. The Data Plane's lane opens
+with its timescaledb bootstrap. The two lanes number independently: each
+counts from `000001`, because golang-migrate records versions in the
+database it migrates.
 
 A migration belongs to exactly one lane, and its lane decides the database it
 is applied to: the runner's lane argument points `-path` and `-database` at

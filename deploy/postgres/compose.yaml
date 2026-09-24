@@ -121,7 +121,8 @@ services:
   # editing a path here, which is what keeps "a migration is applied to the
   # database its plane owns" a property of this file rather than of whoever
   # typed the command. The default is `dataplane`, so the bare command keeps
-  # meaning the lane that has shipped the longest:
+  # meaning the lane that has shipped the longest; the Control Plane's lane is
+  # selected the same way:
   #
   #   GATEWAY_MIGRATE_LANE=control ... run --rm migrate up
   migrate:
