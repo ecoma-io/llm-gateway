@@ -36,11 +36,14 @@
 // port's cursor, which is what makes the Control Plane's position durable; no
 // process constructs that use case yet, because the loop that calls it arrives
 // with the schema the facts are stored in. Management still has neither an
-// adapter nor a use case, and gets both when the API-key lifecycle lands. The
-// port exists ahead of its callers because the seam has to exist before either
-// side of it is built, and because its absence would leave a future author
-// with no recorded answer to "how does the Control Plane talk to the Data
-// Plane?".
+// adapter nor a use case: the API-key lifecycle's ownership half has landed
+// (the identity domain and the control database's records), and what calls
+// WithdrawCredential — the revocation that reaches the projection, with the
+// owned-but-inactive recovery ADR 0006 §8 describes — arrives with the
+// Control → Data credential projection it belongs to. The port exists ahead of
+// its callers because the seam has to exist before either side of it is
+// built, and because its absence would leave a future author with no recorded
+// answer to "how does the Control Plane talk to the Data Plane?".
 package dataplane
 
 import (
