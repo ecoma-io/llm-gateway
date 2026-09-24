@@ -1,0 +1,28 @@
+-- The Control Plane lane's first file: the ownership namespace, and nothing
+-- else.
+--
+-- The lane is the directory this file sits in. `migrations/control/` is
+-- applied to the `control` database and to no other, and the Data Plane's
+-- lane is its sibling — `migrations/README.md` states the rule. This
+-- migration exists to establish, under review and version control, the
+-- namespace the architecture already names: ADR 0006 §5 writes the Control
+-- Plane's future position table as `control.usage_ingestion_cursor` —
+-- schema-qualified — so domain tables in the `control` database live in the
+-- `control` schema. The Data Plane's lane stays on the default `public`
+-- namespace because the ADRs name its tables bare (`usage_events`,
+-- `request_intake`); each plane's namespace follows from how its own tables
+-- are already written (ADR 0006 §7, migrations/README.md).
+--
+-- It creates no business schema. Tables arrive with the domains that own
+-- them, as their own reviewed migrations; this file only gives those future
+-- tables a namespace to land in, so the schema change that carries the first
+-- one is not also the change that exercises the lane's pipeline for the
+-- first time.
+--
+-- No IF NOT EXISTS, unlike the Data Plane's bootstrap: nothing pre-creates
+-- this schema — the timescaledb image extends `template1` with an extension,
+-- not with a namespace — so there is no honest no-op to record here. An
+-- existing `control` schema would be an unexpected fact about this database,
+-- and the migration fails loudly on it rather than adopting it.
+CREATE SCHEMA control;
+COMMENT ON SCHEMA control IS 'Control Plane ownership namespace (ADR 0006 §7); owned by apps/console-api.';

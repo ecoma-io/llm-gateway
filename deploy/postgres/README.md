@@ -37,9 +37,9 @@ They do NOT give:    separate credentials · no privileged cross-database access
 The two migration lanes mirror the two databases exactly, and the lane
 directory is the database name — `migrations/control/`, `migrations/dataplane/`
 — so a file's directory is also the deployment decision about where it runs;
-only the Data Plane's lane exists so far, and `migrations/README.md` states the
-rule that ties the two together and why an empty Control Plane lane would be
-worse than a missing one. Both databases are created by
+`migrations/README.md` states the rule that ties the two together, and why the
+Control Plane's lane opens on a foundation migration — its ownership
+namespace — rather than a business table. Both databases are created by
 [`initdb/`](initdb/10-create-plane-databases.sh), on the first start of an
 empty volume.
 
@@ -117,10 +117,13 @@ actually applied>` — for a transactionally rolled-back failure that is the
   not a rollback, it is a guess.
 - **Accepted gap.** No checksum verification: nothing in the tool compares
   applied history against the files that produced it. The mitigations are
-  the immutability rule above, review, and this suite. If silent-edit
-  detection or destructive-change linting ever becomes a requirement,
-  re-evaluate Atlas (checksummed directories, Pro-licensed lint) — that is a
-  deliberate escalation, not a default.
+  the immutability rule above, review, and this suite — whose opening step
+  proves each lane's shape (versions numbered without a gap or duplicate,
+  one pair per version, nothing else in the directory), which is the drift a
+  directory listing can catch; the content of an applied file stays outside
+  every check. If silent-edit detection or destructive-change linting ever
+  becomes a requirement, re-evaluate Atlas (checksummed directories,
+  Pro-licensed lint) — that is a deliberate escalation, not a default.
 
 The tool runs from its pinned image as a compose service — never a
 host-installed binary — so a contributor needs Docker and nothing else, and
@@ -175,13 +178,12 @@ and nothing else. The lane is one variable, `GATEWAY_MIGRATE_LANE`, and it
 names both the directory the runner reads and the database it writes:
 
 ```bash
-# Apply every pending migration. The default lane is `dataplane`, the only
-# one with migrations today.
+# Apply every pending migration. The default lane is `dataplane`, so this
+# one command never touches the Control Plane's database.
 docker compose -f deploy/postgres/compose.yaml run --rm migrate up
 
-# The same command against the Control Plane's database. It refuses today —
-# an empty lane is an error, not a no-op (`migrations/README.md`) — and it
-# becomes the Control Plane's migration command the day its first file lands.
+# The same verb for the Control Plane: its lane applies `migrations/control/`
+# to the `control` database and to no other (`migrations/README.md`).
 GATEWAY_MIGRATE_LANE=control \
   docker compose -f deploy/postgres/compose.yaml run --rm migrate up
 
@@ -235,7 +237,7 @@ docker compose -f deploy/postgres/compose.yaml exec postgres \
 Both commands reach the same role, and that is the fixture's convenience rather
 than a security property: these are two ownership boundaries, not two
 credential boundaries — ["What is deliberately not here"](#what-is-deliberately-not-here)
-states the production guidance.
+states the production privilege contract.
 
 The database also listens on `127.0.0.1:5432` (`GATEWAY_POSTGRES_HOST` and
 `GATEWAY_POSTGRES_PORT` to move either) for a local psql or a GUI client.
@@ -246,12 +248,21 @@ The database also listens on `127.0.0.1:5432` (`GATEWAY_POSTGRES_HOST` and
 bash deploy/postgres/verify.sh
 ```
 
-Runs the whole integration suite — startup, both databases answering,
-migration application, validation, the two lanes proving out as two databases
-and one role opening both, transaction behaviour, a migration that fails
-mid-file (proved to roll back whole, record itself dirty, refuse further
-runs, and recover through `force`), clean rollback — against the real
-database, and leaves the database migrated and running. CI runs this exact
+Runs the whole integration suite against the real database: both lanes'
+directories proven to hold exactly what the runner will read — versions
+numbered 1..N with no gap and no duplicate, one `.up.sql` and one `.down.sql`
+per version, nothing else in either lane, and the failing-migration fixture
+in neither; startup with both plane databases answering; the pinned image
+proving it ships the timescaledb extension; each lane applying into its own
+database, its recorded version validated against the lane's newest file and
+proven clean, and re-application proven a no-op; the two lanes proven to be
+two databases — the Control Plane's foundation migration building its
+ownership namespace and nothing else, no history and no schema crossing the
+boundary in either direction, and one fixture credential opening both;
+transaction behaviour; a migration that fails mid-file (proved to roll back
+whole, record itself dirty, refuse further runs, and recover through
+`force`); a full down roll of both lanes, proved clean — and both databases
+left migrated and running. CI runs this exact
 command: the `Verify (persistence)` job in
 [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) executes it on
 a runner whose preinstalled Docker and compose plugin meet the
@@ -264,22 +275,32 @@ definition of green, for a contributor and for the pipeline alike.
 - No business schema. Tables arrive with the domains that own them, as
   migrations in the lane that owns them; the Data Plane's bootstrap
   migration enables the `timescaledb` extension and nothing else, and the
-  Control Plane's lane has no file yet.
+  Control Plane's first migration establishes its ownership namespace and
+  nothing else — foundation, not business schema.
 - No per-plane roles, and no claim that this fixture demonstrates credential
   isolation — it does not. One convenient role (`gateway`) owns and opens both
   databases, which is a local-development fixture and not a security property:
   the database ownership boundary above is real, the credential boundary is
   absent. `verify.sh` asserts that the one role opens both databases, so the
   absence is a fact the suite proves rather than prose that can drift back into
-  a stronger claim. The guidance:
+  a stronger claim. Production is a different contract, and this is the whole
+  of it — per plane database, two roles, stated as required properties; the
+  names are a suggestion in the shape `<plane>_app` / `<plane>_migrator`, not
+  a fixed convention:
 
-  ```text
-  local development fixture: one convenient role may be used (today's `gateway`)
-  production:                a dedicated role per plane, least-privilege
-                             CONNECT/database privileges, appropriate connection
-                             and database access controls, and no privileged
-                             cross-plane mechanism (FDW/dblink)
-  ```
+  - The application role. CONNECT on its own plane's database; USAGE on its
+    namespace; SELECT, INSERT, UPDATE and DELETE on that plane's tables. No
+    CREATE, no DDL, no superuser, no cross-plane grant.
+  - The migration role. Ownership of the lane's schema objects; CREATE on the
+    namespace; the only role that runs golang-migrate — invoked by CI or an
+    operator through the pinned runner image, never by an application:
+    `console-api`, `dataplane` and `dataplane-api` do not run migrations at
+    startup or anywhere else. `dataplane-api` holds no database role at all,
+    because it owns no database (ADR 0006 §7).
+
+  The local fixture provisions neither role and keeps the single `gateway`
+  one. Which roles exist in a given deployment, and what they are called, is
+  a production decision this fixture deliberately does not pre-make.
 
 - No production deployment. This compose project is a development database;
   how the store runs in production is a deployment decision that has not
