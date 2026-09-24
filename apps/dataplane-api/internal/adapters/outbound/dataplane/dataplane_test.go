@@ -325,6 +325,178 @@ func TestReadUsageEventsClassifiesEveryFailureTheSeamCanProduce(t *testing.T) {
 	}
 }
 
+// validFactBody is one well-formed fact as the private listener writes it, for
+// the tests below to break one field of at a time.
+const validFactBody = `{"request_id":"req_01HZ","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{"allocation_id":"alloc-1"}}`
+
+// TestReadUsageEventsRefusesAPageMissingRequiredFields is the fail-closed
+// table: every field the contract marks required — the page's three and the
+// fact's five — is refused when the body omits it or carries it as null.
+//
+// The refusals are ErrUpstreamUnavailable, the same classification as a body
+// the façade cannot read at all, because they are the same condition from a
+// caller's point of view: the answer arrived and it is not a page this process
+// can answer from. Re-encoding a page with a fact missing its request_id — or
+// a has_more that decoded into false because the field never arrived — would
+// be this process inventing the one field a consumer settles or stops on.
+//
+// One row per class, and each row's body is a page that differs from a valid
+// one by the single field under test, so a green run cannot come from some
+// other refusal firing instead.
+func TestReadUsageEventsRefusesAPageMissingRequiredFields(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "a page with no events field at all",
+			body: `{"next_cursor":"c","has_more":false}`,
+		},
+		{
+			name: "a page whose events field is null",
+			body: `{"events":null,"next_cursor":"c","has_more":false}`,
+		},
+		{
+			name: "a page with no next_cursor field at all",
+			body: `{"events":[],"has_more":false}`,
+		},
+		{
+			name: "a page whose next_cursor field is null",
+			body: `{"events":[],"next_cursor":null,"has_more":false}`,
+		},
+		{
+			name: "a page with no has_more field at all",
+			body: `{"events":[],"next_cursor":"c"}`,
+		},
+		{
+			name: "a page whose has_more field is null",
+			body: `{"events":[],"next_cursor":"c","has_more":null}`,
+		},
+		{
+			name: "a fact with no request_id field at all",
+			body: `{"events":[{"kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
+		},
+		{
+			name: "a fact whose request_id field is null",
+			body: `{"events":[{"request_id":null,"kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
+		},
+		{
+			name: "a fact with no kind field at all",
+			body: `{"events":[{"request_id":"r","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
+		},
+		{
+			name: "a fact whose kind field is null",
+			body: `{"events":[{"request_id":"r","kind":null,"schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
+		},
+		{
+			name: "a fact with no schema_version field at all",
+			body: `{"events":[{"request_id":"r","kind":"settled","occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
+		},
+		{
+			name: "a fact whose schema_version field is null",
+			body: `{"events":[{"request_id":"r","kind":"settled","schema_version":null,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
+		},
+		{
+			name: "a fact with no occurred_at field at all",
+			body: `{"events":[{"request_id":"r","kind":"settled","schema_version":1,"payload":{}}],"next_cursor":"c","has_more":false}`,
+		},
+		{
+			name: "a fact whose occurred_at field is null",
+			body: `{"events":[{"request_id":"r","kind":"settled","schema_version":1,"occurred_at":null,"payload":{}}],"next_cursor":"c","has_more":false}`,
+		},
+		{
+			name: "a fact with no payload field at all",
+			body: `{"events":[{"request_id":"r","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z"}],"next_cursor":"c","has_more":false}`,
+		},
+		{
+			name: "a fact whose payload field is null",
+			body: `{"events":[{"request_id":"r","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":null}],"next_cursor":"c","has_more":false}`,
+		},
+		{
+			name: "a fact that is an empty object",
+			body: `{"events":[{}],"next_cursor":"c","has_more":false}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, _ *stdhttp.Request) {
+				w.WriteHeader(stdhttp.StatusOK)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			t.Cleanup(server.Close)
+
+			client := New(server.Client(), server.URL, testCredential)
+			page, err := client.ReadUsageEvents(context.Background(), opaqueCursor, 100)
+			if !errors.Is(err, dataplane.ErrUpstreamUnavailable) {
+				t.Fatalf("ReadUsageEvents() error = %v, want it to wrap %v", err, dataplane.ErrUpstreamUnavailable)
+			}
+			if page.Events != nil || page.NextCursor != "" || page.HasMore {
+				t.Errorf("ReadUsageEvents() returned %+v beside an error, want the zero Page — a caller that ignored the error must not find an answer in it", page)
+			}
+			// The refusal is made of the response and not of the deployment, so
+			// it must not smuggle back the address or the credential either.
+			if strings.Contains(err.Error(), testCredential) {
+				t.Errorf("the error text carries the credential: %q", err.Error())
+			}
+			if strings.Contains(err.Error(), server.URL) {
+				t.Errorf("the error text carries the Data Plane's address: %q", err.Error())
+			}
+		})
+	}
+}
+
+// TestAFactWithPresentButEmptyFieldsIsStillAPage is the boundary the table
+// above must not erode: presence is the whole check. An empty request_id, a
+// kind this build has never heard of, a schema_version of zero, an instant at
+// the beginning of time and a payload that is not an object are all fields the
+// body carried — deciding what may settle is the consumer's decision, below
+// the port, and a façade that started refusing them would be answering a
+// question the contract leaves to the applier.
+func TestAFactWithPresentButEmptyFieldsIsStillAPage(t *testing.T) {
+	body := `{"events":[{"request_id":"","kind":"a-kind-nobody-knows","schema_version":0,"occurred_at":"0001-01-01T00:00:00Z","payload":[1,2]}],"next_cursor":"c","has_more":false}`
+
+	up := &upstream{body: body}
+	client := up.server(t)
+
+	page, err := client.ReadUsageEvents(context.Background(), opaqueCursor, 100)
+	if err != nil {
+		t.Fatalf("ReadUsageEvents() error = %v, want nil — every required field is present", err)
+	}
+	if len(page.Events) != 1 {
+		t.Fatalf("len(Events) = %d, want 1", len(page.Events))
+	}
+	event := page.Events[0]
+	if event.RequestID != "" || event.Kind != "a-kind-nobody-knows" || event.SchemaVersion != 0 {
+		t.Errorf("event = %+v, want the values the body carried, empty or not", event)
+	}
+	if want := string([]byte(`[1,2]`)); string(event.Payload) != want {
+		t.Errorf("Payload = %s, want %s — a present payload crosses raw whatever it holds", event.Payload, want)
+	}
+}
+
+// TestAPageMayCarryFieldsTheContractDoesNotName pins the decoder's forward
+// compatibility: the Data Plane may add a field to the envelope or to a fact
+// before this module ships, and an unfamiliar key is ignored, never refused. A
+// façade that refused one would be a version lock on the plane it fronts.
+func TestAPageMayCarryFieldsTheContractDoesNotName(t *testing.T) {
+	body := `{"events":[` + validFactBody[:len(validFactBody)-1] + `,"trace_id":"t-1"}],"next_cursor":"c","has_more":false,"published_at":"2026-09-23T10:00:00Z"}`
+
+	up := &upstream{body: body}
+	client := up.server(t)
+
+	page, err := client.ReadUsageEvents(context.Background(), opaqueCursor, 100)
+	if err != nil {
+		t.Fatalf("ReadUsageEvents() error = %v, want nil — unknown fields are tolerated", err)
+	}
+	if got, want := page.NextCursor, "c"; got != want {
+		t.Errorf("NextCursor = %q, want %q", got, want)
+	}
+	if len(page.Events) != 1 {
+		t.Fatalf("len(Events) = %d, want 1", len(page.Events))
+	}
+}
+
 // TestThePositionBoundIsCountedInCharactersAndNotBytes pins which side of the
 // contract's bound this adapter stands on when the answer carries a multi-byte
 // cursor.
