@@ -132,10 +132,10 @@ jobs:
     # whether the other two survived the same edit.
     #
     # `integration` marks the legs that own a `test-integration` target. The
-    # service container below is declared once for the job and therefore starts
-    # for every leg, including the one that does not use it; declaring it per
-    # leg would need three copies of a digest pin, which is exactly the drift
-    # the parity step below exists to prevent.
+    # service containers below are declared once for the job and therefore
+    # start for every leg, including the ones that do not use them; declaring
+    # them per leg would need a copy of each digest pin per leg, which is
+    # exactly the drift the parity step below exists to prevent.
     strategy:
       fail-fast: false
       matrix:
@@ -184,6 +184,54 @@ jobs:
           --health-retries 10
           --health-start-period 2s
           --tmpfs /data
+
+      # The databases' integration server: the same digest-pinned image the
+      # local fixture in `deploy/postgres/compose.yaml` runs, for the same
+      # one-suite-two-runners reason as the Valkey container above — the image
+      # line and the compose file name the same tag AND digest, and the parity
+      # step re-derives both at run time.
+      #
+      # Two stated divergences from the fixture, both forced by what a service
+      # container cannot do:
+      #
+      # - No `initdb/` mount, so the two plane databases (`control`,
+      #   `dataplane`) are not created by the fixture's script. Each
+      #   application's postgres integration suite ensures its own plane's
+      #   database exists from the admin DSN this job hands it
+      #   (POSTGRES_TEST_ADMIN_DSN below) before it runs — the same
+      #   ensure-then-connect shape a developer's machine exercises, with the
+      #   creation step made explicit instead of delegated to an entrypoint.
+      # - No migration runner: migrations are verify-persistence's subject
+      #   (`deploy/postgres/verify.sh`, the same suite a contributor runs).
+      #   The Go integration tier needs no migrated schema — the foundation
+      #   suites exercise connection, transaction and lifecycle behaviour on
+      #   probe tables they create and drop themselves.
+      #
+      # The role is the fixture's own `gateway` role with the fixture's
+      # documented development password — in a fresh container that role is
+      # the cluster superuser, so the admin DSN a developer uses locally and
+      # the one this job sets are the same string. It authorizes a container
+      # that dies with the runner, on a loopback-only port; no value here is
+      # a production credential. Telemetry is off for the same reason the
+      # compose file turns it off.
+      postgres:
+        image: timescale/timescaledb:2.30.1-pg18@sha256:9dede0e3ccc071cf71935b17f76bf243331df0b1575338c8ac294640fcf12a36
+        ports:
+          - 127.0.0.1:5432:5432
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway-dev-only
+          TIMESCALEDB_TELEMETRY: "off"
+        # The fixture's healthcheck, in effect: pg_isready against the named
+        # role and database rather than a TCP probe, with the same intervals
+        # and the start period that absorbs a cold image pull.
+        options: >-
+          --health-cmd "pg_isready -U gateway -d postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+          --health-start-period 10s
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -210,15 +258,16 @@ jobs:
           go-version-file: apps/${{ matrix.app }}/go.mod
           cache: false
 
-      # The two files that name a Valkey image — this workflow's service
-      # container and `deploy/redis/docker-compose.yml`, the fixture a
-      # developer runs — are written out by hand in both places, and nothing
-      # structural ties them together. A one-sided upgrade would leave this
-      # job green against a server version no developer has ever executed,
-      # which is exactly the drift the suite exists to prevent. This step
-      # re-derives both pins from their files at run time instead of comparing
-      # against a third hardcoded copy: a third copy is a third place to
-      # forget, and this way the compose file stays the single source.
+      # The files that name a service image — this workflow's containers and
+      # the compose fixtures a developer runs (`deploy/redis/docker-compose.yml`
+      # for Valkey, `deploy/postgres/compose.yaml` for the database) — are
+      # written out by hand in both places, and nothing structural ties them
+      # together. A one-sided upgrade would leave this job green against a
+      # server version no developer has ever executed, which is exactly the
+      # drift the suites exist to prevent. This step re-derives every pin from
+      # its files at run time instead of comparing against a third hardcoded
+      # copy: a third copy is a third place to forget, and this way the compose
+      # files stay the single source.
       #
       # Only `image:` declaration lines are read, not the whole file: a pin
       # string surviving in a comment must neither keep a drifted service
@@ -232,37 +281,53 @@ jobs:
       # before the reason is printed.
       #
       # Before the expensive api checks — the linter tarball download and
-      # every suite: this is two greps, and a drifted pin should fail the
+      # every suite: this is a few greps, and a drifted pin should fail the
       # job in seconds rather than after minutes of toolchain downloads.
-      - name: Assert the CI and local fixture Valkey pins agree
+      - name: Assert the CI and local fixture image pins agree
         run: |
           set -euo pipefail
-          pattern='valkey/valkey:[0-9A-Za-z._-]+@sha256:[0-9a-f]{64}'
-          compose="$(grep -E '^[[:space:]]*image:' deploy/redis/docker-compose.yml | grep -ohE "$pattern" | sort -u || true)"
-          workflow="$(grep -E '^[[:space:]]*image:' .github/workflows/ci.yml | grep -ohE "$pattern" | sort -u || true)"
 
-          require_single_pin() {
-            if [ -z "$2" ]; then
-              echo "No Valkey tag@digest pin found in $1 — both files must carry exactly one" >&2
+          # One row per pinned service: a display name, the image pattern that
+          # identifies exactly that service's pin, and the fixture file that
+          # is the single source for it. The workflow side of every row is
+          # this file.
+          check_pin() {
+            name="$1"
+            pattern="$2"
+            fixture="$3"
+            compose="$(grep -E '^[[:space:]]*image:' "$fixture" | grep -ohE "$pattern" | sort -u || true)"
+            workflow="$(grep -E '^[[:space:]]*image:' .github/workflows/ci.yml | grep -ohE "$pattern" | sort -u || true)"
+
+            require_single_pin() {
+              if [ -z "$2" ]; then
+                echo "No $name tag@digest pin found in $1 — both files must carry exactly one" >&2
+                exit 1
+              fi
+              if [ "$(printf '%s\n' "$2" | wc -l)" -gt 1 ]; then
+                echo "$1 carries more than one distinct $name pin:" >&2
+                printf '%s\n' "$2" >&2
+                exit 1
+              fi
+            }
+
+            require_single_pin "$fixture" "$compose"
+            require_single_pin ".github/workflows/ci.yml" "$workflow"
+
+            if [ "$compose" != "$workflow" ]; then
+              echo "The $name pins diverge — upgrade both files in the same change:" >&2
+              echo "  $fixture                        $compose" >&2
+              echo "  .github/workflows/ci.yml $workflow" >&2
               exit 1
             fi
-            if [ "$(printf '%s\n' "$2" | wc -l)" -gt 1 ]; then
-              echo "$1 carries more than one distinct Valkey pin:" >&2
-              printf '%s\n' "$2" >&2
-              exit 1
-            fi
+            echo "CI and the local fixture pin the same $name image: $compose"
           }
 
-          require_single_pin "deploy/redis/docker-compose.yml" "$compose"
-          require_single_pin ".github/workflows/ci.yml" "$workflow"
-
-          if [ "$compose" != "$workflow" ]; then
-            echo "The Valkey pins diverge — upgrade both files in the same change:" >&2
-            echo "  deploy/redis/docker-compose.yml  $compose" >&2
-            echo "  .github/workflows/ci.yml         $workflow" >&2
-            exit 1
-          fi
-          echo "CI and the local fixture pin the same image: $compose"
+          check_pin "Valkey" \
+            'valkey/valkey:[0-9A-Za-z._-]+@sha256:[0-9a-f]{64}' \
+            "deploy/redis/docker-compose.yml"
+          check_pin "TimescaleDB" \
+            'timescale/timescaledb:[0-9A-Za-z._-]+@sha256:[0-9a-f]{64}' \
+            "deploy/postgres/compose.yaml"
 
       # golangci-lint is downloaded and checksum-pinned rather than taken from
       # the runner image (whose copy moves underneath every job) and rather
@@ -303,23 +368,29 @@ jobs:
           pnpm exec moon run ${{ matrix.app }}:lint ${{ matrix.app }}:test
           ${{ matrix.app }}:typecheck ${{ matrix.app }}:build
 
-      # The integration tier against the service container above, through the
+      # The integration tier against the service containers above, through the
       # same target a developer runs — the module's `test-integration` is the
       # single definition of the run (its `moon.yml` target owns the
-      # required-address and executed-something guards). The address is the
-      # loopback literal the fixture README documents rather than `localhost`:
-      # the published port is IPv4, and a resolver answering ::1 first would
-      # dial nothing. The suite itself refuses to run without an explicit
-      # address; the variable here is what satisfies that contract in CI.
+      # required-address and executed-something guards). The Valkey address is
+      # the loopback literal the fixture README documents rather than
+      # `localhost`: the published port is IPv4, and a resolver answering ::1
+      # first would dial nothing. Each suite refuses to run without its
+      # explicit variable; the env here is what satisfies that contract in CI.
       #
-      # The variable is named for the server rather than for the protocol
-      # family, and it matches the prefix `apps/*/internal/adapters/outbound/valkey`
-      # reads — so the name this job sets is the name an adapter consumes, with
-      # no translation step in between that nobody would remember to update.
-      - name: Run the Valkey integration suite against the service container
+      # Both variables are named for the server rather than for the protocol
+      # family, and each matches the name the adapter under
+      # `apps/*/internal/adapters/outbound/` reads — so the names this job
+      # sets are the names consumers read, with no translation step in between
+      # that nobody would remember to update. POSTGRES_TEST_ADMIN_DSN points
+      # at the cluster's maintenance database: the postgres suite derives its
+      # plane database from it (ensuring the database exists first — see the
+      # service container's divergences above) rather than receiving one
+      # ready-made.
+      - name: Run the integration suites against the service containers
         if: matrix.integration
         env:
           VALKEY_ADDRESS: 127.0.0.1:6379
+          POSTGRES_TEST_ADMIN_DSN: postgres://gateway:gateway-dev-only@127.0.0.1:5432/postgres?sslmode=disable
         run: pnpm exec moon run ${{ matrix.app }}:test-integration
 
   verify-persistence:
