@@ -534,9 +534,9 @@ func TestIntegrationNothingPersistedCarriesSecretMaterial(t *testing.T) {
 		table string
 		id    string
 	}{
-		{"api_keys", string(key.ID)},
-		{"users", string(user.ID)},
-		{"accounts", string(account.ID)},
+		{"control.api_keys", string(key.ID)},
+		{"control.users", string(user.ID)},
+		{"control.accounts", string(account.ID)},
 	} {
 		var serialised string
 		if err := db.QueryRowContext(ctx,
