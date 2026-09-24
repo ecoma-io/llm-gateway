@@ -1,9 +1,9 @@
 // Package config loads the dataplane's small, typed runtime configuration.
 //
 // Bootstrap configuration is process-level: it is read once before the server
-// starts, and a change requires a restart. There are five values today, so a
-// hand-written loader keeps defaults, parsing and validation visible instead of
-// buying a configuration framework to hide them.
+// starts, and a change requires a restart. The set is small enough to read in
+// one sitting, so a hand-written loader keeps defaults, parsing and validation
+// visible instead of buying a configuration framework to hide them.
 //
 // The environment prefix is the application's own. That is the point of the
 // prefix: one deployment environment may carry the variables of all four
@@ -13,7 +13,9 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +37,43 @@ const (
 	// headers. Read and write body timeouts wait for real traffic with measured
 	// sizes; inventing them before that is guessing with a straight face.
 	DefaultReadHeaderTimeout = 5 * time.Second
+
+	// DefaultPostgresDSN is the connection string used when
+	// DATAPLANE_POSTGRES_DSN is absent: the local development fixture from
+	// deploy/postgres/compose.yaml — one TimescaleDB cluster on this machine,
+	// the database `dataplane` this application owns (ADR 0006 §7), and the
+	// fixture's own role and password. It is a development default and nothing
+	// more: no production credential lives in this file, and a deployment that
+	// means production states its own DSN through the variable.
+	DefaultPostgresDSN = "postgres://gateway:gateway-dev-only@127.0.0.1:5432/dataplane?sslmode=disable"
+
+	// DefaultPostgresMaxOpenConns bounds the connections the pool may hold. The
+	// runtime is the request hot path, and its database is what makes intake,
+	// reservations and usage durable — a latency-bound, connection-heavy
+	// workload (ADR 0006 §2) — so the pool is sized for concurrency rather than
+	// frugality. Twenty-five leaves headroom under PostgreSQL's default
+	// max_connections of 100 even with the Control Plane's own pool beside it
+	// on the one shared cluster.
+	DefaultPostgresMaxOpenConns = 25
+
+	// DefaultPostgresMaxIdleConns keeps five connections warm between bursts.
+	// Idle connections cost the server almost nothing and save a fresh
+	// handshake on the next burst; the value rides under the open-connections
+	// bound rather than beside it.
+	DefaultPostgresMaxIdleConns = 5
+
+	// DefaultPostgresConnMaxLifetime bounds how long one connection may be
+	// reused before it is retired and replaced. It spreads a connection's
+	// lifetime out in time so no failure mode that develops with connection age
+	// — a NAT or firewall entry gone stale, a server-side recycle — lands on
+	// every connection at once.
+	DefaultPostgresConnMaxLifetime = 30 * time.Minute
+
+	// DefaultPostgresConnMaxIdleTime bounds how long an idle connection is kept
+	// before it is closed. A runtime that goes quiet between traffic bursts
+	// should not hold its whole pool open against a server that may have moved
+	// on underneath it.
+	DefaultPostgresConnMaxIdleTime = 5 * time.Minute
 )
 
 // Config is the complete bootstrap configuration of the dataplane process.
@@ -68,6 +107,26 @@ type Config struct {
 	// loader below reads it into exactly this field and nothing else in this
 	// process formats it.
 	ManagementToken string
+
+	// Postgres holds the connection settings for this process's own plane's
+	// database — the one outbound address this configuration names, and the
+	// only one it may name: the `dataplane` database of ADR 0006 §7, which the
+	// runtime owns and nothing else does. A setting that pointed this process
+	// at the Control Plane's listener would be a dependency on it; a setting
+	// that points it at its own database is what makes its hot path work when
+	// the Control Plane is unreachable.
+	Postgres Postgres
+}
+
+// Postgres holds the connection settings for this application's own plane's
+// database — `dataplane` (ADR 0006 §7). The DSN is a secret-bearing value: it
+// is redacted by LogValue and never appears in an error.
+type Postgres struct {
+	DSN             string
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+	ConnMaxIdleTime time.Duration
 }
 
 // Defaults returns the configuration used when no supported environment
@@ -78,6 +137,13 @@ func Defaults() Config {
 		Addr:              DefaultAddr,
 		ShutdownTimeout:   DefaultShutdownTimeout,
 		ReadHeaderTimeout: DefaultReadHeaderTimeout,
+		Postgres: Postgres{
+			DSN:             DefaultPostgresDSN,
+			MaxOpenConns:    DefaultPostgresMaxOpenConns,
+			MaxIdleConns:    DefaultPostgresMaxIdleConns,
+			ConnMaxLifetime: DefaultPostgresConnMaxLifetime,
+			ConnMaxIdleTime: DefaultPostgresConnMaxIdleTime,
+		},
 	}
 }
 
@@ -142,7 +208,45 @@ func Load(lookup LookupEnv) (Config, error) {
 		return Config{}, fmt.Errorf("DATAPLANE_MANAGEMENT_TOKEN is required when DATAPLANE_MANAGEMENT_ADDR is set")
 	}
 
+	if value, ok := lookup("DATAPLANE_POSTGRES_DSN"); ok {
+		if value == "" {
+			return Config{}, fmt.Errorf("DATAPLANE_POSTGRES_DSN must not be empty")
+		}
+		cfg.Postgres.DSN = value
+	}
+	if value, ok := lookup("DATAPLANE_POSTGRES_MAX_OPEN_CONNS"); ok {
+		conns, err := parseInt("DATAPLANE_POSTGRES_MAX_OPEN_CONNS", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Postgres.MaxOpenConns = conns
+	}
+	if value, ok := lookup("DATAPLANE_POSTGRES_MAX_IDLE_CONNS"); ok {
+		conns, err := parseInt("DATAPLANE_POSTGRES_MAX_IDLE_CONNS", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Postgres.MaxIdleConns = conns
+	}
+	if value, ok := lookup("DATAPLANE_POSTGRES_CONN_MAX_LIFETIME"); ok {
+		duration, err := parsePositiveDuration("DATAPLANE_POSTGRES_CONN_MAX_LIFETIME", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Postgres.ConnMaxLifetime = duration
+	}
+	if value, ok := lookup("DATAPLANE_POSTGRES_CONN_MAX_IDLE_TIME"); ok {
+		duration, err := parsePositiveDuration("DATAPLANE_POSTGRES_CONN_MAX_IDLE_TIME", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Postgres.ConnMaxIdleTime = duration
+	}
+
 	if err := validateAddr("DATAPLANE_ADDR", cfg.Addr); err != nil {
+		return Config{}, err
+	}
+	if err := validatePostgres(cfg.Postgres); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -162,6 +266,77 @@ func parsePositiveDuration(name, value string) (time.Duration, error) {
 	return duration, nil
 }
 
+// parseInt parses one connection-count variable. The range each count must sit
+// in is a relationship between two values — idle against open — so the range
+// checks live in validatePostgres where both are in hand, and this helper only
+// refuses what is not a number at all.
+func parseInt(name, value string) (int, error) {
+	if value == "" {
+		return 0, fmt.Errorf("%s must not be empty", name)
+	}
+	number, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer: %v", name, err)
+	}
+	return number, nil
+}
+
+// validatePostgres checks the pool settings as a set: each count against its
+// own bound, the idle bound against the open bound, and the DSN against both
+// its shape and the plane it may name. The variable names are spelled here
+// rather than inferred because a message that named the wrong variable would
+// send an operator to the wrong line of their deployment.
+func validatePostgres(p Postgres) error {
+	if p.MaxOpenConns <= 0 {
+		return fmt.Errorf("DATAPLANE_POSTGRES_MAX_OPEN_CONNS must be greater than zero")
+	}
+	if p.MaxIdleConns < 0 {
+		return fmt.Errorf("DATAPLANE_POSTGRES_MAX_IDLE_CONNS must not be negative")
+	}
+	if p.MaxIdleConns > p.MaxOpenConns {
+		return fmt.Errorf(
+			"DATAPLANE_POSTGRES_MAX_IDLE_CONNS (%d) must not be greater than DATAPLANE_POSTGRES_MAX_OPEN_CONNS (%d)",
+			p.MaxIdleConns, p.MaxOpenConns)
+	}
+	return validatePostgresDSN("DATAPLANE_POSTGRES_DSN", p.DSN)
+}
+
+// validatePostgresDSN checks one connection string's shape and, past shape,
+// the one rule that is an ownership boundary: this application may only be
+// pointed at the database it owns. The default DSN names `dataplane`, and no
+// override may name anything else — a DSN naming `control` would point this
+// process at the Control Plane's database, which ADR 0006 §7 assigns to the
+// other plane and which no ordinary query may span into. Configured against
+// the wrong plane, the process refuses to start rather than starting half
+// wrong.
+//
+// The failure messages never quote the DSN: its userinfo carries the
+// password, and a validation error is a string an operator will paste into a
+// ticket.
+func validatePostgresDSN(name, dsn string) error {
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		// url.Parse's own error quotes the URL it was handed — userinfo and
+		// all — so the reason is dropped rather than wrapped. A value that is
+		// not a URL at all has nothing diagnosable to preserve anyway: the fix
+		// is the same whatever the parser choked on.
+		return fmt.Errorf("%s must be a parsable URL", name)
+	}
+	if parsed.Scheme != "postgres" && parsed.Scheme != "postgresql" {
+		return fmt.Errorf("%s must use the postgres or postgresql scheme", name)
+	}
+	database := strings.Trim(parsed.Path, "/")
+	if database == "" || strings.Contains(database, "/") {
+		return fmt.Errorf("%s must name exactly one database in its path", name)
+	}
+	if database != "dataplane" {
+		return fmt.Errorf(
+			"%s names the %q database; this application owns only the dataplane database (ADR 0006 §7) and must not be configured against another plane's",
+			name, database)
+	}
+	return nil
+}
+
 // validateAddr checks one listener address. The name is a parameter rather than
 // a constant because there are two listeners now and a message that named the
 // wrong variable would send an operator to the wrong line of their deployment.
@@ -178,4 +353,36 @@ func validateAddr(name, addr string) error {
 		return fmt.Errorf("%s must contain a numeric port", name)
 	}
 	return nil
+}
+
+// LogValue renders the connection settings safe for logs: where the pool
+// points and how it is sized are operational facts, and the DSN's userinfo —
+// its password — is not one. Postgres satisfies slog.LogValuer, so
+// `slog.Any("postgres", cfg.Postgres)` redacts by construction: the
+// requirement that the DSN never reach a log is enforced by the type rather
+// than by every call site remembering to, which is the pattern the valkey
+// adapter's Config already uses. The DSN is decomposed rather than truncated,
+// because its components are the useful part of it and the whole is the
+// dangerous one.
+func (p Postgres) LogValue() slog.Value {
+	if parsed, err := url.Parse(p.DSN); err == nil {
+		return slog.GroupValue(
+			slog.String("scheme", parsed.Scheme),
+			slog.String("host", parsed.Hostname()),
+			slog.String("port", parsed.Port()),
+			slog.String("database", strings.Trim(parsed.Path, "/")),
+			slog.Int("max_open_conns", p.MaxOpenConns),
+			slog.Int("max_idle_conns", p.MaxIdleConns),
+			slog.Duration("conn_max_lifetime", p.ConnMaxLifetime),
+			slog.Duration("conn_max_idle_time", p.ConnMaxIdleTime),
+		)
+	}
+	// An unparsable DSN cannot be decomposed, so none of it is shown.
+	return slog.GroupValue(
+		slog.String("dsn", "[unparsable, redacted]"),
+		slog.Int("max_open_conns", p.MaxOpenConns),
+		slog.Int("max_idle_conns", p.MaxIdleConns),
+		slog.Duration("conn_max_lifetime", p.ConnMaxLifetime),
+		slog.Duration("conn_max_idle_time", p.ConnMaxIdleTime),
+	)
 }

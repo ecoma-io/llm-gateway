@@ -2,20 +2,24 @@
 //
 // Everything HTTP lives in internal/adapters/inbound/http and
 // internal/adapters/inbound/management so it can be tested through httptest
-// without a process; what remains here is the version stamp, the listeners, and
-// signal handling. Configuration is parsed and validated by internal/config
-// before this package sees it, so an invalid value fails the process before it
-// has accepted traffic.
+// without a process; what remains here is the version stamp, the database
+// pool, the listeners, and signal handling. Configuration is parsed and
+// validated by internal/config before this package sees it, so an invalid
+// value fails the process before it has accepted traffic.
 //
 // This is the only place in the module where an adapter is chosen and handed to
 // the application. Nothing above it names a concrete implementation: the
 // application depends on the outbound ports, and a port whose adapter is not
-// wired yet is simply absent — which is why the persistence and cache adapters
-// exist here and are not constructed. They are wired by the change that first
-// has a query to run, not before. The fact reader is constructed, and what it
-// answers today is that there is no durable source yet: refusing is the honest
-// state of a Data Plane whose fact table arrives with the accounting schema,
-// and it is not the same thing as an adapter that was forgotten.
+// wired yet is simply absent — which is why the cache adapter exists here and
+// is not constructed, wired by the change that first has a command to run, not
+// before. The database is the exception whose time has come: its pool is opened
+// and pinged here at startup, because intake, reservations and usage are
+// durable only through the database this process owns. The persistence.Store
+// over that pool is still not constructed — no use case runs a query yet, and
+// it is wired by the change that first does. The fact reader is constructed,
+// and what it answers today is that there is no durable source yet: refusing is
+// the honest state of a Data Plane whose fact table arrives with the accounting
+// schema, and it is not the same thing as an adapter that was forgotten.
 //
 // There are two listeners and one application between them. The runtime's is the
 // public surface, opened on DATAPLANE_ADDR always; the management surface is
@@ -35,16 +39,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	stdhttp "net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/adapters/inbound/http"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/adapters/inbound/management"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/adapters/outbound/postgres"
 	usagefactsadapter "github.com/ecoma-io/llm-gateway/apps/dataplane/internal/adapters/outbound/usagefacts"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/config"
@@ -59,6 +67,15 @@ import (
 // It remains the one version source: application.New receives the value and
 // GET /version serves it, so no endpoint ever restates it.
 var version = "dev"
+
+// postgresOpenTimeout bounds opening the runtime's own database: one ping, at
+// boot, against the database this process owns. Startup validation must fail
+// fast — an unreachable database is exactly the condition a container
+// orchestrator should restart on, and a booting process that hung here would
+// look alive to everything but every request it served. Five seconds is the
+// whole of the patience a local database on the same plane owes a booting
+// process; it is not a retry budget.
+const postgresOpenTimeout = 5 * time.Second
 
 // service is one listener this process serves, together with the name that
 // makes a failure or a startup line say which one it was.
@@ -80,6 +97,33 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The runtime's database is opened — and pinged — before any listener
+	// binds. Intake, reservations and usage are durable only because this
+	// database holds them, so a process whose database is unreachable has
+	// nothing to serve from and must not pretend otherwise. The dependency
+	// points at this process's own plane's database and nowhere else: nothing
+	// here waits on the Control Plane (ADR 0006 §4), and failing on an
+	// unreachable database is failing on a store this process owns, not one it
+	// borrows.
+	poolCtx, cancelPool := context.WithTimeout(context.Background(), postgresOpenTimeout)
+	pool, err := postgres.Open(poolCtx, postgres.Options{
+		DSN:             cfg.Postgres.DSN,
+		MaxOpenConns:    cfg.Postgres.MaxOpenConns,
+		MaxIdleConns:    cfg.Postgres.MaxIdleConns,
+		ConnMaxLifetime: cfg.Postgres.ConnMaxLifetime,
+		ConnMaxIdleTime: cfg.Postgres.ConnMaxIdleTime,
+	})
+	cancelPool()
+	if err != nil {
+		log.Printf("dataplane postgres: %v", err)
+		os.Exit(1)
+	}
+	log.Printf("dataplane %s postgres pool on %s", version, postgresLocation(cfg))
+	// The persistence.Store over this pool is still not constructed: no use
+	// case runs a query yet, and postgres.New(pool) is wired by the change
+	// that first does. (The usage-fact reader stays refusing until the fact
+	// table exists; an open pool does not change that answer.)
+
 	// Every listener is bound before any of them serves. A process that
 	// answered on the runtime port while its management port was already taken
 	// would be a process an operator believes is fully deployed and which is
@@ -100,7 +144,7 @@ func main() {
 	// main never reads it — no goroutine outliving the decision it reports.
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- run(ctx, stop, services, cfg.ShutdownTimeout)
+		errCh <- run(ctx, stop, services, cfg.ShutdownTimeout, pool)
 	}()
 
 	for _, s := range services {
@@ -112,6 +156,21 @@ func main() {
 	}
 
 	log.Printf("dataplane %s stopped", version)
+}
+
+// postgresLocation renders where the pool points — host, port, database — for
+// the startup line. The DSN it reads is never rendered itself: its userinfo
+// carries the credential, and a startup line is exactly the kind of string
+// that ends up pasted somewhere public.
+func postgresLocation(cfg config.Config) string {
+	parsed, err := url.Parse(cfg.Postgres.DSN)
+	if err != nil {
+		// Unreachable behind Load, which has already validated the DSN; the
+		// fallback stays silent about the value rather than risk the
+		// credential.
+		return "(dsn not rendered)"
+	}
+	return fmt.Sprintf("%s:%s/%s", parsed.Hostname(), parsed.Port(), strings.TrimPrefix(parsed.Path, "/"))
 }
 
 // bind opens every listener this configuration asks for and wires the handlers
@@ -162,7 +221,18 @@ func bind(cfg config.Config) ([]service, error) {
 // the configured timeout for in-flight requests. A drain that overruns its
 // timeout is a defect worth reporting, so run returns the error and the process
 // exits non-zero instead of green.
-func run(ctx context.Context, stop context.CancelFunc, services []service, shutdownTimeout time.Duration) error {
+//
+// The database pool is closed when run returns, which orders it correctly on
+// every path: after the servers have drained on the stop path, so no request
+// still in flight loses its database mid-query, and immediately on the
+// listener-failed path, where nothing is being served at all. It arrives as
+// io.Closer because closing is the whole of what run does with it.
+func run(ctx context.Context, stop context.CancelFunc, services []service, shutdownTimeout time.Duration, pool io.Closer) error {
+	// The close's result has nothing to be reported to: the drain outcome run
+	// is about to return is the last word this process speaks, and a failed
+	// close after a successful drain would only bury it.
+	defer func() { _ = pool.Close() }()
+
 	// Buffered for the same reason as main's channel: each goroutine records
 	// its result and exits even if the select below never reads it.
 	errCh := make(chan error, len(services))

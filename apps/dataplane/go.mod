@@ -20,6 +20,25 @@ go 1.26
 // valkey-go is the sole RESP client. deploy/redis/README.md records why it is
 // the smallest reasonable dependency and why Valkey is selected; the Go
 // standard library has no Redis-compatible client.
-require github.com/valkey-io/valkey-go v1.0.78
+//
+// pgx is the PostgreSQL driver behind the persistence port's database/sql
+// shape. There is no PostgreSQL driver in the standard library, and
+// database/sql is the port's decided vocabulary — a transaction must be
+// expressible — so the driver must speak it: lib/pq is in maintenance mode,
+// and pgx's stdlib package is the maintained database/sql driver, registered
+// under the name "pgx" by the one blank import in
+// internal/adapters/outbound/postgres. Nothing else in this module names the
+// driver or any of the indirect modules below.
+require (
+	github.com/jackc/pgx/v5 v5.11.0
+	github.com/valkey-io/valkey-go v1.0.78
+)
 
-require golang.org/x/sys v0.47.0 // indirect
+require (
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
+	golang.org/x/sync v0.22.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
+)
