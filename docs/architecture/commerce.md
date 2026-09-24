@@ -150,6 +150,15 @@ before the roll asks whether to extend it; promotions run first because a
 due pending subscription is dead capacity until it activates; the expiry
 lanes only observe what the first three left behind.
 
+One row no lane reaches: a suspended fixed-term subscription carrying a
+scheduled instruction. The cancellation lane requires `active`, the expiry
+lane refuses a row with an instruction on file, and the roll lane requires
+renewal — so the row sits, deliberately, until reinstatement puts it back in
+the cancellation lane's view. The hibernation is the semantics, not a gap:
+suspension preserves the customer's words, and the reinstated subscription
+is ended by them at the instructed instant, whether that instant has already
+passed or is yet to come.
+
 The lanes' shared vocabulary:
 
 - **The database clock decides everything due.** Every scan predicate and

@@ -71,6 +71,17 @@ their discipline:
 - **The group name is one path segment, escaped.** The wildcard group's `*`
   travels percent-encoded; the segment's form is part of the contract, not
   the caller's choice.
+- **A route-absent `404` is indistinguishable from a catalog miss.** The
+  façade translates every listener `404` the same way, so a private hop the
+  deployment never routed — a version skew where the façade runs ahead of
+  its listener — arrives as the port's not-found sentinel too, the same
+  answer a group with no version gets. The skew is therefore fail-safe: the
+  roll stops its pass and sells nothing, exactly as a real catalog defect
+  makes it. What it is not is separable — telling "route missing" from
+  "group missing" apart would need the listener to speak a second status
+  code the contract does not give it, and the roll's operator-facing
+  symptom ("a plan grants a scope that resolves to nothing") names the
+  commercial truth either way.
 - **A miss is an answer, not a transport failure.** The roll lane stops its
   pass on one on purpose — a plan granting a scope that resolves to nothing
   is a commercial catalog defect, and skipping it every pass would silently
