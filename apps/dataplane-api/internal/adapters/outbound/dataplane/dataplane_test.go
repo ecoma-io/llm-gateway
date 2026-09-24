@@ -214,6 +214,31 @@ func TestReadUsageEventsReadsTheDataPlanesPage(t *testing.T) {
 	}
 }
 
+// TestReadUsageEventsServesADrainedPage is the boundary the refusal table
+// must not erode: an empty events array under an intact envelope is the
+// contract's spelling of caught up, not a page missing its facts. Every
+// required field is present, and the pointer checks refuse absence and null,
+// never emptiness — so a feed with nothing new crosses and leaves the consumer
+// where it was, rather than failing a read that succeeded.
+func TestReadUsageEventsServesADrainedPage(t *testing.T) {
+	up := &upstream{body: `{"events":[],"next_cursor":"` + opaqueCursor + `","has_more":false}`}
+	client := up.server(t)
+
+	page, err := client.ReadUsageEvents(context.Background(), opaqueCursor, 100)
+	if err != nil {
+		t.Fatalf("ReadUsageEvents() error = %v", err)
+	}
+	if len(page.Events) != 0 {
+		t.Errorf("len(Events) = %d, want 0", len(page.Events))
+	}
+	if page.HasMore {
+		t.Error("HasMore = true, want false — a drained page is one the consumer has caught up on")
+	}
+	if page.NextCursor != opaqueCursor {
+		t.Errorf("NextCursor = %q, want %q byte for byte", page.NextCursor, opaqueCursor)
+	}
+}
+
 // TestReadUsageEventsClassifiesEveryFailureTheSeamCanProduce is the mapping
 // table: a position the Data Plane has aged out is the one failure a caller can
 // act on, and everything else — unreachable, refused, unreadable, or an

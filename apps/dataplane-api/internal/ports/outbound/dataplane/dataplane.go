@@ -94,10 +94,11 @@ type Page struct {
 var ErrCursorExpired = errors.New("usage fact cursor is no longer replayable")
 
 // ErrUpstreamUnavailable reports that the Data Plane could not be read — it
-// could not be reached, it answered with a status this façade cannot use, or
-// its answer could not be decoded. All three are one condition from a caller's
-// point of view: the answer is unknown, and this process holds nothing it could
-// answer with instead.
+// could not be reached, it answered with a status this façade cannot use, its
+// answer could not be decoded, or the page it answered with is missing one of
+// the fields this surface contracts as required. All four are one condition
+// from a caller's point of view: the answer is unknown, and this process holds
+// nothing it could answer with instead.
 var ErrUpstreamUnavailable = errors.New("the data plane is unavailable")
 
 // UsageFacts is the fact half of the cross-plane seam: the one read this
