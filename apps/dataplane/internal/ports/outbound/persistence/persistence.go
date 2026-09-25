@@ -26,11 +26,12 @@
 // databases, and the credential boundary is the authenticated management
 // surface of ADR 0006 §9.
 //
-// The port is deliberately small. It carries what the service has a consumer
-// for today — a reachability check, a transaction-scoped unit of work, and
-// the query surface that unit of work hands to the repositories built on it
-// — and it grows one member per real caller. A repository interface invented
-// before the table that backs it is a shape guessed at twice.
+// The port grows one member per real caller. Today it carries the runtime
+// storage repositories (execution.go, accounting.go), each shaped by the
+// call its storage design dictates rather than by generic CRUD, and each
+// backed by the 000002_runtime_storage schema — a repository interface
+// invented before the table that backs it would have been a shape guessed
+// at twice.
 package persistence
 
 import (

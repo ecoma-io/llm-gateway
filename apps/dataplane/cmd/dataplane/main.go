@@ -16,10 +16,11 @@
 // and pinged here at startup, because intake, reservations and usage are
 // durable only through the database this process owns. The persistence.Store
 // over that pool is still not constructed — no use case runs a query yet, and
-// it is wired by the change that first does. The fact reader is constructed,
-// and what it answers today is that there is no durable source yet: refusing is
-// the honest state of a Data Plane whose fact table arrives with the accounting
-// schema, and it is not the same thing as an adapter that was forgotten.
+// it is wired by the change that first does. The fact reader is constructed
+// over the same pool and answers from the usage_events table the runtime
+// storage schema creates: replaying what this process recorded, in the order
+// the store committed it, to whoever presents a position the stream can still
+// honour.
 //
 // There are two listeners and one application between them. The runtime's is the
 // public surface, opened on DATAPLANE_ADDR always; the management surface is
@@ -37,6 +38,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -53,7 +55,6 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/adapters/inbound/http"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/adapters/inbound/management"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/adapters/outbound/postgres"
-	usagefactsadapter "github.com/ecoma-io/llm-gateway/apps/dataplane/internal/adapters/outbound/usagefacts"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/config"
 )
@@ -121,14 +122,14 @@ func main() {
 	log.Printf("dataplane %s postgres pool on %s", version, postgresLocation(cfg))
 	// The persistence.Store over this pool is still not constructed: no use
 	// case runs a query yet, and postgres.New(pool) is wired by the change
-	// that first does. (The usage-fact reader stays refusing until the fact
-	// table exists; an open pool does not change that answer.)
+	// that first does. The fact reader is over the same pool already — bind
+	// takes it, because the reader exists and answers from usage_events.
 
 	// Every listener is bound before any of them serves. A process that
 	// answered on the runtime port while its management port was already taken
 	// would be a process an operator believes is fully deployed and which is
 	// half of one.
-	services, err := bind(cfg)
+	services, err := bind(cfg, pool)
 	if err != nil {
 		log.Printf("dataplane listen: %v", err)
 		os.Exit(1)
@@ -181,8 +182,12 @@ func postgresLocation(cfg config.Config) string {
 // That is also why the runtime handler is built here and not inside the
 // management branch: the surface that serves traffic must exist whether or not
 // an administrative port was configured.
-func bind(cfg config.Config) ([]service, error) {
-	app := application.New(version, usagefactsadapter.New())
+//
+// The pool arrives as an argument rather than being reopened here because the
+// fact reader is built over it: one database, one pool, and the composition
+// root is where the two adapters that share it meet.
+func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
+	app := application.New(version, postgres.NewUsageFacts(pool))
 
 	runtimeListener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
