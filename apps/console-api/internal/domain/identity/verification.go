@@ -26,21 +26,28 @@ type Credential struct {
 //  1. Constant-time digest equality — always executed, on every path, so
 //     wall time never reveals whether a key id exists. A mismatch and a
 //     missing record are the same sentinel (ErrUnknownCredential).
-//  2. Key state — a matched secret still does not authenticate a revoked
+//  2. Recorded identity — a matching digest must belong to the presented key
+//     id. This check sits after the digest burn, so only a caller possessing
+//     the secret can test whether the source answered the lookup it was
+//     given; a disagreeing record follows the miss path byte for byte.
+//  3. Key state — a matched secret still does not authenticate a revoked
 //     key. Revocation must survive a correct secret.
-//  3. Account state — the runtime contract (request-lifecycle steps 1–2)
+//  4. Account state — the runtime contract (request-lifecycle steps 1–2)
 //     requires the key active AND the account active, with distinct
 //     outcomes for suspended and closed accounts.
-//  4. Only then does a Principal exist.
+//  5. Only then does a Principal exist.
 //
-// The order is load-bearing: authentication (step 1) precedes authorisation
-// (steps 2–3), and no step after the first can be reached with a mismatched
-// secret. The function is pure — same inputs, same verdict, no clock, no I/O
-// — so the Data Plane's hot path can mirror it verbatim against its own
-// records.
+// The order is load-bearing: authentication (steps 1–2) precedes
+// authorisation (steps 3–4), and no step after the digest comparison can be
+// reached with a mismatched secret or a record answering another key. The
+// function is pure — same inputs, same verdict, no clock, no I/O — so the
+// Data Plane's hot path can mirror it verbatim against its own records.
 func VerifyCredential(presentedID APIKeyID, presented Secret, recorded Credential) (Principal, error) {
 	matched := EqualDigests(recorded.Digest, presented.Digest())
 	if !matched {
+		return Principal{}, fmt.Errorf("identity: verify credential %s: %w", presentedID, ErrUnknownCredential)
+	}
+	if recorded.KeyID != presentedID {
 		return Principal{}, fmt.Errorf("identity: verify credential %s: %w", presentedID, ErrUnknownCredential)
 	}
 	switch recorded.KeyState {

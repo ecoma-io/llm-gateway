@@ -37,6 +37,28 @@ func TestVerificationAuthenticatesAMatchingLiveCredential(t *testing.T) {
 	}
 }
 
+func TestVerificationRefusesARecordForAnotherKeyIdenticallyToAMiss(t *testing.T) {
+	// A record whose key id disagrees with the id it was looked up by is a
+	// source failure — cache keying, column mapping, a corrupt projection —
+	// and it must read exactly as a miss: the digest is left valid for the
+	// secret, so only the key-id check can reject it, and the rejection
+	// shares the miss path's sentinel and byte-for-byte text.
+	secret, recorded := verifiedFixture(t)
+	presentedID := recorded.KeyID
+	_, miss := VerifyCredential(presentedID, secret, Credential{})
+	if miss == nil {
+		t.Fatal("the zero record must miss")
+	}
+	recorded.KeyID = APIKeyID("119203d0-9a1b-4c2a-8f1e-3f5a6b7c8d9e")
+	_, disagree := VerifyCredential(presentedID, secret, recorded)
+	if !errors.Is(disagree, ErrUnknownCredential) {
+		t.Fatalf("record for another key error = %v, want ErrUnknownCredential", disagree)
+	}
+	if disagree.Error() != miss.Error() {
+		t.Fatalf("record for another key error = %q, want the miss text %q", disagree.Error(), miss.Error())
+	}
+}
+
 func TestVerificationTreatsMismatchAndMissingAsTheSameUnknown(t *testing.T) {
 	secret, recorded := verifiedFixture(t)
 
