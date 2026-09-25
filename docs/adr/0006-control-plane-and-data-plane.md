@@ -100,6 +100,12 @@ boundary does not creep.
 | `dataplane-api` | Data Plane management | Administrative configuration of the Data Plane: providers, model aliases and candidates, routing and egress policy, runtime key state, quota configuration, operational status                                                                                   | Exposes console concepts (`/me`, sessions, subscriptions, billing); re-implements the Data Plane domain |
 | `dataplane`     | Data Plane runtime    | `/v1/*`; API-key authentication; alias resolution; admission and quota enforcement; routing and candidate selection; pre-commitment fallback; provider adapters; egress; streaming; usage capture; request history; runtime reservation and settlement mechanics | Calls `console-api`; requires `dataplane-api` to serve a request; holds billing authority               |
 
+One decision already sits beneath this table's identity row: how console
+sign-in resolves a user — account-scoped, by `(account_id, email)` over live
+rows, never by email alone — is
+[ADR 0008](0008-console-sign-in-identity.md), the primitive the session work
+here inherits.
+
 ### 4. Runtime hot-path isolation
 
 The invariant, stated once and enforced by tests:
