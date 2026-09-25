@@ -133,13 +133,19 @@ func formatUUID(b [16]byte) string {
 }
 
 // isCanonicalUUID reports whether s is the exact 36-character canonical
-// spelling of a uuid — lowercase hex with hyphens where RFC 9562 puts them.
+// spelling of a uuid this package mints: lowercase hex with hyphens where
+// RFC 9562 puts them, version 7 at the version nibble, and the RFC 9562
+// variant at the variant bits.
 //
-// The check is deliberately stricter than "parses as a uuid": PostgreSQL
-// accepts braces, urn prefixes and mixed case, but an id this package compares,
-// embeds in a cursor or hands across a plane is canonical or it is nothing, and
-// accepting the loose spellings here would mean normalising them everywhere
-// else instead.
+// The check is deliberately stricter than "parses as a uuid" in both
+// directions. PostgreSQL accepts braces, urn prefixes and mixed case, but an
+// id this package compares, embeds in a cursor or hands across a plane is
+// canonical or it is nothing, and accepting the loose spellings here would
+// mean normalising them everywhere else instead. And a canonical spelling of
+// another version — the nil uuid, a v4 — is not an id this package mints
+// either: version 7 is what every minted id carries, so a value with a
+// different version nibble or variant is refused rather than carried as an
+// identity nothing minted.
 func isCanonicalUUID(s string) bool {
 	if len(s) != 36 {
 		return false
@@ -155,6 +161,14 @@ func isCanonicalUUID(s string) bool {
 				return false
 			}
 		}
+	}
+	if s[14] != '7' {
+		return false
+	}
+	switch s[19] {
+	case '8', '9', 'a', 'b':
+	default:
+		return false
 	}
 	return true
 }

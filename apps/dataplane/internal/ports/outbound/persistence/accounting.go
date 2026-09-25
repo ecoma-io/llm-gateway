@@ -98,6 +98,15 @@ type QuotaProjectionRepository interface {
 	// built from what the store granted, never from what the caller hoped.
 	// ErrInsufficientCapacity means the whole order fell short, with nothing
 	// drawn — the walk gives back what it took before saying so.
+	//
+	// The walk, the takes and the giveback run through the Querier ctx
+	// resolves, so they are one atomic unit of work exactly when ctx carries
+	// one — admission's call belongs inside a WithinTx, and the concurrency
+	// guarantee above is a unit-of-work guarantee: a Drawdown spread over
+	// pool connections is statements without a snapshot, and its giveback is
+	// three writes where a rollback would have been one. The store's doctrine
+	// is that the caller owns the boundary; this is the method where forgetting
+	// it would look like it worked.
 	Drawdown(ctx context.Context, accountID string, amount int64) ([]accounting.Allocation, error)
 
 	// Return puts drawn-down capacity back, one leg at a time, each update
