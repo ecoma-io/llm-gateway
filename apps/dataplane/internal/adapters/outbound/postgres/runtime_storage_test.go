@@ -32,11 +32,13 @@ package postgres
 //     database is retained forever by design and carries rows from every
 //     earlier run, so the suite must be safe to run twice against one server.
 //     The tests whose assertions need a database of their own — the genesis
-//     feed, the from-scratch schema apply, the simulated lost stream (the one
-//     place the append-only writer discipline is broken, because its failure
-//     mode is what has to be proved; the migration header documents why no
-//     trigger guards those deletions) — mint a throwaway database instead and
-//     answer to nobody else's rows.
+//     feed, the from-scratch schema apply, the two that empty usage_events
+//     outright (the simulated lost stream, whose loss is the failure mode
+//     being proved, and the truncate-boundary probe that states where the
+//     000006 append-only guard ends; since that migration the engine refuses
+//     the UPDATE and DELETE that once emptied a feed, and both go around it
+//     the way only a privileged role can) — mint a throwaway database instead
+//     and answer to nobody else's rows.
 
 import (
 	"bytes"
@@ -1679,8 +1681,14 @@ func TestIntegrationRebornStreamFailsOldCursorsClosed(t *testing.T) {
 	}
 
 	// The lost stream: the one sanctioned deletion in the suite, on a
-	// database carrying nobody's rows but this test's.
-	if _, err := db.ExecContext(ctx, "DELETE FROM public.usage_events"); err != nil {
+	// database carrying nobody's rows but this test's. usage_events is
+	// append-only at the engine since 000006_usage_events_append_only, and a
+	// superseded row is the one thing that guard has no statement for — which
+	// is the point of issuing it: a real lost feed is emptied, not edited. The
+	// guard's own test pins that TRUNCATE is not part of its reach, so this
+	// simulation is precisely the reach of a role the production contract
+	// gives no application.
+	if _, err := db.ExecContext(ctx, "TRUNCATE public.usage_events"); err != nil {
 		t.Fatalf("simulating the lost feed: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, "DELETE FROM public.usage_events_stream WHERE singleton"); err != nil {
