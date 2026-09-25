@@ -134,7 +134,10 @@ components:
             The terminal outcome the fact records, and what a consumer derives
             from it: a settlement with consume and release legs for `settled`,
             release legs alone for `released` and `expired`, and no customer
-            charge at all for `unbillable_orphaned`.
+            charge at all for `unbillable_orphaned`. The vocabulary is terminal
+            on purpose — a hold is Data-Plane reservation state, not a fact of
+            its own, so no kind delivers one; what a consumer learns of a hold
+            rides in each fact's allocation tail.
         schema_version:
           type: integer
           minimum: 1

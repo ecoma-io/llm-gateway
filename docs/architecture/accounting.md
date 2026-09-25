@@ -43,7 +43,8 @@ Two pairs in that list get collapsed, and neither collapse is allowed:
 - **A Reservation Allocation is not a Ledger Entry.** The allocation is the
   runtime's record of which buckets a hold was split across and in what order;
   the `hold`, `consume` and `release` legs are the ledger's, written in the
-  Control Plane from the fact. The order is the same and the rows are not.
+  Control Plane from the reservation's terminal fact. The order is the same
+  and the rows are not.
 
 **Who writes what is the boundary.** The runtime never writes `ledger_entries`,
 `funding_buckets` or `settlements`; the Control Plane never provides runtime
@@ -218,14 +219,14 @@ without consuming tokens), referencing their settlement or, across the plane
 boundary, their reservation **by ID alone** — no foreign key exists in either
 direction (ADR 0006 §7):
 
-| Kind         | Written when                                     | Bucket             | Meaning                                                                     |
-| ------------ | ------------------------------------------------ | ------------------ | --------------------------------------------------------------------------- |
-| `grant`      | a subscription's grant cycle rolls               | entitlement cycle  | capacity issued for the cycle                                               |
-| `topup`      | operator today, payment provider later (webhook) | PAYG               | funding added                                                               |
-| `hold`       | after admission, from the reservation as a fact  | entitlement / PAYG | capacity occupied by a reservation                                          |
-| `release`    | settlement tail, exhaustion, reaper expiry       | entitlement / PAYG | occupied capacity returned                                                  |
-| `consume`    | settlement                                       | entitlement / PAYG | capacity actually spent                                                     |
-| `adjustment` | explicit operator correction only                | entitlement / PAYG | compensating pair with reason, original ref, and stated settled/held deltas |
+| Kind         | Written when                                             | Bucket             | Meaning                                                                     |
+| ------------ | -------------------------------------------------------- | ------------------ | --------------------------------------------------------------------------- |
+| `grant`      | a subscription's grant cycle rolls                       | entitlement cycle  | capacity issued for the cycle                                               |
+| `topup`      | operator today, payment provider later (webhook)         | PAYG               | funding added                                                               |
+| `hold`       | from the reservation's terminal fact, never at admission | entitlement / PAYG | capacity the reservation held, carried by the fact's allocation tail        |
+| `release`    | settlement tail, exhaustion, reaper expiry               | entitlement / PAYG | occupied capacity returned                                                  |
+| `consume`    | settlement                                               | entitlement / PAYG | capacity actually spent                                                     |
+| `adjustment` | explicit operator correction only                        | entitlement / PAYG | compensating pair with reason, original ref, and stated settled/held deltas |
 
 **Formal projections** per funding bucket (G = grants/topups, C = consumes,
 H = holds, R = releases, A = adjustment `(settled_delta, held_delta)` pairs):
@@ -235,6 +236,35 @@ settled   = ΣG − ΣC + ΣA.settled_delta
 held      = ΣH − ΣR − ΣC + ΣA.held_delta
 available = settled − held        (must stay ≥ 0 — the hold guard refuses the overdraw)
 ```
+
+**Where ΣH comes from, and what `held` therefore is.** A hold is never a
+fact on the cross-plane feed: it is Data-Plane state — the reservation and its
+allocation legs, drawn down against the runtime's quota projection at
+admission — and the runtime writes none of this plane's rows. The feed
+(`api/openapi/shared/usage-facts.yaml`) carries **terminal outcomes only** —
+`settled`, `released`, `expired`, `unbillable_orphaned` — so no kind delivers
+a hold leg, and no consumer of the feed can read a bucket's held amount at an
+instant. What reaches this plane instead is each terminal fact's allocation
+tail, whose per-bucket `amount` is the held amount that reservation booked
+([cross-plane protocols](cross-plane-protocols.md)), and the `hold` leg is
+booked here from that tail — before the `release`/`consume` legs it funds,
+which the engine requires anyway (a release names a reservation that has a
+hold leg on file, and a consume draws against held). Idempotency is by
+`request_id`, on the leg's own uniqueness, and B12's applier is the caller
+that will do it — B6 shipped the primitive and no caller, and no other channel
+exists: the feed is the only path by which a `dataplane` row becomes a
+`control` row ([data implications](data-implications.md)), and the management
+surface contracts no read of live reservations.
+
+The consequence for the projection above is exact: a bucket's cached `held`
+is algebra over holds whose terminal fact has already been applied, never the
+runtime's in-flight total. The two differ by exactly the reservations still
+open in the Data Plane — the window between a committed reservation and its
+settlement that ADR 0006 names as a bounded property, for reconciliation
+(B13) to converge — and the hold guard's `available ≥ take` is judged against
+the bucket as the applied facts left it, not as admission left it. The guard
+that refuses an overdraw at admission is the runtime's projection, not this
+column; `held` is the ledger's record of what was held and how it ended.
 
 No kind can make any of the three negative. The non-adjustment kinds cannot
 — consume's guard checks the take against held _and_ settled before either
@@ -262,7 +292,7 @@ bucket is an **Accounting aggregate** (ADR 0001) and it lives in the Control
 Plane: its row is written only by the accounting flows of that plane — the
 Control-Plane halves of the four coordinated transactions (settlement, and the
 cycle roll's grant), the `hold`/`release` legs derived from the reservation's
-facts, and the context-local `topup`/`adjustment` refills — while the Commerce
+terminal fact, and the context-local `topup`/`adjustment` refills — while the Commerce
 entitlement cycle or PAYG flag it projects references it by identifier. One
 entitlement cycle and one account each own exactly one bucket (the owner
 exclusivity is a schema `CHECK`, not a convention), and the bucket is never
@@ -274,7 +304,10 @@ assignment naming another account's bucket is an error, not a silent no-op).
 correction that states its settled/held deltas explicitly, with the reason and
 the original entry it corrects; it is never an automatic overdraw path (the
 reservation ceiling means automatic debt cannot arise) and never a credit
-mechanism (the no-credit rule above).
+mechanism (the no-credit rule above). A bucket's cached `held` is as complete
+as its legs and no more: it is held-and-returned, never held-and-outstanding,
+and the completeness window is a fact-delivery latency plus the reservations
+still open in the Data Plane.
 
 The legs carry their own provenance promises in the engine: a `release` names
 a reservation this bucket actually booked a `hold` for, and an `adjustment`
@@ -310,32 +343,39 @@ drawn.
 
 ### Worked ledger sequences
 
+The left column names the **Data-Plane event** a leg is derived from, not when
+the Control Plane books it. Every leg of a request's money — its `hold` and the
+`release`/`consume` legs that end it — is booked in this plane when that
+request's terminal fact is applied, because that is the only thing the runtime
+publishes (see **Where ΣH comes from**, above). A bucket's committed `held`
+therefore never tracks a reservation still being served.
+
 **Success, no fallback, usage below the hold** — entitlement bucket granted
 100 this cycle:
 
 ```text
-admission   hold     S1  12          → bucket: held 12
-settle      consume  S1   7
-            release  S1   5          → bucket: held 0, settled 100 − 7 = 93
+reserved     hold     S1  12
+settled      consume  S1   7
+             release  S1   5          → bucket: held 0, settled 100 − 7 = 93
 ```
 
 **Fallback** — candidate 1 fails before commitment, candidate 2 serves. One
 reservation; only the committed attempt settles (invariant 6):
 
 ```text
-admission   hold     S1  12
-attempt×2   (attempt rows only — failed attempts never create legs)
-settle      consume  S1  11
-            release  S1   1
+reserved     hold     S1  12
+attempt×2    (attempt rows only — failed attempts never create legs)
+settled      consume  S1  11
+             release  S1   1
 ```
 
 **Stream dies after commitment, client received part** — capture method
 `gateway_observed`, observed delivery prices to 20 against a hold of 30:
 
 ```text
-admission   hold     S1  30
-settle      consume  S1  20
-            release  S1  10
+reserved     hold     S1  30
+settled      consume  S1  20
+             release  S1  10
 ```
 
 The hold always covers the charge (hard ceiling), so `release` is never
@@ -348,8 +388,8 @@ cancelled remainder lands on the attempt row as provider-cost telemetry only.
 **Crash before settlement** — lease dies, reaper closes an abandoned hold:
 
 ```text
-admission   hold     S1  12
-reaper      release  S1  12         (state: expired)
+reserved     hold     S1  12
+expired      release  S1  12         (state: expired)
 ```
 
 No settlement exists; if attempt telemetry proves the orphaned completion,
@@ -412,8 +452,9 @@ account-funding choreographies commerce calls. The flows that will drive it
 arrive later, and none is stubbed here:
 
 - **Admission (B8)** — the runtime's reservation waterfall against its quota
-  projection; this plane's `hold` legs are booked from its decisions as
-  facts.
+  projection; admission writes no fact — the feed carries terminal outcomes
+  only — so this plane's `hold` legs wait for the terminal fact's allocation
+  tail, as **Where ΣH comes from** above records.
 - **Usage → pricing → settlement wiring (B12)** — the consumer loop that
   reads the fact feed and calls Settle; what that feed must carry is the
   open defect of
