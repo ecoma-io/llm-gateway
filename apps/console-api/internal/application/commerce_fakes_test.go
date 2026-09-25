@@ -480,6 +480,27 @@ func (f fakeSubscriptions) Cancel(_ context.Context, id commerce.SubscriptionID,
 	return true, nil
 }
 
+// CompleteScheduledCancellation is the cancellation lane's verdict,
+// predicate for predicate with the statement: the instruction exactly as the
+// scan read it — scheduled, and due on the world's clock — still on file.
+// An instruction rescheduled after the scan (a later CancelAt, or a
+// different mode) leaves this false, and the row stays what the customer's
+// latest instruction made it.
+func (f fakeSubscriptions) CompleteScheduledCancellation(_ context.Context, id commerce.SubscriptionID, updatedAt time.Time) (bool, error) {
+	subscription, ok := f.world.subs[id]
+	if !ok ||
+		subscription.State != commerce.SubscriptionActive ||
+		subscription.CancellationMode != commerce.CancellationScheduled ||
+		subscription.CancelAt == nil ||
+		subscription.CancelAt.After(f.world.now) {
+		return false, nil
+	}
+	subscription.State = commerce.SubscriptionCancelled
+	subscription.UpdatedAt = updatedAt
+	f.world.subs[id] = subscription
+	return true, nil
+}
+
 // Activate is the promotion's guarded verdict, predicate for predicate with
 // the statement: pending, start arrived on the world's clock, owner active.
 func (f fakeSubscriptions) Activate(_ context.Context, id commerce.SubscriptionID, periodStart, periodEnd, updatedAt time.Time) (bool, error) {
@@ -535,8 +556,7 @@ func (f fakeSubscriptions) Expire(_ context.Context, id commerce.SubscriptionID,
 		subscription.RenewalEnabled ||
 		subscription.PeriodEnd == nil ||
 		subscription.PeriodEnd.After(f.world.now) ||
-		subscription.CancelAt != nil ||
-		f.world.guardAccountInactive {
+		subscription.CancelAt != nil {
 		return false, nil
 	}
 	subscription.State = commerce.SubscriptionExpired
@@ -571,7 +591,8 @@ func (f fakeSubscriptions) DuePromotionIDs(_ context.Context, limit int) ([]comm
 		return nil, err
 	}
 	return f.scanIDs(limit, func(a, b commerce.Subscription) bool { return a.StartAt.Before(b.StartAt) }, func(s commerce.Subscription) bool {
-		return s.State == commerce.SubscriptionPending && !s.StartAt.After(f.world.now)
+		return s.State == commerce.SubscriptionPending && !s.StartAt.After(f.world.now) &&
+			f.world.accountActive(s.AccountID)
 	})
 }
 
@@ -581,7 +602,8 @@ func (f fakeSubscriptions) DueRollIDs(_ context.Context, limit int) ([]commerce.
 	}
 	return f.scanIDs(limit, func(a, b commerce.Subscription) bool { return a.PeriodEnd.Before(*b.PeriodEnd) }, func(s commerce.Subscription) bool {
 		return s.State == commerce.SubscriptionActive && s.RenewalEnabled &&
-			s.PeriodEnd != nil && !s.PeriodEnd.After(f.world.now)
+			s.PeriodEnd != nil && !s.PeriodEnd.After(f.world.now) &&
+			f.world.accountActive(s.AccountID)
 	})
 }
 
@@ -613,6 +635,14 @@ type fakeEntitlements struct {
 func (f fakeEntitlements) Create(_ context.Context, entitlement commerce.Entitlement) error {
 	if err := f.world.failOn["entitlements.create"]; err != nil {
 		return err
+	}
+	for _, existing := range f.world.ents {
+		if existing.SubscriptionID == entitlement.SubscriptionID &&
+			existing.CycleNumber == entitlement.CycleNumber &&
+			existing.GrantDefinitionID == entitlement.GrantDefinitionID {
+			return fmt.Errorf("fakes: entitlement %s duplicates subscription %s cycle %d definition %s",
+				entitlement.ID, entitlement.SubscriptionID, entitlement.CycleNumber, entitlement.GrantDefinitionID)
+		}
 	}
 	f.world.ents[entitlement.ID] = entitlement
 	return nil

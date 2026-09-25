@@ -375,6 +375,21 @@ func TestExpiry(t *testing.T) {
 			t.Fatal("a renewing subscription is due for expiry at the period end")
 		}
 	})
+	t.Run("an outstanding instruction takes the end away from expiry", func(t *testing.T) {
+		// The instruction is the cancellation lane's to execute. Expiry
+		// refusing here is what keeps the two lanes from reaching for the
+		// same row's terminal state.
+		s, end := expireCase(t, false)
+		if err := s.ScheduleCancellation(end.Add(24*time.Hour), end.Add(-time.Hour)); err != nil {
+			t.Fatalf("ScheduleCancellation returned error: %v", err)
+		}
+		if s.IsDueForExpiry(end) {
+			t.Fatal("a fixed term under an outstanding instruction is due for expiry")
+		}
+		if err := s.Expire(end); !errors.Is(err, ErrNotDue) {
+			t.Fatalf("expire under an instruction error = %v, want ErrNotDue", err)
+		}
+	})
 	t.Run("a cancelled subscription never expires", func(t *testing.T) {
 		s, end := expireCase(t, true)
 		if err := s.Cancel(end.Add(-24 * time.Hour)); err != nil {

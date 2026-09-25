@@ -287,7 +287,10 @@ func (s *Subscription) IsDueForExpiry(now time.Time) bool {
 	if s.State != SubscriptionActive && s.State != SubscriptionSuspended {
 		return false
 	}
-	if s.PeriodEnd == nil || s.RenewalEnabled {
+	// An outstanding cancellation instruction is not this end's to execute:
+	// the cancellation lane owns it, and an instruction due after the term
+	// must complete as a cancellation, not be pre-empted by an expiry.
+	if s.PeriodEnd == nil || s.RenewalEnabled || s.CancelAt != nil {
 		return false
 	}
 	return !now.UTC().Before(*s.PeriodEnd)

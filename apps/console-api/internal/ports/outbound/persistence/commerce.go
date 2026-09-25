@@ -157,6 +157,19 @@ type Subscriptions interface {
 	// the row active and wins, the rest read cancelled and stop.
 	Cancel(ctx context.Context, id commerce.SubscriptionID, cancelledAt time.Time) (bool, error)
 
+	// CompleteScheduledCancellation is the cancellation lane's
+	// single-statement verdict: the scheduled instruction completes — state
+	// cancelled, the instructed instant and its mode kept as the record of
+	// when the customer asked — only while the row still shows active,
+	// still carries a scheduled instruction, and that instruction has
+	// arrived on the database clock. The instruction predicates are
+	// repeated from the scan because the instruction can move after the
+	// scan reads it: a reschedule that pushes cancel_at back into the
+	// future must leave the row uncompleted, not cancelled under an
+	// instruction the customer had already superseded. False means the
+	// world moved; the caller skips the row benignly.
+	CompleteScheduledCancellation(ctx context.Context, id commerce.SubscriptionID, updatedAt time.Time) (bool, error)
+
 	// Activate is the promotion's single-statement verdict: the pending row
 	// becomes active with cycle 1's bounds only while it still reads
 	// pending, its start_at has arrived on the database clock, and its

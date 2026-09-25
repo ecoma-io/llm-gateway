@@ -799,22 +799,27 @@ func TestIntegrationCommerceTheWholeLifecycleWalksOnOneSubscription(t *testing.T
 		t.Fatalf("the instructed subscription is missing from the cancellation scan: %v", dueCancellations)
 	}
 
-	// Completion: the immediate path is the one completion statement this
-	// port carries, and it is idempotent by its CAS — the first caller wins,
-	// the rest read cancelled and stop.
-	applied, err := c.subscriptions.Cancel(ctx, subscription.ID, time.Now().UTC())
+	// Completion: the lane's own statement is the verdict — it repeats the
+	// instruction the scan read (scheduled, and due on the database clock),
+	// and the first completion absorbs every later one. The instructed
+	// instant is kept: the row is ended by the cancellation the customer
+	// asked for, not rewritten by the lane that executed it.
+	applied, err := c.subscriptions.CompleteScheduledCancellation(ctx, subscription.ID, time.Now().UTC())
 	if err != nil || !applied {
-		t.Fatalf("complete the cancellation = (%t, %v), want (true, nil)", applied, err)
+		t.Fatalf("complete the scheduled cancellation = (%t, %v), want (true, nil)", applied, err)
 	}
-	if applied, err := c.subscriptions.Cancel(ctx, subscription.ID, time.Now().UTC()); err != nil || applied {
-		t.Fatalf("a second cancel = (%t, %v), want (false, nil)", applied, err)
+	if applied, err = c.subscriptions.CompleteScheduledCancellation(ctx, subscription.ID, time.Now().UTC()); err != nil || applied {
+		t.Fatalf("a second completion = (%t, %v), want (false, nil)", applied, err)
 	}
 	final, err := c.subscriptions.ByID(ctx, subscription.ID)
 	if err != nil {
 		t.Fatalf("read the cancelled subscription: %v", err)
 	}
-	if final.State != commerce.SubscriptionCancelled || final.CancellationMode != commerce.CancellationImmediate {
-		t.Fatalf("the cancelled subscription = %+v, want cancelled by the immediate path", final)
+	if final.State != commerce.SubscriptionCancelled || final.CancellationMode != commerce.CancellationScheduled {
+		t.Fatalf("the cancelled subscription = %+v, want cancelled with the scheduled instruction it was ended by", final)
+	}
+	if final.CancelAt == nil || !micros(*final.CancelAt).Equal(micros(cancelAt)) {
+		t.Fatalf("completion moved cancel_at to %v, want the instructed %v", final.CancelAt, cancelAt)
 	}
 
 	// Terminal is terminal for every lane: no roll, no expiry, no scan.
@@ -836,6 +841,185 @@ func TestIntegrationCommerceTheWholeLifecycleWalksOnOneSubscription(t *testing.T
 	}
 	if len(candidates) != 0 {
 		t.Fatalf("a cancelled subscription's grants are still candidates: %d of them", len(candidates))
+	}
+}
+
+// TestIntegrationCommerceScheduledCompletionIsItsOwnStatementVerdict pins
+// the cancellation lane's verdict: the statement repeats the instruction the
+// scan read — state active, mode scheduled, cancel_at due on the database
+// clock — so every neighbour the predicates exclude waits, and an
+// instruction rescheduled after the scan is not executed under words the
+// customer already superseded.
+func TestIntegrationCommerceScheduledCompletionIsItsOwnStatementVerdict(t *testing.T) {
+	c := integrationCommerce(t)
+	ctx := t.Context()
+	plan := newIntegrationPlan(t, c)
+	version, _ := publishVersionWithDefinitions(t, c, plan.ID, commerce.WildcardGroupName)
+	now := time.Now().UTC()
+	account := integrationCommerceAccount(t, c, "it-commerce completion probe")
+
+	// Fires: due, scheduled, active — and the completion keeps the
+	// instructed instant and the scheduled mode beside the terminal state.
+	due := activate(t, c, pendingSubscription(t, c, account, version.ID, matureStartAt(now), true))
+	dueAt := now.Add(-time.Minute)
+	if applied, err := c.subscriptions.ScheduleCancellation(ctx, due.ID, dueAt, now); err != nil || !applied {
+		t.Fatalf("schedule the instruction = (%t, %v), want (true, nil)", applied, err)
+	}
+	applied, err := c.subscriptions.CompleteScheduledCancellation(ctx, due.ID, now)
+	if err != nil || !applied {
+		t.Fatalf("complete the due instruction = (%t, %v), want (true, nil)", applied, err)
+	}
+	stored, err := c.subscriptions.ByID(ctx, due.ID)
+	if err != nil || stored.State != commerce.SubscriptionCancelled || stored.CancellationMode != commerce.CancellationScheduled {
+		t.Fatalf("the completed row = %+v (%v), want cancelled with the scheduled mode kept", stored, err)
+	}
+	if stored.CancelAt == nil || !micros(*stored.CancelAt).Equal(micros(dueAt)) {
+		t.Fatalf("completion moved cancel_at to %v, want the instructed %v", stored.CancelAt, dueAt)
+	}
+
+	// Refuses: the instruction is not due. The clock test is part of the
+	// statement, so a lane arriving before the instant leaves the row
+	// exactly as it found it.
+	early := activate(t, c, pendingSubscription(t, c, account, version.ID, matureStartAt(now), true))
+	if applied, err := c.subscriptions.ScheduleCancellation(ctx, early.ID, now.Add(time.Hour), now); err != nil || !applied {
+		t.Fatalf("schedule the instruction = (%t, %v), want (true, nil)", applied, err)
+	}
+	if applied, err := c.subscriptions.CompleteScheduledCancellation(ctx, early.ID, now); err != nil || applied {
+		t.Fatalf("a completion before the instant = (%t, %v), want (false, nil)", applied, err)
+	}
+
+	// Refuses: the immediate path got there first. The row is terminal, and
+	// terminal is no verdict's to revisit.
+	imm := activate(t, c, pendingSubscription(t, c, account, version.ID, matureStartAt(now), true))
+	if applied, err := c.subscriptions.Cancel(ctx, imm.ID, now); err != nil || !applied {
+		t.Fatalf("the immediate cancel = (%t, %v), want (true, nil)", applied, err)
+	}
+	if applied, err := c.subscriptions.CompleteScheduledCancellation(ctx, imm.ID, now); err != nil || applied {
+		t.Fatalf("a completion of an immediately-cancelled row = (%t, %v), want (false, nil)", applied, err)
+	}
+
+	// Refuses: the row is suspended. A suspension on file supersedes the
+	// lane's verdict the way any moved world does — the instruction waits
+	// for a row whose state the statement names.
+	frozen := activate(t, c, pendingSubscription(t, c, account, version.ID, matureStartAt(now), true))
+	if applied, err := c.subscriptions.ScheduleCancellation(ctx, frozen.ID, now.Add(-time.Minute), now); err != nil || !applied {
+		t.Fatalf("schedule the instruction = (%t, %v), want (true, nil)", applied, err)
+	}
+	if applied, err := c.subscriptions.TransitionState(ctx, frozen.ID, commerce.SubscriptionActive, commerce.SubscriptionSuspended, now); err != nil || !applied {
+		t.Fatalf("suspend the instructed row = (%t, %v), want (true, nil)", applied, err)
+	}
+	if applied, err := c.subscriptions.CompleteScheduledCancellation(ctx, frozen.ID, now); err != nil || applied {
+		t.Fatalf("a completion of a suspended row = (%t, %v), want (false, nil)", applied, err)
+	}
+
+	// Refuses: the instruction moved after the scan. The lane's read said
+	// due; the customer pushed the instant out; the statement's clock test
+	// judges the instant on file, not the one the scan saw.
+	moved := activate(t, c, pendingSubscription(t, c, account, version.ID, matureStartAt(now), true))
+	if applied, err := c.subscriptions.ScheduleCancellation(ctx, moved.ID, now.Add(-time.Minute), now); err != nil || !applied {
+		t.Fatalf("schedule the instruction = (%t, %v), want (true, nil)", applied, err)
+	}
+	pushedTo := now.Add(time.Hour)
+	if applied, err := c.subscriptions.ScheduleCancellation(ctx, moved.ID, pushedTo, now); err != nil || !applied {
+		t.Fatalf("reschedule the instruction = (%t, %v), want (true, nil)", applied, err)
+	}
+	if applied, err := c.subscriptions.CompleteScheduledCancellation(ctx, moved.ID, now); err != nil || applied {
+		t.Fatalf("a completion of a rescheduled instruction = (%t, %v), want (false, nil)", applied, err)
+	}
+	still, err := c.subscriptions.ByID(ctx, moved.ID)
+	if err != nil || still.State != commerce.SubscriptionActive ||
+		still.CancelAt == nil || !micros(*still.CancelAt).Equal(micros(pushedTo)) {
+		t.Fatalf("the rescheduled row = %+v (%v), want active with the pushed instant intact", still, err)
+	}
+}
+
+// TestIntegrationCommerceALostRollTakesItsGrantBack pins the roll unit of
+// work's all-or-nothing shape: when the guarded advance matches nothing, the
+// entitlement inserted beside it in the same transaction does not survive —
+// a grant without its cycle advance is exactly the half-state the doctrine
+// forbids.
+func TestIntegrationCommerceALostRollTakesItsGrantBack(t *testing.T) {
+	c := integrationCommerce(t)
+	ctx := t.Context()
+	plan := newIntegrationPlan(t, c)
+	version, definitions := publishVersionWithDefinitions(t, c, plan.ID, commerce.WildcardGroupName)
+	definition := definitions[0]
+	account := integrationCommerceAccount(t, c, "it-commerce rollback probe")
+	subscription := activate(t, c, pendingSubscription(t, c, account, version.ID, liveStartAt(time.Now().UTC()), true))
+
+	// Cycle 1's grant, the way the promotion's unit of work leaves it.
+	cycle1Start, cycle1End := mustCycleBounds(t, subscription.StartAt, 1)
+	if err := c.entitlements.Create(ctx, *grantCycle(t, subscription.ID, 1, definition, cycle1Start, cycle1End)); err != nil {
+		t.Fatalf("grant cycle 1: %v", err)
+	}
+
+	// The live period means the advance refuses; the unit of work returns
+	// with cycle 2's insert undone.
+	if applied := rollOnce(t, c, subscription.ID, definition); applied {
+		t.Fatal("a roll inside a live period reported true")
+	}
+	candidates, err := c.entitlements.ActiveCandidates(ctx, account)
+	if err != nil {
+		t.Fatalf("read the candidates after the lost roll: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].Entitlement.CycleNumber != 1 {
+		t.Fatalf("candidates after the lost roll = %+v, want only cycle 1's grant — the next cycle's insert must not survive the rollback", candidates)
+	}
+	stored, err := c.subscriptions.ByID(ctx, subscription.ID)
+	if err != nil || stored.CycleNumber == nil || *stored.CycleNumber != 1 {
+		t.Fatalf("the subscription after the lost roll = %+v (%v), want cycle 1 untouched", stored, err)
+	}
+}
+
+// TestIntegrationCommerceTheDueScansRepeatTheirStatementsAccountGate pins
+// the EXISTS gate the promotion and roll scans carry beside their own
+// predicates: a row whose owner account is not active waits in no lane, so
+// a permanently unpayable row cannot sit at a batch's head starving the
+// rows behind it.
+func TestIntegrationCommerceTheDueScansRepeatTheirStatementsAccountGate(t *testing.T) {
+	c := integrationCommerce(t)
+	ctx := t.Context()
+	plan := newIntegrationPlan(t, c)
+	version, _ := publishVersionWithDefinitions(t, c, plan.ID, commerce.WildcardGroupName)
+	now := time.Now().UTC()
+	owner := integrationCommerceAccount(t, c, "it-commerce scan gate probe")
+	pending := pendingSubscription(t, c, owner, version.ID, matureStartAt(now), true)
+	rolling := activate(t, c, pendingSubscription(t, c, owner, version.ID, matureStartAt(now), true))
+
+	if applied, err := c.accounts.TransitionState(ctx, identity.AccountID(owner), identity.AccountActive, identity.AccountSuspended, now); err != nil || !applied {
+		t.Fatalf("suspend the owner account = (%t, %v), want (true, nil)", applied, err)
+	}
+	duePromotions, err := c.subscriptions.DuePromotionIDs(ctx, 100)
+	if err != nil {
+		t.Fatalf("scan due promotions: %v", err)
+	}
+	if containsSubscription(duePromotions, pending.ID) {
+		t.Fatal("a suspended owner's pending subscription is listed for promotion — the scan's gate is missing")
+	}
+	dueRolls, err := c.subscriptions.DueRollIDs(ctx, 100)
+	if err != nil {
+		t.Fatalf("scan due rolls: %v", err)
+	}
+	if containsSubscription(dueRolls, rolling.ID) {
+		t.Fatal("a suspended owner's ended cycle is listed for roll — the scan's gate is missing")
+	}
+
+	// The gate is the account's state, not the rows' worthiness: the moment
+	// the account is back, the same rows return to the same scans.
+	if applied, err := c.accounts.TransitionState(ctx, identity.AccountID(owner), identity.AccountSuspended, identity.AccountActive, now); err != nil || !applied {
+		t.Fatalf("reinstate the owner account = (%t, %v), want (true, nil)", applied, err)
+	}
+	if duePromotions, err = c.subscriptions.DuePromotionIDs(ctx, 100); err != nil {
+		t.Fatalf("re-scan due promotions: %v", err)
+	}
+	if !containsSubscription(duePromotions, pending.ID) {
+		t.Fatalf("the reinstated owner's pending subscription is missing from the promotion scan: %v", duePromotions)
+	}
+	if dueRolls, err = c.subscriptions.DueRollIDs(ctx, 100); err != nil {
+		t.Fatalf("re-scan due rolls: %v", err)
+	}
+	if !containsSubscription(dueRolls, rolling.ID) {
+		t.Fatalf("the reinstated owner's ended cycle is missing from the roll scan: %v", dueRolls)
 	}
 }
 

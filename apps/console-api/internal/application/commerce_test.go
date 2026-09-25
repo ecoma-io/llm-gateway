@@ -302,6 +302,72 @@ func TestSubscriptionLifecycleMoves(t *testing.T) {
 		}
 	})
 
+	t.Run("cancelling now stamps the instruction beside the state", func(t *testing.T) {
+		// The cancelled row is more than a state: cancel_at and the mode
+		// travel with it, because the record is what says the customer asked
+		// to stop and when the stop took effect.
+		world := newCommerceWorld(t)
+		commerceUse := newCommerce(world)
+		accountID := world.seedAccount(t)
+		_, versionID := world.seedPublishedVersion(t)
+		subscription := world.seedSubscription(t, accountID, versionID, world.now, true)
+		if _, err := commerceUse.PromoteDueSubscriptions(t.Context(), 10); err != nil {
+			t.Fatalf("PromoteDueSubscriptions returned error: %v", err)
+		}
+		if err := commerceUse.CancelSubscriptionNow(t.Context(), subscription.ID); err != nil {
+			t.Fatalf("CancelSubscriptionNow returned error: %v", err)
+		}
+		row := world.subs[subscription.ID]
+		if row.State != commerce.SubscriptionCancelled ||
+			row.CancellationMode != commerce.CancellationImmediate ||
+			row.CancelAt == nil {
+			t.Fatalf("cancelled row = %q mode %q cancel_at %v, want cancelled, immediate, stamped",
+				row.State, row.CancellationMode, row.CancelAt)
+		}
+	})
+
+	t.Run("a rescheduled instruction waits for its new instant", func(t *testing.T) {
+		world := newCommerceWorld(t)
+		commerceUse := newCommerce(world)
+		accountID := world.seedAccount(t)
+		_, versionID := world.seedPublishedVersion(t)
+		subscription := world.seedSubscription(t, accountID, versionID, world.now, true)
+		if _, err := commerceUse.PromoteDueSubscriptions(t.Context(), 10); err != nil {
+			t.Fatalf("PromoteDueSubscriptions returned error: %v", err)
+		}
+		first := world.now.Add(48 * time.Hour)
+		if err := commerceUse.ScheduleSubscriptionCancellation(t.Context(), subscription.ID, first); err != nil {
+			t.Fatalf("ScheduleSubscriptionCancellation returned error: %v", err)
+		}
+		world.now = first
+		later := first.Add(24 * time.Hour)
+		if err := commerceUse.ScheduleSubscriptionCancellation(t.Context(), subscription.ID, later); err != nil {
+			t.Fatalf("the reschedule returned error: %v", err)
+		}
+
+		// The lane that arrives between the two instructions finds an
+		// instant the clock has not reached, and waits.
+		cancelled, err := commerceUse.CompleteDueCancellations(t.Context(), 10)
+		if err != nil {
+			t.Fatalf("CompleteDueCancellations returned error: %v", err)
+		}
+		if cancelled != 0 || world.subs[subscription.ID].State != commerce.SubscriptionActive {
+			t.Fatalf("cancelled = %d state = %q, want the rescheduled instruction to wait",
+				cancelled, world.subs[subscription.ID].State)
+		}
+
+		world.now = later
+		cancelled, err = commerceUse.CompleteDueCancellations(t.Context(), 10)
+		if err != nil {
+			t.Fatalf("CompleteDueCancellations returned error: %v", err)
+		}
+		row := world.subs[subscription.ID]
+		if cancelled != 1 || row.State != commerce.SubscriptionCancelled || row.CancelAt == nil || !row.CancelAt.Equal(later) {
+			t.Fatalf("cancelled = %d row = %q cancel_at %v, want one completion that keeps the instructed instant",
+				cancelled, row.State, row.CancelAt)
+		}
+	})
+
 	t.Run("cancelling now is idempotent", func(t *testing.T) {
 		world := newCommerceWorld(t)
 		commerceUse := newCommerce(world)
@@ -686,6 +752,33 @@ func TestRollLane(t *testing.T) {
 		}
 		if rolled != 0 {
 			t.Fatalf("rolled = %d, want the stale scan to skip", rolled)
+		}
+	})
+
+	t.Run("a retired version still feeds its subscribers' rolls", func(t *testing.T) {
+		// Retirement stops new sales; it rewrites nothing. The subscription
+		// pinned the version forever, so its cycles keep rolling on the
+		// version's definitions — freezing them would be the retroactive
+		// rewrite the model forbids.
+		world, commerceUse, subscription := seedActive(t, true)
+		versionID := world.subs[subscription.ID].PlanVersionID
+		version := world.versions[versionID]
+		if err := version.Retire(world.now); err != nil {
+			t.Fatalf("Retire returned error: %v", err)
+		}
+		world.versions[versionID] = version
+		before := len(world.ents)
+
+		rolled, err := commerceUse.RollDueSubscriptions(t.Context(), 10)
+		if err != nil {
+			t.Fatalf("RollDueSubscriptions returned error: %v", err)
+		}
+		if rolled != 1 {
+			t.Fatalf("rolled = %d, want the retired version to keep feeding its pinned subscriber", rolled)
+		}
+		if *world.subs[subscription.ID].CycleNumber != 2 || len(world.ents) != before+2 {
+			t.Fatalf("cycle = %v entitlements = %d, want cycle 2 with its two grants",
+				world.subs[subscription.ID].CycleNumber, len(world.ents))
 		}
 	})
 }

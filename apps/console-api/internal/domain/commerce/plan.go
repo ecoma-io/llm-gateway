@@ -182,6 +182,7 @@ type GrantDefinition struct {
 	AliasGroupName AliasGroupName
 	Dimension      Dimension
 	GrantedAmount  int64
+	CreatedAt      time.Time
 }
 
 // NewGrantDefinition validates one definition against the rules the schema

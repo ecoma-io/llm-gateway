@@ -241,7 +241,7 @@ WHERE id = $1`
 // order to within the v7 timestamp's millisecond, which is more determinism
 // than anything here needs — it is only asked to be one order, always.
 const selectPlanVersionDefinitions = `
-SELECT id, plan_version_id, alias_group_name, dimension, granted_amount
+SELECT id, plan_version_id, alias_group_name, dimension, granted_amount, created_at
 FROM control.plan_grant_definitions
 WHERE plan_version_id = $1
 ORDER BY id ASC`
@@ -347,7 +347,7 @@ func (r *planVersionRepo) ByID(ctx context.Context, id commerce.PlanVersionID) (
 	for rows.Next() {
 		var d commerce.GrantDefinition
 		var versionID, scope, dimension string
-		if err := rows.Scan(&d.ID, &versionID, &scope, &dimension, &d.GrantedAmount); err != nil {
+		if err := rows.Scan(&d.ID, &versionID, &scope, &dimension, &d.GrantedAmount, &d.CreatedAt); err != nil {
 			return commerce.PlanVersion{}, nil, fmt.Errorf("postgres: plan version %s: read grant definitions: %w", id, err)
 		}
 		d.PlanVersionID = commerce.PlanVersionID(versionID)
@@ -364,7 +364,7 @@ func (r *planVersionRepo) ByID(ctx context.Context, id commerce.PlanVersionID) (
 func (r *planVersionRepo) AddGrantDefinition(ctx context.Context, definition commerce.GrantDefinition) error {
 	res, err := r.store.Querier(ctx).ExecContext(ctx, insertGrantDefinitionIfDraft,
 		string(definition.ID), string(definition.PlanVersionID), string(definition.AliasGroupName),
-		string(definition.Dimension), definition.GrantedAmount, time.Now().UTC())
+		string(definition.Dimension), definition.GrantedAmount, definition.CreatedAt)
 	if err != nil {
 		// The live constraint is plan_grant_definitions_scope_dimension_key —
 		// one definition per (scope, dimension) per version.
@@ -537,6 +537,10 @@ WHERE id = $1
 const selectDuePromotionIDs = `
 SELECT id FROM control.subscriptions
 WHERE state = 'pending' AND start_at <= transaction_timestamp()
+  AND EXISTS (
+      SELECT 1 FROM control.accounts a
+      WHERE a.id = control.subscriptions.account_id AND a.state = 'active'
+  )
 ORDER BY start_at ASC
 LIMIT $1`
 
@@ -548,6 +552,10 @@ const selectDueRollIDs = `
 SELECT id FROM control.subscriptions
 WHERE state = 'active' AND renewal_enabled
   AND period_end IS NOT NULL AND period_end <= transaction_timestamp()
+  AND EXISTS (
+      SELECT 1 FROM control.accounts a
+      WHERE a.id = control.subscriptions.account_id AND a.state = 'active'
+  )
 ORDER BY period_end ASC
 LIMIT $1`
 
@@ -692,6 +700,37 @@ func (r *subscriptionRepo) ScheduleCancellation(ctx context.Context, id commerce
 	}
 	// False means the subscription moved on — the caller re-reads and lets
 	// the domain refuse what the state no longer admits.
+	return n == 1, nil
+}
+
+// The cancellation lane's single-statement verdict: the completion keeps the
+// instructed instant and its mode on the terminal row — the historical
+// record of when the customer asked — and refuses to fire on anything the
+// scan's own words no longer describe: a row that moved, an instruction no
+// longer scheduled, one the database clock has not reached. The `updated_at`
+// stamp is the caller's; `cancel_at` is not touched, because the instant it
+// holds is the instruction's, not the completion's.
+const completeScheduledCancellation = `
+UPDATE control.subscriptions
+SET state = 'cancelled', updated_at = $2
+WHERE id = $1
+  AND state = 'active'
+  AND cancellation_mode = 'scheduled'
+  AND cancel_at IS NOT NULL
+  AND cancel_at <= transaction_timestamp()`
+
+func (r *subscriptionRepo) CompleteScheduledCancellation(ctx context.Context, id commerce.SubscriptionID, updatedAt time.Time) (bool, error) {
+	res, err := r.store.Querier(ctx).ExecContext(ctx, completeScheduledCancellation, string(id), updatedAt)
+	if err != nil {
+		return false, fmt.Errorf("postgres: complete scheduled cancellation of subscription %s: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("postgres: complete scheduled cancellation of subscription %s: read rows affected: %w", id, err)
+	}
+	// False means the world moved — the row left active, or the instruction
+	// was rescheduled or withdrawn after the scan read it. The row waits
+	// for the next pass.
 	return n == 1, nil
 }
 
@@ -956,7 +995,8 @@ WHERE account_id = $1`
 // The one place this port writes without a prior read: the flag's whole
 // state is one boolean, and insert-or-update is the single statement that
 // carries it. created_at rides the insert path only — the row's birth is
-// the first enablement, and an update must not rewrite it; funding_bucket_id
+// the first recorded state, an enable or a disable alike, and an update must
+// not rewrite it; funding_bucket_id
 // is deliberately absent from both paths, because disabling does not touch
 // the bucket and the reference is Accounting's to assign once.
 const setAccountPaygEnabled = `
@@ -1012,9 +1052,9 @@ func (r *paygRepo) AssignFundingBucket(ctx context.Context, accountID commerce.A
 		return false, fmt.Errorf("postgres: assign funding bucket to account %s: read rows affected: %w", accountID, err)
 	}
 	// False means the world moved and the caller re-reads: a reference is
-	// already on file, or the account has no PAYG row at all — the row a
-	// first enablement inserts is the row this assigns into, so an account
-	// with no row has never enabled PAYG and has nothing to fund. Either
-	// way nothing was written.
+	// already on file, or the account has no PAYG row at all — a row comes
+	// into being the first time any PAYG state is recorded, enable or
+	// disable alike, so no row means no state and no reference has ever
+	// existed to assign into. Either way nothing was written.
 	return n == 1, nil
 }

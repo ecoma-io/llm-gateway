@@ -253,6 +253,11 @@ func (c *Commerce) AddGrantDefinition(ctx context.Context, versionID commerce.Pl
 		return commerce.GrantDefinition{}, fmt.Errorf("application: add grant definition: %w", err)
 	}
 	err = c.store.WithinTx(ctx, func(txCtx context.Context) error {
+		createdAt, err := dbNow(txCtx, c.clock, "add grant definition")
+		if err != nil {
+			return fmt.Errorf("application: add grant definition: %w", err)
+		}
+		definition.CreatedAt = createdAt
 		version, definitions, err := c.versions.ByID(txCtx, versionID)
 		if err != nil {
 			return fmt.Errorf("application: add grant definition: read version: %w", err)
@@ -462,19 +467,23 @@ func (c *Commerce) CancelSubscriptionNow(ctx context.Context, id commerce.Subscr
 			if subscription.State == commerce.SubscriptionCancelled {
 				return nil
 			}
-			before := subscription.State
 			if err := subscription.Cancel(now); err != nil {
 				return fmt.Errorf("application: cancel subscription %s: %w", id, err)
 			}
-			applied, err := c.subscriptions.TransitionState(txCtx, id, before, subscription.State, subscription.UpdatedAt)
+			// The immediate path has its own statement, because the record it
+			// writes is more than a state: cancel_at and the immediate mode
+			// land beside it, in the same guarded write.
+			applied, err := c.subscriptions.Cancel(txCtx, id, now)
 			if err != nil {
 				return fmt.Errorf("application: cancel subscription %s: %w", id, err)
 			}
 			if applied {
 				return nil
 			}
-			// Lost the swap: another cancellation completed first. Confirm —
-			// it is the only state a lost cancel swap can mean.
+			// Lost the swap: a racing cancellation completed first (the row
+			// reads cancelled, and the loop converges), or a suspend won the
+			// moment — the next attempt refuses at the domain check above,
+			// and that refusal is the truth about the row.
 			subscription, err = c.subscriptions.ByID(txCtx, id)
 			if err != nil {
 				return fmt.Errorf("application: cancel subscription %s: %w", id, err)
@@ -549,6 +558,12 @@ func (c *Commerce) EnableAccountPayg(ctx context.Context, accountID commerce.Acc
 		if account.State != identity.AccountActive {
 			return fmt.Errorf("application: enable payg: %w (%s is %s)", identity.ErrAccountNotActive, accountID, account.State)
 		}
+		// The active gate is a plain read, not part of the write: the flag's
+		// statement guards on nothing but the account key. An account
+		// deactivated between this read and the write keeps the flag it was
+		// given — a residual the admission side already prices in, because a
+		// disabled account's subscriptions stop being served regardless of
+		// what its spending flag says.
 		now, err := dbNow(txCtx, c.clock, "enable payg")
 		if err != nil {
 			return err
@@ -631,6 +646,13 @@ func (c *Commerce) AssignAccountFundingBucket(ctx context.Context, accountID com
 // canonical answer to "what may this account consume, from which grant, until
 // when" — the projection seed's upstream, and deliberately nothing about what
 // has been consumed.
+//
+// The instant is the caller's to source: this method takes no clock, and a
+// caller making a commercial decision on the answer owes it the same
+// discipline as every writer — an instant read from transaction_timestamp()
+// inside the caller's transaction, not a process wall clock. The derivation
+// is pure, so the same rows and the same instant always answer identically;
+// a caller that hands in a different clock has asked a different question.
 func (c *Commerce) EffectiveEntitlements(ctx context.Context, accountID commerce.AccountID, at time.Time) ([]commerce.EffectiveEntitlement, error) {
 	candidates, err := c.entitlements.ActiveCandidates(ctx, accountID)
 	if err != nil {
@@ -891,16 +913,19 @@ func (c *Commerce) rollSubscription(ctx context.Context, id commerce.Subscriptio
 // retry policy, not this file's, that decides what a run of failures means.
 //
 // The boolean is the one skip that is not an error: a version read as draft
-// has no business feeding a roll yet, and waiting a pass costs nothing. The
-// version cannot otherwise change under the lane — publication freezes the
-// set forever, and retirement rewrites nothing — so the definitions resolved
-// here are the definitions the unit of work will insert against.
+// has no business feeding a roll yet, and waiting a pass costs nothing. A
+// retired version keeps feeding the rolls of the subscriptions that pinned
+// it — retirement stops new sales, it rewrites nothing, and freezing its
+// existing subscribers' cycles would be exactly the retroactive rewrite the
+// model forbids. The version cannot otherwise change under the lane —
+// publication freezes the set forever — so the definitions resolved here are
+// the definitions the unit of work will insert against.
 func (c *Commerce) resolveCycleInputs(ctx context.Context, versionID commerce.PlanVersionID) ([]commerce.GrantDefinition, map[commerce.GrantDefinitionID]commerce.AliasGroupVersionID, bool, error) {
 	version, definitions, err := c.versions.ByID(ctx, versionID)
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("application: resolve cycle inputs of version %s: %w", versionID, err)
 	}
-	if version.State != commerce.PlanVersionPublished {
+	if version.State == commerce.PlanVersionDraft {
 		return nil, nil, true, nil
 	}
 	scopes := make(map[commerce.GrantDefinitionID]commerce.AliasGroupVersionID, len(definitions))
@@ -976,9 +1001,11 @@ func (c *Commerce) CompleteDueCancellations(ctx context.Context, limit int) (int
 }
 
 // completeCancellation completes one scheduled cancellation: the domain
-// validates the instruction against the row as read, and the state
-// transition's compare-and-swap is the verdict — a row that moved to
-// cancelled or suspended between the read and the swap simply does not fire.
+// validates the instruction against the row as read, and the completion
+// statement is the verdict — it repeats the instruction the scan read
+// (scheduled, and due on the database clock), so an instruction rescheduled
+// or withdrawn between the read and the write leaves the row uncompleted
+// rather than cancelled under words the customer had already superseded.
 func (c *Commerce) completeCancellation(ctx context.Context, id commerce.SubscriptionID) (bool, error) {
 	subscription, err := c.subscriptions.ByID(ctx, id)
 	if err != nil {
@@ -994,7 +1021,7 @@ func (c *Commerce) completeCancellation(ctx context.Context, id commerce.Subscri
 		}
 		return false, fmt.Errorf("application: complete cancellation of subscription %s: %w", id, err)
 	}
-	applied, err := c.subscriptions.TransitionState(ctx, id, commerce.SubscriptionActive, subscription.State, subscription.UpdatedAt)
+	applied, err := c.subscriptions.CompleteScheduledCancellation(ctx, id, subscription.UpdatedAt)
 	if err != nil {
 		return false, fmt.Errorf("application: complete cancellation of subscription %s: %w", id, err)
 	}
