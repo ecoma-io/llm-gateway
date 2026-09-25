@@ -62,8 +62,12 @@
 --   * lifecycle states are checked text spelled exactly as the domain
 --     spells them;
 --   * no DELETE path and no ON DELETE CASCADE anywhere: the ledger and the
---     settlements are history, and the buckets are the rows history points
---     at;
+--     settlements are history — append-only, by trigger — and the buckets
+--     are the rows history points at, held by a leg or a PAYG edge. A
+--     bucket is a mutable projection, so that last protection is the
+--     references' rather than a trigger of its own: a bucket that has
+--     neither a leg nor a PAYG edge has nothing to lose but its own empty
+--     history, and no port method deletes one;
 --   * every accounting-minted id is an RFC 9562 version-7 UUID, CHECKed on
 --     the version and variant nibbles exactly as commerce's are. The two
 --     blind references are the deliberate exceptions the plane boundary
@@ -298,7 +302,7 @@ COMMENT ON COLUMN control.ledger_entries.settled_delta IS
 COMMENT ON COLUMN control.ledger_entries.held_delta IS
     'How this leg moves the bucket''s cached held balance: +amount for hold, −amount for release, and −amount for consume — consumption vacates the hold it was secured by, which is why consume subtracts from both balances (ADR 0004).';
 COMMENT ON COLUMN control.ledger_entries.settlement_id IS
-    'The settlement this leg belongs to: required on consume legs, carried by the release legs that return an allocation''s unconsumed tail. A reservation/settlement may have many legs; one of each kind per bucket per settlement is the ceiling (ledger_entries_settlement_bucket_kind).';
+    'The settlement this leg belongs to: required on consume legs, carried by the release legs a settlement books for an allocation''s unconsumed tail (a reaper''s or a compensation''s release has none, which is why the shape CHECK leaves it optional there rather than requiring it). A reservation/settlement may have many legs; one of each kind per bucket per settlement is the ceiling (ledger_entries_settlement_bucket_kind).';
 COMMENT ON COLUMN control.ledger_entries.reservation_id IS
     'The Data Plane reservation this leg secures or returns, by identifier alone — no foreign key can cross the plane boundary (ADR 0006 §7), and no grammar is asserted beyond the uuid type''s, because the runtime owns this identifier''s shape. Holds and releases always name one; the pair with the bucket is unique per kind (ledger_entries_reservation_bucket_kind), which is what makes a redelivered fact unable to book a movement twice.';
 COMMENT ON COLUMN control.ledger_entries.command_key IS
