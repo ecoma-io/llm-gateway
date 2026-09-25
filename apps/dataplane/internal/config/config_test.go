@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -479,6 +480,160 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			},
 			wantErr: "DATAPLANE_MANAGEMENT_TOKEN is set but DATAPLANE_MANAGEMENT_ADDR is not",
 		},
+		{
+			name: "configures an egress policy with one proxy route",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES":     "trusted",
+				"DATAPLANE_EGRESS_TRUSTED_TYPE": "socks5h",
+				"DATAPLANE_EGRESS_TRUSTED_ADDR": "10.0.0.9:1080",
+			},
+			want: Config{
+				Addr:                  DefaultAddr,
+				ShutdownTimeout:       DefaultShutdownTimeout,
+				ReadHeaderTimeout:     DefaultReadHeaderTimeout,
+				ReservationHoldWindow: DefaultReservationHoldWindow,
+				ReservationLeaseTTL:   DefaultReservationLeaseTTL,
+				Egress: Egress{Policies: map[string]EgressPolicy{
+					"trusted": {Routes: []EgressRoute{{Type: "socks5h", Addr: "10.0.0.9:1080"}}},
+				}},
+				Postgres: postgresDefaults(),
+			},
+		},
+		{
+			name: "configures an ordered multi-route policy including a direct hop",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES":     "rotated",
+				"DATAPLANE_EGRESS_ROTATED_TYPE": "socks5, direct, http-connect",
+				"DATAPLANE_EGRESS_ROTATED_ADDR": "10.0.0.9:1080, ,10.0.0.10:3128",
+			},
+			want: Config{
+				Addr:                  DefaultAddr,
+				ShutdownTimeout:       DefaultShutdownTimeout,
+				ReadHeaderTimeout:     DefaultReadHeaderTimeout,
+				ReservationHoldWindow: DefaultReservationHoldWindow,
+				ReservationLeaseTTL:   DefaultReservationLeaseTTL,
+				Egress: Egress{Policies: map[string]EgressPolicy{
+					"rotated": {Routes: []EgressRoute{
+						{Type: "socks5", Addr: "10.0.0.9:1080"},
+						{Type: "direct"},
+						{Type: "http-connect", Addr: "10.0.0.10:3128"},
+					}},
+				}},
+				Postgres: postgresDefaults(),
+			},
+		},
+		{
+			name: "refuses a policy whose type list never arrived",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES": "trusted",
+			},
+			wantErr: "DATAPLANE_EGRESS_TRUSTED_TYPE is missing",
+		},
+		{
+			name: "refuses a route type outside the vocabulary",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES":     "trusted",
+				"DATAPLANE_EGRESS_TRUSTED_TYPE": "kerberos",
+				"DATAPLANE_EGRESS_TRUSTED_ADDR": "10.0.0.9:1080",
+			},
+			wantErr: "not a route type",
+		},
+		{
+			name: "refuses address and type lists of different lengths",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES":     "trusted",
+				"DATAPLANE_EGRESS_TRUSTED_TYPE": "socks5,http-connect",
+				"DATAPLANE_EGRESS_TRUSTED_ADDR": "10.0.0.9:1080",
+			},
+			wantErr: "must have the same length",
+		},
+		{
+			name: "refuses a proxy route with no address beside it",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES":     "trusted",
+				"DATAPLANE_EGRESS_TRUSTED_TYPE": "socks5,direct",
+				"DATAPLANE_EGRESS_TRUSTED_ADDR": ",",
+			},
+			wantErr: "needs its proxy address",
+		},
+		{
+			name: "refuses a direct route that carries an address",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES":     "trusted",
+				"DATAPLANE_EGRESS_TRUSTED_TYPE": "direct",
+				"DATAPLANE_EGRESS_TRUSTED_ADDR": "10.0.0.9:1080",
+			},
+			wantErr: "direct is the absence of a hop",
+		},
+		{
+			name: "refuses a policy claiming the reserved direct name",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES":    "direct",
+				"DATAPLANE_EGRESS_DIRECT_TYPE": "socks5h",
+				"DATAPLANE_EGRESS_DIRECT_ADDR": "10.0.0.9:1080",
+			},
+			wantErr: "is reserved",
+		},
+		{
+			name: "refuses a policy name that cannot become its own variable",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES": "trusted-pool.eu",
+			},
+			wantErr: "letters, digits and underscores",
+		},
+		{
+			name: "refuses an empty policy list",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES": "  ",
+			},
+			wantErr: "DATAPLANE_EGRESS_POLICIES must not be empty",
+		},
+		{
+			name: "refuses an empty name inside the policy list",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES": "trusted,,fallback",
+			},
+			wantErr: "DATAPLANE_EGRESS_POLICIES must not carry an empty policy name",
+		},
+		{
+			name: "refuses a policy name too long to be its own variable",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES": strings.Repeat("t", 65),
+			},
+			wantErr: "longer than 64 characters",
+		},
+		{
+			name: "refuses the same policy named twice",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES": "trusted,trusted",
+			},
+			wantErr: "names policy \"trusted\" twice",
+		},
+		{
+			name: "refuses a type list set but empty",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES":     "trusted",
+				"DATAPLANE_EGRESS_TRUSTED_TYPE": "  ",
+			},
+			wantErr: "DATAPLANE_EGRESS_TRUSTED_TYPE must not be empty",
+		},
+		{
+			name: "refuses an empty type inside the type list",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES":     "trusted",
+				"DATAPLANE_EGRESS_TRUSTED_TYPE": "socks5,,direct",
+			},
+			wantErr: "must not carry an empty route type",
+		},
+		{
+			name: "refuses a proxy address that is not a host:port",
+			env: map[string]string{
+				"DATAPLANE_EGRESS_POLICIES":     "trusted",
+				"DATAPLANE_EGRESS_TRUSTED_TYPE": "http-connect",
+				"DATAPLANE_EGRESS_TRUSTED_ADDR": "10.0.0.9",
+			},
+			wantErr: "must be a host:port address",
+		},
 	}
 
 	for _, tt := range tests {
@@ -502,7 +657,7 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Load() error = %v", err)
 			}
-			if got != tt.want {
+			if !reflect.DeepEqual(got, tt.want) {
 				// Redacted, not %#v-raw: a dumped Config carries Postgres.DSN,
 				// and a test failure is CI output the whole world can read.
 				t.Errorf("Load() = %s, want %s", redactDSN(got), redactDSN(tt.want))
@@ -563,6 +718,20 @@ func TestPostgresLogValueRedactsADSNCannotBeDecomposed(t *testing.T) {
 	}
 	if strings.Contains(rendered, "gateway-host") {
 		t.Errorf("LogValue() = %q, want it to carry nothing of a DSN it could not parse", rendered)
+	}
+}
+
+func TestEgressLogValueRendersThePoliciesSortedAndUnredacted(t *testing.T) {
+	e := Egress{Policies: map[string]EgressPolicy{
+		"zeta":    {Routes: []EgressRoute{{Type: "socks5h", Addr: "10.0.0.9:1080"}, {Type: "direct"}}},
+		"trusted": {Routes: []EgressRoute{{Type: "http-connect", Addr: "10.0.0.10:3128"}}},
+	}}
+
+	rendered := renderLogValue(e.LogValue())
+	// Sorted, so two runs of the same configuration log identically.
+	want := "trusted=http-connect@10.0.0.10:3128 zeta=socks5h@10.0.0.9:1080, direct@"
+	if rendered != want {
+		t.Errorf("LogValue() = %q, want %q — policy names sorted, routes in order, addresses whole", rendered, want)
 	}
 }
 

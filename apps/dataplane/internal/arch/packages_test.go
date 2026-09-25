@@ -223,11 +223,20 @@ func TestTheScanSeesTheModule(t *testing.T) {
 // first — which is why the list is written out rather than derived, and why a
 // port named for a peer application would be an edit here that a reviewer
 // cannot miss.
+//
+// `egress` is the fifth, and it exists below `executors` rather than beside
+// the plane question: it is the dial a provider call is carried on — the
+// proxies and direct hops between this process and the provider an admitted
+// request is already on its way to (ADR 0002 puts it under the adapter
+// boundary). Its adapters dial infrastructure configuration names, never an
+// application of this repository, and the same reviewer bar applies: a port
+// that could reach a peer application gets its line here first or does not
+// get written at all.
 func TestTheRuntimeHasNoCrossPlanePort(t *testing.T) {
 	ports := outboundPorts(t)
-	want := []string{"cache", "executors", "persistence", "usagefacts"}
+	want := []string{"cache", "egress", "executors", "persistence", "usagefacts"}
 	if !slices.Equal(ports, want) {
-		t.Errorf("outbound ports are %v, want %v — the four are this process's own infrastructure: its cache, its database, its own recorded history, and the provider drivers its routing stage calls. A port named for the Control Plane or the management API would be a hop on the request path, and the runtime does not have one", ports, want)
+		t.Errorf("outbound ports are %v, want %v — the five are this process's own infrastructure: its cache, its database, its own recorded history, the provider drivers its routing stage calls, and the dial those calls are carried on. A port named for the Control Plane or the management API would be a hop on the request path, and the runtime does not have one", ports, want)
 	}
 }
 
