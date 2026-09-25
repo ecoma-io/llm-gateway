@@ -103,10 +103,11 @@ dataplane application                       ReadUsageEvents — returns the page
 dataplane ports/outbound/usagefacts         Reader — the port to the runtime's own
    │                                        recorded facts
    ▼
-dataplane adapters/outbound/usagefacts      the durable source. It reports
-                                            ErrSourceUnavailable until the fact table
-                                            exists, rather than serving an in-memory
-                                            feed that would lose every fact on restart
+dataplane adapters/outbound/postgres        UsageFacts — the production reader, and
+                                            the durable source: pages read from
+                                            usage_events in append order, never an
+                                            in-memory feed that would lose every
+                                            fact on restart
 ```
 
 Three things this chain demonstrates, and each is the reason a layer is shaped

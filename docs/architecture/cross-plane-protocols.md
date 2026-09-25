@@ -351,30 +351,36 @@ why a management call is request/response with a defined failure rather than a
 two-phase commit; the third is why the consumer, not the producer, holds the
 position; the fourth is why nothing in the derivation needs a lock.
 
+### The fact source, decided and landed
+
+The one question this page used to leave open on this seam is closed:
+`usage_events` (B7's `migrations/dataplane/000002_runtime_storage`) is the
+table the facts are read from, and the requirements this page names are
+properties of that schema rather than promises about a future one. Ordering is
+**commit ordering**: each fact's `append_seq` is allocated from the single
+`usage_events_stream` row under its row lock held to the writer's commit, so
+the order a consumer reads is the order the appends became visible — no clock
+participates. The stream row's `epoch` is a server-minted uuid from the first
+append (never a migration), and the position a page carries is minted from
+that pair — epoch and sequence — which is why a position from a lost and
+re-seeded stream is refusable rather than silently reusable. The encoding
+remains this Data Plane's private affair: still opaque to every consumer,
+still changeable, and now with a landed fact order behind it and a landed
+reader over it — the postgres adapter's `UsageFacts`
+([ports and adapters](ports.md)) — rather than a promise
+(ADR 0006 §5; [data implications](data-implications.md)).
+
 ## What this page does not decide
 
-- **The durable fact source.** Decided and landed: `usage_events` (B7's
-  `migrations/dataplane/000002_runtime_storage`) is the table the facts are
-  read from, and the requirements this page names are properties of that
-  schema rather than promises about a future one. Ordering is **commit
-  ordering**: each fact's `append_seq` is allocated from the single
-  `usage_events_stream` row under its row lock held to the writer's commit, so
-  the order a consumer reads is the order the appends became visible — no
-  clock participates. The stream row's `epoch` is a server-minted uuid from
-  the first append (never a migration), and the position a page carries is
-  minted from that pair — epoch and sequence — which is why a position from a
-  lost and re-seeded stream is refuseable rather than silently reusable. The
-  encoding remains this Data Plane's private affair: still opaque to every
-  consumer, still changeable, and now with a landed fact order behind it
-  (ADR 0006 §5; [data implications](data-implications.md)).
 - **The ingestion-cursor schema.** `control.usage_ingestion_cursor` is the
   future table the Control Plane stores its position in. Today the position is a
   repository-level port in `apps/console-api/internal/ports/outbound/persistence`
   with the future table documented beside it and test fakes behind it; a
-  production implementation arrives with the schema rather than before it. On
-  the other side of the same seam, the Data Plane's production fact reader
-  refuses with a source-unavailable error instead of serving an in-memory feed
-  that would lose every fact on restart.
+  production implementation arrives with the schema rather than before it. The
+  Data Plane's side of the same seam has no such gap — its production fact
+  reader is landed ([above](#the-fact-source-decided-and-landed)) — so what
+  remains undecided here is the Control Plane's table and the loop that drives
+  it.
 - **The settlement consumer loop.** Nothing schedules the replay: there is no
   worker, no ticker and no background process. The loop that calls the ingestion
   use case belongs to the pull the schema PR builds, beside the table the cursor
@@ -392,9 +398,9 @@ position; the fourth is why nothing in the derivation needs a lock.
   failure this page spends its length avoiding. What has changed with the
   landed fact schema is that the number is now **derivable** rather than
   unknowable: the source caps `payload` at 32768 octets by schema CHECK
-  ([data implications](data-implications.md)), the contract caps a page at
-  1000 events, and the typed columns are fixed-width, so the largest honest
-  page is on the order of 33 MiB — an `io.LimitReader` set just above it can
+  ([data implications](data-implications.md)) and the contract caps a page at
+  1000 events, so the largest honest page is on the order of tens of MiB
+  (~32 MiB — 33 MB decimal) — an `io.LimitReader` set just above it can
   be written the day the contract carries the number, and not before. The
   change is small and belongs with the fact schema: a limit at each decode,
   one above the largest page the contract permits, and a test that feeds a

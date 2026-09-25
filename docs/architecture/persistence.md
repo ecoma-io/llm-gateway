@@ -19,16 +19,18 @@ must look like when it arrives.
 One TimescaleDB deployment, two databases, explicitly owned
 ([ADR 0006](../adr/0006-control-plane-and-data-plane.md) §7):
 
-| Database    | Owner                                      | What it holds                                                                                                                                           |
-| ----------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `control`   | `apps/console-api` — the Control Plane API | the Control Plane's relational family and nothing else: identity, commerce, and the accounting working set ([data implications](data-implications.md))  |
-| `dataplane` | `apps/dataplane` — the Data Plane runtime  | the runtime's own relational rows **and** the event family — the only database that carries the TimescaleDB extension and the hypertables (ADR 0006 §7) |
+| Database    | Owner                                      | What it holds                                                                                                                                                                                                                  |
+| ----------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `control`   | `apps/console-api` — the Control Plane API | the Control Plane's relational family and nothing else: identity, commerce, and the accounting working set ([data implications](data-implications.md))                                                                         |
+| `dataplane` | `apps/dataplane` — the Data Plane runtime  | the runtime's own relational rows **and** the event family — the only database that carries the TimescaleDB extension (ADR 0006 §7), whose event tables landed plain rather than as the hypertables ADR 0005 first placed here |
 
 Where the extension lives is not an implementation detail. The high-volume
-time-series facts are the runtime's, so the extension and the hypertables
-belong to the runtime's database and the Control Plane's database stays
+time-series facts are the runtime's, so the extension belongs to the runtime's
+database and the Control Plane's database stays
 relational tables only (ADR 0006 §7); a migration that enabled `timescaledb`
-in `control` would be applying a decision nobody made.
+in `control` would be applying a decision nobody made. The hypertables that
+came with the extension in ADR 0005's original wording, though, never landed:
+the runtime schema's tables are plain, by that ADR's B7 amendment.
 
 `dataplane-api` is the third Go application and owns no database at all. It is
 a management façade and a transport — no persistence adapter, no persistence
@@ -215,7 +217,7 @@ here, and none is invented here.
 | Money              | `bigint` minor units in the single platform currency — never float, never `numeric`, and no per-row currency column (ADR 0003; ADR 0004)                                                                                                                                                                                                                                                                                                                |
 | Lifecycle          | explicit state machines carrying the ADRs' exact state vocabulary — `pending` \| `active` \| `suspended` \| `cancelled` \| `expired` for a subscription, `open` \| `settled` \| `released` \| `expired` for a reservation — and no soft-delete columns: deletion policy is the retention policy (ADR 0005)                                                                                                                                              |
 | Append-only tables | `ledger_entries` and `usage_events` have no `UPDATE` or `DELETE` path (ADR 0004, invariants 1–2)                                                                                                                                                                                                                                                                                                                                                        |
-| JSONB              | opaque provider telemetry only — never a load-bearing, queryable field; everything the model requires to be queryable is a column. One sanctioned second category: per-candidate provider parameter overrides — opaque to the gateway, never queried, validated by the domain and passed through to the provider at execution                                                                                                                           |
+| JSONB              | opaque bytes the model never queries into — the schema's sanctioned columns are `request_attempts.provider_error` (provider telemetry) and `usage_events.payload` (the fact's versioned allocation envelope); one sanctioned second category: per-candidate provider parameter overrides — opaque to the gateway, never queried, validated by the domain and passed through to the provider at execution; everything the model requires to be queryable is a column
 | Enumerated states  | `text` plus a `CHECK` constraint — migration-friendly where an `ENUM` type is not — carrying the value sets the ADRs name                                                                                                                                                                                                                                                                                                                               |
 | Foreign keys       | within one database only, and within it up to the family boundary in both directions, as [ADR 0005](../adr/0005-relational-and-event-storage-split.md) states; none across planes in either direction (ADR 0006 §7)                                                                                                                                                                                                                                     |
 | Constraint names   | `<table>_<columns>_idx`, `<table>_<columns>_key`, `<table>_<column>_fkey` — PostgreSQL's own defaults, kept rather than overridden; a CHECK names `<table>_<what>_<rule>` in the identity migration's vocabulary (`_state_valid`, `_length`, `_shape`, `_consistency`), and a qualifying infix is kept when it carries the rule's one subtlety (the `live` of `users_account_live_email_key`, the live-only partial index)                              |

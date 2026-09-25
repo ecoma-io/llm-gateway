@@ -3,8 +3,10 @@
 Reference page mapping the domain model onto the intended storage split. The
 decision is [ADR 0005](../adr/0005-relational-and-event-storage-split.md):
 **one PostgreSQL cluster; mutable authoritative state is relational; immutable
-time-series facts are Timescale-oriented event tables (hypertables) in that
-same cluster.** [ADR 0006 §7](../adr/0006-control-plane-and-data-plane.md)
+time-series facts are Timescale-oriented event tables in that same cluster**
+(hypertables in the ADR's original wording — the landed schema ships them as
+plain tables, [below](#event-family-in-dataplane)).
+[ADR 0006 §7](../adr/0006-control-plane-and-data-plane.md)
 splits that cluster into **two databases, one per plane** — `control` for the
 Control Plane API, `dataplane` for the runtime, one migration lane each — so
 the family a table belongs to and the database it lands in are two separate
@@ -133,18 +135,14 @@ grant_definition)` unique on entitlements; alias identities unique across
 ### Event family (in `dataplane`)
 
 All three live in the Data Plane's database. ADR 0005 placed this family on
-TimescaleDB hypertables; **the landed schema deviates, deliberately**: B7's
-`000002_runtime_storage` ships all seven runtime tables as **plain
-(unpartitioned) tables**, because three load-bearing constraints of the runtime
-schema are impossible on a hypertable — global uniqueness (`requests(id)` as
-primary key, the attempt business key, and the usage-fact dedup partial uniques
-all violate the partitioning-column rule), referenced-side foreign keys (the
-attempts and facts must reference their billing subject `requests`), and the
-fact that a later `create_hypertable` conversion would have to rebuild exactly
-those constraints. What is given up, stated plainly: columnstore compression on
-`request_attempts` (the archivable high-volume table), chunk-based retention
-pruning for the event family, and continuous aggregates over `usage_events`
-until an equivalent is built. The extension stays installed
+TimescaleDB hypertables; the landed schema deviates: B7's
+`000002_runtime_storage` ships all nine of the runtime schema's tables as
+**plain (unpartitioned) tables** — the three below, plus `request_intake`,
+`reservations` (+ `reservation_allocations`), the quota projection
+(`quota_projections`, `quota_refills`) and `usage_events_stream`. The reasons
+and the price of that deviation are the [amendment recorded in ADR
+0005](../adr/0005-relational-and-event-storage-split.md); what this page adds
+is where the deviation landed. The extension stays installed
 (`000001_timescaledb_bootstrap`); its fate is decided with the
 retention/compression milestone, not here.
 
@@ -158,7 +156,8 @@ Notes for the schema designer:
 
 - ~~Time-partitioned hypertables~~ **plain tables** — the placement deviation
   above is the decision; hypertable conversion would mean rebuilding the
-  uniqueness and foreign-key constraints the money path leans on.
+  uniqueness and foreign-key constraints the money path leans on (ADR 0005's
+  amendment).
 - `requests.id` is minted at admission; the shell-then-finalize shape is
   intentional (attempts and reservations reference it from birth).
 - **Fact ordering is commit ordering** (`usage_events.append_seq`): the
@@ -169,14 +168,24 @@ Notes for the schema designer:
   The stream's `epoch` is server-minted at the first append and never by a
   migration, so a database that lost its rows cannot be mistaken for the same
   feed ([cross-plane protocols](cross-plane-protocols.md)).
-- **The fact payload is opaque provider telemetry** — the one sanctioned jsonb
-  on the runtime's money path, capped at 32768 octets by the schema's CHECK
-  and at half that by the writer's domain guard. It carries no request or
-  response body, no key, no prompt material and no secret; its envelope
-  (`v1`) carries the allocation legs a Control-Plane settlement derives
-  consume/release legs from. Anything settlement needs beyond the typed
-  columns must be an explicit envelope field, never a convention hidden in
-  untyped bytes.
+- **The fact payload is the allocation tail** — the waterfall legs this ending
+  closes out, serialised as the `v1` envelope
+  `{"allocations":[{"funding_bucket_id",…,"amount",…,"ordinal",…}]}` by
+  `apps/dataplane/internal/domain/accounting` (`payloadV1`). Opaque to every
+  consumer as a matter of contract — the shape belongs to the writer package —
+  but it is not provider telemetry. It is one of the schema's two sanctioned
+  jsonb columns (the other is `request_attempts.provider_error`), capped at
+  32768 octets by the schema's CHECK and at half that by the writer's domain
+  guard. It carries no request or response body, no key, no
+  prompt material and no secret; a Control-Plane settlement derives
+  consume/release legs from the legs it carries. Anything settlement needs
+  beyond the typed columns must be an explicit envelope field, never a
+  convention hidden in untyped bytes. The no-bodies rule has exactly one
+  sanctioned exception, and it is the other jsonb: `provider_error`
+  preserves opaque provider telemetry for debugging, and the executor that
+  will populate it (a future milestone) is responsible for redacting request
+  material before it reaches the column — B7's guard on it is shape and size
+  only.
 - A cross-plane reference is by ID, with **no foreign key and no join in
   either direction**. The ordinary cross-plane query is not something review
   has to keep out — PostgreSQL cannot query across databases in one statement,
@@ -224,7 +233,7 @@ through a distributed commit (ADR 0006 §5, §7).
 | Admission                                               | Data Plane (local)    | `request_intake` (insert), `requests` (shell), `reservations` + allocation legs (insert), the quota projection (conditional drawdown)                                                                                    | 3, 6, 10               |
 | Settlement — the runtime's close                        | Data Plane (local)    | `usage_events` (append), `reservations` (close, state-guarded), `requests` (finalise)                                                                                                                                    | 1, 6, 7                |
 | Settlement — settlement from the fact                   | Control Plane (local) | `settlements` (insert), `ledger_entries` (`consume`/`release` legs), `funding_buckets` (projections)                                                                                                                     | 2, 4, 8, 10            |
-| Release (explicit compensation, or the reaper's expiry) | Data Plane (local)    | `usage_events` (append, the `released`/`expired` fact — same unit of work), `reservations` (close, state-guarded), `requests` (finalise with failure reason)                                                             | 3, 6                   |
+| Release (explicit compensation, or the reaper's expiry) | Data Plane (local)    | `reservations` (close, state-guarded), the quota projection (capacity returned, leg by leg), `usage_events` (append, the `released`/`expired` fact — same unit of work), `requests` (finalise with failure reason)       | 3, 6                   |
 | Cycle roll                                              | Control Plane (local) | `entitlements` + `funding_buckets` (create), `ledger_entries` (`grant` legs), `subscriptions` (cycle fields) — keyed `(subscription, cycle)`; the new capacity then reaches the runtime's projection as a published fact | 3 (grant exactly once) |
 
 The two settlement rows are one logical settlement split by the plane that
@@ -238,10 +247,18 @@ Data-Plane transactions for the same reason, and their `hold` and `release`
 legs are Control-Plane rows written from the reservation as a fact: the
 runtime writes no ledger row at all (ADR 0006 §3, §7). The release row's fact
 append is the crash-consistency rule made concrete: a compensation and the
-fact that reports it commit or vanish together, so no terminal reservation
-state ever exists without its fact in the feed — a released or expired
-reservation with no fact, or a fact with no reservation behind it, is a bug
-the schema's own guards make unwritable, not an outage to reconcile.
+fact that reports it commit or vanish together, and the pairing is a property
+of the callers' unit-of-work discipline, not of a constraint — the append is
+the **last** statement of the close's unit of work
+([accounting](accounting.md)), so a crash in the window rolls the whole unit
+back and leaves the reservation still open, never a terminal state without its
+fact. A fact with no reservation behind it is refused by that same discipline
+— the store refuses an append whose context carries no unit of work at all,
+because a sequence allocated outside the unit it belongs to is a fact that
+commits before the close it reports — and the pairing is caught by the
+integration suite (`TestIntegrationSettlementUnitIsAllOrNothing`), not by a
+schema guard — no constraint enforces the fact↔reservation pairing, because
+`usage_events` references `requests`, not `reservations`.
 
 Catalog configuration activation (aliases, group versions, price revisions)
 is a coordinated transaction internal to the Catalog context (ADR 0003) —
