@@ -805,8 +805,12 @@ func integrationAppendSettled(t testing.TB, ctx context.Context, repos integrati
 // integrationReservation opens one zero-amount hold for a fresh request: the
 // reaper's subject is the lease vocabulary, not the allocation tail, so the
 // hold carries the pricing basis and token bounds the sweep reads back and no
-// legs at all — the one shape NewReservation accepts without any.
-func integrationReservation(t testing.TB, ctx context.Context, repos integrationRepositories, account string, createdAt, expiresAt, leaseExpiresAt time.Time) (identity.ReservationID, identity.RequestID) {
+// legs at all — the one shape NewReservation accepts without any. The request
+// is written the way an admission unit writes it: with its replay record
+// beside it, because the sweep carries the record's identity back and
+// fail-closes on a hold whose request has none. The key comes back — the
+// sweep is the reader that recovers it from the store.
+func integrationReservation(t testing.TB, ctx context.Context, repos integrationRepositories, account string, createdAt, expiresAt, leaseExpiresAt time.Time) (identity.ReservationID, identity.RequestID, string) {
 	t.Helper()
 	price := integrationPrice()
 	request, err := execution.NewRequest(identity.NewRequestID(), account, account+"-api-key", "bench/alias", 10, 20, price, createdAt)
@@ -815,6 +819,13 @@ func integrationReservation(t testing.TB, ctx context.Context, repos integration
 	}
 	if err := repos.requests.Insert(ctx, request); err != nil {
 		t.Fatalf("inserting the reaper's request: %v", err)
+	}
+	record, err := execution.NewIntake(account, account+"-key", "b7it-reaper-digest", request.ID, createdAt)
+	if err != nil {
+		t.Fatalf("building the replay record: %v", err)
+	}
+	if err := repos.intakes.Insert(ctx, record); err != nil {
+		t.Fatalf("inserting the reaper's replay record: %v", err)
 	}
 	reservation, err := accounting.NewReservation(identity.NewReservationID(), request.ID,
 		price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice,
@@ -826,15 +837,16 @@ func integrationReservation(t testing.TB, ctx context.Context, repos integration
 	if err := repos.reserves.Insert(ctx, reservation); err != nil {
 		t.Fatalf("inserting the reaper's reservation: %v", err)
 	}
-	return reservation.ID, request.ID
+	return reservation.ID, request.ID, account + "-key"
 }
 
 // integrationReservationWithLegs opens one hold that carries an allocation
 // tail — the sweep must read the legs back with the hold, and the expired
 // fact built from them must clear the engine's envelope guard on the way in.
 // The bucket ids are free text on purpose: the leg table is the reservation's
-// own memory of its drawdown, with no join into the quota projections.
-func integrationReservationWithLegs(t testing.TB, ctx context.Context, repos integrationRepositories, account string, createdAt, expiresAt, leaseExpiresAt time.Time) (identity.ReservationID, identity.RequestID) {
+// own memory of its drawdown, with no join into the quota projections. The
+// request carries its replay record, as integrationReservation's does.
+func integrationReservationWithLegs(t testing.TB, ctx context.Context, repos integrationRepositories, account string, createdAt, expiresAt, leaseExpiresAt time.Time) (identity.ReservationID, identity.RequestID, string) {
 	t.Helper()
 	price := integrationPrice()
 	request, err := execution.NewRequest(identity.NewRequestID(), account, account+"-api-key", "bench/alias", 10, 20, price, createdAt)
@@ -843,6 +855,13 @@ func integrationReservationWithLegs(t testing.TB, ctx context.Context, repos int
 	}
 	if err := repos.requests.Insert(ctx, request); err != nil {
 		t.Fatalf("inserting the reaper's request: %v", err)
+	}
+	record, err := execution.NewIntake(account, account+"-key", "b7it-reaper-digest", request.ID, createdAt)
+	if err != nil {
+		t.Fatalf("building the replay record: %v", err)
+	}
+	if err := repos.intakes.Insert(ctx, record); err != nil {
+		t.Fatalf("inserting the reaper's replay record: %v", err)
 	}
 	reservation, err := accounting.NewReservation(identity.NewReservationID(), request.ID,
 		price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice,
@@ -857,7 +876,7 @@ func integrationReservationWithLegs(t testing.TB, ctx context.Context, repos int
 	if err := repos.reserves.Insert(ctx, reservation); err != nil {
 		t.Fatalf("inserting the reaper's reservation: %v", err)
 	}
-	return reservation.ID, request.ID
+	return reservation.ID, request.ID, account + "-key"
 }
 
 // integrationStreamRow reads the feed's identity row: the epoch cursors are
@@ -2212,14 +2231,15 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 	// and half an hour ago), one with both live. The reaper's order is
 	// lease_expires_at, so the hour-old lease is the first victim a limited
 	// sweep takes.
-	lapsedOld, oldRequest := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-a"), created, now.Add(-time.Hour), now.Add(-time.Hour))
-	lapsedRecent, recentRequest := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-b"), created, now.Add(-30*time.Minute), now.Add(-30*time.Minute))
-	fresh, freshRequest := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-c"), created, expires, now.Add(30*time.Minute))
+	accountA := integrationRuntimeAccount(t, "reaper-a")
+	lapsedOld, oldRequest, oldKey := integrationReservation(t, ctx, repos, accountA, created, now.Add(-time.Hour), now.Add(-time.Hour))
+	lapsedRecent, recentRequest, _ := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-b"), created, now.Add(-30*time.Minute), now.Add(-30*time.Minute))
+	fresh, freshRequest, _ := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-c"), created, expires, now.Add(30*time.Minute))
 	// And the two one-sided survivors the AND exists for: each has exactly
 	// one clock lapsed, and neither may be taken no matter how the sweep is
 	// limited.
-	hiccup, hiccupRequest := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-e"), created, expires, now.Add(-time.Hour))                              // lease lapsed, window live
-	walkedAway, walkedAwayRequest := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-f"), created, now.Add(-30*time.Minute), now.Add(30*time.Minute)) // window lapsed, lease live
+	hiccup, hiccupRequest, _ := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-e"), created, expires, now.Add(-time.Hour))                              // lease lapsed, window live
+	walkedAway, walkedAwayRequest, _ := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-f"), created, now.Add(-30*time.Minute), now.Add(30*time.Minute)) // window lapsed, lease live
 
 	victims, err := repos.reserves.ExpireLapsedLeases(ctx, 1)
 	if err != nil {
@@ -2233,6 +2253,9 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 	}
 	if victims[0].LeaseOwner != "b7it-runtime" || victims[0].PriceRevision != integrationPrice().RevisionID {
 		t.Errorf("the victim carries owner %q under revision %q, want the hold's own lease owner and pricing basis — the expired fact derives from them", victims[0].LeaseOwner, victims[0].PriceRevision)
+	}
+	if victims[0].AccountID != accountA || victims[0].IdempotencyKey != oldKey {
+		t.Errorf("the victim carries replay identity (%q, %q), want the account the request was admitted under (%q) and its idempotency key %q — the sweep is the only reader that can recover the keys to finalise what the hold left open", victims[0].AccountID, victims[0].IdempotencyKey, accountA, oldKey)
 	}
 	if got := integrationReservationState(t, db, lapsedOld); got != string(accounting.StateExpired) {
 		t.Errorf("the first victim's state = %q, want expired", got)
@@ -2278,7 +2301,7 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 	// lease vocabulary, but the sweep must read the allocation tail back too),
 	// and the fact built from the sweep's own answer — payload included —
 	// must clear the engine's envelope guard on the way in.
-	lostVictim, lostRequest := integrationReservationWithLegs(t, ctx, repos, integrationRuntimeAccount(t, "reaper-d"), created, now.Add(-time.Hour), now.Add(-time.Hour))
+	lostVictim, lostRequest, _ := integrationReservationWithLegs(t, ctx, repos, integrationRuntimeAccount(t, "reaper-d"), created, now.Add(-time.Hour), now.Add(-time.Hour))
 	var sweptAllocations []accounting.Allocation
 	err = store.WithinTx(ctx, func(ctx context.Context) error {
 		closed, err := repos.reserves.ExpireLapsedLeases(ctx, 1)
@@ -2352,6 +2375,195 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 	}
 	if renewedClosed, err := repos.reserves.RenewLease(ctx, lostVictim, "b7it-runtime", now.Add(time.Hour)); err != nil || renewedClosed {
 		t.Errorf("RenewLease(an expired hold) = (%t, %v), want (false, nil) — a lease is not renewed on a hold that is gone", renewedClosed, err)
+	}
+}
+
+// TestIntegrationReaperSweepSettlesTheCloseItMade drives the whole expired
+// close as one unit of work, on the identity the sweep carries back: the
+// sweep's CAS ends the hold, the request row finalises from executing through
+// the domain's own FailAbandoned (failed, gateway_abandoned, no attempt named
+// — the reaper cannot know whether the dead process committed), the replay
+// record's pointer is written by the same keyed Finalise the release path
+// calls, and the expired fact is appended last. Nothing here needs a second
+// lookup: the keys ride the sweep's answer, which is why the sweep reads them
+// where it reads the legs.
+//
+// The engine's guards hold throughout: the record's identity is rewritten by
+// nobody (the identity trigger refuses it), the terminal request row is
+// updated by nobody (the terminal trigger refuses it), and a second
+// finalisation of either row is answered false — the CAS is the once-only
+// story, the triggers the bug detector behind it.
+//
+// It runs on a throwaway database for the same reason the reaper test does:
+// the sweep it drives is a batch over the whole reservations table, and its
+// verdicts are about the one hold this test created.
+func TestIntegrationReaperSweepSettlesTheCloseItMade(t *testing.T) {
+	integrationThrowawaySerialise(t)
+	db := integrationThrowawayDatabase(t, "dataplane_b7_reaper_finalise")
+	integrationRuntimeSchema(t, db)
+	store := New(db)
+	repos := integrationRepos(t, store)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	account := integrationRuntimeAccount(t, "reaper-finalise")
+	now := time.Now().UTC()
+	hold, request, key := integrationReservation(t, ctx, repos, account, now.Add(-2*time.Hour), now.Add(-time.Hour), now.Add(-time.Hour))
+
+	var (
+		swept        persistence.ExpiredLease
+		sweptCount   int
+		finalised    bool
+		pointerSet   bool
+		factAppended bool
+	)
+	err := store.WithinTx(ctx, func(ctx context.Context) error {
+		closed, err := repos.reserves.ExpireLapsedLeases(ctx, 1)
+		if err != nil {
+			return err
+		}
+		sweptCount = len(closed)
+		if sweptCount != 1 || closed[0].ID != hold {
+			return fmt.Errorf("the sweep closed %v, want exactly hold %v", closed, hold)
+		}
+		swept = closed[0]
+		// The request finalises by its id, through the same Finalise the
+		// settlement path calls: the caller forms the executing aggregate the
+		// sweep's request id names, and the domain's own transition supplies
+		// the vocabulary — the adapter's SQL never spells it.
+		abandoned := execution.Request{ID: swept.RequestID, Status: execution.StatusExecuting}
+		if err := abandoned.FailAbandoned(time.Now().UTC()); err != nil {
+			return err
+		}
+		if finalised, err = repos.requests.Finalise(ctx, abandoned); err != nil {
+			return err
+		}
+		if !finalised {
+			return fmt.Errorf("the request finalised nobody: the sweep's own CAS had just read the hold open")
+		}
+		// The replay record finalises keyed exactly as the release path keys
+		// it — the identity came back on the sweep's answer.
+		if pointerSet, err = repos.intakes.Finalise(ctx, swept.AccountID, swept.IdempotencyKey, execution.FinalFailed, "", execution.FailedGatewayAbandoned); err != nil {
+			return err
+		}
+		if !pointerSet {
+			return fmt.Errorf("the replay record's pointer was already written")
+		}
+		legs := make([]accounting.AllocationLeg, 0, len(swept.Allocations))
+		for _, leg := range swept.Allocations {
+			legs = append(legs, accounting.AllocationLeg{FundingBucketID: leg.FundingBucketID, Amount: leg.Amount, Ordinal: leg.Ordinal})
+		}
+		fact, err := accounting.NewExpired(swept.RequestID, legs, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		_, err = repos.facts.Append(ctx, fact)
+		factAppended = err == nil
+		return err
+	})
+	if err != nil {
+		t.Fatalf("the expired close's unit of work: %v", err)
+	}
+	if sweptCount != 1 || !finalised || !pointerSet || !factAppended {
+		t.Fatalf("the unit reads (swept %d, request finalised %t, pointer set %t, fact appended %t), want all four — the close is not settled in halves", sweptCount, finalised, pointerSet, factAppended)
+	}
+	if swept.AccountID != account || swept.IdempotencyKey != key {
+		t.Fatalf("the sweep carried replay identity (%q, %q), want (%q, %q) — without it the unit cannot name the record to finalise", swept.AccountID, swept.IdempotencyKey, account, key)
+	}
+
+	// The request row: failed the way the reaper's close must read — the
+	// failure the dead process cannot answer for, no attempt claimed, an
+	// ending stamped.
+	var (
+		status        string
+		failureReason sql.NullString
+		rejection     sql.NullString
+		attempt       sql.NullString
+		finishedAt    sql.NullTime
+	)
+	if err := db.QueryRowContext(ctx, `SELECT status, failure_reason, rejection_reason, committed_attempt_id, finished_at
+		FROM public.requests WHERE id = $1`, string(request)).Scan(&status, &failureReason, &rejection, &attempt, &finishedAt); err != nil {
+		t.Fatalf("reading the reaped request: %v", err)
+	}
+	if status != string(execution.StatusFailed) || !failureReason.Valid || failureReason.String != string(execution.FailedGatewayAbandoned) || rejection.Valid || attempt.Valid || !finishedAt.Valid {
+		t.Errorf("the reaped request reads (%s, failure %q, rejection %q, attempt %q, finished %v), want failed/gateway_abandoned with no attempt claimed and an ending stamped", status, failureReason.String, rejection.String, attempt.String, finishedAt.Time)
+	}
+
+	// The replay record: the pointer the keyed Finalise wrote, read back
+	// through the port's own Find.
+	record, err := repos.intakes.Find(ctx, account, key)
+	if err != nil {
+		t.Fatalf("reading the replay record: %v", err)
+	}
+	if record.FinalStatus == nil || *record.FinalStatus != execution.FinalFailed || record.FinalFailureReason != execution.FailedGatewayAbandoned || record.FinalRejectionReason != "" {
+		t.Errorf("the replay record reads (%v, failure %q, rejection %q), want failed/gateway_abandoned", record.FinalStatus, record.FinalFailureReason, record.FinalRejectionReason)
+	}
+
+	// Once-only, both rows: a second finalisation of the request and a
+	// second write of the pointer are answered false with no error — the
+	// losing writer has nothing left to do.
+	again := execution.Request{ID: request, Status: execution.StatusExecuting}
+	if err := again.FailAbandoned(time.Now().UTC()); err != nil {
+		t.Fatalf("building the second close: %v", err)
+	}
+	if finalisedAgain, err := repos.requests.Finalise(ctx, again); err != nil || finalisedAgain {
+		t.Errorf("Finalise(the finalised request) = (%t, %v), want (false, nil)", finalisedAgain, err)
+	}
+	if pointerAgain, err := repos.intakes.Finalise(ctx, account, key, execution.FinalFailed, "", execution.FailedGatewayAbandoned); err != nil || pointerAgain {
+		t.Errorf("Finalise(the decided record) = (%t, %v), want (false, nil)", pointerAgain, err)
+	}
+
+	// The fail-closed half, and the shape of its failure. The orphan is
+	// minted raw — request row and hold, no replay record, which the helpers
+	// write because admission always does — with both clocks lapsed exactly
+	// like the hold above. The sweep refuses it loud, and the refusal leaves
+	// nothing half-done: the unit of work rolls back, so the orphan is still
+	// open for the next sweep to refuse again, never closed without its
+	// settlement tail.
+	orphanAccount := integrationRuntimeAccount(t, "reaper-orphan")
+	orphanCreated := time.Now().UTC().Add(-2 * time.Hour)
+	orphanPrice := integrationPrice()
+	orphanRequest, err := execution.NewRequest(identity.NewRequestID(), orphanAccount, orphanAccount+"-api-key", "bench/alias", 10, 20, orphanPrice, orphanCreated)
+	if err != nil {
+		t.Fatalf("building the orphan request: %v", err)
+	}
+	if err := repos.requests.Insert(ctx, orphanRequest); err != nil {
+		t.Fatalf("inserting the orphan request: %v", err)
+	}
+	orphanReservation, err := accounting.NewReservation(identity.NewReservationID(), orphanRequest.ID,
+		orphanPrice.RevisionID, orphanPrice.InputUnitPrice, orphanPrice.OutputUnitPrice,
+		orphanRequest.InputTokens, orphanRequest.MaxOutputTokens,
+		0, nil, orphanCreated, now.Add(-time.Hour), "b7it-runtime", now.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("building the orphan hold: %v", err)
+	}
+	if err := repos.reserves.Insert(ctx, orphanReservation); err != nil {
+		t.Fatalf("inserting the orphan hold: %v", err)
+	}
+	sweepErr := store.WithinTx(ctx, func(ctx context.Context) error {
+		_, err := repos.reserves.ExpireLapsedLeases(ctx, 10)
+		return err
+	})
+	if sweepErr == nil {
+		t.Errorf("the sweep settled a hold whose request has no replay record — the fail-close did not fire")
+	}
+	if got := integrationReservationState(t, db, orphanReservation.ID); got != string(accounting.StateOpen) {
+		t.Errorf("the refused sweep left the orphan hold %q, want open — the error rolls the sweep's unit back, so the batch commits nothing", got)
+	}
+
+	// The engine stands behind the port's CAS: a rewrite of the terminal
+	// request row and a rewrite of the record's replay identity are both
+	// refused at the engine, whatever the caller. Both probes are shaped to
+	// be refused by their trigger and by nothing else: the request-row write
+	// changes no value (every CHECK and the composite FK are satisfied by the
+	// row's own shape, so a dropped trigger would let it through and this
+	// assertion would fail), and the intake write touches only a column the
+	// identity trigger guards.
+	if _, err := db.ExecContext(ctx, `UPDATE public.requests SET finished_at = finished_at WHERE id = $1`, string(request)); err == nil {
+		t.Errorf("the terminal request row took an UPDATE — requests_terminal_immutability is the bug detector behind the port's CAS, and it did not fire")
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE public.request_intake SET request_digest = 'b7it-rewritten' WHERE account_id = $1 AND idempotency_key = $2`, account, key); err == nil {
+		t.Errorf("the replay record's identity took a rewrite — request_intake_identity_immutability did not fire")
 	}
 }
 

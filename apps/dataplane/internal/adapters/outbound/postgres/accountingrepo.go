@@ -43,11 +43,41 @@ WHERE id = $1 AND state = 'open'`
 // lease alone would close out a request that is still executing, and taking
 // on a lapsed window alone would hold capacity for a caller that already
 // walked away. The rows that moved come back whole — the request, the pricing
-// basis, the lease, and the legs their hold was split into (the fact's
-// allocation tail, read here so the append needs no second read) — so the
-// caller can append their facts inside the same unit of work and no closed
-// hold is ever left without its fact (crash consistency: no completed close
-// without a fact).
+// basis, the lease, the legs their hold was split into (the fact's
+// allocation tail, read here so the append needs no second read), and the
+// request's replay identity (the intake record's account and idempotency
+// key, joined here so finalising what the hold left open needs no second
+// lookup) — so the caller can append their facts and finalise their requests
+// and replay records inside the same unit of work, and no closed hold is ever
+// left without its fact or with a request row still executing (crash
+// consistency: no completed close without its settlement tail).
+//
+// The replay identity's join is LATERAL and oldest-first because
+// request_intake's enforced key is (account_id, idempotency_key), not
+// request_id — the table's own comment records why — so the one record a
+// request can have is found by request_id through
+// request_intake_request_id_idx (migration 000008), and ORDER BY created_at
+// with the replay pair as tiebreak makes the answer deterministic even for a
+// table that does not enforce the pair unique. The identity returned is the
+// record's OWN pair — the pair the caller's keyed finalisation will name —
+// never the request row's account dressed in the record's key; requests
+// joins LEFT only as the sentinel the scan fail-closes on: no foreign key
+// stands behind reservations.request_id (cross-family ID references carry
+// none), and a hold whose request row has gone missing must not vanish from
+// the sweep's answer — a closed hold the caller never hears about is exactly
+// the tear the sweep exists to prevent.
+//
+// THE WEDGE, STATED. Every fail-close below (a request row that does not
+// exist, a replay record that does not exist or does not belong to the
+// request's account, a request id identity cannot parse) errors the whole
+// sweep, and the sweep's unit of work rolls back with it — nothing of the
+// batch commits, which is the posture that never settles a close in halves.
+// Because victims return oldest-lease-first, one such row is by construction
+// the first victim every later sweep picks: it stops all reaping until it is
+// repaired, and holds behind it leak their capacity while it stands. That is
+// the price of the posture, chosen over silently skipping a hold forever; a
+// loop consuming this port must treat the error as a page to an operator,
+// not a reason to retry.
 const reservationExpireLapsed = `WITH victims AS (
     SELECT id, lease_expires_at, request_id::text AS request_id,
            price_revision_id, input_unit_price, output_unit_price,
@@ -71,6 +101,9 @@ const reservationExpireLapsed = `WITH victims AS (
 SELECT closed.id, closed.request_id, closed.price_revision_id,
        closed.input_unit_price, closed.output_unit_price,
        closed.input_tokens, closed.max_output_tokens, closed.lease_owner,
+       requests.account_id AS request_account,
+       replay.account_id AS record_account,
+       replay.idempotency_key AS record_key,
        COALESCE((
            SELECT jsonb_agg(jsonb_build_object(
                       'funding_bucket_id', legs.funding_bucket_id,
@@ -81,6 +114,14 @@ SELECT closed.id, closed.request_id, closed.price_revision_id,
            WHERE legs.reservation_id = closed.id::uuid
        ), '[]'::jsonb) AS allocations
 FROM closed
+LEFT JOIN public.requests ON requests.id = closed.request_id::uuid
+LEFT JOIN LATERAL (
+    SELECT intake.account_id, intake.idempotency_key
+    FROM public.request_intake intake
+    WHERE intake.request_id = closed.request_id::uuid
+    ORDER BY intake.created_at, intake.account_id, intake.idempotency_key
+    LIMIT 1
+) replay ON true
 ORDER BY closed.lease_expires_at, closed.id`
 
 // ReservationRepository is the PostgreSQL implementation of the reservation
@@ -186,9 +227,12 @@ func (repository *ReservationRepository) ExpireLapsedLeases(ctx context.Context,
 	expired := make([]persistence.ExpiredLease, 0)
 	for rows.Next() {
 		var (
-			expiredRow persistence.ExpiredLease
-			requestID  string
-			legsJSON   []byte
+			expiredRow     persistence.ExpiredLease
+			requestID      string
+			requestAccount sql.NullString
+			recordAccount  sql.NullString
+			recordKey      sql.NullString
+			legsJSON       []byte
 		)
 		if err := rows.Scan(
 			&expiredRow.ID,
@@ -199,6 +243,9 @@ func (repository *ReservationRepository) ExpireLapsedLeases(ctx context.Context,
 			&expiredRow.InputTokens,
 			&expiredRow.MaxOutputTokens,
 			&expiredRow.LeaseOwner,
+			&requestAccount,
+			&recordAccount,
+			&recordKey,
 			&legsJSON,
 		); err != nil {
 			return nil, fmt.Errorf("postgres: expire lapsed leases: %w", err)
@@ -208,6 +255,27 @@ func (repository *ReservationRepository) ExpireLapsedLeases(ctx context.Context,
 			// hold this build can close loudly and correctly.
 			return nil, fmt.Errorf("postgres: expire lapsed leases: %w", err)
 		}
+		// Fail closed on the identity, for the same reason the sweep already
+		// fail-closes on an unparseable request id: admission writes the
+		// request row and its replay record inside one unit of work, so a
+		// closed hold whose identity did not come back whole is a row the
+		// write discipline says cannot exist. Erroring makes the corruption
+		// loud and keeps the sweep's answer whole — the unit it ran in
+		// aborts, so no victim of the batch is left closed without its
+		// settlement tail. The wedge this buys into (one such row is the
+		// oldest lapsed lease and stops every sweep behind it) is stated on
+		// the statement above.
+		if !requestAccount.Valid {
+			return nil, fmt.Errorf("postgres: expire lapsed leases: hold %s for request %s names a request row that does not exist — admission writes the request and its replay record together, so the pair is torn and the sweep refuses it", expiredRow.ID, requestID)
+		}
+		if !recordAccount.Valid || !recordKey.Valid || recordKey.String == "" {
+			return nil, fmt.Errorf("postgres: expire lapsed leases: hold %s for request %s has no replay record to finalise — admission writes the request and its replay record together, so the pair is torn and the sweep refuses it", expiredRow.ID, requestID)
+		}
+		if requestAccount.String != recordAccount.String {
+			return nil, fmt.Errorf("postgres: expire lapsed leases: hold %s for request %s carries a replay record of account %q beside a request row of account %q — the pair is torn and the sweep refuses it", expiredRow.ID, requestID, recordAccount.String, requestAccount.String)
+		}
+		expiredRow.AccountID = recordAccount.String
+		expiredRow.IdempotencyKey = recordKey.String
 		// The legs came back in ordinal order; decode them through the domain's
 		// own leg shape (the one the fact payload uses) so a schema drift here
 		// is a decode error, not silently-empty allocations.
