@@ -213,15 +213,30 @@ func readFactQuery(r *stdhttp.Request) (string, int, error) {
 }
 
 // payloadOrEmpty substitutes an empty JSON object for a fact that carries no
-// body.
+// body: no bytes at all, or the four bytes of a literal JSON `null` — the two
+// spellings of the same absence, because a fact source that surfaces a JSON
+// null column hands back `json.RawMessage("null")` where an empty one hands
+// back an empty slice, and neither is a page this surface may write.
 //
 // The contract types `payload` as an object and requires it, so `null` would be
 // a response no consumer could parse against the document it was written from.
 // An empty body is a fact with nothing in it, which is what an empty object
 // says; `null` would say the fact has no body at all, and it would make every
 // consumer write the same nil check to find that out.
+//
+// The match is byte-exact and not whitespace-tolerant, because no producer
+// exists that could pad it: jsonb's text rendering carries no surrounding
+// whitespace, and nothing on this path rewrites the bytes. A lenient match here
+// would be guessing at inputs nothing upstream can emit, while making this
+// guard's charter — absence, exactly as written — harder to state. The other
+// boundary is the JSON *string* `"null"`, four bytes wrapped in quotes: it is
+// a value and not an absence, it passes through untouched like every other
+// body, and the object shape behind it is already refused elsewhere — by the
+// store's `usage_events_payload_shape` CHECK on the way in and by the fact
+// source's own decoding on the way out — so widening this guard to judge
+// shapes would duplicate a refusal that belongs to those two places.
 func payloadOrEmpty(payload json.RawMessage) json.RawMessage {
-	if len(payload) == 0 {
+	if len(payload) == 0 || string(payload) == "null" {
 		return json.RawMessage(`{}`)
 	}
 	return payload

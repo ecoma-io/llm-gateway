@@ -388,6 +388,86 @@ func TestAFactWithNoBodySerializesAsAnEmptyObject(t *testing.T) {
 	}
 }
 
+func TestAFactWithALiteralNullBodySerializesAsAnEmptyObject(t *testing.T) {
+	// The second spelling of no body (#43). A fact source that surfaces a
+	// JSON null column hands back the four bytes `null`, and a guard that
+	// checked only emptiness would put them on the wire as `"payload":null` —
+	// a page the contract does not describe, and one the façade in front of
+	// this listener answers with 502 on every retry of the position rather
+	// than serve. The bytes are not nothing, so no length check can catch
+	// them; only their spelling can.
+	facts := &stubFacts{page: usagefacts.Page{
+		Events: []usagefacts.Event{{
+			RequestID:     "req_3",
+			Kind:          "released",
+			SchemaVersion: 1,
+			Payload:       json.RawMessage(`null`),
+		}},
+		NextCursor: "position-9",
+	}}
+
+	rec := serve(t, facts, authed(t, "/internal/usage-events"))
+
+	want := `"payload":{}`
+	if got := rec.Body.String(); !strings.Contains(got, want) {
+		t.Errorf("body = %s, want it to contain %s; the second spelling of no body must reach the wire as the first one does", got, want)
+	}
+}
+
+// TestTheFeedNormalisesOnlyTheTwoSpellingsOfAnAbsentBody pins the boundary of
+// the substitution byte for byte, at the one level where all of it can be said
+// honestly. Two of the four rows cannot be driven through the handler above:
+// the empty slice is the test before this one's subject, and the JSON string
+// `"null"` is a value and not an absence — served through the handler it would
+// pin a page the contract forbids, asserting the violation a guard exists to
+// prevent. What only this table states is the charter itself: absence, in
+// either of its two spellings, becomes `{}`, and everything else leaves as the
+// bytes it arrived as, because this surface is a reader of facts and not their
+// interpreter — the object shape behind a body is the store's CHECK on the way
+// in and the fact source's own decoding on the way out, not a judgement this
+// guard repeats.
+func TestTheFeedNormalisesOnlyTheTwoSpellingsOfAnAbsentBody(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload json.RawMessage
+		want    string
+	}{
+		{
+			// The spelling of a column that never had bytes: an empty slice,
+			// which no length can distinguish from any other emptiness.
+			name:    "no bytes at all",
+			payload: json.RawMessage(nil),
+			want:    `{}`,
+		},
+		{
+			name:    "the four bytes of a literal null",
+			payload: json.RawMessage(`null`),
+			want:    `{}`,
+		},
+		{
+			// Four bytes wrapped in quotes: a JSON string whose content
+			// happens to spell null. It is a value, and the guard that
+			// judges values is a different guard in a different place.
+			name:    "the json string null, which is a value and not an absence",
+			payload: json.RawMessage(`"null"`),
+			want:    `"null"`,
+		},
+		{
+			name:    "a body, whatever is in it",
+			payload: json.RawMessage(`{"tokens":7}`),
+			want:    `{"tokens":7}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := string(payloadOrEmpty(tt.payload)); got != tt.want {
+				t.Errorf("payloadOrEmpty(%s) = %s, want %s; absence is normalised and nothing else is", tt.payload, got, tt.want)
+			}
+		})
+	}
+}
+
 // envelopeCode and envelopeMessage decode just enough of the management
 // envelope to assert on a field. They are deliberately not used for the success
 // path, whose bytes are pinned exactly.
