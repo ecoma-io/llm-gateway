@@ -54,11 +54,16 @@ import (
 // nothing in the Control Plane chooses which path the feed lives at.
 const usageEventsPath = "/internal/usage-events"
 
-// currentGroupVersionPath is the path prefix of the group-version read, as
-// dataplane.yaml declares it; the group name is appended as the one path
-// segment, escaped. Like usageEventsPath it is the contract's, not the
-// caller's.
-const currentGroupVersionPath = "/internal/alias-groups"
+// currentGroupVersionPath is the fixed part of the group-version read's path,
+// as dataplane.yaml declares it: the group name is the one path segment
+// between this prefix and the /versions/current suffix, escaped. Like
+// usageEventsPath it is the contract's, not the caller's.
+const (
+	currentGroupVersionPrefix = "/internal/alias-groups/"
+	// currentGroupVersionSuffix completes the contract's path;
+	// the read is of a group's *current* version, not of the group.
+	currentGroupVersionSuffix = "/versions/current"
+)
 
 // usageCursorMaxLength is the bound the contract puts on a cursor
 // (`shared/usage-facts.yaml`, UsageCursor: `maxLength: 512`), and it is checked
@@ -361,7 +366,7 @@ func (c *Client) CurrentGroupVersion(ctx context.Context, groupName string) (por
 	if groupName == "" {
 		return port.GroupVersion{}, errors.New("dataplane: current group version requires a group name")
 	}
-	requestURL := c.url(currentGroupVersionPath + "/" + url.PathEscape(groupName))
+	requestURL := c.url(currentGroupVersionPrefix + url.PathEscape(groupName) + currentGroupVersionSuffix)
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
 	if err != nil {
