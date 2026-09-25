@@ -109,7 +109,7 @@ func (s seamStore) WithinTx(ctx context.Context, fn func(context.Context) error)
 		effects[requestID] = fact
 	}
 
-	if err := fn(ctx); err != nil {
+	if err := fn(context.WithValue(ctx, seamTxKey{}, true)); err != nil {
 		s.world.position = position
 		s.world.effects = effects
 		s.world.log = append(s.world.log, "rollback")
@@ -117,6 +117,17 @@ func (s seamStore) WithinTx(ctx context.Context, fn func(context.Context) error)
 	}
 	s.world.log = append(s.world.log, "commit")
 	return nil
+}
+
+// seamTxKey marks the context a unit of work handed its callback, the way the
+// real store's transaction travels; InUnitOfWork reads it back.
+type seamTxKey struct{}
+
+// InUnitOfWork answers the marker WithinTx marks with — the fake of the port
+// member the unit-of-work-shaped repositories ask before refusing a call.
+func (s seamStore) InUnitOfWork(ctx context.Context) bool {
+	marked, ok := ctx.Value(seamTxKey{}).(bool)
+	return ok && marked
 }
 
 type seamCursor struct{ world *seamWorld }

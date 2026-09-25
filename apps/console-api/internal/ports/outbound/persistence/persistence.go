@@ -120,6 +120,16 @@ type Store interface {
 	// opens, owns, and commits a transaction of its own, because a
 	// transaction on one pool can no more carry another pool's writes than
 	// a query can reach across pools.
+	//
+	// Every unit of work runs at the driver's default isolation, READ
+	// COMMITTED, and the port's concurrency model is built on that rather
+	// than on a stronger level: a guarded statement is a single statement —
+	// its WHERE clause is the guard and its rows-affected count the verdict
+	// — so no read-modify-write sequence spans statements for a second
+	// writer to slip into. A caller that needs a stricter level for one
+	// unit raises it itself as the unit's first statement
+	// (`SELECT set_config(...)`) and owns the retry policy that level
+	// demands; the port neither hides nor automates that choice.
 	WithinTx(ctx context.Context, fn func(ctx context.Context) error) error
 
 	// InUnitOfWork reports whether ctx carries a unit of work this store

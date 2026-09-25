@@ -332,13 +332,15 @@ the bound. Consequences:
 - **Activation** is the per-account enablement flag — operator-set today,
   self-service later. It authorises spending; it funds nothing. The flag is a
   Commerce-owned row keyed by the account (`control.account_payg` — an absent
-  row is PAYG off), and its funding-bucket reference is write-once: commerce
-  refuses to re-point an assigned bucket, while the bucket row it names
-  remains the Accounting context's (B6). The PAYG funding-bucket row exists
-  from account creation with a zero balance —
+  row is PAYG off), and its funding-bucket reference is write-once: it lands
+  as one guarded statement that refuses to re-point an assigned bucket, and
+  enabling is refused while no reference is on file — a spending
+  authorisation that names no bucket would authorise draws from nothing.
+  The bucket row the reference names remains the Accounting context's (B6).
+  That bucket row exists from account creation with a zero balance —
   created as the Accounting-side write of the account-creation workflow, a
   choreography over IDs rather than a shared transaction (ADR 0001; the
-  bucket is an Accounting aggregate), so enabling is only a flag flip.
+  bucket is an Accounting aggregate) — so enabling is only a flag flip.
   **Disabling** blocks new spills at admission
   (the waterfall treats PAYG as absent); holds already secured against the
   bucket settle normally against it.

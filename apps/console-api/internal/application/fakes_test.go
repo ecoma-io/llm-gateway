@@ -203,6 +203,13 @@ func inTransaction(ctx context.Context) bool {
 	return ok && marked
 }
 
+// InUnitOfWork answers the same lookup WithinTx marks with — the fake of the
+// port member the ledger-side repositories ask before refusing to append
+// outside a unit of work.
+func (s fakeStore) InUnitOfWork(ctx context.Context) bool {
+	return inTransaction(ctx)
+}
+
 // errApply is the applier failure the rollback test injects. It is a plain
 // error rather than an application one because the applier's failures belong to
 // the port, and the use case's job is to propagate them rather than to

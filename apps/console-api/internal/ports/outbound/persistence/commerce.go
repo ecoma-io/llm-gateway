@@ -266,11 +266,14 @@ type PaygAccounts interface {
 	// ledger's to discover.
 	SetEnabled(ctx context.Context, accountID commerce.AccountID, enabled bool, now time.Time) error
 
-	// AssignFundingBucket records the bucket reference, write-once: the
-	// assignment lands only while the row's reference is still unset, and
-	// false means a reference is already on file — one PAYG source and one
-	// bucket per account, ever. The row a first PAYG enablement inserted is
-	// the row this assigns into; an account with no row has never enabled
-	// PAYG and has nothing to fund, and false is not that case's answer.
+	// AssignFundingBucket records the bucket reference as an insert-or-update
+	// in one statement: an account with no PAYG row yet gets the row created
+	// around the reference — PAYG still disabled, because a reference alone
+	// funds and authorises nothing — and a row whose reference is already
+	// set is left untouched. False means a reference is already on file (the
+	// caller re-reads to converge on it or to name the conflict); true means
+	// this call wrote it, by either path. One PAYG source and one bucket per
+	// account, ever — the guard is the statement's WHERE clause, not a
+	// read-then-write a second writer could slip between.
 	AssignFundingBucket(ctx context.Context, accountID commerce.AccountID, bucketID commerce.FundingBucketID, updatedAt time.Time) (bool, error)
 }
