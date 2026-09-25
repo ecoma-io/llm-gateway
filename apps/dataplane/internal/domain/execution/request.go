@@ -4,7 +4,7 @@
 //
 // The package owns the terminal vocabulary and the state machine the
 // `dataplane` database enforces a second time (migration
-// 000002_runtime_storage: every shape CHECK here has a twin constraint on the
+// 000003_runtime_storage: every shape CHECK here has a twin constraint on the
 // row). The doubling is the design, not a courtesy copy: the database is the
 // final guard — no process, version or bug can write a row the vocabulary
 // forbids — while this package is where a caller gets a legible error instead

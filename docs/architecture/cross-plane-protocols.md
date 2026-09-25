@@ -354,7 +354,7 @@ position; the fourth is why nothing in the derivation needs a lock.
 ### The fact source, decided and landed
 
 The one question this page used to leave open on this seam is closed:
-`usage_events` (B7's `migrations/dataplane/000002_runtime_storage`) is the
+`usage_events` (B7's `migrations/dataplane/000003_runtime_storage`) is the
 table the facts are read from, and the requirements this page names are
 properties of that schema rather than promises about a future one. Ordering is
 **commit ordering**: each fact's `append_seq` is allocated from the single

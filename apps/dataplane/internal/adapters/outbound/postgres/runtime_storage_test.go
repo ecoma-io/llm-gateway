@@ -3,7 +3,7 @@
 package postgres
 
 // The runtime-storage integration suite: the B7 repositories and the fact
-// reader against a real PostgreSQL carrying the 000002_runtime_storage schema.
+// reader against a real PostgreSQL carrying the 000003_runtime_storage schema.
 // The unit suites beside this file pin the adapters' orchestration against the
 // hand-written driver fake; what these tests prove is the other half — that
 // the conditional drawdown, the dedup partial uniques, the stream's

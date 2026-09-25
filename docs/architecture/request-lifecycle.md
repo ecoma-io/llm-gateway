@@ -67,7 +67,7 @@ their rows sit, and the two steps that cross a plane are marked.
 
 The vocabulary this table uses is landed code, not a glossary to be honoured
 later: the terminal statuses and every rejection and failure reason are values
-of `migrations/dataplane/000002_runtime_storage`'s CHECK constraints and of the
+of `migrations/dataplane/000003_runtime_storage`'s CHECK constraints and of the
 runtime's `execution` domain (`apps/dataplane/internal/domain/execution`), which
 refuses in Go what the database would refuse again in SQL. Three details in the
 table are worth reading precisely because the landed schema fixes their shape.

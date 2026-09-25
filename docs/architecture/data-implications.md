@@ -11,7 +11,7 @@ splits that cluster into **two databases, one per plane** — `control` for the
 Control Plane API, `dataplane` for the runtime, one migration lane each — so
 the family a table belongs to and the database it lands in are two separate
 answers, and every table below states both. The runtime's half of this page has
-a landed schema (`migrations/dataplane/000002_runtime_storage`, the B7 runtime
+a landed schema (`migrations/dataplane/000003_runtime_storage`, the B7 runtime
 storage foundation); the Control Plane's tables are still constraints here, not
 DDL. Where a landed schema and this page describe the same row, the migration —
 and the ADR amendment it records — is what shipped; this page says which.
@@ -136,7 +136,7 @@ grant_definition)` unique on entitlements; alias identities unique across
 
 All three live in the Data Plane's database. ADR 0005 placed this family on
 TimescaleDB hypertables; the landed schema deviates: B7's
-`000002_runtime_storage` ships all nine of the runtime schema's tables as
+`000003_runtime_storage` ships all nine of the runtime schema's tables as
 **plain (unpartitioned) tables** — the three below, plus `request_intake`,
 `reservations` (+ `reservation_allocations`), the quota projection
 (`quota_projections`, `quota_refills`) and `usage_events_stream`. The reasons

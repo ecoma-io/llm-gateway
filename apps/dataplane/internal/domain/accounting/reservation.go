@@ -12,7 +12,7 @@
 // deciding and the Control Plane starts deriving.
 //
 // The package mirrors its tables the way package execution does: every
-// invariant here has a twin constraint in migration 000002_runtime_storage,
+// invariant here has a twin constraint in migration 000003_runtime_storage,
 // the database as the final guard and this package as the legible refusal.
 package accounting
 

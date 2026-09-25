@@ -71,7 +71,7 @@ never the accounting write path.
 
 > **Amended (B7, runtime storage): the event family ships as plain tables, not
 > hypertables.** The runtime's nine tables landed in
-> `migrations/dataplane/000002_runtime_storage` unpartitioned, because three
+> `migrations/dataplane/000003_runtime_storage` unpartitioned, because three
 > constraints the money path leans on cannot be expressed on a hypertable: the
 > partitioning-column rule forbids `requests(id)` as primary key, the attempts'
 > business key, and the usage-fact dedup partial uniques on

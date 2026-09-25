@@ -1,4 +1,4 @@
--- The exact inverse of 000002_runtime_storage.up.sql, in dependency order.
+-- The exact inverse of 000003_runtime_storage.up.sql, in dependency order.
 --
 -- Every trigger function is dropped explicitly: a DROP TABLE removes its
 -- triggers but NOT the functions they reference, and an orphaned function in

@@ -27,7 +27,7 @@ Reference pages for the designed domain model the ADRs produce — the picture
 an engineer needs before writing migrations or a contract under `api/openapi/`.
 They describe the design; where a slice of it has shipped, the page says so and
 grounds the claim in the schema or package that carries it — the runtime
-storage foundation (`migrations/dataplane/000002_runtime_storage` and the
+storage foundation (`migrations/dataplane/000003_runtime_storage` and the
 `apps/dataplane` domain, ports and adapters behind it) is the first such slice,
 and the serving domains are still design.
 
