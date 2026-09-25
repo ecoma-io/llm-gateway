@@ -390,9 +390,16 @@ ledger safe to read from any process and its projections safe to rebuild.
   the message, and the PAYG row's `funding_bucket_id` is write-once the same
   way — re-pointing and deleting the reference are both refused.
 
-The adapter's WHERE-clause guards and its sentinel classification are
-therefore a translation of verdicts the engine guarantees twice over, not
-the last line of defense wearing a Go interface.
+For the promises the engine carries outright — append-only, write-once,
+provenance, owner-match — the adapter's WHERE-clause guards and its sentinel
+classification are a translation of verdicts the engine guarantees before
+the statement even runs, not the last line of defense wearing a Go
+interface. The funder-ownership rule and the sufficiency each leg's own
+deltas demand are the other kind: no single row can hold both sides, so the
+domain states them and the echo's WHERE clause states them again — the same
+guard in two vocabularies, and the classification names which one refused.
+A writer that bypasses both has only the engine's words to answer to, which
+is exactly why the derivable promises were made engine promises at all.
 
 ### What the foundation carries, and what waits
 
