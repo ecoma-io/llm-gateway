@@ -131,6 +131,57 @@ tasks:
       - "**/*"
       - "/go.work"
       - "/go.work.sum"
+  # `test-integration` with the race detector turned on. The same two
+  # runners, the same required-address contract, the same vacuity guard — only
+  # the flag and the sentence differ — because `-race` changes what the run
+  # costs, not what it guarantees: every tagged test, or the green means
+  # nothing. It exists so the concurrency the storage tier's gates exercise is
+  # also proved race-free, not merely passed.
+  test-integration-race:
+    script: |
+      if [ -z "${VALKEY_ADDRESS:-}" ]; then
+        echo "VALKEY_ADDRESS is required — start the fixture (from the repository root: docker compose -f deploy/redis/docker-compose.yml up -d) and set it to 127.0.0.1:6379 (see deploy/redis/README.md)"
+        exit 1
+      fi
+      if [ -z "${POSTGRES_TEST_ADMIN_DSN:-}" ]; then
+        echo "POSTGRES_TEST_ADMIN_DSN is required — start the fixture (from the repository root: docker compose -f deploy/postgres/compose.yaml up -d --wait) and set it to postgres://gateway:gateway-dev-only@127.0.0.1:5432/postgres?sslmode=disable (see deploy/postgres/README.md)"
+        exit 1
+      fi
+      status=0
+      output="$(go test -race -v -tags=integration ./internal/adapters/outbound/valkey ./internal/adapters/outbound/postgres 2>&1)" || status=$?
+      printf '%s\n' "$output"
+      [ "$status" -eq 0 ] || exit "$status"
+      if ! printf '%s\n' "$output" | grep -q '^=== RUN'; then
+        echo "go test -race -tags=integration executed no tests — a green target here would mean nothing ran"
+        exit 1
+      fi
+    inputs:
+      - "**/*"
+      - "/go.work"
+      - "/go.work.sum"
+  # `test` with the race detector turned on, and a target of its own because it
+  # cannot be `test` itself: the detector's instrumentation makes the build and
+  # the run an order of magnitude slower, and a gate that slow on every change
+  # gets worked around rather than waited on. Everything else is `test`'s
+  # script unchanged — `-count=1` and the same out-of-tree inputs, the same
+  # `=== RUN` vacuity guard — because `-race` changes what the suite costs, not
+  # what the target guarantees: every test, every package, or the green means
+  # nothing.
+  test-race:
+    script: |
+      status=0
+      output="$(go test -count=1 -race -v ./... 2>&1)" || status=$?
+      printf '%s\n' "$output"
+      [ "$status" -eq 0 ] || exit "$status"
+      if ! printf '%s\n' "$output" | grep -q '^=== RUN'; then
+        echo "go test -race ./... executed no tests — a green target here would mean nothing ran"
+        exit 1
+      fi
+    inputs:
+      - "**/*"
+      - "/api/openapi/**/*"
+      - "/go.work"
+      - "/go.work.sum"
   # The Go half of what `vue-tsc --noEmit` is for the console project. `go
   # build` over more than one package compiles and discards, writing no binary
   # — a typecheck target that dropped an executable into the package root would
