@@ -56,6 +56,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/adapters/inbound/http"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/adapters/inbound/management"
@@ -328,9 +329,21 @@ func leaseOwner() string {
 	if err != nil || host == "" {
 		host = "unknown-host"
 	}
-	suffix := ":" + strconv.Itoa(os.Getpid())
+	return leaseOwnerFrom(host, os.Getpid())
+}
+
+// leaseOwnerFrom is the derivation the owner above makes from its inputs, and
+// the shape the tests exercise. The cut is rune-safe: a host name that stops
+// mid-rune would put a torn UTF-8 sequence into a value the schema stores and
+// the lease compares byte-for-byte, so the truncation steps back to the
+// nearest valid boundary before the pid half is joined.
+func leaseOwnerFrom(host string, pid int) string {
+	suffix := ":" + strconv.Itoa(pid)
 	if keep := maxLeaseOwnerOctets - len(suffix); len(host) > keep {
 		host = host[:keep]
+		for len(host) > 0 && !utf8.ValidString(host) {
+			host = host[:len(host)-1]
+		}
 	}
 	return host + suffix
 }

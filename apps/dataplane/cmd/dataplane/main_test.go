@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/config"
 )
@@ -34,6 +35,33 @@ func TestLeaseOwnerStaysInsideTheSchemaBound(t *testing.T) {
 	}
 	if !strings.HasPrefix(owner, "unknown-host") && !strings.Contains(owner, ":") {
 		t.Fatalf("the derived lease owner carries no pid half: %d octets of host name only", len(owner))
+	}
+}
+
+// TestLeaseOwnerTruncatesOnARuneBoundary: a host name is cut at the schema's
+// octet bound, and a cut that lands inside a multi-byte character would put a
+// torn UTF-8 sequence into a value the store keeps and the lease compares —
+// so the derivation steps back to the last whole rune before the pid half is
+// joined.
+func TestLeaseOwnerTruncatesOnARuneBoundary(t *testing.T) {
+	host := strings.Repeat("høst", 80) // 320 bytes of four-rune repeats, well past the bound
+	owner := leaseOwnerFrom(host, 4242)
+
+	if len(owner) > maxLeaseOwnerOctets {
+		t.Fatalf("the derived lease owner is %d octets, past the bound the schema CHECKs", len(owner))
+	}
+	if !utf8.ValidString(owner) {
+		t.Fatalf("the derived lease owner is not valid UTF-8: a cut landed inside a rune")
+	}
+	if !strings.HasSuffix(owner, ":4242") {
+		t.Fatalf("the derived lease owner lost its pid half: %q", owner)
+	}
+	wantHost := host[:maxLeaseOwnerOctets-len(":4242")]
+	for len(wantHost) > 0 && !utf8.ValidString(wantHost) {
+		wantHost = wantHost[:len(wantHost)-1]
+	}
+	if !strings.HasPrefix(owner, wantHost) {
+		t.Fatalf("the derived lease owner does not start with the rune-safe truncation of the host")
 	}
 }
 

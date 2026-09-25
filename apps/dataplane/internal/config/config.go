@@ -66,6 +66,15 @@ const (
 	// that a load-time fact instead of a per-deployment hope.
 	MaxReservationHoldWindow = 30 * 24 * time.Hour
 
+	// minReservationHorizon is the floor both reservation horizons share. A
+	// horizon this short cannot do the work it exists for: the reaper's
+	// reclaim test and the lease's fence both compare timestamps written by
+	// more than one process, and a window measured in milliseconds expires
+	// between the write of a stamp and the read of it. Below this, a
+	// deployment is not tuned, it is broken — so the loader refuses rather
+	// than runs.
+	minReservationHorizon = time.Second
+
 	// ownedDatabase is the only database this application may be pointed at —
 	// the plane binding of ADR 0006 §7, checked in validatePostgresDSN and
 	// again by the persistence adapter (which carries a constant of the same
@@ -437,6 +446,22 @@ func validateAddr(name, addr string) error {
 // are spelled rather than inferred because a message that named the wrong
 // variable would send an operator to the wrong line of their deployment.
 func validateReservationHorizons(hold, lease time.Duration) error {
+	// Both horizons carry a one-second floor on top of "positive". These are
+	// clocks a distributed invariant rides on — the reaper reclaims what the
+	// hold window has expired, the lease fences whoever may close the hold —
+	// and a sub-second value there is not a tuning choice, it is a
+	// misreading: two processes would disagree about expiry by more than the
+	// horizon itself.
+	if hold < minReservationHorizon {
+		return fmt.Errorf(
+			"DATAPLANE_RESERVATION_HOLD_WINDOW (%s) must not be shorter than %s",
+			hold, minReservationHorizon)
+	}
+	if lease < minReservationHorizon {
+		return fmt.Errorf(
+			"DATAPLANE_RESERVATION_LEASE_TTL (%s) must not be shorter than %s",
+			lease, minReservationHorizon)
+	}
 	if hold > MaxReservationHoldWindow {
 		return fmt.Errorf(
 			"DATAPLANE_RESERVATION_HOLD_WINDOW (%s) must not be greater than %s",

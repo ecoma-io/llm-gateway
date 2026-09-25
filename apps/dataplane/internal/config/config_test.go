@@ -222,6 +222,40 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			wantErr: "DATAPLANE_RESERVATION_LEASE_TTL (2m1s) must be strictly shorter than DATAPLANE_RESERVATION_HOLD_WINDOW (2m0s); a lease must never outlive the hold it fences",
 		},
 		{
+			name: "refuses a sub-second hold window",
+			env: map[string]string{
+				"DATAPLANE_RESERVATION_HOLD_WINDOW": "500ms",
+				"DATAPLANE_RESERVATION_LEASE_TTL":   DefaultReservationLeaseTTL.String(),
+			},
+			wantErr: "DATAPLANE_RESERVATION_HOLD_WINDOW (500ms) must not be shorter than 1s",
+		},
+		{
+			name: "refuses a sub-second lease ttl",
+			env: map[string]string{
+				"DATAPLANE_RESERVATION_HOLD_WINDOW": DefaultReservationHoldWindow.String(),
+				"DATAPLANE_RESERVATION_LEASE_TTL":   "750ms",
+			},
+			wantErr: "DATAPLANE_RESERVATION_LEASE_TTL (750ms) must not be shorter than 1s",
+		},
+		{
+			// Both horizons at their one-second floor: the shortest pairing the
+			// loader accepts, a lease that fences its hold exactly as tightly
+			// as the floor allows.
+			name: "accepts the two horizons at their one-second floor",
+			env: map[string]string{
+				"DATAPLANE_RESERVATION_HOLD_WINDOW": "2s",
+				"DATAPLANE_RESERVATION_LEASE_TTL":   "1s",
+			},
+			want: Config{
+				Addr:                  DefaultAddr,
+				ShutdownTimeout:       DefaultShutdownTimeout,
+				ReadHeaderTimeout:     DefaultReadHeaderTimeout,
+				ReservationHoldWindow: 2 * time.Second,
+				ReservationLeaseTTL:   time.Second,
+				Postgres:              postgresDefaults(),
+			},
+		},
+		{
 			name: "serves no management surface unless one is configured",
 			env: map[string]string{
 				"DATAPLANE_ADDR": "127.0.0.1:9090",
