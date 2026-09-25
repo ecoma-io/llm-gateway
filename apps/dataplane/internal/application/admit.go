@@ -682,17 +682,22 @@ func parseChatRequest(raw []byte) (*chatRequest, *chatRefusal) {
 	if err := json.Unmarshal(body.Model, &model); err != nil || model == "" {
 		return nil, &chatRefusal{reason: execution.RejectedInvalidRequest, detail: DetailModel}
 	}
+	if !catalog.ValidAliasName(model) {
+		return nil, &chatRefusal{reason: execution.RejectedInvalidRequest, detail: DetailModel}
+	}
 	parsed := &chatRequest{
 		model:         model,
 		maxTokens:     body.MaxTokens,
 		maxCompletion: body.MaxCompletion,
 		stream:        body.Stream != nil && *body.Stream,
 	}
+	contents := make([]string, 0, len(body.Messages))
 	for _, message := range body.Messages {
 		if message.Content != nil {
-			parsed.inputTokens += int64(len(*message.Content))
+			contents = append(contents, *message.Content)
 		}
 	}
+	parsed.inputTokens = catalog.CountInputTokens(contents)
 	return parsed, nil
 }
 

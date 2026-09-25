@@ -280,9 +280,12 @@ paths:
                 model:
                   type: string
                   maxLength: 128
+                  pattern: "^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$"
                   description: >-
-                    The model alias requested. An unknown alias is answered 404
-                    with the `model_not_found` code.
+                    The model alias requested. A value outside this grammar is
+                    a malformed request, answered 400 with `model` named in
+                    `param`; a well-formed name no alias carries is answered
+                    404 with the `model_not_found` code.
                 messages:
                   type: array
                   description: >-

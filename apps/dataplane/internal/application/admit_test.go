@@ -674,6 +674,30 @@ func TestAdmissionRefusalsInsideTheUnitWriteThePairAndCommit(t *testing.T) {
 			wantDetail: DetailModel,
 		},
 		{
+			name:       "a model past the grammar's length",
+			body:       []byte(fmt.Sprintf(`{"model":%q,"max_tokens":16,"messages":[{"content":"hello"}]}`, strings.Repeat("a", 200))),
+			wantReason: execution.RejectedInvalidRequest,
+			wantDetail: DetailModel,
+		},
+		{
+			name:       "a model past the provider's own bound",
+			body:       []byte(fmt.Sprintf(`{"model":%q,"max_tokens":16,"messages":[{"content":"hello"}]}`, strings.Repeat("a", 300))),
+			wantReason: execution.RejectedInvalidRequest,
+			wantDetail: DetailModel,
+		},
+		{
+			name:       "a model with a character the grammar does not carry",
+			body:       []byte(`{"model":"open ai","max_tokens":16,"messages":[{"content":"hello"}]}`),
+			wantReason: execution.RejectedInvalidRequest,
+			wantDetail: DetailModel,
+		},
+		{
+			name:       "a multibyte model",
+			body:       []byte(`{"model":"mødel","max_tokens":16,"messages":[{"content":"hello"}]}`),
+			wantReason: execution.RejectedInvalidRequest,
+			wantDetail: DetailModel,
+		},
+		{
 			name:       "no output ceiling spelled at all",
 			body:       []byte(`{"model":"test-model","messages":[{"content":"hello"}]}`),
 			wantReason: execution.RejectedInvalidRequest,
@@ -1193,5 +1217,29 @@ func TestAdmissionParsesTheCeilingsSpellingsDirectly(t *testing.T) {
 	}
 	if world.happened("ledger.drawdown") {
 		t.Fatalf("an unknown alias reached the waterfall")
+	}
+}
+// ---------------------------------------------------------------------------
+// the interim tokenizer seam
+// ---------------------------------------------------------------------------
+
+// TestParseCountsContentInBytes: the input count prices the hold, and the
+// seam it comes from counts bytes, not runes — a multibyte message holds
+// against its real wire size.
+func TestParseCountsContentInBytes(t *testing.T) {
+	raw := []byte(`{"model":"test-model","max_tokens":16,"messages":[` +
+		`{"content":"hello"},` +
+		`{"content":"你好世界"},` +
+		`{"role":"assistant"},` +
+		`{"content":""}` +
+		`],"stream":false}`)
+	parsed, refusal := parseChatRequest(raw)
+	if refusal != nil {
+		t.Fatalf("a well-formed body refused: %s", refusal.reason)
+	}
+	// "hello" is 5 bytes; "你好世界" is 12 bytes (4 runes × 3), not 4; the
+	// content-less message contributes nothing, and so does the empty one.
+	if parsed.inputTokens != 17 {
+		t.Fatalf("input tokens = %d, want 17 — the count is bytes, not runes", parsed.inputTokens)
 	}
 }
