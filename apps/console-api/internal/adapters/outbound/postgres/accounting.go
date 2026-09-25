@@ -306,6 +306,10 @@ SET held_amount = held_amount + $3,
 WHERE id = $1 AND status = 'active' AND settled_amount - held_amount >= $2
 RETURNING ` + fundingBucketColumns
 
+// The release echo carries the provenance its schema guard pins: the named
+// reservation has a hold leg on file for this bucket. The ledger appends,
+// so the condition is monotone — once true it cannot be withdrawn — and the
+// INSERT-time trigger is braces for writers that skip the echo.
 const echoRelease = `
 UPDATE control.funding_buckets
 SET held_amount = held_amount + $2,
@@ -314,6 +318,11 @@ SET held_amount = held_amount + $2,
     version = version + 1,
     updated_at = $3
 WHERE id = $1 AND status = 'active' AND held_amount + $2 >= 0
+  AND EXISTS (
+      SELECT 1 FROM control.ledger_entries prior
+      WHERE prior.funding_bucket_id = funding_buckets.id
+        AND prior.reservation_id = $4
+        AND prior.kind = 'hold')
 RETURNING ` + fundingBucketColumns
 
 const echoConsume = `
@@ -328,6 +337,9 @@ WHERE id = $1 AND status = 'active'
   AND held_amount + $3 >= 0 AND settled_amount + $2 >= 0
 RETURNING ` + fundingBucketColumns
 
+// The adjustment echo carries the same provenance the schema guard pins:
+// the entry this correction cites lives on the bucket the correction lands
+// on — a foreign leg is not this bucket's history to correct.
 const echoAdjustment = `
 UPDATE control.funding_buckets
 SET settled_amount = settled_amount + $2,
@@ -340,6 +352,10 @@ WHERE id = $1 AND status = 'active'
   AND settled_amount + $2 >= 0
   AND held_amount + $3 >= 0
   AND settled_amount + $2 - held_amount - $3 >= 0
+  AND EXISTS (
+      SELECT 1 FROM control.ledger_entries original
+      WHERE original.id = $5
+        AND original.funding_bucket_id = funding_buckets.id)
 RETURNING ` + fundingBucketColumns
 
 // echoFor returns the kind's echo statement. An unknown kind is a minted-leg
@@ -377,8 +393,9 @@ func echoArgs(entry accounting.LedgerEntry) ([]any, error) {
 		return []any{string(entry.FundingBucketID),
 			entry.Amount.Int64(), entry.HeldDelta.Int64(), entry.CreatedAt}, nil
 	case accounting.KindRelease:
+		// $4 is the reservation the provenance guard matches the hold on.
 		return []any{string(entry.FundingBucketID),
-			entry.HeldDelta.Int64(), entry.CreatedAt}, nil
+			entry.HeldDelta.Int64(), entry.CreatedAt, string(entry.ReservationID)}, nil
 	case accounting.KindConsume:
 		// The amount column rides the deltas for this kind — both move by the
 		// same take — so the echo binds no fourth value; an unreferenced
@@ -386,8 +403,10 @@ func echoArgs(entry accounting.LedgerEntry) ([]any, error) {
 		return []any{string(entry.FundingBucketID),
 			entry.SettledDelta.Int64(), entry.HeldDelta.Int64(), entry.CreatedAt}, nil
 	case accounting.KindAdjustment:
+		// $5 is the entry the provenance guard pins to this bucket.
 		return []any{string(entry.FundingBucketID),
-			entry.SettledDelta.Int64(), entry.HeldDelta.Int64(), entry.CreatedAt}, nil
+			entry.SettledDelta.Int64(), entry.HeldDelta.Int64(), entry.CreatedAt,
+			string(entry.OriginalEntryID)}, nil
 	default:
 		return nil, fmt.Errorf("postgres: append ledger entry: %w: unknown kind %q", accounting.ErrInvalidTransition, entry.Kind)
 	}
@@ -411,6 +430,37 @@ const selectLedgerByReservationKind = `
 SELECT ` + ledgerEntryColumns + `
 FROM control.ledger_entries
 WHERE funding_bucket_id = $1 AND reservation_id = $2 AND kind = $3`
+
+// The provenance conditions the release and adjustment echoes carry in their
+// WHERE clauses, run fresh when an echo fires zero rows so the
+// classification can name which verdict fired. The ledger appends, so both
+// answers are monotone: a hold on file is never withdrawn, and the entry a
+// correction cites is never rewritten.
+const selectHoldOnFile = `SELECT EXISTS (
+    SELECT 1 FROM control.ledger_entries
+    WHERE funding_bucket_id = $1 AND reservation_id = $2 AND kind = 'hold')`
+
+const selectAdjustmentOnOwnBucket = `SELECT EXISTS (
+    SELECT 1 FROM control.ledger_entries
+    WHERE id = $1 AND funding_bucket_id = $2)`
+
+func (r *ledgerRepo) holdOnFile(ctx context.Context, bucketID accounting.FundingBucketID, reservationID accounting.ReservationID) (bool, error) {
+	var onFile bool
+	if err := r.store.Querier(ctx).QueryRowContext(ctx, selectHoldOnFile,
+		string(bucketID), string(reservationID)).Scan(&onFile); err != nil {
+		return false, err
+	}
+	return onFile, nil
+}
+
+func (r *ledgerRepo) correctsOwnBucket(ctx context.Context, entryID accounting.LedgerEntryID, bucketID accounting.FundingBucketID) (bool, error) {
+	var own bool
+	if err := r.store.Querier(ctx).QueryRowContext(ctx, selectAdjustmentOnOwnBucket,
+		string(entryID), string(bucketID)).Scan(&own); err != nil {
+		return false, err
+	}
+	return own, nil
+}
 
 // Append lands one leg. The order inside the savepoint is the echo first,
 // the insert second: the echo both allocates the sequence the insert needs
@@ -509,8 +559,23 @@ func (r *ledgerRepo) classifyGuardMiss(ctx context.Context, entry accounting.Led
 		return fmt.Errorf("postgres: append hold entry to bucket %s: %w: %d available, %d requested",
 			bucket.ID, accounting.ErrInsufficientAvailable, bucket.Available, take)
 	case accounting.KindRelease:
-		return fmt.Errorf("postgres: append release entry to bucket %s: %w: %d held, %d released",
-			bucket.ID, accounting.ErrInsufficientHeld, bucket.Held, take)
+		// The echo's WHERE names two verdicts — the bucket cannot afford the
+		// return, or the named reservation has no hold on file. The fresh
+		// read separates them in that order, the echo's own.
+		if bucket.Held < accounting.Balance(take.Int64()) {
+			return fmt.Errorf("postgres: append release entry to bucket %s: %w: %d held, %d released",
+				bucket.ID, accounting.ErrInsufficientHeld, bucket.Held, take)
+		}
+		onFile, err := r.holdOnFile(ctx, bucket.ID, entry.ReservationID)
+		if err != nil {
+			return conflictOf(fmt.Errorf("postgres: append release entry to bucket %s: classify guard miss: %w", bucket.ID, err))
+		}
+		if !onFile {
+			return fmt.Errorf("postgres: append release entry to bucket %s: %w: reservation %s has no hold leg on file here",
+				bucket.ID, accounting.ErrInvalidReference, entry.ReservationID)
+		}
+		return fmt.Errorf("postgres: append release entry to bucket %s: %w: the guard's verdict does not reproduce on a fresh read",
+			bucket.ID, accounting.ErrInvalidTransition)
 	case accounting.KindConsume:
 		if bucket.Held < accounting.Balance(take.Int64()) {
 			return fmt.Errorf("postgres: append consume entry to bucket %s: %w: %d held, %d consumed",
@@ -519,8 +584,23 @@ func (r *ledgerRepo) classifyGuardMiss(ctx context.Context, entry accounting.Led
 		return fmt.Errorf("postgres: append consume entry to bucket %s: %w: %d settled, %d consumed",
 			bucket.ID, accounting.ErrInsufficientSettled, bucket.Settled, take)
 	case accounting.KindAdjustment:
-		return fmt.Errorf("postgres: append adjustment entry to bucket %s: %w: settled %d, held %d, available %d does not admit the stated deltas",
-			bucket.ID, accounting.ErrInvalidAdjustment, bucket.Settled, bucket.Held, bucket.Available)
+		// Same split, same order: the balance fit first — re-run as the
+		// domain guard against the fresh row — then the cited entry's
+		// provenance.
+		if _, applyErr := entry.ApplyTo(bucket); applyErr != nil {
+			return fmt.Errorf("postgres: append adjustment entry to bucket %s: %w: settled %d, held %d, available %d does not admit the stated deltas",
+				bucket.ID, accounting.ErrInvalidAdjustment, bucket.Settled, bucket.Held, bucket.Available)
+		}
+		own, err := r.correctsOwnBucket(ctx, entry.OriginalEntryID, bucket.ID)
+		if err != nil {
+			return conflictOf(fmt.Errorf("postgres: append adjustment entry to bucket %s: classify guard miss: %w", bucket.ID, err))
+		}
+		if !own {
+			return fmt.Errorf("postgres: append adjustment entry to bucket %s: %w: the entry it corrects, %s, is not this bucket's",
+				bucket.ID, accounting.ErrInvalidReference, entry.OriginalEntryID)
+		}
+		return fmt.Errorf("postgres: append adjustment entry to bucket %s: %w: the guard's verdict does not reproduce on a fresh read",
+			bucket.ID, accounting.ErrInvalidTransition)
 	case accounting.KindGrant, accounting.KindTopup:
 		// The only guard these echoes carry beyond the active gate is the
 		// owner rule, and the owner cannot change under a leg: an active

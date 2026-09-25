@@ -267,11 +267,23 @@ entitlement cycle or PAYG flag it projects references it by identifier. One
 entitlement cycle and one account each own exactly one bucket (the owner
 exclusivity is a schema `CHECK`, not a convention), and the bucket is never
 re-pointed: the PAYG row's reference to it is write-once, so an account's
-funded money has one home for its whole life. `adjustment` is an operator
+funded money has one home for its whole life — and the reference names only
+its own account's bucket, a match the engine refuses to see broken (an
+assignment naming another account's bucket is an error, not a silent no-op).
+`adjustment` is an operator
 correction that states its settled/held deltas explicitly, with the reason and
 the original entry it corrects; it is never an automatic overdraw path (the
 reservation ceiling means automatic debt cannot arise) and never a credit
 mechanism (the no-credit rule above).
+
+The legs carry their own provenance promises in the engine: a `release` names
+a reservation this bucket actually booked a `hold` for, and an `adjustment`
+cites an original entry that belongs to this bucket — a release or correction
+naming someone else's history is refused, not booked. What the engine does
+_not_ pin is the per-reservation hold ceiling: consume legs settle the
+reservation without naming it, so "released ≤ held for this reservation" is
+the runtime's admission state (ADR 0006 §7) — the ledger pins the part it can
+derive, and the reservation's own figures travel with the reservation.
 
 **The Data Plane holds no copy of this row.** What the runtime conditionally
 draws down is the _quota projection_: the lockable capacity row for one

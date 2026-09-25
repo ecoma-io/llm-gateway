@@ -220,6 +220,21 @@ func (a *accountingRepos) newAccountBucket(t *testing.T, name string) accounting
 	return bucket
 }
 
+// newAccountBucketFor opens a PAYG bucket owned by the account the caller
+// names — the reference choreography's fixture, where the assignment must
+// pair the row with its own account's bucket.
+func (a *accountingRepos) newAccountBucketFor(t *testing.T, accountID commerce.AccountID) accounting.Bucket {
+	t.Helper()
+	bucket, err := accounting.NewAccountBucket(acctBucketID(t), accounting.AccountID(accountID), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("new account bucket: %v", err)
+	}
+	if err := a.buckets.Create(t.Context(), bucket); err != nil {
+		t.Fatalf("create account bucket: %v", err)
+	}
+	return bucket
+}
+
 // newEntitlementBucket opens a cycle bucket whose entitlement row the
 // commerce ports built — the row the funding_buckets_entitlement_id_fkey
 // demands, in the state a cycle-1 promotion grant produces: a subscription
@@ -386,7 +401,7 @@ func TestIntegrationAccountingGuardMissesClassifyAndLeaveTheWorkAlive(t *testing
 
 	t.Run("a hold above available is refused", func(t *testing.T) {
 		bucket := a.newAccountBucket(t, "it-accounting hold guard")
-		a.appendCommitted(t, a.grantEntry(t, bucket.ID, 10000))
+		a.appendCommitted(t, a.topupEntry(t, bucket.ID, 10000, acctCommandKey(t, "seed-")))
 
 		err := a.store.WithinTx(ctx, func(ctx context.Context) error {
 			_, _, err := a.ledger.Append(ctx, a.holdEntry(t, bucket.ID, 80000, acctReservation(t)))
@@ -406,7 +421,7 @@ func TestIntegrationAccountingGuardMissesClassifyAndLeaveTheWorkAlive(t *testing
 
 	t.Run("a release above held is refused", func(t *testing.T) {
 		bucket := a.newAccountBucket(t, "it-accounting release guard")
-		a.appendCommitted(t, a.grantEntry(t, bucket.ID, 10000))
+		a.appendCommitted(t, a.topupEntry(t, bucket.ID, 10000, acctCommandKey(t, "seed-")))
 		reservation := acctReservation(t)
 		a.appendCommitted(t, a.holdEntry(t, bucket.ID, 3000, reservation))
 
@@ -426,14 +441,14 @@ func TestIntegrationAccountingGuardMissesClassifyAndLeaveTheWorkAlive(t *testing
 
 	t.Run("an adjustment that overdraws is refused", func(t *testing.T) {
 		bucket := a.newAccountBucket(t, "it-accounting adjustment guard")
-		grant, _ := a.appendCommitted(t, a.grantEntry(t, bucket.ID, 10000))
+		seed, _ := a.appendCommitted(t, a.topupEntry(t, bucket.ID, 10000, acctCommandKey(t, "seed-")))
 
 		err := a.store.WithinTx(ctx, func(ctx context.Context) error {
-			_, _, err := a.ledger.Append(ctx, a.adjustEntry(t, bucket.ID, -20000, 0, grant.ID, ""))
+			_, _, err := a.ledger.Append(ctx, a.adjustEntry(t, bucket.ID, -20000, 0, seed.ID, ""))
 			if !errors.Is(err, accounting.ErrInvalidAdjustment) {
 				t.Fatalf("adjustment of -20000 against settled 10000 = %v, want ErrInvalidAdjustment", err)
 			}
-			_, _, err = a.ledger.Append(ctx, a.adjustEntry(t, bucket.ID, -3000, 0, grant.ID, ""))
+			_, _, err = a.ledger.Append(ctx, a.adjustEntry(t, bucket.ID, -3000, 0, seed.ID, ""))
 			return err
 		})
 		if err != nil {
@@ -523,6 +538,59 @@ func TestIntegrationAccountingAFunderRefusesTheOtherOwner(t *testing.T) {
 	})
 }
 
+// TestIntegrationAccountingLegsCiteTheirOwnProvenance proves the provenance
+// half of the release and adjustment echoes: a release names a reservation
+// this bucket held, and a correction cites this bucket's own leg — the
+// foreign variants are refused as invalid references, with the unit of work
+// alive underneath. The INSERT-time triggers are the same promise for
+// writers that skip the echo; deploy/postgres/verify.sh owns that tier.
+func TestIntegrationAccountingLegsCiteTheirOwnProvenance(t *testing.T) {
+	a := integrationAccounting(t)
+	ctx := t.Context()
+
+	t.Run("a release names a hold on file", func(t *testing.T) {
+		bucket := a.newAccountBucket(t, "it-accounting release provenance")
+		a.appendCommitted(t, a.topupEntry(t, bucket.ID, 10000, acctCommandKey(t, "topup-prov-")))
+		held := acctReservation(t)
+		a.appendCommitted(t, a.holdEntry(t, bucket.ID, 4000, held))
+
+		err := a.store.WithinTx(ctx, func(ctx context.Context) error {
+			_, _, err := a.ledger.Append(ctx, a.releaseEntry(t, bucket.ID, 4000, acctReservation(t), ""))
+			if !errors.Is(err, accounting.ErrInvalidReference) {
+				t.Fatalf("release naming an unheld reservation = %v, want ErrInvalidReference", err)
+			}
+			// The unit of work is unharmed: the hold's own release lands.
+			_, _, err = a.ledger.Append(ctx, a.releaseEntry(t, bucket.ID, 4000, held, ""))
+			return err
+		})
+		if err != nil {
+			t.Fatalf("the unit of work that suffered a provenance miss must commit: %v", err)
+		}
+		a.assertBalances(t, bucket.ID, 10000, 0, 10000, 3, 3)
+	})
+
+	t.Run("an adjustment cites its own bucket's leg", func(t *testing.T) {
+		bucket := a.newAccountBucket(t, "it-accounting adjust provenance")
+		foreign := a.newAccountBucket(t, "it-accounting adjust foreign")
+		own, _ := a.appendCommitted(t, a.topupEntry(t, bucket.ID, 10000, acctCommandKey(t, "topup-own-")))
+		stray, _ := a.appendCommitted(t, a.topupEntry(t, foreign.ID, 5000, acctCommandKey(t, "topup-foreign-")))
+
+		err := a.store.WithinTx(ctx, func(ctx context.Context) error {
+			_, _, err := a.ledger.Append(ctx, a.adjustEntry(t, bucket.ID, -1000, 0, stray.ID, ""))
+			if !errors.Is(err, accounting.ErrInvalidReference) {
+				t.Fatalf("adjustment citing another bucket's leg = %v, want ErrInvalidReference", err)
+			}
+			// The unit of work is unharmed: the bucket's own correction lands.
+			_, _, err = a.ledger.Append(ctx, a.adjustEntry(t, bucket.ID, -1000, 0, own.ID, ""))
+			return err
+		})
+		if err != nil {
+			t.Fatalf("the unit of work that suffered a provenance miss must commit: %v", err)
+		}
+		a.assertBalances(t, bucket.ID, 9000, 0, 9000, 2, 2)
+	})
+}
+
 // TestIntegrationAccountingCollisionsMapToTheirSentinels loses to both
 // uniqueness constraints on purpose. The adapter's verdict is the sentinel
 // and a living unit of work — the payload comparison that turns a collision
@@ -536,7 +604,7 @@ func TestIntegrationAccountingCollisionsMapToTheirSentinels(t *testing.T) {
 	t.Run("the same command key twice is a duplicate command", func(t *testing.T) {
 		bucket := a.newAccountBucket(t, "it-accounting command collision")
 		key := acctCommandKey(t, "topup-")
-		a.appendCommitted(t, a.grantEntry(t, bucket.ID, 10000))
+		a.appendCommitted(t, a.topupEntry(t, bucket.ID, 10000, acctCommandKey(t, "seed-")))
 		a.appendCommitted(t, a.topupEntry(t, bucket.ID, 5000, key))
 
 		err := a.store.WithinTx(ctx, func(ctx context.Context) error {
@@ -560,7 +628,7 @@ func TestIntegrationAccountingCollisionsMapToTheirSentinels(t *testing.T) {
 
 	t.Run("the same reservation and kind twice is a duplicate movement", func(t *testing.T) {
 		bucket := a.newAccountBucket(t, "it-accounting movement collision")
-		a.appendCommitted(t, a.grantEntry(t, bucket.ID, 10000))
+		a.appendCommitted(t, a.topupEntry(t, bucket.ID, 10000, acctCommandKey(t, "seed-")))
 		reservation := acctReservation(t)
 		a.appendCommitted(t, a.holdEntry(t, bucket.ID, 2000, reservation))
 
@@ -723,7 +791,7 @@ func TestIntegrationAccountingTwoConcurrentHoldsCannotBothSucceed(t *testing.T) 
 	a := integrationAccounting(t)
 	ctx := t.Context()
 	bucket := a.newAccountBucket(t, "it-accounting concurrent holds")
-	a.appendCommitted(t, a.grantEntry(t, bucket.ID, 10000))
+	a.appendCommitted(t, a.topupEntry(t, bucket.ID, 10000, acctCommandKey(t, "seed-")))
 
 	const holdTake = int64(8000)
 	one, two := acctReservation(t), acctReservation(t)
@@ -841,17 +909,18 @@ func TestIntegrationAccountingConcurrentTopupsOnOneCommandKeyLandOneLeg(t *testi
 // ---------------------------------------------------------------------------
 
 // TestIntegrationAccountingThePaygReferenceIsWriteOnce walks the reference
-// choreography through the port: the first assignment files it, every later
-// one is a no-op that reports false, a conflicting bucket is never taken,
-// and — the upsert path the enable-flag's row shares — a PAYG row that
-// exists without a reference takes one.
+// choreography through the port: the first assignment files it — and files it
+// only against the row's own account's bucket, the owner guard refusing
+// anything else outright — a re-offer of the filed bucket is the no-op that
+// reports false, and — the upsert path the enable-flag's row shares — a PAYG
+// row that exists without a reference takes one.
 func TestIntegrationAccountingThePaygReferenceIsWriteOnce(t *testing.T) {
 	a := integrationAccounting(t)
 	ctx := t.Context()
 	now := time.Now().UTC()
 
 	account := integrationCommerceAccount(t, a.commerce, "it-accounting payg reference")
-	bucket := a.newAccountBucket(t, "it-accounting payg reference bucket")
+	bucket := a.newAccountBucketFor(t, account)
 
 	assigned, err := a.payg.AssignFundingBucket(ctx, account, commerce.FundingBucketID(bucket.ID), now)
 	if err != nil || !assigned {
@@ -867,24 +936,25 @@ func TestIntegrationAccountingThePaygReferenceIsWriteOnce(t *testing.T) {
 		t.Fatalf("re-assign the same reference = (%t, %v), want (false, nil)", assigned, err)
 	}
 
-	// A different bucket: still false, and the reference on file does not
-	// move. The second bucket hangs off its own account — one account, one
-	// bucket is the owner uniqueness.
+	// Another account's bucket: the owner guard refuses the call outright —
+	// an edge into someone else's money is not a silent no-op — and the
+	// reference on file does not move.
 	other := a.newAccountBucket(t, "it-accounting payg other bucket")
-	if assigned, err := a.payg.AssignFundingBucket(ctx, account, commerce.FundingBucketID(other.ID), now); err != nil || assigned {
-		t.Fatalf("assign over a filed reference = (%t, %v), want (false, nil)", assigned, err)
+	if _, err := a.payg.AssignFundingBucket(ctx, account, commerce.FundingBucketID(other.ID), now); err == nil {
+		t.Fatalf("assign another account's bucket = (nil error), want the owner guard's refusal")
 	}
 	if payg, err := a.payg.ByAccount(ctx, account); err != nil || commerce.FundingBucketID(payg.FundingBucketID) != commerce.FundingBucketID(bucket.ID) {
 		t.Fatalf("ByAccount = (bucket %q, %v), want the original reference standing", payg.FundingBucketID, err)
 	}
 
 	// The enable flag's insert-or-update makes a row that carries no
-	// reference; the assignment's UPDATE path is what fills it.
+	// reference; the assignment's UPDATE path is what fills it — with the
+	// row's own account's bucket, as ever.
 	later := integrationCommerceAccount(t, a.commerce, "it-accounting payg enabled account")
 	if err := a.payg.SetEnabled(ctx, later, true, now); err != nil {
 		t.Fatalf("enable payg: %v", err)
 	}
-	enabledBucket := a.newAccountBucket(t, "it-accounting payg enabled bucket")
+	enabledBucket := a.newAccountBucketFor(t, later)
 	assigned, err = a.payg.AssignFundingBucket(ctx, later, commerce.FundingBucketID(enabledBucket.ID), now)
 	if err != nil || !assigned {
 		t.Fatalf("assign a reference to an enabled row = (%t, %v), want (true, nil)", assigned, err)

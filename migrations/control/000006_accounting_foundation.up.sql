@@ -38,8 +38,9 @@
 --                     no foreign key can cross the plane boundary (ADR 0006
 --                     §7).
 --
--- Three engine guards ride with the tables, because append-only and
--- write-once are schema promises here, not application discipline:
+-- Engine guards ride with the tables, because append-only, write-once,
+-- ownership and provenance are schema promises here, not application
+-- discipline:
 --
 --   * ledger_entries and settlements refuse UPDATE and DELETE outright — a
 --     correction is a new adjustment leg referencing the original entry, and
@@ -51,7 +52,21 @@
 --     buckets. The statement-level guard the commerce adapter already
 --     carries (the upsert's WHERE clause) is belt; this trigger is braces —
 --     no future writer can re-point the reference any more than it can
---     rewrite the ledger.
+--     rewrite the ledger;
+--   * the same edge is one-to-one and owner-matched: one PAYG row per
+--     funding bucket (a partial unique index), and a PAYG row's bucket
+--     belongs to the PAYG row's own account (a trigger — the pair lives in
+--     two tables, so no CHECK can state it), because an edge into someone
+--     else's bucket is an edge into someone else's money;
+--   * a release leg names a reservation that has a hold leg on file for the
+--     same bucket — the hold being returned is the named reservation's.
+--     What the ledger cannot derive stays outside: a hold's consumed share
+--     does not name its reservation (the settlement does), so the
+--     per-reservation ceiling remains the runtime's admission state and the
+--     release's amount is trusted within what the bucket holds;
+--   * an adjustment leg's original entry lives on the same bucket — a
+--     correction moves this bucket's balances and cites this bucket's own
+--     history, never another bucket's leg.
 --
 -- Conventions held across the lane, kept here:
 --   * explicit names on every constraint, index and trigger, so error
@@ -357,8 +372,60 @@ CREATE TRIGGER account_payg_bucket_write_once_guard
 COMMENT ON FUNCTION control.account_payg_bucket_write_once() IS
     'Accounting engine guard: the PAYG bucket reference is write-once (ADR 0001 rule 5, one PAYG source and one bucket per account, ever). The statement-level guard in the commerce adapter is the belt; this trigger is braces.';
 
+-- Write-once stops the re-point; the edge itself is one-to-one and
+-- owner-matched. One PAYG row per funding bucket: a second account naming
+-- the same bucket would spend from a balance that is not its edge's, and
+-- the buckets' own keys already make one account bucket per account, so
+-- the pairing is one-to-one both ways. The index is the structural
+-- backstop; the owner guard below is the speaking guard — with it in
+-- place, a mis-owned edge is refused before a collision can even be
+-- reached. And the bucket a PAYG row names belongs to the PAYG row's own
+-- account — an entitlement's cycle bucket belongs to no account at all,
+-- and another account's is someone else's money. The pairing spans two
+-- tables, so no CHECK can state it; the trigger can.
+CREATE UNIQUE INDEX account_payg_funding_bucket_key
+    ON control.account_payg (funding_bucket_id)
+    WHERE funding_bucket_id IS NOT NULL;
+
+CREATE FUNCTION control.account_payg_bucket_owner() RETURNS trigger
+LANGUAGE plpgsql AS $account_payg_owner$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM control.funding_buckets b
+        WHERE b.id = NEW.funding_bucket_id AND b.account_id = NEW.account_id
+    ) THEN
+        -- Before-row triggers run before the constraint checks, so a value
+        -- that is not this guard's to judge is passed through to the
+        -- constraint that owns it: a bucket that does not exist at all is
+        -- the foreign key's refusal (or the v7 grammar's, for a value that
+        -- could not name any bucket), and only a real bucket with the wrong
+        -- owner is this guard's to name.
+        IF NOT EXISTS (
+            SELECT 1 FROM control.funding_buckets b
+            WHERE b.id = NEW.funding_bucket_id
+        ) THEN
+            RETURN NEW;
+        END IF;
+        RAISE EXCEPTION 'control.account_payg.funding_bucket_id must name a bucket owned by the PAYG row''s account: bucket % is not account %''s', NEW.funding_bucket_id, NEW.account_id;
+    END IF;
+    RETURN NEW;
+END;
+$account_payg_owner$;
+
+-- Named so it sorts after account_payg_bucket_write_once_guard: on the
+-- UPDATE path the write-once refusal is the truer verdict and fires first;
+-- the owner guard is the whole of the INSERT path's protection.
+CREATE TRIGGER account_payg_owner_guard
+    BEFORE INSERT OR UPDATE OF funding_bucket_id ON control.account_payg
+    FOR EACH ROW
+    WHEN (NEW.funding_bucket_id IS NOT NULL)
+    EXECUTE FUNCTION control.account_payg_bucket_owner();
+
+COMMENT ON FUNCTION control.account_payg_bucket_owner() IS
+    'Accounting engine guard: a PAYG row''s funding bucket belongs to the PAYG row''s account (ADR 0001 rule 5). One bucket per account is already a funding_buckets key; this pins the edge to match, so no writer — adapter or raw SQL — can point an account at money that is not its own.';
+
 -- ---------------------------------------------------------------------------
--- Append-only engine guards on the history tables.
+-- Engine guards on the history tables: append-only outright, and the
+-- provenance a leg's own references promise.
 -- ---------------------------------------------------------------------------
 
 CREATE FUNCTION control.ledger_entries_append_only() RETURNS trigger
@@ -385,3 +452,63 @@ COMMENT ON FUNCTION control.ledger_entries_append_only() IS
     'Accounting engine guard: the ledger is history (ADR 0004 invariants 1–2). Balances move because compensating legs move them, never because a row was edited.';
 COMMENT ON FUNCTION control.settlements_append_only() IS
     'Accounting engine guard: the settlement of record is written once (ADR 0004). A charge correction appends adjustment legs; the header is never touched again.';
+
+-- A release returns a hold, so the reservation it names must have a hold
+-- leg on file for the same bucket: a release against a reservation this
+-- bucket never held for is the movement it is not, and naming another
+-- reservation's hold would strand the first reservation's money booked
+-- forever. The ledger appends, so the EXISTS is monotone — once a hold is
+-- on file it is never withdrawn — and the echo the ledger adapter runs
+-- repeats the same condition, which is where the port's refusal is
+-- classified. What this guard deliberately does NOT state is a
+-- per-reservation ceiling: a hold's consumed share is named by the
+-- settlement, not the leg, so the remaining hold for one reservation is
+-- the runtime's admission state (ADR 0006 §7) and the release's amount is
+-- trusted within what the bucket holds.
+CREATE FUNCTION control.ledger_entries_release_references_hold() RETURNS trigger
+LANGUAGE plpgsql AS $release_references_hold$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM control.ledger_entries prior
+        WHERE prior.funding_bucket_id = NEW.funding_bucket_id
+          AND prior.reservation_id = NEW.reservation_id
+          AND prior.kind = 'hold'
+    ) THEN
+        RAISE EXCEPTION 'control.ledger_entries: a release names reservation % on bucket %, which has no hold leg on file here', NEW.reservation_id, NEW.funding_bucket_id;
+    END IF;
+    RETURN NEW;
+END;
+$release_references_hold$;
+
+CREATE TRIGGER ledger_entries_release_references_hold_guard
+    BEFORE INSERT ON control.ledger_entries
+    FOR EACH ROW
+    WHEN (NEW.kind = 'release')
+    EXECUTE FUNCTION control.ledger_entries_release_references_hold();
+
+COMMENT ON FUNCTION control.ledger_entries_release_references_hold() IS
+    'Accounting engine guard: a release returns the named reservation''s hold, so that hold must be on file for the same bucket. Reaper, compensation and settlement-tail releases all book against holds this ledger itself wrote.';
+
+-- A correction moves one bucket's balances and cites the entry it corrects;
+-- that entry is this bucket's own history. An adjustment citing another
+-- bucket's leg would dress a foreign correction in this bucket's name.
+CREATE FUNCTION control.ledger_entries_adjustment_references_own_bucket() RETURNS trigger
+LANGUAGE plpgsql AS $adjustment_own_bucket$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM control.ledger_entries original
+        WHERE original.id = NEW.original_entry_id
+          AND original.funding_bucket_id = NEW.funding_bucket_id
+    ) THEN
+        RAISE EXCEPTION 'control.ledger_entries: an adjustment on bucket % cites entry %, which is not this bucket''s', NEW.funding_bucket_id, NEW.original_entry_id;
+    END IF;
+    RETURN NEW;
+END;
+$adjustment_own_bucket$;
+
+CREATE TRIGGER ledger_entries_adjustment_references_own_bucket_guard
+    BEFORE INSERT ON control.ledger_entries
+    FOR EACH ROW
+    WHEN (NEW.kind = 'adjustment')
+    EXECUTE FUNCTION control.ledger_entries_adjustment_references_own_bucket();
+
+COMMENT ON FUNCTION control.ledger_entries_adjustment_references_own_bucket() IS
+    'Accounting engine guard: the entry an adjustment corrects lives on the bucket the adjustment lands on. The foreign key already refuses an unknown original; this refuses a foreign one.';

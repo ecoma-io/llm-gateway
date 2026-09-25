@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -293,11 +294,22 @@ func (f fakeFundingLedger) Append(ctx context.Context, entry accounting.LedgerEn
 
 // land is the insert plus the echo: ApplyTo is the guarded UPDATE over the
 // world's row, the sequence is allocated from the row's counter, and both
-// facts land together.
+// facts land together. The provenance conditions the real echo's WHERE
+// clause carries are repeated here against the world's legs — a release
+// names a hold on file, a correction cites its own bucket's leg — so the
+// fake refuses what the statement pair refuses.
 func (w *accountingWorld) land(entry accounting.LedgerEntry) (accounting.LedgerEntry, accounting.Bucket, error) {
 	bucket, ok := w.buckets[entry.FundingBucketID]
 	if !ok {
 		return accounting.LedgerEntry{}, accounting.Bucket{}, persistence.ErrNotFound
+	}
+	if entry.Kind == accounting.KindRelease && !w.holdOnFile(entry.FundingBucketID, entry.ReservationID) {
+		return accounting.LedgerEntry{}, accounting.Bucket{}, fmt.Errorf("fakes: release names reservation %s on bucket %s, which has no hold leg on file here: %w",
+			entry.ReservationID, entry.FundingBucketID, accounting.ErrInvalidReference)
+	}
+	if entry.Kind == accounting.KindAdjustment && !w.correctsOwnBucket(entry.OriginalEntryID, entry.FundingBucketID) {
+		return accounting.LedgerEntry{}, accounting.Bucket{}, fmt.Errorf("fakes: adjustment on bucket %s cites entry %s, which is not this bucket's: %w",
+			entry.FundingBucketID, entry.OriginalEntryID, accounting.ErrInvalidReference)
 	}
 	after, err := entry.ApplyTo(bucket)
 	if err != nil {
@@ -311,6 +323,28 @@ func (w *accountingWorld) land(entry accounting.LedgerEntry) (accounting.LedgerE
 	w.legs = append(w.legs, stamped)
 	w.buckets[after.ID] = after
 	return stamped, after, nil
+}
+
+// holdOnFile answers the release echo's provenance condition over the
+// world's legs: did this bucket book the named reservation's hold?
+func (w *accountingWorld) holdOnFile(bucketID accounting.FundingBucketID, reservationID accounting.ReservationID) bool {
+	for _, leg := range w.legs {
+		if leg.FundingBucketID == bucketID && leg.ReservationID == reservationID && leg.Kind == accounting.KindHold {
+			return true
+		}
+	}
+	return false
+}
+
+// correctsOwnBucket answers the adjustment echo's provenance condition: is
+// the cited entry this bucket's own leg?
+func (w *accountingWorld) correctsOwnBucket(entryID accounting.LedgerEntryID, bucketID accounting.FundingBucketID) bool {
+	for _, leg := range w.legs {
+		if leg.ID == entryID && leg.FundingBucketID == bucketID {
+			return true
+		}
+	}
+	return false
 }
 
 // sameLedgerKey states the two uniqueness constraints the ledger enforces per

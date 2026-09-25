@@ -354,6 +354,55 @@ func TestReleaseHoldReturnsExactlyWhatWasHeld(t *testing.T) {
 	}
 }
 
+func TestReleaseHoldRefusesAReservationThisBucketNeverHeld(t *testing.T) {
+	world := newAccountingWorld(t)
+	use := newAccounting(world)
+	bucket := world.seedAccountFunding(t, "account-payg-1")
+	if _, err := use.TopUp(t.Context(), bucket.ID, 100, "cmd-1"); err != nil {
+		t.Fatalf("top up: %v", err)
+	}
+	held := accounting.ReservationID("3d6f8a20-93e1-4c2b-9a7d-5f1e2d3c4b5a")
+	if _, err := use.Hold(t.Context(), bucket.ID, held, 40); err != nil {
+		t.Fatalf("hold: %v", err)
+	}
+
+	// The bucket holds 40 — for the other reservation. A release naming a
+	// reservation this bucket never held for would return someone else's
+	// occupancy and strand the real reservation's money booked forever, so
+	// the provenance guard names it as the reference defect it is.
+	stray := accounting.ReservationID("0b7e5f1a-2c3d-4e5f-8a9b-0c1d2e3f4a5b")
+	if _, err := use.ReleaseHold(t.Context(), bucket.ID, stray, 40); !errors.Is(err, accounting.ErrInvalidReference) {
+		t.Fatalf("release naming a reservation with no hold on file = %v, want ErrInvalidReference", err)
+	}
+	if len(world.legs) != 2 {
+		t.Fatalf("%d legs after the refused release, want 2 — the topup and the hold", len(world.legs))
+	}
+}
+
+func TestAdjustRefusesAForeignOriginal(t *testing.T) {
+	world := newAccountingWorld(t)
+	use := newAccounting(world)
+	bucket := world.seedAccountFunding(t, "account-payg-1")
+	if _, err := use.TopUp(t.Context(), bucket.ID, 100, "cmd-1"); err != nil {
+		t.Fatalf("top up: %v", err)
+	}
+	other := world.seedAccountFunding(t, "account-payg-2")
+	if _, err := use.TopUp(t.Context(), other.ID, 50, "cmd-2"); err != nil {
+		t.Fatalf("top up the other bucket: %v", err)
+	}
+
+	// A correction moves this bucket's balances and cites this bucket's own
+	// history; the other bucket's topup leg is not this bucket's to correct.
+	foreign := world.legs[len(world.legs)-1].ID
+	if _, err := use.Adjust(t.Context(), bucket.ID, -10, 0, "misposted topup",
+		foreign, "ops-1", ""); !errors.Is(err, accounting.ErrInvalidReference) {
+		t.Fatalf("adjustment citing another bucket's leg = %v, want ErrInvalidReference", err)
+	}
+	if len(world.legs) != 2 {
+		t.Fatalf("%d legs after the refused correction, want 2 — the two topups", len(world.legs))
+	}
+}
+
 func TestAdjustRefusesToOverdrawAndConvergesWhenKeyed(t *testing.T) {
 	world := newAccountingWorld(t)
 	use := newAccounting(world)

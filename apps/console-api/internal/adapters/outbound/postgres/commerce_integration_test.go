@@ -1279,8 +1279,15 @@ func TestIntegrationCommercePaygIsARowPerAccountWithAWriteOnceBucket(t *testing.
 		t.Fatalf("assign the funding bucket = (%t, %v), want (true, nil)", applied, err)
 	}
 	bucketTwo := integrationPaygBucket(t, c, neverEnabled)
-	if applied, err := c.payg.AssignFundingBucket(ctx, account, bucketTwo, time.Now().UTC()); err != nil || applied {
-		t.Fatalf("reassign the funding bucket = (%t, %v), want (false, nil) — one bucket per account, ever", applied, err)
+	// Another account's bucket: the owner guard refuses the call outright —
+	// an edge into someone else's money is not a silent no-op.
+	if _, err := c.payg.AssignFundingBucket(ctx, account, bucketTwo, time.Now().UTC()); err == nil {
+		t.Fatal("assign another account's bucket = (nil error), want the owner guard's refusal")
+	}
+	// The row's own bucket re-offered is the write-once no-op that reports
+	// false — one bucket per account, ever.
+	if applied, err := c.payg.AssignFundingBucket(ctx, account, bucketOne, time.Now().UTC()); err != nil || applied {
+		t.Fatalf("re-offer the filed bucket = (%t, %v), want (false, nil)", applied, err)
 	}
 	stored, err = c.payg.ByAccount(ctx, account)
 	if err != nil {
@@ -1315,10 +1322,14 @@ func TestIntegrationCommercePaygIsARowPerAccountWithAWriteOnceBucket(t *testing.
 		t.Fatalf("the created PAYG row = %+v, want disabled, bucket %s, born at %s", stored, bucketTwo, micros(assignedAt))
 	}
 
-	// The row the creation path made is under the same one-bucket rule:
-	// a second assignment is refused and changes nothing.
-	if applied, err := c.payg.AssignFundingBucket(ctx, neverEnabled, bucketOne, time.Now().UTC()); err != nil || applied {
-		t.Fatalf("reassign the created row's bucket = (%t, %v), want (false, nil)", applied, err)
+	// The row the creation path made is under the same rules: another
+	// account's bucket is refused outright, and the row's own bucket
+	// re-offered is the write-once no-op that reports false.
+	if _, err := c.payg.AssignFundingBucket(ctx, neverEnabled, bucketOne, time.Now().UTC()); err == nil {
+		t.Fatal("assign the created row another account's bucket = (nil error), want the owner guard's refusal")
+	}
+	if applied, err := c.payg.AssignFundingBucket(ctx, neverEnabled, bucketTwo, time.Now().UTC()); err != nil || applied {
+		t.Fatalf("re-offer the created row's own bucket = (%t, %v), want (false, nil)", applied, err)
 	}
 	// Enabling the created row flips only the flag: the bucket survives it
 	// untouched, and the birth is never rewritten by an update-path upsert.
