@@ -147,7 +147,7 @@ func (repository *ReservationRepository) ExpireLapsedLeases(ctx context.Context,
 	if err != nil {
 		return nil, fmt.Errorf("postgres: expire lapsed leases: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	expired := make([]persistence.ExpiredLease, 0)
 	for rows.Next() {

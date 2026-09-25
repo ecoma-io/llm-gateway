@@ -117,7 +117,7 @@ func (reader *UsageFacts) Read(ctx context.Context, after string, limit int) (us
 	if err != nil {
 		return usagefacts.Page{}, fmt.Errorf("%w: query the fact page: %w", usagefacts.ErrSourceUnavailable, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	page := usagefacts.Page{Events: make([]usagefacts.Event, 0, limit)}
 	var lastSeen int64

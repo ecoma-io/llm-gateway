@@ -102,20 +102,13 @@ func unauthenticatedFailure() failure {
 	}
 }
 
-func internalFailure() failure {
-	return failure{
-		status:   stdhttp.StatusInternalServerError,
-		code:     codeInternal,
-		message:  internalErrorMessage,
-		internal: true,
-	}
-}
-
 // internalFailureWithCause is the internal failure carrying what went wrong
-// for the log line. The wire answer is identical to internalFailure's — same
-// status, same fixed message — because a management caller can act on a
-// status and a request ID and cannot act on a driver error; the cause is what
-// the operator reading the log line needs, and it never reaches the envelope.
+// for the log line. The wire answer is fixed — 500, the internal code, the
+// one message — because a management caller can act on a status and a request
+// ID and cannot act on a driver error; the cause is what the operator reading
+// the log line needs, and it never reaches the envelope. Every internal
+// failure this surface decides has a cause, so there is no cause-less
+// constructor to forget one with.
 func internalFailureWithCause(cause error) failure {
 	return failure{
 		status:   stdhttp.StatusInternalServerError,

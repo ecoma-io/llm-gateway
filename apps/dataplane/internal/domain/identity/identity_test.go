@@ -54,7 +54,7 @@ func TestMintedIDsAreCanonicalUUIDv7(t *testing.T) {
 						t.Errorf("%s() = %q, want a hyphen at position %d", m.name, id, i)
 					}
 				default:
-					if !(('0' <= c && c <= '9') || ('a' <= c && c <= 'f')) {
+					if c < '0' || ('9' < c && c < 'a') || 'f' < c {
 						t.Errorf("%s() = %q, want lowercase hex at position %d, got %q", m.name, id, i, c)
 					}
 				}
