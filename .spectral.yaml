@@ -35,13 +35,14 @@ rules:
   info-contact: off
 
   # Fires once, on `POST /v1/chat/completions`, which declares no 2xx response
-  # on purpose. The operation exists in the contract so a caller can tell
-  # "belongs to this application and is not built" (501) from "is not a path
-  # here" (404), and the runtime cannot produce a successful completion yet.
-  # Declaring a 200 would be the contract claiming a capability the code does
-  # not have, which is the one thing this repository's contract-first rule is
-  # meant to prevent — see AGENTS.md rule 2 and api/openapi/runtime.yaml's
-  # header. This is the suppression that should disappear first: the day the
-  # operation is implemented, the rule goes back on and the document must have
-  # gained its 200.
+  # on purpose. The operation contracts admission — authentication, entitlement,
+  # quota and the reservation of spend — and every refusal that admission can
+  # produce is declared. What it deliberately does not declare is the successful
+  # completion: the runtime hands an admitted request to its routing half, and
+  # the shape routing streams back is contracted when routing lands. Declaring
+  # a 200 today would be the contract claiming a capability the code does not
+  # have, which is the one thing this repository's contract-first rule is meant
+  # to prevent — see AGENTS.md rule 2 and api/openapi/runtime.yaml's header.
+  # This is the suppression that should disappear first: the day the routing
+  # half lands, the rule goes back on and the document must have gained its 200.
   operation-success-response: off
