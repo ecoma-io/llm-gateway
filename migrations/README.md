@@ -68,6 +68,18 @@ Migrations are append-only — an applied migration is immutable history, and
 a correction is a new migration, never an edit to a file the runner has
 already recorded.
 
+Two rules about what goes in the file. First, transaction control: the
+runner delivers each file to PostgreSQL as one simple query — one implicit
+transaction, the safety model [`deploy/postgres/README.md`](../deploy/postgres/README.md)
+records — so a migration file carries no `BEGIN`, `COMMIT` or `ROLLBACK` of
+its own, and no statement that cannot live inside one transaction: `CREATE
+INDEX CONCURRENTLY` and the other non-transactional DDL have no home in the
+lanes. Second, scope: the conventions a migration's header states are that
+schema's conventions, not the repository's. The control identity migration's
+no-DELETE rule is the rule for rows that are history; the Data Plane's
+catalog rows are mutable configuration and its event rows age out under
+retention (ADR 0005). Read a header as the voice of its own tables.
+
 Run the suite after adding one — `bash deploy/postgres/verify.sh` — which
 applies, asserts, rolls back, and recovers from a deliberately failed
 migration, against the pinned TimescaleDB.
