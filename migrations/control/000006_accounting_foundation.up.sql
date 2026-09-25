@@ -5,7 +5,7 @@
 -- exactly-once boundary, and the append-only ledger legs every movement of
 -- money is written as.
 --
--- 000005 — accounting foundation (ADR 0004, as amended by ADR 0006;
+-- 000006 — accounting foundation (ADR 0004, as amended by ADR 0006;
 -- ADR 0001 rule 5):
 --
 --   funding_buckets   the authoritative, lockable capacity projection for
@@ -93,7 +93,7 @@
 -- file-managed transaction control to verify.sh's lane-drift scan — the
 -- bodies carry none.
 --
--- The inverse of this file is 000005_accounting_foundation.down.sql, in
+-- The inverse of this file is 000006_accounting_foundation.down.sql, in
 -- reverse creation order, no CASCADE.
 
 -- ---------------------------------------------------------------------------

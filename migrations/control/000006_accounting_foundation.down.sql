@@ -1,4 +1,4 @@
--- The inverse of 000005_accounting_foundation.up.sql, in reverse creation
+-- The inverse of 000006_accounting_foundation.up.sql, in reverse creation
 -- order, no CASCADE: the engine guards go first (the history tables' triggers
 -- and the account_payg write-once pair), then the edge the guards protect,
 -- then the tables — legs before settlements before buckets, the order the
