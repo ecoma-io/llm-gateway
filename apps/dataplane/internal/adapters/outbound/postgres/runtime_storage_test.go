@@ -27,14 +27,16 @@ package postgres
 //     from-scratch path on a throwaway database instead of assuming it.
 //
 //   - every test mints a unique account id (integrationRuntimeAccount) and
-//     every multi-write unit runs inside store.WithinTx. No test truncates a
-//     shared table and no test reads another's rows: the fixture database is
-//     retained forever by design and carries rows from every earlier run, so
-//     the suite must be safe to run twice against one server. The one
-//     sanctioned exception is the cursor test's simulated lost stream, which
-//     deletes the feed and its stream row; the migration header documents why
-//     no trigger guards those (append-only is a writer discipline, not a DB
-//     guard), and that test is where the discipline's failure mode is proved.
+//     every multi-write unit runs inside store.WithinTx. No test truncates or
+//     deletes from a shared table and no test reads another's rows: the fixture
+//     database is retained forever by design and carries rows from every
+//     earlier run, so the suite must be safe to run twice against one server.
+//     The tests whose assertions need a database of their own — the genesis
+//     feed, the from-scratch schema apply, the simulated lost stream (the one
+//     place the append-only writer discipline is broken, because its failure
+//     mode is what has to be proved; the migration header documents why no
+//     trigger guards those deletions) — mint a throwaway database instead and
+//     answer to nobody else's rows.
 
 import (
 	"bytes"
@@ -110,11 +112,13 @@ func integrationRepositoryRoot(t testing.TB) string {
 // transaction per applied file.
 //
 // Doing this in the suite rather than requiring a pre-migrated database is
-// what makes one target serve both runners: the local fixture (and CI's
-// service container) is already at the newest version, so the helper applies
-// nothing and costs one lock and one read — while a fresh CI database is
-// brought up whole, migration 000001's timescaledb bootstrap included, with
-// no out-of-band step a forgotten README line could skip.
+// what makes one target serve both runners without an out-of-band step a
+// forgotten README line could skip: an already-migrated target — the local
+// fixture, CI's service container after the first run — costs one lock and
+// one read, while a fresh CI database is brought up whole, migration
+// 000001's timescaledb bootstrap included. The helper assumes nothing about
+// the target's state; it reads the version that is there and applies what is
+// missing.
 //
 // The versioning discipline is golang-migrate's, mirrored: its table is
 // created if missing (a database migrated by no one yet has none), its single
@@ -707,6 +711,37 @@ func integrationReservation(t testing.TB, ctx context.Context, repos integration
 		0, nil, createdAt, expiresAt, "b7it-runtime", leaseExpiresAt)
 	if err != nil {
 		t.Fatalf("building a reservation: %v", err)
+	}
+	if err := repos.reserves.Insert(ctx, reservation); err != nil {
+		t.Fatalf("inserting the reaper's reservation: %v", err)
+	}
+	return reservation.ID, request.ID
+}
+
+// integrationReservationWithLegs opens one hold that carries an allocation
+// tail — the sweep must read the legs back with the hold, and the expired
+// fact built from them must clear the engine's envelope guard on the way in.
+// The bucket ids are free text on purpose: the leg table is the reservation's
+// own memory of its drawdown, with no join into the quota projections.
+func integrationReservationWithLegs(t testing.TB, ctx context.Context, repos integrationRepositories, account string, createdAt, expiresAt, leaseExpiresAt time.Time) (identity.ReservationID, identity.RequestID) {
+	t.Helper()
+	price := integrationPrice()
+	request, err := execution.NewRequest(identity.NewRequestID(), account, account+"-api-key", "bench/alias", 10, 20, price, createdAt)
+	if err != nil {
+		t.Fatalf("building a request: %v", err)
+	}
+	if err := repos.requests.Insert(ctx, request); err != nil {
+		t.Fatalf("inserting the reaper's request: %v", err)
+	}
+	reservation, err := accounting.NewReservation(identity.NewReservationID(), request.ID,
+		price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice,
+		request.InputTokens, request.MaxOutputTokens,
+		700, []accounting.Allocation{
+			{FundingBucketID: "bucket-reaper-a", Amount: 400, Ordinal: 1},
+			{FundingBucketID: "bucket-reaper-b", Amount: 300, Ordinal: 2},
+		}, createdAt, expiresAt, "b7it-runtime", leaseExpiresAt)
+	if err != nil {
+		t.Fatalf("building a reservation with legs: %v", err)
 	}
 	if err := repos.reserves.Insert(ctx, reservation); err != nil {
 		t.Fatalf("inserting the reaper's reservation: %v", err)
@@ -1379,25 +1414,36 @@ func TestIntegrationSettlementDedupAllowsOneClosePerRequest(t *testing.T) {
 	}
 
 	// The settlement key spans every terminal close: a released fact for the
-	// same request is the same second ending, whatever its kind.
+	// same request is the same second ending, whatever its kind. Every append
+	// below rides its own unit of work — the refusal semantics now demand one,
+	// and these calls are shaped the way any real closer is.
 	released, err := accounting.NewReleased(request.ID, nil, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("building a released fact: %v", err)
 	}
-	if _, err := repos.facts.Append(ctx, released); !errors.Is(err, persistence.ErrDuplicateFact) {
+	err = store.WithinTx(ctx, func(ctx context.Context) error {
+		_, err := repos.facts.Append(ctx, released)
+		return err
+	})
+	if !errors.Is(err, persistence.ErrDuplicateFact) {
 		t.Errorf("Append(released for a settled request) error = %v, want persistence.ErrDuplicateFact — the settlement key spans settled, released and expired", err)
 	}
 
 	// The correction is the sanctioned exception: a NEW fact referencing the
-	// original through CorrectsAppendSeq sits outside the partial index, so
-	// the wire shape never forecloses corrections without admitting a second
-	// settlement today.
+	// original through CorrectsAppendSeq sits outside the partial index — and
+	// the correction_targets FK keeps it pointing at a fact of ITS OWN
+	// REQUEST — so the wire shape never forecloses corrections without
+	// admitting a second settlement today.
 	correction, err := accounting.NewReleased(request.ID, nil, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("building the correction fact: %v", err)
 	}
 	correction.CorrectsAppendSeq = &winnerSeq
-	if _, err := repos.facts.Append(ctx, correction); err != nil {
+	err = store.WithinTx(ctx, func(ctx context.Context) error {
+		_, err := repos.facts.Append(ctx, correction)
+		return err
+	})
+	if err != nil {
 		t.Errorf("Append(corrects_append_seq set) error = %v, want nil — the correction is the one fact the dedup admits behind the original", err)
 	}
 
@@ -1408,11 +1454,19 @@ func TestIntegrationSettlementDedupAllowsOneClosePerRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("building an orphaned fact: %v", err)
 	}
-	if _, err := repos.facts.Append(ctx, orphan); err != nil {
+	err = store.WithinTx(ctx, func(ctx context.Context) error {
+		_, err := repos.facts.Append(ctx, orphan)
+		return err
+	})
+	if err != nil {
 		t.Errorf("Append(unbillable_orphaned beside a settlement) error = %v, want nil — the orphan key is separate by design", err)
 	}
 	// ...and a second orphan is the same duplicated ending a second time.
-	if _, err := repos.facts.Append(ctx, orphan); !errors.Is(err, persistence.ErrDuplicateFact) {
+	err = store.WithinTx(ctx, func(ctx context.Context) error {
+		_, err := repos.facts.Append(ctx, orphan)
+		return err
+	})
+	if !errors.Is(err, persistence.ErrDuplicateFact) {
 		t.Errorf("Append(a second orphan) error = %v, want persistence.ErrDuplicateFact", err)
 	}
 
@@ -1425,10 +1479,11 @@ func TestIntegrationSettlementDedupAllowsOneClosePerRequest(t *testing.T) {
 // table: every spelling this adapter never issued — malformed, mistyped,
 // negative, non-canonical — is refused with ErrCursorExpired, the port's
 // answer for a position it cannot place (which the management surface maps to
-// 410, the protocol's stop-and-ask-a-human). It then proves the epoch half
-// does its job: after a simulated lost stream the old cursor names an epoch
-// that no longer exists, and the reader must fail closed rather than serve the
-// new stream's facts to a consumer that believes it delivered them.
+// 410, the protocol's stop-and-ask-a-human). The beyond-this-stream refusals
+// — a position past the tail, an epoch that no longer exists — need a stream
+// the suite controls end to end, and run on their own throwaway database
+// (TestIntegrationRebornStreamFailsOldCursorsClosed below); the shared
+// fixture's stream is every earlier run's, and no test deletes from it.
 func TestIntegrationRefusedCursorsFailClosed(t *testing.T) {
 	db, store := integrationPool(t)
 	repos := integrationRepos(t, store)
@@ -1485,22 +1540,67 @@ func TestIntegrationRefusedCursorsFailClosed(t *testing.T) {
 			t.Errorf("Read(%q) error = %v, want a cursor decision — a refused position is not a broken source", candidate, err)
 		}
 	}
+}
 
-	// The lost stream. No trigger guards either delete — append-only is a
-	// writer discipline, not a DB guard — and this is the one place the suite
-	// is allowed to break that discipline, because the discipline's failure
-	// mode is exactly what has to be proved: a recreated database mints a new
-	// epoch on its first append, and every cursor from the old stream must
-	// fail closed instead of silently skipping the re-appended facts.
+// TestIntegrationRebornStreamFailsOldCursorsClosed proves the two
+// beyond-this-stream refusals on a database of the suite's own: a position
+// past the tail is expired rather than served as an empty page, and a cursor
+// minted before the stream was lost is expired rather than silently skipping
+// the re-appended facts. The lost stream itself is simulated here, on a
+// throwaway database, by deleting the feed and its stream row — no trigger
+// guards either (append-only is a writer discipline, not a DB guard), and the
+// shared fixture is exactly the wrong place to break it: rows from every
+// earlier run and every other test live there forever.
+func TestIntegrationRebornStreamFailsOldCursorsClosed(t *testing.T) {
+	integrationThrowawaySerialise(t)
+	db := integrationThrowawayDatabase(t, "dataplane_b7_reborn_stream_probe")
+	integrationRuntimeSchema(t, db)
+	repos := integrationRepos(t, New(db))
+	reader := NewUsageFacts(db)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// A real page on a real stream: three facts, and the cursor naming the
+	// last one's position.
+	var lastSeq int64
+	for i := 0; i < 3; i++ {
+		_, _, seq := integrationAppendSettled(t, ctx, repos, integrationRuntimeAccount(t, fmt.Sprintf("reborn-f%d", i+1)), nil, time.Now().UTC())
+		lastSeq = seq
+	}
+	valid := integrationStreamCursor(t, db)
+	pastTail := encodeCursor(strings.Split(valid, ".")[1], lastSeq+1000)
+
+	// A position beyond the tail is expired, not empty: the sequence it names
+	// has never been allocated on this epoch, so the cursor is from a sibling
+	// database and the facts between its position and the real tail would be
+	// silently skipped.
+	_, err := reader.Read(ctx, pastTail, 10)
+	if !errors.Is(err, usagefacts.ErrCursorExpired) {
+		t.Errorf("Read(past-the-tail) error = %v, want usagefacts.ErrCursorExpired — a position no append allocated is not a caught-up consumer", err)
+	}
+
+	// The lost stream: the one sanctioned deletion in the suite, on a
+	// database carrying nobody's rows but this test's.
 	if _, err := db.ExecContext(ctx, "DELETE FROM public.usage_events"); err != nil {
 		t.Fatalf("simulating the lost feed: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, "DELETE FROM public.usage_events_stream WHERE singleton"); err != nil {
 		t.Fatalf("simulating the lost stream identity: %v", err)
 	}
-	_, _, newSeq := integrationAppendSettled(t, ctx, repos, integrationRuntimeAccount(t, "cursor-reborn"), nil, time.Now().UTC())
+	rebornEpoch, _, _ := integrationStreamRow(t, db)
+	if rebornEpoch != "" {
+		t.Fatalf("the stream identity survived the loss as %s, want none — the epoch is minted by the first append, not by a migration", rebornEpoch)
+	}
+	_, _, newSeq := integrationAppendSettled(t, ctx, repos, integrationRuntimeAccount(t, "reborn"), nil, time.Now().UTC())
 	if newSeq != 1 {
 		t.Errorf("the first append of the new stream allocated %d, want 1 — a new epoch counts from the beginning", newSeq)
+	}
+	newEpoch, _, _ := integrationStreamRow(t, db)
+	if newEpoch == "" {
+		t.Fatal("the re-appended stream has no epoch — the server mints one on first append")
+	}
+	if oldEpoch := strings.Split(valid, ".")[1]; newEpoch == oldEpoch {
+		t.Fatal("the recreated stream mints the same epoch as the lost one — the epoch is what tells the two apart")
 	}
 	_, err = reader.Read(ctx, valid, 10)
 	if !errors.Is(err, usagefacts.ErrCursorExpired) {
@@ -1509,13 +1609,14 @@ func TestIntegrationRefusedCursorsFailClosed(t *testing.T) {
 }
 
 // TestIntegrationSettlementUnitIsAllOrNothing is the crash-consistency proof,
-// in the shape the runtime actually runs: admission commits its unit (request,
-// attempt, drawdown, open hold), then the settlement unit closes the hold and
-// appends the fact and FAILS — and leaves neither behind, the hold open, no
-// fact, the admission's rows exactly as they were. The failing unit's error is
-// returned after both statements have run, so the rollback is the only thing
-// that could have removed them. The successful twin commits both sides
-// together, which is the whole promise.
+// in the shape the runtime actually runs: admission commits its unit (drawdown,
+// request, attempt, open hold — one unit, none of them alone), a refused
+// admission gives its drawdown back with the rest of its rollback, and the
+// settlement unit closes the hold and appends the fact and FAILS — and leaves
+// neither behind, the hold open, no fact, the admission's rows exactly as they
+// were. The failing unit's error is returned after its statements have run, so
+// the rollback is the only thing that could have removed them. The successful
+// twin commits both sides together, which is the whole promise.
 func TestIntegrationSettlementUnitIsAllOrNothing(t *testing.T) {
 	db, store := integrationPool(t)
 	repos := integrationRepos(t, store)
@@ -1537,27 +1638,33 @@ func TestIntegrationSettlementUnitIsAllOrNothing(t *testing.T) {
 		t.Fatalf("building an attempt: %v", err)
 	}
 
-	// The admission unit commits first, the way the runtime actually runs:
-	// the request, its attempt, the drawdown and the open hold are durable
-	// before any settlement begins. The grant is spent 250 of its 5000 by
-	// what follows — the settlement unit's failure must not change that.
-	drawn, err := repos.quota.Drawdown(ctx, account, 250)
-	if err != nil {
-		t.Fatalf("Drawdown(250): %v", err)
-	}
-	reservation, err := accounting.NewReservation(identity.NewReservationID(), request.ID,
-		price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice,
-		request.InputTokens, request.MaxOutputTokens,
-		250, drawn, now, now.Add(time.Hour), "b7it-runtime", now.Add(30*time.Minute))
-	if err != nil {
-		t.Fatalf("building the hold: %v", err)
-	}
+	// The admission unit commits first, the way the runtime actually runs —
+	// as ONE unit: the drawdown, the request, its attempt and the open hold
+	// are durable together before any settlement begins, and none of them is
+	// durable alone. The grant is spent 250 of its 5000 by what follows — the
+	// settlement unit's failure must not change that.
+	var (
+		drawn       []accounting.Allocation
+		reservation accounting.Reservation
+	)
 	err = store.WithinTx(ctx, func(ctx context.Context) error {
-		if err := repos.requests.Insert(ctx, request); err != nil {
-			return err
+		var unitErr error
+		drawn, unitErr = repos.quota.Drawdown(ctx, account, 250)
+		if unitErr != nil {
+			return unitErr
 		}
-		if err := repos.attempts.Insert(ctx, attempt); err != nil {
-			return err
+		reservation, unitErr = accounting.NewReservation(identity.NewReservationID(), request.ID,
+			price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice,
+			request.InputTokens, request.MaxOutputTokens,
+			250, drawn, now, now.Add(time.Hour), "b7it-runtime", now.Add(30*time.Minute))
+		if unitErr != nil {
+			return unitErr
+		}
+		if unitErr = repos.requests.Insert(ctx, request); unitErr != nil {
+			return unitErr
+		}
+		if unitErr = repos.attempts.Insert(ctx, attempt); unitErr != nil {
+			return unitErr
 		}
 		return repos.reserves.Insert(ctx, reservation)
 	})
@@ -1568,11 +1675,27 @@ func TestIntegrationSettlementUnitIsAllOrNothing(t *testing.T) {
 		t.Fatalf("available after admission = %d, want 4750", available)
 	}
 
+	// A refused admission undoes itself: the drawdown ran inside the failed
+	// unit, so the rollback must give every unit it spent back — the capacity
+	// was never offered to a request that does not exist.
+	boom := errors.New("the unit failed after its statements ran")
+	err = store.WithinTx(ctx, func(ctx context.Context) error {
+		if _, drawErr := repos.quota.Drawdown(ctx, account, 250); drawErr != nil {
+			return drawErr
+		}
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("the refused admission unit = %v, want the unit's own failure handed back", err)
+	}
+	if available, _, _, _ := integrationProjectionRow(t, db, account+"-bucket"); available != 4750 {
+		t.Errorf("available after the refused admission = %d, want 4750 — a failed unit's drawdown never commits", available)
+	}
+
 	// The failing settlement unit: the close and the append BOTH run, then the
 	// unit reports failure. Everything it did — the close, the fact, the
 	// sequence it allocated — rolls back, and the admission's rows stand
 	// exactly as they were.
-	boom := errors.New("the settlement unit failed after both statements")
 	err = store.WithinTx(ctx, func(ctx context.Context) error {
 		closed, err := repos.reserves.Close(ctx, reservation.ID, accounting.StateSettled, now)
 		if err != nil {
@@ -1678,28 +1801,52 @@ func TestIntegrationPublicationAlgebraKeepsSpentCapacitySpent(t *testing.T) {
 	}
 
 	// The refill, guarded by the CURRENT revision: applies, available grows.
-	refill, err := accounting.NewRefill(bucket, 50, 2)
+	// The identity matters as much as the guard — it is what makes a
+	// redelivery of this very call a recorded no-op below. It is derived from
+	// this test's bucket, not spelled as a literal: the suite's database keeps
+	// its rows between runs, and a fixed identity would make the second run's
+	// first delivery answer already_applied — a receipt of a previous run, not
+	// a redelivery.
+	refill, err := accounting.NewRefill(bucket+"-refill-guarded", bucket, 50, 2)
 	if err != nil {
 		t.Fatalf("building the guarded refill: %v", err)
 	}
-	if applied, err := repos.quota.ApplyRefill(ctx, refill); err != nil || !applied {
-		t.Fatalf("ApplyRefill(at revision 2) = (%t, %v), want (true, nil)", applied, err)
+	if outcome, err := repos.quota.ApplyRefill(ctx, refill); err != nil || outcome != accounting.RefillApplied {
+		t.Fatalf("ApplyRefill(at revision 2) = (%q, %v), want (%q, nil)", outcome, err, accounting.RefillApplied)
 	}
 	if available, _, _, _ := integrationProjectionRow(t, db, bucket); available != 450 {
 		t.Errorf("available after the guarded refill = %d, want 450", available)
 	}
-	// The same increase replayed against the OLD revision: refused — an
-	// unguarded refill replayed is capacity minted twice, the one way this
-	// table could invent money.
-	staleRefill, err := accounting.NewRefill(bucket, 50, 1)
+	// The same identity delivered again — the at-least-once redelivery the
+	// plane boundary guarantees: answered already_applied, available unmoved.
+	// The guard revision is not what answers here (a redelivery usually still
+	// names a revision the projection has since passed); the identity is.
+	if outcome, err := repos.quota.ApplyRefill(ctx, refill); err != nil || outcome != accounting.RefillAlreadyApplied {
+		t.Errorf("ApplyRefill(redelivered) = (%q, %v), want (%q, nil) — one identity mints at most once", outcome, err, accounting.RefillAlreadyApplied)
+	}
+	if available, _, _, _ := integrationProjectionRow(t, db, bucket); available != 450 {
+		t.Errorf("available after the redelivered refill = %d, want 450 — the redelivery must not mint again", available)
+	}
+	// A different identity against the OLD revision: stale — recorded
+	// unapplied, and the increase must be re-derived under a new identity.
+	// Delivering it twice answers stale once and already_applied afterwards:
+	// the identity was seen, whatever the outcome was.
+	staleRefill, err := accounting.NewRefill(bucket+"-refill-stale", bucket, 50, 1)
 	if err != nil {
 		t.Fatalf("building the stale refill: %v", err)
 	}
-	if applied, err := repos.quota.ApplyRefill(ctx, staleRefill); err != nil || applied {
-		t.Errorf("ApplyRefill(at revision 1) = (%t, %v), want (false, nil) — the guard revision has moved on", applied, err)
+	if outcome, err := repos.quota.ApplyRefill(ctx, staleRefill); err != nil || outcome != accounting.RefillStale {
+		t.Errorf("ApplyRefill(at revision 1) = (%q, %v), want (%q, nil) — the guard revision has moved on", outcome, err, accounting.RefillStale)
 	}
 	if available, _, _, _ := integrationProjectionRow(t, db, bucket); available != 450 {
 		t.Errorf("available after the refused refill = %d, want 450", available)
+	}
+	var refills int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM public.quota_refills WHERE refill_id = $1`, staleRefill.RefillID).Scan(&refills); err != nil {
+		t.Fatalf("counting the stale identity's receipts: %v", err)
+	}
+	if refills != 1 {
+		t.Errorf("the stale refill left %d receipt rows, want exactly 1 — stale is recorded, not discarded", refills)
 	}
 
 	// Back to active, and drain the whole projection, so the outstanding
@@ -1861,16 +2008,18 @@ func TestIntegrationWaterfallDrawdownMatchesTheDomainOrder(t *testing.T) {
 	}
 
 	// The SQL half: the adapter's own order by, spelled here exactly as
-	// projectionWalk spells it, over the same rows. One order, two spellings,
-	// one proof: this query and ByWaterfall disagreeing is the bug this test
-	// exists to catch, and it is asserted against the domain's answer rather
-	// than against a hardcoded list so the two halves are pinned to each
-	// other, not merely to the test's expectations.
+	// projectionWalk spells it — the trailing funding-bucket tiebreak
+	// included, the one that makes the order total and the lock order
+	// deadlock-free. One order, two spellings, one proof: this query and
+	// ByWaterfall disagreeing is the bug this test exists to catch, and it is
+	// asserted against the domain's answer rather than against a hardcoded
+	// list so the two halves are pinned to each other, not merely to the
+	// test's expectations.
 	sqlOrdered := `SELECT funding_bucket_id
 	FROM public.quota_projections
 	WHERE account_id = $1 AND state = 'active'
 	ORDER BY named_scope DESC, period_end ASC NULLS LAST,
-	         subscription_created_at ASC, entitlement_id ASC`
+	         subscription_created_at ASC, entitlement_id ASC, funding_bucket_id ASC`
 	sqlRows, err := db.QueryContext(ctx, sqlOrdered, account)
 	if err != nil {
 		t.Fatalf("reading the SQL waterfall order: %v", err)
@@ -1890,13 +2039,32 @@ func TestIntegrationWaterfallDrawdownMatchesTheDomainOrder(t *testing.T) {
 	if !reflect.DeepEqual(sqlOrder, gotOrder) {
 		t.Errorf("the SQL order by produced %v, want the domain's %v — the two spellings are one order or the waterfall is two waterfalls", sqlOrder, gotOrder)
 	}
+
+	// The next drawdown walks what is left of the waterfall, from its head:
+	// the drained named-early grant is skipped whole (no zero leg, no re-read
+	// of a dry bucket) and the ordinals restart at 1 — an ordinal is the
+	// position within its own drawdown's tail, never a global counter, or two
+	// facts could never both carry the leg that drew first.
+	more, err := repos.quota.Drawdown(ctx, account, 30)
+	if err != nil {
+		t.Fatalf("Drawdown(30): %v", err)
+	}
+	wantMore := []accounting.Allocation{
+		{FundingBucketID: grantList[1].bucket, Amount: 30, Ordinal: 1},
+	}
+	if !reflect.DeepEqual(more, wantMore) {
+		t.Errorf("Drawdown(30) legs = %+v, want %+v — the dry head is skipped and the ordinals start over", more, wantMore)
+	}
 }
 
 // TestIntegrationReaperExpiresOnlyLapsedLeases drives the reaper's batch CAS:
-// a sweep closes exactly the holds whose leases have lapsed, oldest lease
-// first, up to its limit, and returns them whole so the caller can append the
-// expired fact in the same unit of work. A hold whose lease is still live
-// survives every sweep, however many lapsed neighbours it sits between.
+// a sweep closes exactly the holds whose hold window AND whose lease have
+// both lapsed, oldest lease first, up to its limit, and returns them whole —
+// legs included — so the caller can append the expired fact in the same unit
+// of work. A hold that fails either half of the predicate survives every
+// sweep, however lapsed its neighbours are: a lapsed lease with a live window
+// is a holder mid-renewal-hiccup, and a lapsed window with a live lease is a
+// close the settlement path — not the reaper — still has time to make.
 func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 	db, store := integrationPool(t)
 	repos := integrationRepos(t, store)
@@ -1907,12 +2075,18 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 	now := time.Now().UTC()
 	created := now.Add(-2 * time.Hour)
 	expires := now.Add(time.Hour)
-	// Three holds, one account: two leases lapsed (an hour ago and half an
-	// hour ago), one still live. The reaper's order is lease_expires_at, so
-	// the hour-old lease is the first victim a limited sweep takes.
-	lapsedOld, oldRequest := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-a"), created, expires, now.Add(-time.Hour))
-	lapsedRecent, recentRequest := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-b"), created, expires, now.Add(-30*time.Minute))
+	// Three holds: two take-able (window and lease both lapsed, an hour ago
+	// and half an hour ago), one with both live. The reaper's order is
+	// lease_expires_at, so the hour-old lease is the first victim a limited
+	// sweep takes.
+	lapsedOld, oldRequest := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-a"), created, now.Add(-time.Hour), now.Add(-time.Hour))
+	lapsedRecent, recentRequest := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-b"), created, now.Add(-30*time.Minute), now.Add(-30*time.Minute))
 	fresh, freshRequest := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-c"), created, expires, now.Add(30*time.Minute))
+	// And the two one-sided survivors the AND exists for: each has exactly
+	// one clock lapsed, and neither may be taken no matter how the sweep is
+	// limited.
+	hiccup, hiccupRequest := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-e"), created, expires, now.Add(-time.Hour))                              // lease lapsed, window live
+	walkedAway, walkedAwayRequest := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-f"), created, now.Add(-30*time.Minute), now.Add(30*time.Minute)) // window lapsed, lease live
 
 	victims, err := repos.reserves.ExpireLapsedLeases(ctx, 1)
 	if err != nil {
@@ -1930,8 +2104,13 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 	if got := integrationReservationState(t, db, lapsedOld); got != string(accounting.StateExpired) {
 		t.Errorf("the first victim's state = %q, want expired", got)
 	}
-	if got := integrationReservationState(t, db, lapsedRecent); got != string(accounting.StateOpen) {
-		t.Errorf("the half-hour lapsed hold = %q after a sweep of limit 1, want open — the limit bounds the sweep, not the lapse", got)
+	for _, survivor := range []struct {
+		id   identity.ReservationID
+		name string
+	}{{lapsedRecent, "the half-hour lapsed hold"}, {hiccup, "the lease-lapsed hold"}, {walkedAway, "the window-lapsed hold"}} {
+		if got := integrationReservationState(t, db, survivor.id); got != string(accounting.StateOpen) {
+			t.Errorf("%s = %q after a sweep of limit 1, want open — the limit bounds the sweep and the predicate needs both clocks", survivor.name, got)
+		}
 	}
 
 	victims, err = repos.reserves.ExpireLapsedLeases(ctx, 1)
@@ -1947,17 +2126,27 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 		t.Fatalf("the sweeping ExpireLapsedLeases(5): %v", err)
 	}
 	if len(victims) != 0 {
-		t.Errorf("the sweeping reaper closed %v, want none — the live lease is not the reaper's to take", victims)
+		t.Errorf("the sweeping reaper closed %v, want none — a one-sided lapse is not the reaper's to take", victims)
 	}
-	if got := integrationReservationState(t, db, fresh); got != string(accounting.StateOpen) {
-		t.Errorf("the fresh hold = %q after every sweep, want open", got)
+	for _, survivor := range []struct {
+		id   identity.ReservationID
+		name string
+	}{{fresh, "the fresh hold"}, {hiccup, "the lease-lapsed hold"}, {walkedAway, "the window-lapsed hold"}} {
+		if got := integrationReservationState(t, db, survivor.id); got != string(accounting.StateOpen) {
+			t.Errorf("%s = %q after every sweep, want open", survivor.name, got)
+		}
 	}
 
 	// The reaper's whole contract is the pair, in one unit of work: the sweep
 	// and the fact derived from what the sweep read back. A victim closed
 	// without its fact would be a hold the runtime ended that no feed page
 	// ever reports — the crash the settlement doctrine exists to prevent.
-	lostVictim, lostRequest := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-d"), created, expires, now.Add(-time.Hour))
+	// This victim carries legs (the reaper test's subject is normally the
+	// lease vocabulary, but the sweep must read the allocation tail back too),
+	// and the fact built from the sweep's own answer — payload included —
+	// must clear the engine's envelope guard on the way in.
+	lostVictim, lostRequest := integrationReservationWithLegs(t, ctx, repos, integrationRuntimeAccount(t, "reaper-d"), created, now.Add(-time.Hour), now.Add(-time.Hour))
+	var sweptAllocations []accounting.Allocation
 	err = store.WithinTx(ctx, func(ctx context.Context) error {
 		closed, err := repos.reserves.ExpireLapsedLeases(ctx, 1)
 		if err != nil {
@@ -1966,7 +2155,12 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 		if len(closed) != 1 || closed[0].ID != lostVictim {
 			return fmt.Errorf("the reaping unit closed %v, want exactly hold %v", closed, lostVictim)
 		}
-		fact, err := accounting.NewExpired(closed[0].RequestID, nil, time.Now().UTC())
+		sweptAllocations = closed[0].Allocations
+		sweptLegs := make([]accounting.AllocationLeg, 0, len(sweptAllocations))
+		for _, leg := range sweptAllocations {
+			sweptLegs = append(sweptLegs, accounting.AllocationLeg{FundingBucketID: leg.FundingBucketID, Amount: leg.Amount, Ordinal: leg.Ordinal})
+		}
+		fact, err := accounting.NewExpired(closed[0].RequestID, sweptLegs, time.Now().UTC())
 		if err != nil {
 			return err
 		}
@@ -1976,17 +2170,55 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the reaping unit of work: %v", err)
 	}
+	if len(sweptAllocations) != 2 || sweptAllocations[0].FundingBucketID != "bucket-reaper-a" || sweptAllocations[0].Amount != 400 || sweptAllocations[0].Ordinal != 1 ||
+		sweptAllocations[1].FundingBucketID != "bucket-reaper-b" || sweptAllocations[1].Amount != 300 || sweptAllocations[1].Ordinal != 2 {
+		t.Errorf("the sweep returned legs %v, want [bucket-reaper-a 400 #1 bucket-reaper-b 300 #2] in ordinal order — the fact's allocation tail is the sweep's to carry", sweptAllocations)
+	}
 	if got := integrationFactCount(t, db, lostRequest); got != 1 {
 		t.Errorf("the reaped request carries %d facts, want the one expired fact its sweep appended", got)
 	}
 	if got := integrationReservationState(t, db, lostVictim); got != string(accounting.StateExpired) {
 		t.Errorf("the reaped hold = %q, want expired", got)
 	}
-	if got := integrationReservationState(t, db, fresh); got != string(accounting.StateOpen) {
-		t.Errorf("the fresh hold after the reaping unit = %q, want open", got)
+	for _, survivor := range []struct {
+		id   identity.ReservationID
+		name string
+	}{{fresh, "the fresh hold"}, {hiccup, "the lease-lapsed hold"}, {walkedAway, "the window-lapsed hold"}} {
+		if got := integrationReservationState(t, db, survivor.id); got != string(accounting.StateOpen) {
+			t.Errorf("%s after the reaping unit = %q, want open", survivor.name, got)
+		}
 	}
 	if got := integrationFactCount(t, db, freshRequest); got != 0 {
-		t.Errorf("the live hold's request carries %d facts, want 0 — nothing the sweeps did touches it", got)
+		t.Errorf("the fresh hold's request carries %d facts, want 0 — nothing the sweeps did touches it", got)
+	}
+	if got := integrationFactCount(t, db, hiccupRequest); got != 0 {
+		t.Errorf("the lease-lapsed hold's request carries %d facts, want 0", got)
+	}
+	if got := integrationFactCount(t, db, walkedAwayRequest); got != 0 {
+		t.Errorf("the window-lapsed hold's request carries %d facts, want 0", got)
+	}
+
+	// A renewal is the settlement path's answer to the hiccup case: the
+	// lapsed-lease hold, renewed by its owner before the sweep's next pass,
+	// moves out of every later predicate. The renewal is owner-scoped — a
+	// renewal naming another owner, or naming a closed hold, is answered
+	// false and moves nothing.
+	renewed, err := repos.reserves.RenewLease(ctx, hiccup, "b7it-runtime", now.Add(time.Hour))
+	if err != nil || !renewed {
+		t.Fatalf("RenewLease(the hiccup hold) = (%t, %v), want (true, nil)", renewed, err)
+	}
+	victims, err = repos.reserves.ExpireLapsedLeases(ctx, 10)
+	if err != nil {
+		t.Fatalf("the post-renewal sweep: %v", err)
+	}
+	if len(victims) != 0 {
+		t.Errorf("the post-renewal sweep closed %v, want none — the renewed lease took the hold out of the predicate", victims)
+	}
+	if renewedByStranger, err := repos.reserves.RenewLease(ctx, walkedAway, "someone-else", now.Add(time.Hour)); err != nil || renewedByStranger {
+		t.Errorf("RenewLease(by another owner) = (%t, %v), want (false, nil) — a lease is renewed by the process that holds it", renewedByStranger, err)
+	}
+	if renewedClosed, err := repos.reserves.RenewLease(ctx, lostVictim, "b7it-runtime", now.Add(time.Hour)); err != nil || renewedClosed {
+		t.Errorf("RenewLease(an expired hold) = (%t, %v), want (false, nil) — a lease is not renewed on a hold that is gone", renewedClosed, err)
 	}
 }
 
@@ -2623,5 +2855,446 @@ func TestIntegrationReaderReportsAnUnavailableSource(t *testing.T) {
 	}
 	if errors.Is(err, usagefacts.ErrCursorExpired) {
 		t.Errorf("Read(against a closed pool) error = %v, want nothing of the cursor vocabulary — a broken source is not an expired position", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The engine guards. Every repository refusal above has a twin in the schema —
+// a trigger or a foreign key that refuses the same malformed write no matter
+// whose hand wrote it. These probes drive the shapes the repositories can
+// never produce (raw SQL, against this test's own rows) and prove the twins
+// are armed: the domain's legible refusal is the first guard, the engine is
+// the last one, and only the second survives a future writer that never heard
+// of the first.
+// ---------------------------------------------------------------------------
+
+// integrationRawSequence allocates the next append sequence the way the store
+// does — the same stream UPSERT, the allocation and the fact it is for riding
+// one transaction, so a refused probe leaves neither behind. The raw probes
+// bypass the repositories' fact shaping, never the stream's allocation: a row
+// written past the stream's tail would poison every cursor the feed has ever
+// issued, and the rest of the suite reads that feed.
+func integrationRawSequence(t *testing.T, tx *sql.Tx) (int64, error) {
+	t.Helper()
+	var seq int64
+	err := tx.QueryRowContext(context.Background(), `INSERT INTO public.usage_events_stream (singleton, epoch, last_seq)
+		VALUES (true, gen_random_uuid(), 1)
+		ON CONFLICT (singleton)
+		DO UPDATE SET last_seq = public.usage_events_stream.last_seq + 1,
+		              updated_at = clock_timestamp()
+		RETURNING last_seq`).Scan(&seq)
+	return seq, err
+}
+
+// integrationRawSettledFact writes one settled fact row by hand — the payload
+// spelled exactly as given, at a sequence the stream properly allocated. It is
+// the payload envelope trigger's subject: the domain marshals only deliverable
+// payloads, so a refusal here can only be the engine's.
+func integrationRawSettledFact(t *testing.T, db *sql.DB, request identity.RequestID, attempt identity.AttemptID, payload string) error {
+	t.Helper()
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	seq, err := integrationRawSequence(t, tx)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(context.Background(), `INSERT INTO public.usage_events
+		(append_seq, request_id, kind, schema_version, capture_method, committed_attempt_id,
+		 price_revision_id, input_unit_price, output_unit_price, settled_amount, payload, occurred_at)
+		VALUES ($1, $2, 'settled', 1, 'reported', $3, 'b7it-price-revision-1', 2, 3, 375, $4::jsonb, now())`,
+		seq, string(request), string(attempt), payload); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// integrationRawReleasedFact writes one released fact row by hand, its
+// correction pointer spelled by the caller — a foreign pointer to prove the
+// composite foreign key's refusal, none to prove the row beside it was never
+// the problem.
+func integrationRawReleasedFact(t *testing.T, db *sql.DB, request identity.RequestID, correctsAppendSeq *int64) error {
+	t.Helper()
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	seq, err := integrationRawSequence(t, tx)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(context.Background(), `INSERT INTO public.usage_events
+		(append_seq, request_id, kind, schema_version, corrects_append_seq, payload, occurred_at)
+		VALUES ($1, $2, 'released', 1, $3, '{"allocations": []}'::jsonb, now())`,
+		seq, string(request), correctsAppendSeq); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// TestIntegrationAppendRefusesAContextWithNoUnit pins the append's placement
+// refusal: the fact's sequence allocation holds the stream row to the
+// transaction's commit, so an append with no unit of work around it has
+// nothing to hold — the caller is one refactor away from a fact that lands
+// before the close it belongs to — and the store refuses to be that refactor's
+// tool.
+func TestIntegrationAppendRefusesAContextWithNoUnit(t *testing.T) {
+	_, store := integrationPool(t)
+	repos := integrationRepos(t, store)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_, _, fact := integrationFormSettled(t, integrationRuntimeAccount(t, "append-alone"), nil, time.Now().UTC())
+	_, err := repos.facts.Append(ctx, fact)
+	if !errors.Is(err, persistence.ErrAppendOutsideUnitOfWork) {
+		t.Errorf("Append() with no unit of work error = %v, want persistence.ErrAppendOutsideUnitOfWork", err)
+	}
+}
+
+// TestIntegrationEngineRefusesUndeliverableFactPayloads drives the payload
+// envelope trigger through the shapes the domain's marshalling can never
+// produce: not the envelope, more than the envelope, an amount a consumer's
+// integer decoder would choke on, an ordinal that does not count from one, a
+// bucket named twice. Each is refused at the engine with its reason named;
+// the deliverable payload written last is the proof the trigger refuses
+// shapes, not rows.
+func TestIntegrationEngineRefusesUndeliverableFactPayloads(t *testing.T) {
+	db, store := integrationPool(t)
+	repos := integrationRepos(t, store)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	account := integrationRuntimeAccount(t, "envelope")
+	price := integrationPrice()
+	now := time.Now().UTC()
+	request, err := execution.NewRequest(identity.NewRequestID(), account, account+"-api-key", "bench/alias", 120, 4096, price, now)
+	if err != nil {
+		t.Fatalf("building a request: %v", err)
+	}
+	attempt, err := execution.NewAttempt(identity.NewAttemptID(), request.ID, 0, 0, "b7it-backend", "b7it/model", execution.OutcomeSucceeded, "", now, now)
+	if err != nil {
+		t.Fatalf("building an attempt: %v", err)
+	}
+	if err := repos.requests.Insert(ctx, request); err != nil {
+		t.Fatalf("inserting the request: %v", err)
+	}
+	if err := repos.attempts.Insert(ctx, attempt); err != nil {
+		t.Fatalf("inserting the attempt: %v", err)
+	}
+
+	bucket := account + "-env-bucket"
+	leg := func(bucketID, amount, ordinal string) string {
+		return `{"funding_bucket_id":"` + bucketID + `","amount":` + amount + `,"ordinal":` + ordinal + `}`
+	}
+	refusals := []struct {
+		name       string
+		payload    string
+		wantReason string
+	}{
+		{"an empty object is not the envelope", `{}`, "not exactly the version-1 allocation envelope"},
+		{"a second key rides foreign material", `{"allocations":[{"funding_bucket_id":"` + bucket + `","amount":100,"ordinal":1}],"note":"x"}`, "not exactly the version-1 allocation envelope"},
+		{"an amount spelled as text cannot feed an int64 decoder", `{"allocations":[{"funding_bucket_id":"` + bucket + `","amount":"100","ordinal":1}]}`, "not an allocation of the version-1 envelope"},
+		{"a fractional amount is not a minor-unit count", `{"allocations":[{"funding_bucket_id":"` + bucket + `","amount":5.5,"ordinal":1}]}`, "not an allocation of the version-1 envelope"},
+		{"a zero amount draws nothing and invents less", `{"allocations":[` + leg(bucket, "0", "1") + `]}`, "not an allocation of the version-1 envelope"},
+		{"an ordinal that does not count from one skips a leg", `{"allocations":[` + leg(bucket, "100", "2") + `]}`, "not an allocation of the version-1 envelope"},
+		{"a leg carrying a fourth field is not the shape", `{"allocations":[{"funding_bucket_id":"` + bucket + `","amount":100,"ordinal":1,"captured_at":"2026"}]}`, "not an allocation of the version-1 envelope"},
+		{"a bucket named twice mints the same money twice", `{"allocations":[` + leg(bucket, "60", "1") + "," + leg(bucket, "40", "2") + `]}`, "naming its funding bucket twice"},
+	}
+	for _, tt := range refusals {
+		err := integrationRawSettledFact(t, db, request.ID, attempt.ID, tt.payload)
+		if err == nil {
+			t.Errorf("%s: the raw insert succeeded, want the trigger's refusal", tt.name)
+			continue
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "P0001" {
+			t.Errorf("%s: error = %v, want the trigger's raise_exception (P0001)", tt.name, err)
+			continue
+		}
+		if !strings.Contains(pgErr.Message, tt.wantReason) {
+			t.Errorf("%s: trigger message = %q, want it to name %q", tt.name, pgErr.Message, tt.wantReason)
+		}
+	}
+
+	// The deliverable shape — exactly the envelope, one leg, positive integer
+	// amounts, ordinals from one — is the raw insert the trigger lets through:
+	// the guard is against undeliverable payloads, not against writers it does
+	// not recognise. (The envelope's empty tail — what a released fact carries
+	// — is proved accepted by the correction probe below, whose rows are
+	// spelled that way.)
+	if err := integrationRawSettledFact(t, db, request.ID, attempt.ID,
+		`{"allocations":[{"funding_bucket_id":"`+bucket+`","amount":100,"ordinal":1}]}`); err != nil {
+		t.Errorf("the deliverable payload error = %v, want the insert accepted", err)
+	}
+}
+
+// TestIntegrationEngineRefusesLegsThatDoNotRederiveTheHold drives the
+// statement trigger that judges a legs insert whole: the set's sum must equal
+// the hold, the ordinals must count from one without gaps, and each leg must
+// be its hold's only memory of its bucket (that last one the table's own
+// uniques arbitrate, not the trigger). The reservation row itself is written
+// by hand because the domain refuses to build a hold its legs do not re-derive
+// — which is exactly why the engine needs its own refusal. The immutability
+// trigger behind it is proved on the surviving legs: once written, the memory
+// does not change.
+func TestIntegrationEngineRefusesLegsThatDoNotRederiveTheHold(t *testing.T) {
+	db, store := integrationPool(t)
+	repos := integrationRepos(t, store)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	account := integrationRuntimeAccount(t, "legsum")
+	price := integrationPrice()
+	now := time.Now().UTC()
+	request, err := execution.NewRequest(identity.NewRequestID(), account, account+"-api-key", "bench/alias", 10, 20, price, now)
+	if err != nil {
+		t.Fatalf("building a request: %v", err)
+	}
+	if err := repos.requests.Insert(ctx, request); err != nil {
+		t.Fatalf("inserting the request: %v", err)
+	}
+	reservationID := identity.NewReservationID()
+	_, err = db.ExecContext(ctx, `INSERT INTO public.reservations
+		(id, request_id, price_revision_id, input_unit_price, output_unit_price,
+		 input_tokens, max_output_tokens, reserved_amount, created_at, expires_at, lease_owner, lease_expires_at)
+		VALUES ($1, $2, $3, $4, $5, 10, 20, 100, $6, $7, 'b7it-probe', $8)`,
+		string(reservationID), string(request.ID), price.RevisionID,
+		price.InputUnitPrice, price.OutputUnitPrice,
+		now, now.Add(time.Hour), now.Add(30*time.Minute))
+	if err != nil {
+		t.Fatalf("writing the probe's reservation row: %v", err)
+	}
+
+	legStatement := `INSERT INTO public.reservation_allocations (reservation_id, funding_bucket_id, amount, ordinal) VALUES `
+	legs := func(pairs ...string) string {
+		return legStatement + strings.Join(pairs, ", ")
+	}
+	leg := func(bucket string, amount, ordinal string) string {
+		return `('` + string(reservationID) + `', '` + bucket + `', ` + amount + `, ` + ordinal + `)`
+	}
+	refusals := []struct {
+		name       string
+		statement  string
+		wantReason string
+	}{
+		{
+			name:       "legs summing short of the hold under-draw what was reserved",
+			statement:  legs(leg(account+"-ls-a", "40", "1"), leg(account+"-ls-b", "50", "2")),
+			wantReason: "do not re-derive its hold",
+		},
+		{
+			name:       "legs summing past the hold draw capacity the hold never had",
+			statement:  legs(leg(account+"-ls-a", "60", "1"), leg(account+"-ls-b", "60", "2")),
+			wantReason: "do not re-derive its hold",
+		},
+		{
+			name:       "an ordinal gap hides a leg nobody can point at",
+			statement:  legs(leg(account+"-ls-a", "50", "1"), leg(account+"-ls-b", "50", "3")),
+			wantReason: "do not re-derive its hold",
+		},
+		{
+			name:       "ordinals not starting at one leave the tail unanchored",
+			statement:  legs(leg(account+"-ls-a", "50", "2"), leg(account+"-ls-b", "50", "3")),
+			wantReason: "do not re-derive its hold",
+		},
+	}
+	for _, tt := range refusals {
+		_, err := db.ExecContext(ctx, tt.statement)
+		if err == nil {
+			t.Errorf("%s: the insert succeeded, want the statement trigger's refusal", tt.name)
+			continue
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "P0001" {
+			t.Errorf("%s: error = %v, want the trigger's raise_exception (P0001)", tt.name, err)
+			continue
+		}
+		if !strings.Contains(pgErr.Message, tt.wantReason) {
+			t.Errorf("%s: trigger message = %q, want it to name %q", tt.name, pgErr.Message, tt.wantReason)
+		}
+	}
+
+	// The set that does re-derive the hold lands whole: two legs, 100 of 100.
+	if _, err := db.ExecContext(ctx, legs(leg(account+"-ls-a", "60", "1"), leg(account+"-ls-b", "40", "2"))); err != nil {
+		t.Fatalf("the re-deriving leg set error = %v, want it accepted", err)
+	}
+
+	// And the memory does not change afterwards — not by update, not by
+	// delete. The rows just written are the subject; the refusal is the
+	// immutability trigger's.
+	var pgErr *pgconn.PgError
+	_, err = db.ExecContext(ctx, `UPDATE public.reservation_allocations SET amount = 99
+		WHERE reservation_id = $1 AND ordinal = 1`, string(reservationID))
+	if !errors.As(err, &pgErr) || pgErr.Code != "P0001" || !strings.Contains(pgErr.Message, "cannot be rewritten") {
+		t.Errorf("UPDATE on a written leg error = %v, want the immutability trigger's exception", err)
+	}
+	_, err = db.ExecContext(ctx, `DELETE FROM public.reservation_allocations WHERE reservation_id = $1`, string(reservationID))
+	if !errors.As(err, &pgErr) || pgErr.Code != "P0001" || !strings.Contains(pgErr.Message, "cannot be rewritten") {
+		t.Errorf("DELETE of a written leg error = %v, want the immutability trigger's exception", err)
+	}
+}
+
+// TestIntegrationEngineRefusesAnIntakeIdentityRewrite drives the intake
+// trigger's half of its contract the repositories never touch: the identity
+// fields are refused to every UPDATE, while the finalisation pointer beside
+// them stays writable — a decided record can be completed, never re-addressed.
+func TestIntegrationEngineRefusesAnIntakeIdentityRewrite(t *testing.T) {
+	db, store := integrationPool(t)
+	repos := integrationRepos(t, store)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	account := integrationRuntimeAccount(t, "intake-idem")
+	key := account + "-key"
+	intake, err := execution.NewIntake(account, key, "b7it-digest-"+account, identity.NewRequestID(), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("building the intake: %v", err)
+	}
+	if err := store.WithinTx(ctx, func(ctx context.Context) error {
+		return repos.intakes.Insert(ctx, intake)
+	}); err != nil {
+		t.Fatalf("inserting the intake: %v", err)
+	}
+
+	var pgErr *pgconn.PgError
+	_, err = db.ExecContext(ctx, `UPDATE public.request_intake SET request_id = $1
+		WHERE account_id = $2 AND idempotency_key = $3`, string(identity.NewRequestID()), account, key)
+	if !errors.As(err, &pgErr) || pgErr.Code != "P0001" || !strings.Contains(pgErr.Message, "replay identity that cannot be rewritten") {
+		t.Errorf("rewriting the intake's request error = %v, want the identity trigger's exception", err)
+	}
+	_, err = db.ExecContext(ctx, `UPDATE public.request_intake SET request_digest = 'b7it-rewritten'
+		WHERE account_id = $1 AND idempotency_key = $2`, account, key)
+	if !errors.As(err, &pgErr) || pgErr.Code != "P0001" || !strings.Contains(pgErr.Message, "replay identity that cannot be rewritten") {
+		t.Errorf("rewriting the intake's digest error = %v, want the identity trigger's exception", err)
+	}
+
+	// The pointer half stays open: the same row's finalisation columns accept
+	// the write the identity trigger has no opinion about.
+	if _, err := db.ExecContext(ctx, `UPDATE public.request_intake SET final_status = 'succeeded'
+		WHERE account_id = $1 AND idempotency_key = $2`, account, key); err != nil {
+		t.Errorf("finalising the intake row error = %v, want the pointer half writable", err)
+	}
+}
+
+// TestIntegrationEngineRefusesAnotherRequestsCorrection drives the correction
+// pointer's composite foreign key: a fact may correct another fact OF ITS OWN
+// REQUEST and no other — a correction aimed at a sibling request's sequence is
+// a foreign-key refusal naming the constraint, not a silent re-pointing.
+func TestIntegrationEngineRefusesAnotherRequestsCorrection(t *testing.T) {
+	db, store := integrationPool(t)
+	repos := integrationRepos(t, store)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// The corrected fact: a real settlement appended the way the store
+	// allocates sequences, so the pointer below names a sequence that exists.
+	correctedAccount := integrationRuntimeAccount(t, "corrected")
+	_, _, correctedSeq := integrationSettlement(t, ctx, repos, correctedAccount)
+
+	// The claiming request: real, its own, carrying none of the corrected
+	// request's rows.
+	claimingAccount := integrationRuntimeAccount(t, "claimant")
+	price := integrationPrice()
+	now := time.Now().UTC()
+	request, err := execution.NewRequest(identity.NewRequestID(), claimingAccount, claimingAccount+"-api-key", "bench/alias", 10, 20, price, now)
+	if err != nil {
+		t.Fatalf("building the claiming request: %v", err)
+	}
+	if err := repos.requests.Insert(ctx, request); err != nil {
+		t.Fatalf("inserting the claiming request: %v", err)
+	}
+
+	err = integrationRawReleasedFact(t, db, request.ID, &correctedSeq)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23503" {
+		t.Fatalf("the cross-request correction error = %v, want the correction pointer's foreign-key refusal (23503)", err)
+	}
+	if pgErr.ConstraintName != "usage_events_correction_targets_same_request_fkey" {
+		t.Errorf("the refusal names constraint %q, want usage_events_correction_targets_same_request_fkey", pgErr.ConstraintName)
+	}
+
+	// The same row without the foreign pointer is the shape the schema admits
+	// (a real correction would carry its own kind vocabulary; this probe
+	// proves only the pointer's routing).
+	if err := integrationRawReleasedFact(t, db, request.ID, nil); err != nil {
+		t.Errorf("the same row without the foreign pointer error = %v, want it accepted — the refusal was the pointer's, not the row's", err)
+	}
+}
+
+// TestIntegrationPublicationRaceSeedsExactlyOnce drives the publication
+// algebra's first clause from two sessions at once: two deliveries of one
+// fresh grant, same revision, arriving together. Exactly one seeds (available
+// starts at the limit); the other is stale — the row it lost to is already at
+// its revision — and the bucket ends with one row carrying the limit once,
+// never twice.
+func TestIntegrationPublicationRaceSeedsExactlyOnce(t *testing.T) {
+	db, store := integrationPool(t)
+	repos := integrationRepos(t, store)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	account := integrationRuntimeAccount(t, "pub-race")
+	bucket := account + "-bucket"
+	publication := accounting.Publication{
+		AccountID:             account,
+		FundingBucketID:       bucket,
+		AliasGroupVersionID:   "b7it-alias-group-1",
+		ScopeKind:             accounting.ScopePayGBalance,
+		NamedScope:            false,
+		PeriodEnd:             time.Time{},
+		SubscriptionCreatedAt: integrationSubscriptionCreatedAt,
+		State:                 accounting.ProjectionActive,
+		LimitAmount:           777,
+		Revision:              1,
+	}
+
+	const sessions = 2
+	outcomes := make(chan accounting.PublicationOutcome, sessions)
+	errs := make(chan error, sessions)
+	var wg sync.WaitGroup
+	for i := 0; i < sessions; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			outcome, err := repos.quota.ApplyPublication(ctx, publication)
+			outcomes <- outcome
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(outcomes)
+	close(errs)
+
+	seeded, stale := 0, 0
+	for outcome := range outcomes {
+		switch outcome {
+		case accounting.PublicationSeeded:
+			seeded++
+		case accounting.PublicationStale:
+			stale++
+		default:
+			t.Errorf("a racing delivery answered %q, want seeded or stale — nothing else is a first-contact answer", outcome)
+		}
+	}
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("a racing delivery failed: %v", err)
+		}
+	}
+	if seeded != 1 || stale != sessions-1 {
+		t.Errorf("the race answered %d seeded and %d stale, want exactly 1 seeded and %d stale — one grant, one seed", seeded, stale, sessions-1)
+	}
+	if available, limit, revision, state := integrationProjectionRow(t, db, bucket); available != 777 || limit != 777 || revision != 1 || state != string(accounting.ProjectionActive) {
+		t.Errorf("the raced row = (available %d, limit %d, revision %d, state %s), want (777, 777, 1, active) — the limit is offered once", available, limit, revision, state)
+	}
+	var rows int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM public.quota_projections WHERE funding_bucket_id = $1`, bucket).Scan(&rows); err != nil {
+		t.Fatalf("counting the bucket's rows: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("the bucket carries %d rows, want 1 — one funding bucket, one projection", rows)
 	}
 }

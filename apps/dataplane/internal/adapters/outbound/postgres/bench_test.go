@@ -86,7 +86,7 @@ func BenchmarkAdmissionUnit(b *testing.B) {
 	ctx := benchmarkContext(b)
 
 	account := integrationRuntimeAccount(b, "bench-admission")
-	bucket := integrationSeedProjection(b, ctx, repos, account, true, time.Now().UTC().Add(24*time.Hour), 1_000_000_000_000_000)
+	integrationSeedProjection(b, ctx, repos, account, true, time.Now().UTC().Add(24*time.Hour), 1_000_000_000_000_000)
 	price := integrationPrice()
 
 	// Formed up front: the identity minting and struct building are not the
@@ -135,7 +135,6 @@ func BenchmarkAdmissionUnit(b *testing.B) {
 			b.Fatalf("admission unit %d: %v", i, err)
 		}
 	}
-	_ = bucket
 }
 
 // BenchmarkContendedDrawdown costs the conditional drawdown under real
@@ -255,8 +254,7 @@ func BenchmarkReservationCloseAndFactAppend(b *testing.B) {
 
 	type prepared struct {
 		reservationID identity.ReservationID
-		requestID     identity.RequestID
-		attemptID     identity.AttemptID
+		fact          accounting.Fact
 	}
 	units := make([]prepared, b.N)
 	b.StopTimer()
@@ -276,6 +274,18 @@ func BenchmarkReservationCloseAndFactAppend(b *testing.B) {
 		if err != nil {
 			b.Fatalf("forming a hold: %v", err)
 		}
+		// The fact is formed here too, with the timer stopped: its building is
+		// the domain's struct work, not the unit's round trips, and the timed
+		// loop should hold nothing but the close and the append it exists to
+		// measure.
+		fact, err := accounting.NewSettled(request.ID, attempt.ID, accounting.CaptureReported,
+			int64Ptr(120), int64Ptr(45), int64Ptr(45),
+			price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice, 375,
+			[]accounting.AllocationLeg{{FundingBucketID: account + "-bench-bucket", Amount: 250, Ordinal: 1}},
+			time.Now().UTC())
+		if err != nil {
+			b.Fatalf("forming settlement fact %d: %v", i, err)
+		}
 		if err := store.WithinTx(ctx, func(ctx context.Context) error {
 			if err := repos.requests.Insert(ctx, request); err != nil {
 				return err
@@ -287,7 +297,7 @@ func BenchmarkReservationCloseAndFactAppend(b *testing.B) {
 		}); err != nil {
 			b.Fatalf("inserting settlement unit %d: %v", i, err)
 		}
-		units[i] = prepared{reservationID: reservation.ID, requestID: request.ID, attemptID: attempt.ID}
+		units[i] = prepared{reservationID: reservation.ID, fact: fact}
 	}
 	b.StartTimer()
 
@@ -302,15 +312,7 @@ func BenchmarkReservationCloseAndFactAppend(b *testing.B) {
 			if !closed {
 				return errors.New("reservation.Close() = false inside the unit that opened it")
 			}
-			fact, err := accounting.NewSettled(units[i].requestID, units[i].attemptID, accounting.CaptureReported,
-				int64Ptr(120), int64Ptr(45), int64Ptr(45),
-				price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice, 375,
-				[]accounting.AllocationLeg{{FundingBucketID: account + "-bench-bucket", Amount: 250, Ordinal: 1}},
-				time.Now().UTC())
-			if err != nil {
-				return err
-			}
-			_, err = repos.facts.Append(ctx, fact)
+			_, err = repos.facts.Append(ctx, units[i].fact)
 			return err
 		})
 		if err != nil {
