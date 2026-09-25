@@ -53,4 +53,17 @@ var (
 	// cannot record: a blank instant, or one set on a subscription that
 	// is not active.
 	ErrInvalidCancellation = errors.New("invalid cancellation")
+	// ErrPlanNameTaken is a plan name another plan already carries — the
+	// schema's plans_name_key, surfaced by the persistence adapter as this
+	// sentinel so callers branch without knowing a constraint name.
+	ErrPlanNameTaken = errors.New("plan name taken")
+	// ErrPlanVersionNumberTaken is a version number another version of the
+	// same plan already carries — the schema's
+	// plan_versions_version_number_key, the open-version race's signal to
+	// re-read the plan's highest number and try again.
+	ErrPlanVersionNumberTaken = errors.New("plan version number taken")
+	// ErrGrantScopeTaken is a second definition for one (scope, dimension)
+	// within one plan version — the schema's
+	// plan_grant_definitions_scope_dimension_key.
+	ErrGrantScopeTaken = errors.New("grant scope taken")
 )
