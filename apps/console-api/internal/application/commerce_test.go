@@ -469,15 +469,36 @@ func TestPaygEnableDisableAndBucketAssignment(t *testing.T) {
 	}
 
 	// Disabling an account that never enabled PAYG records the flag
-	// explicitly instead of failing.
+	// explicitly instead of failing — and the row that disable created
+	// carries no bucket, so enabling it is refused: the second branch of
+	// the enable gate, and the realistic path a bucket-less row takes.
 	world3 := newCommerceWorld(t)
 	use3 := newCommerce(world3)
 	account3 := world3.seedAccount(t)
-	if err := use3.DisableAccountPayg(t.Context(), commerce.AccountID(account3)); err != nil {
+	payg3 := commerce.AccountID(account3)
+	if err := use3.DisableAccountPayg(t.Context(), payg3); err != nil {
 		t.Fatalf("DisableAccountPayg on an unknown account returned error: %v", err)
 	}
-	if world3.paygRows[commerce.AccountID(account3)].Enabled {
+	if world3.paygRows[payg3].Enabled {
 		t.Fatal("the explicit disable did not land")
+	}
+	if err := use3.EnableAccountPayg(t.Context(), payg3); !errors.Is(err, commerce.ErrInvalidTransition) {
+		t.Fatalf("enable on a bucket-less row error = %v, want commerce.ErrInvalidTransition", err)
+	}
+	if world3.paygRows[payg3].Enabled {
+		t.Fatal("the refused enable flipped the flag on")
+	}
+
+	// A malformed bucket reference is refused in the domain's own words,
+	// before any statement runs.
+	world4 := newCommerceWorld(t)
+	use4 := newCommerce(world4)
+	account4 := world4.seedAccount(t)
+	if err := use4.AssignAccountFundingBucket(t.Context(), commerce.AccountID(account4), "not-a-uuid"); !errors.Is(err, commerce.ErrInvalidFundingBucketID) {
+		t.Fatalf("assign with a malformed bucket id error = %v, want commerce.ErrInvalidFundingBucketID", err)
+	}
+	if _, ok := world4.paygRows[commerce.AccountID(account4)]; ok {
+		t.Fatal("the refused assignment materialised a PAYG row")
 	}
 }
 

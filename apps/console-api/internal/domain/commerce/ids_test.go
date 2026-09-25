@@ -53,8 +53,8 @@ func TestBlindReferenceValidation(t *testing.T) {
 		}
 	})
 	t.Run("funding bucket refuses garbage", func(t *testing.T) {
-		if err := validateFundingBucketID(FundingBucketID("bucket-1")); !errors.Is(err, ErrInvalidFundingBucketID) {
-			t.Fatalf("validateFundingBucketID error = %v, want ErrInvalidFundingBucketID", err)
+		if err := ValidateFundingBucketID(FundingBucketID("bucket-1")); !errors.Is(err, ErrInvalidFundingBucketID) {
+			t.Fatalf("ValidateFundingBucketID error = %v, want ErrInvalidFundingBucketID", err)
 		}
 	})
 	t.Run("unset bucket reference is not validated", func(t *testing.T) {

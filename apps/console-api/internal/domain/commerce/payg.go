@@ -35,7 +35,7 @@ func NewAccountPayg(accountID AccountID, enabled bool, fundingBucketID FundingBu
 		return nil, fmt.Errorf("commerce: new account payg: blank account id")
 	}
 	if fundingBucketID != "" {
-		if err := validateFundingBucketID(fundingBucketID); err != nil {
+		if err := ValidateFundingBucketID(fundingBucketID); err != nil {
 			return nil, err
 		}
 	}

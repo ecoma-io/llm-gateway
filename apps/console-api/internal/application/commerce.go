@@ -570,9 +570,12 @@ func (c *Commerce) EnableAccountPayg(ctx context.Context, accountID commerce.Acc
 		// what its spending flag says.
 		//
 		// The bucket reference reads the same way, and unlike the account
-		// state it is write-once once landed: a reference assigned after this
-		// read would only fill a row this call is about to enable, and the
-		// state that commits still names the bucket every later draw uses.
+		// state it is write-once once landed — so what this read sees is
+		// what every later draw draws from. The race it cannot close runs
+		// the other way: a first assignment landing just after this read
+		// found nothing is refused by this call and converges on retry —
+		// the safe direction, an authorisation that never under-states
+		// its funding.
 		payg, err := c.payg.ByAccount(txCtx, accountID)
 		if err != nil {
 			if errors.Is(err, persistence.ErrNotFound) {
@@ -633,6 +636,13 @@ func (c *Commerce) AccountPayg(ctx context.Context, accountID commerce.AccountID
 // bucket is convergence, a different one is the defect the write-once guard
 // exists to stop.
 func (c *Commerce) AssignAccountFundingBucket(ctx context.Context, accountID commerce.AccountID, bucketID commerce.FundingBucketID) error {
+	// The blind reference's grammar is the domain's to state: a malformed id
+	// is refused in the domain's own words before any statement runs — the
+	// schema's v7 CHECK would refuse it too, but a driver error is not an
+	// answer a caller can branch on.
+	if err := commerce.ValidateFundingBucketID(bucketID); err != nil {
+		return fmt.Errorf("application: assign funding bucket to account %s: %w", accountID, err)
+	}
 	return c.store.WithinTx(ctx, func(txCtx context.Context) error {
 		now, err := dbNow(txCtx, c.clock, "assign funding bucket")
 		if err != nil {

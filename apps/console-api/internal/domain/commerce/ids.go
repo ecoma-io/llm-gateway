@@ -146,9 +146,13 @@ func validateAliasGroupVersionID(id AliasGroupVersionID) error {
 	return nil
 }
 
-// validateFundingBucketID pins the v7 form of an Accounting bucket
-// reference the domain did not mint.
-func validateFundingBucketID(id FundingBucketID) error {
+// ValidateFundingBucketID pins the v7 form of an Accounting bucket
+// reference the domain did not mint. Exported because the choreography's
+// commerce-side write takes the reference from a caller, and the caller is
+// owed the refusal in the domain's own words before any statement runs —
+// the schema's v7 CHECK would refuse the same id anyway, but a driver error
+// is not an answer a caller can branch on.
+func ValidateFundingBucketID(id FundingBucketID) error {
 	if !uuidV7Form.MatchString(string(id)) {
 		return fmt.Errorf("commerce: %w: %q is not a version-7 uuid", ErrInvalidFundingBucketID, id)
 	}
