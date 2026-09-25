@@ -38,14 +38,21 @@ tasks:
   # signal it gives, so emptiness is what this reads.
   #
   # `--allow-serial-runners` is the one flag this repository adds to the
-  # linter's defaults, and it is about the workspace rather than about this
-  # module: golangci-lint locks the shared analysis cache on start and exits
-  # with an error if a second instance already holds it, and `pnpm lint` runs
-  # all three modules' lint targets at once. Serializing around that lock —
-  # rather than disabling it with `--allow-parallel-runners` — keeps one cache
-  # and one verdict per module with no concurrent writer to either. CI's
-  # `verify-go` matrix never contends (one module per runner), so this costs
-  # CI nothing and fixes the local run.
+  # linter's defaults, and it is a policy about a SHARED cache rather than a
+  # statement about this run. By default a second linter sharing a cache
+  # directory exits with "parallel golangci-lint is running"; this flag makes
+  # it wait its turn instead, and the alternative — `--allow-parallel-runners` —
+  # would let the two write one cache at once, which is the very arrangement
+  # that produced issue #70.
+  #
+  # The run itself no longer needs that arbitration: the cache pin below gives
+  # each project its own directory, so `pnpm lint`'s three targets contend for
+  # nothing. The flag stays for the case the pin cannot cover — a caller who
+  # exports one GOLANGCI_LINT_CACHE for a comparison, a bisect, or a task
+  # graph the projects do not predict — and it costs a lock read when no second
+  # runner is there. CI's `verify-go` matrix never contends (one module per
+  # runner) and runs a single checkout, so this costs CI nothing either way.
+  #
   #
   # GOLANGCI_LINT_CACHE is pinned below to a directory unique to this checkout.
   # Sibling git worktrees of this repository share one home directory, and the
