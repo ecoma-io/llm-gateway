@@ -19,11 +19,15 @@ import (
 // The identity port's three rules carry over unchanged, and one is used
 // harder here than there:
 //
-//   - Aggregates go in whole and come out whole. An alias IS its candidate
-//     list (ADR 0001, rule 3), so ByID loads candidates in fallback order
-//     beside the row, and Create writes both in the caller's unit of work —
-//     a candidates table row without its alias row can never exist, because
-//     the schema says so and this port would have to bypass it to try.
+//   - Aggregates go in whole. An alias IS its candidate list (ADR 0001,
+//     rule 3), so Create writes the row and its candidates in the caller's
+//     unit of work — a candidates table row without its alias row can never
+//     exist, because the schema says so and this port would have to bypass
+//     it to try. Reads return every part of the aggregate — ByID loads
+//     candidates in fallback order beside the row — and each part as of its
+//     own committed statement: whether resolution needs the two statements
+//     pinned to one instant is the runtime phase's snapshot decision, not
+//     something this port presumes.
 //   - State and configuration changes travel as compare-and-swap on the
 //     alias row's state. SetCandidates and UpdateBounds apply only while
 //     the row still reads active — the state the caller based its new list
@@ -57,8 +61,11 @@ type Backends interface {
 	// move — the target axis of the backend machine, as TransitionState is
 	// its state axis. It is a total move of that axis (all three values at
 	// once, adapter type absent by design), not a field patch: what it
-	// writes is exactly what the domain's UpdateTarget validated.
-	UpdateTarget(ctx context.Context, id catalog.BackendID, endpoint, credentialsRef, egressPolicyRef string, updatedAt time.Time) error
+	// writes is exactly what the domain's UpdateTarget validated. Like its
+	// sibling it reports whether the row moved; false means the backend is
+	// gone — unreachable today, because nothing deletes backends, but the
+	// port does not promise success on a miss.
+	UpdateTarget(ctx context.Context, id catalog.BackendID, endpoint, credentialsRef, egressPolicyRef string, updatedAt time.Time) (bool, error)
 }
 
 // ModelAliases persists the alias aggregate — the client-facing name and
@@ -72,7 +79,9 @@ type ModelAliases interface {
 	Create(ctx context.Context, alias *catalog.ModelAlias) error
 
 	// ByID returns the whole aggregate — the alias row and its candidates
-	// ordered by position — or ErrNotFound.
+	// ordered by position — or ErrNotFound. The parts each read as of their
+	// own committed statement; see the package comment on what that does and
+	// does not promise.
 	ByID(ctx context.Context, id catalog.AliasID) (*catalog.ModelAlias, error)
 
 	// Retire applies the one-way active → retired move, compare-and-swapped

@@ -223,7 +223,7 @@ func (f fakeBackends) TransitionState(ctx context.Context, id catalog.BackendID,
 	return true, nil
 }
 
-func (f fakeBackends) UpdateTarget(ctx context.Context, id catalog.BackendID, endpoint, credentialsRef, egressPolicyRef string, updatedAt time.Time) error {
+func (f fakeBackends) UpdateTarget(ctx context.Context, id catalog.BackendID, endpoint, credentialsRef, egressPolicyRef string, updatedAt time.Time) (bool, error) {
 	if !inCatalogTx(ctx) {
 		f.world.outsideTx++
 	}
@@ -232,8 +232,9 @@ func (f fakeBackends) UpdateTarget(ctx context.Context, id catalog.BackendID, en
 		backend.CredentialsRef = credentialsRef
 		backend.EgressPolicyRef = egressPolicyRef
 		backend.UpdatedAt = updatedAt
+		return true, nil
 	}
-	return nil
+	return false, nil // the port reports the miss, and so does the fake
 }
 
 // ---------------------------------------------------------------------------

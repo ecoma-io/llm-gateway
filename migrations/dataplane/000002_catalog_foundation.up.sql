@@ -74,10 +74,14 @@
 --     any row whose identity crosses a plane or reaches a client: group
 --     versions are referenced from the Control Plane's entitlements, alias
 --     and backend ids travel in usage facts);
---   * no ON DELETE CASCADE anywhere — the foreign keys below are RESTRICT on
---     purpose: a backend with candidates on file is not silently orphaned by
---     a delete this schema does not offer, and a version's snapshot does not
---     silently shrink.
+--   * no ON DELETE CASCADE anywhere — the foreign keys below say ON DELETE
+--     RESTRICT in so many words: a backend with candidates on file is not
+--     silently orphaned by a delete this schema does not offer, and a
+--     version's snapshot does not silently shrink. RESTRICT rather than the
+--     default NO ACTION is deliberate even though they behave identically
+--     while a constraint stays non-deferrable — the keyword pins the intent
+--     against a future deferrable conversion NO ACTION would silently
+--     reinterpret.
 --
 -- Two invariants the application owns rather than the schema, because a
 -- CHECK cannot see across tables: a non-wildcard group version has at least
@@ -181,13 +185,15 @@ CREATE TABLE model_candidates (
     id uuid PRIMARY KEY,
     alias_id uuid NOT NULL
         CONSTRAINT model_candidates_alias_id_fkey
-        REFERENCES model_aliases (id),
+        REFERENCES model_aliases (id)
+        ON DELETE RESTRICT,
     position integer NOT NULL
         CONSTRAINT model_candidates_position_valid
         CHECK (position >= 1),
     backend_id uuid NOT NULL
         CONSTRAINT model_candidates_backend_id_fkey
-        REFERENCES backends (id),
+        REFERENCES backends (id)
+        ON DELETE RESTRICT,
     provider_model text NOT NULL
         CONSTRAINT model_candidates_provider_model_length
         CHECK (char_length(provider_model) BETWEEN 1 AND 256),
@@ -257,10 +263,12 @@ COMMENT ON COLUMN alias_group_versions.version IS
 CREATE TABLE alias_group_members (
     group_version_id uuid NOT NULL
         CONSTRAINT alias_group_members_group_version_id_fkey
-        REFERENCES alias_group_versions (id),
+        REFERENCES alias_group_versions (id)
+        ON DELETE RESTRICT,
     alias_id uuid NOT NULL
         CONSTRAINT alias_group_members_alias_id_fkey
-        REFERENCES model_aliases (id),
+        REFERENCES model_aliases (id)
+        ON DELETE RESTRICT,
     CONSTRAINT alias_group_members_version_alias_key
         UNIQUE (group_version_id, alias_id)
 );

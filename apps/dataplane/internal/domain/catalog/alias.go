@@ -172,15 +172,19 @@ func (a *ModelAlias) Retire(now time.Time) error {
 }
 
 // assignCandidates validates a candidate list and returns it with positions
-// assigned 1..n in slice order and identities minted. It is the one place
-// the list's shape rules live, which is what makes NewAlias and
-// SetCandidates the same rule and not two.
+// assigned 1..n in slice order and identities minted. A caller may supply an
+// identity, and it is honored — but supplied identities are the caller's
+// uniqueness obligation, so two entries claiming one id are refused here,
+// where the list's shape rules live, rather than as a primary-key collision
+// one statement into the write. It is the one place those rules live, which
+// is what makes NewAlias and SetCandidates the same rule and not two.
 func assignCandidates(candidates []Candidate) ([]Candidate, error) {
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("catalog: assign candidates: %w: list is empty", ErrInvalidCandidates)
 	}
 	assigned := make([]Candidate, len(candidates))
 	seen := make(map[string]bool, len(candidates))
+	suppliedIDs := make(map[string]bool, len(candidates))
 	for i, c := range candidates {
 		if c.BackendID == "" {
 			return nil, fmt.Errorf("catalog: assign candidates: %w: candidate %d names no backend", ErrInvalidCandidates, i)
@@ -191,6 +195,12 @@ func assignCandidates(candidates []Candidate) ([]Candidate, error) {
 		}
 		if utf8.RuneCountInString(model) > maxProviderModelLen {
 			return nil, fmt.Errorf("catalog: assign candidates: %w: candidate %d provider model exceeds %d runes", ErrInvalidCandidates, i, maxProviderModelLen)
+		}
+		if c.ID != "" {
+			if suppliedIDs[string(c.ID)] {
+				return nil, fmt.Errorf("catalog: assign candidates: %w: candidate id %s listed twice", ErrInvalidCandidates, c.ID)
+			}
+			suppliedIDs[string(c.ID)] = true
 		}
 		key := string(c.BackendID) + "\x00" + model
 		if seen[key] {

@@ -233,8 +233,8 @@ func TestIntegrationBackendRoundTripCarriesOptionalRefs(t *testing.T) {
 	// A target move stamps the references on: the round trip must carry
 	// both out of their columns.
 	withRefs := catalogBackend(t, ctx, backends)
-	if err := backends.UpdateTarget(ctx, withRefs.ID, withRefs.Endpoint, "creds/main", "egress/main", time.Now()); err != nil {
-		t.Fatalf("UpdateTarget: %v", err)
+	if applied, err := backends.UpdateTarget(ctx, withRefs.ID, withRefs.Endpoint, "creds/main", "egress/main", time.Now()); err != nil || !applied {
+		t.Fatalf("UpdateTarget = %v, %v; want the move to land", applied, err)
 	}
 	got, err := backends.ByID(ctx, withRefs.ID)
 	if err != nil {
@@ -631,14 +631,17 @@ func TestIntegrationGroupVersionsRoundTripAndMonotonicHighest(t *testing.T) {
 // collision re-read in a fresh unit of work — the collision aborts the
 // transaction that hit it, which is why each attempt is its own unit.
 func openVersionRetry(ctx context.Context, store persistence.Store, versions persistence.AliasGroupVersions, group string, members []catalog.AliasID) (int, error) {
+	// The identity is minted once, outside the loop — the use case's exact
+	// shape. A lost attempt's unit of work rolls back before its row ever
+	// commits, so the id it did not spend is safe to spend on the retry.
+	id, err := catalog.NewGroupVersionID()
+	if err != nil {
+		return 0, err
+	}
 	for attempt := 0; attempt < 8; attempt++ {
 		var opened int
 		err := store.WithinTx(ctx, func(txCtx context.Context) error {
 			highest, err := versions.HighestVersion(txCtx, group)
-			if err != nil {
-				return err
-			}
-			id, err := catalog.NewGroupVersionID()
 			if err != nil {
 				return err
 			}

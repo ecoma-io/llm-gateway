@@ -160,13 +160,13 @@ func (r *backendRepo) TransitionState(ctx context.Context, id catalog.BackendID,
 	return rowsApplied(res, "transition backend", id)
 }
 
-func (r *backendRepo) UpdateTarget(ctx context.Context, id catalog.BackendID, endpoint, credentialsRef, egressPolicyRef string, updatedAt time.Time) error {
-	_, err := r.store.Querier(ctx).ExecContext(ctx, updateBackendTarget,
+func (r *backendRepo) UpdateTarget(ctx context.Context, id catalog.BackendID, endpoint, credentialsRef, egressPolicyRef string, updatedAt time.Time) (bool, error) {
+	res, err := r.store.Querier(ctx).ExecContext(ctx, updateBackendTarget,
 		string(id), endpoint, nullRef(credentialsRef), nullRef(egressPolicyRef), updatedAt)
 	if err != nil {
-		return fmt.Errorf("postgres: update backend %s target: %w", id, err)
+		return false, fmt.Errorf("postgres: update backend %s target: %w", id, err)
 	}
-	return nil
+	return rowsApplied(res, "update backend", id)
 }
 
 // ---------------------------------------------------------------------------

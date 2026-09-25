@@ -118,6 +118,7 @@ func TestCandidateListsAreRefusedBeforeAnyStatementRuns(t *testing.T) {
 		"blank backend":           {{BackendID: "", ProviderModel: "m"}},
 		"blank provider model":    {{BackendID: "b1", ProviderModel: "  "}},
 		"duplicate target":        {{BackendID: "b1", ProviderModel: "m"}, {BackendID: "b1", ProviderModel: "m"}},
+		"duplicate supplied ids":  {{ID: "c-1", BackendID: "b1", ProviderModel: "m"}, {ID: "c-1", BackendID: "b2", ProviderModel: "n"}},
 		"provider model too long": {{BackendID: "b1", ProviderModel: strings.Repeat("m", 257)}},
 		"overrides are an array":  {{BackendID: "b1", ProviderModel: "m", ParameterOverrides: json.RawMessage(`[1,2]`)}},
 		"overrides are not json":  {{BackendID: "b1", ProviderModel: "m", ParameterOverrides: json.RawMessage(`{oops`)}},

@@ -20,14 +20,15 @@ import (
 // overwriting a state its caller never saw. The loser of a swap re-reads and
 // re-applies from the state that actually exists.
 //
-// Nothing constructs this type yet, and no HTTP surface reaches it: B3 is the
-// foundation phase, and the management surface that will call these methods
-// is a later phase's contract change — an OpenAPI edit is explicitly out of
-// scope here. That is also why no method maps failures to application.Error
-// categories: the transport that owns that mapping does not exist yet, and
-// inventing its statuses ahead of it would be a shape guessed twice. Callers
-// match the domain's sentinels (errors.Is) and the persistence port's
-// ErrNotFound.
+// No production code constructs this type yet, and no HTTP surface reaches
+// it: B3 is the foundation phase, and the management surface that will call
+// these methods is a later phase's contract change — an OpenAPI edit is
+// explicitly out of scope here. (The test suite constructs it over fakes;
+// production wiring arrives with the runtime phase.) That is also why no
+// method maps failures to application.Error categories: the transport that
+// owns that mapping does not exist yet, and inventing its statuses ahead of
+// it would be a shape guessed twice. Callers match the domain's sentinels
+// (errors.Is) and the persistence port's ErrNotFound.
 //
 // What this layer deliberately does not do: resolve an alias to a route. A
 // request naming an alias is admitted against the aggregate's bounds and
@@ -136,7 +137,17 @@ func (c *Catalog) RetargetBackend(ctx context.Context, id catalog.BackendID, end
 		if err := backend.UpdateTarget(endpoint, credentialsRef, egressPolicyRef, time.Now()); err != nil {
 			return fmt.Errorf("application: retarget backend %s: %w", id, err)
 		}
-		return c.backends.UpdateTarget(txCtx, id, backend.Endpoint, backend.CredentialsRef, backend.EgressPolicyRef, backend.UpdatedAt)
+		applied, err := c.backends.UpdateTarget(txCtx, id, backend.Endpoint, backend.CredentialsRef, backend.EgressPolicyRef, backend.UpdatedAt)
+		if err != nil {
+			return fmt.Errorf("application: retarget backend %s: %w", id, err)
+		}
+		if !applied {
+			// Unreachable through this path — the read above would have missed
+			// first, and nothing deletes backends — but the port reports the
+			// miss and the use case carries it as one.
+			return fmt.Errorf("application: retarget backend %s: %w", id, persistence.ErrNotFound)
+		}
+		return nil
 	})
 }
 
@@ -212,7 +223,10 @@ func (c *Catalog) DefineAlias(ctx context.Context, name string, maxOutputTokens,
 }
 
 // Alias returns the whole aggregate — the alias row and its candidates in
-// fallback order.
+// fallback order. The parts read as of their own committed statements; a
+// caller that needs them pinned to one instant holds the unit of work (or
+// the runtime phase decides the snapshot question the port's package comment
+// records).
 func (c *Catalog) Alias(ctx context.Context, id catalog.AliasID) (*catalog.ModelAlias, error) {
 	alias, err := c.aliases.ByID(ctx, id)
 	if err != nil {
@@ -313,7 +327,12 @@ func (c *Catalog) reconcileAlias(ctx context.Context, id catalog.AliasID, apply 
 // uniqueness violation does not merely fail a statement, it aborts the
 // PostgreSQL transaction carrying it, so the losing attempt's unit of work
 // is over the moment it loses. Each attempt is therefore its own unit of
-// work; the loop lives outside. Two concurrent opens of the same group both
+// work; the loop lives outside. That guarantee holds while this use case
+// owns its units of work: a caller already inside a joined unit of work
+// turns the first lost race into that unit's abort — the violation kills the
+// caller's transaction and the retry re-joins it aborted. The wiring rule
+// for the phase that calls this: OpenGroupVersion runs outside any open unit
+// of work. Two concurrent opens of the same group both
 // succeed — one at n+1, one at n+2 — and both snapshots are real versions;
 // nothing about monotonicity asks that only one open win.
 func (c *Catalog) OpenGroupVersion(ctx context.Context, groupName string, members []catalog.AliasID) (*catalog.AliasGroupVersion, error) {

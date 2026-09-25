@@ -28,6 +28,15 @@ func TestNewBackendAcceptsAnHonestTarget(t *testing.T) {
 	if backend.CredentialsRef != "creds/main" {
 		t.Errorf("CredentialsRef = %q, want the trimmed reference", backend.CredentialsRef)
 	}
+	// An @ in the query is data, not userinfo: identity lives only before
+	// the host, and this shape must stay acceptable.
+	queryEndpoint := "https://api.example.com/v1?email=a@b.example"
+	atSign, err := NewBackend(id, "openai-compatible", queryEndpoint, "", "", now)
+	if err != nil {
+		t.Errorf("NewBackend(%q) returned error: %v", queryEndpoint, err)
+	} else if atSign.Endpoint != queryEndpoint {
+		t.Errorf("Endpoint = %q, want %q", atSign.Endpoint, queryEndpoint)
+	}
 	// Whitespace-only is absence after trimming: an empty reference is
 	// data, and a blank one is not a credential.
 	if backend.EgressPolicyRef != "" {
@@ -66,6 +75,9 @@ func TestNewBackendRefusesTargetsOutsideTheGrammars(t *testing.T) {
 		"short endpoint":       {map[string]string{"endpoint": "https://"}},
 		"wrong scheme":         {map[string]string{"endpoint": "ftp://api.example.com"}},
 		"no scheme":            {map[string]string{"endpoint": "api.example.com"}},
+		"userinfo endpoint":    {map[string]string{"endpoint": "https://user:pass@api.example.com"}},
+		"bare user endpoint":   {map[string]string{"endpoint": "https://relay@internal.example.com"}},
+		"unparsable endpoint":  {map[string]string{"endpoint": "https://api example.com"}},
 		"endpoint too long":    {map[string]string{"endpoint": "https://" + strings.Repeat("a", 2048)}},
 		"oversized credential": {map[string]string{}},
 	} {

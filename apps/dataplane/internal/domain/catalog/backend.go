@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -184,10 +185,16 @@ func validateAdapterType(adapterType string) error {
 }
 
 // validateEndpoint enforces the endpoint's shape: an http or https URL with
-// something after the scheme. The bar is deliberately low — the gateway does
-// not resolve the host here — because a URL that parses as text but points
-// nowhere fails at call time, where the retry and fallback machinery lives,
-// which is the right place for it to fail.
+// something after the scheme, and no embedded identity. The resolution bar
+// is deliberately low — the gateway does not resolve the host here — because
+// a URL that parses as text but points nowhere fails at call time, where the
+// retry and fallback machinery lives, which is the right place for it to
+// fail. Embedded identity is the one structural refusal: userinfo in the URL
+// is credential material smuggled into a field that travels everywhere the
+// backend does (usage facts, logs, the Console), and credentials have their
+// own reference — credentials_ref — so an endpoint carrying its own has no
+// rule governing where it leaks. A URL the standard parser rejects outright
+// is refused on the same grounds: no honest target is one no parser can read.
 func validateEndpoint(endpoint string) error {
 	const minLen = len("https://") + 1
 	if len(endpoint) < minLen || len(endpoint) > maxEndpointLen {
@@ -195,6 +202,13 @@ func validateEndpoint(endpoint string) error {
 	}
 	if !hasPrefix(endpoint, "http://") && !hasPrefix(endpoint, "https://") {
 		return fmt.Errorf("catalog: new backend: %w: endpoint is not an http(s) URL", ErrInvalidBackendTarget)
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("catalog: new backend: %w: endpoint does not parse as a URL", ErrInvalidBackendTarget)
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("catalog: new backend: %w: endpoint carries userinfo; credentials belong in the credentials reference", ErrInvalidBackendTarget)
 	}
 	return nil
 }
