@@ -37,8 +37,12 @@ package postgres
 //     being proved, and the truncate-boundary probe that states where the
 //     000006 append-only guard ends; since that migration the engine refuses
 //     the UPDATE and DELETE that once emptied a feed, and both go around it
-//     the way only a privileged role can) — mint a throwaway database instead
-//     and answer to nobody else's rows.
+//     the way only a privileged role can), and the surfaced-refusal
+//     vocabulary probe, whose widened failed rows are terminal state the
+//     fixture must never permanently hold — 000007's down migration refuses
+//     to re-narrow the constraint over a widened row by design, so the
+//     fixture stays a database a full roll-back can return to clean — mint a
+//     throwaway database instead and answer to nobody else's rows.
 
 import (
 	"bytes"
@@ -3415,8 +3419,19 @@ func TestIntegrationPublicationRaceSeedsExactlyOnce(t *testing.T) {
 // that names no attempt; a spelling outside the vocabulary is refused; and a
 // refusal row that names a committed attempt is refused by the pairing
 // constraint, exactly as gateway_abandoned always was.
+//
+// It runs on a throwaway database because of what its successful writes leave
+// behind: a failed row is terminal, so the widened-vocabulary rows this test
+// writes stay on file forever, and 000007's down migration refuses — by
+// design, its header says so — to re-narrow requests_failed_shape over any
+// widened row rather than silently reinterpret it. A widened row in the
+// shared fixture would therefore hold every future full roll-back hostage;
+// on a database of its own the rows live and die with the test, and the
+// fixture stays a database the persistence pipeline can roll back to clean.
 func TestIntegrationSurfacedRefusalVocabularyWritesAndRefuses(t *testing.T) {
-	db, store := integrationPool(t)
+	integrationThrowawaySerialise(t)
+	db := integrationThrowawayDatabase(t, "dataplane_b9_vocabulary_probe")
+	store := New(db)
 	repos := integrationRepos(t, store)
 	integrationRuntimeSchema(t, db)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
