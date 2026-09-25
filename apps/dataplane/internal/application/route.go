@@ -21,7 +21,8 @@ import (
 // mixes with neither. Admission's decision is final when it arrives here: the
 // hold is open, the request row is executing, the replay record is watching.
 // Execution's detail is invisible from here: a candidate is one Executor
-// call, whose retries are the adapter's own judgment about its provider.
+// call, and one call is all an executor ever makes (ADR 0002, as amended) —
+// what a failure earns next is this stage's disposition of its class.
 //
 // The walk is the whole policy. Eligibility keeps the catalog's order and
 // drops what cannot serve — a disabled backend, an unregistered executor — so
@@ -370,10 +371,10 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 
 // attemptRow forms one finished call's row. Candidate position counts from
 // zero on the row and from one in the catalog — the walk's first try is the
-// catalog's position 1 — and the retry sequence is always zero: retries
-// inside one candidate are the executor's judgment about its provider, and a
-// router retry of the same candidate would only repeat a failure the catalog
-// forbids listing twice.
+// catalog's position 1 — and the retry sequence is always zero: an executor
+// makes exactly one call per candidate (ADR 0002, as amended), so the column
+// is reserved, not merely unused — a recorded-retry design would have to
+// reopen the attempt schema first.
 func (r *ChatRouting) attemptRow(
 	admitted *Admission,
 	candidate catalog.Candidate,
