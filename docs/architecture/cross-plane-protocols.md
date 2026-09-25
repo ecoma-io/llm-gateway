@@ -580,7 +580,13 @@ reader over it — the postgres adapter's `UsageFacts`
 - **The settlement consumer loop.** Nothing schedules the replay: there is no
   worker, no ticker and no background process. The loop that calls the ingestion
   use case belongs to the pull the schema PR builds, beside the table the cursor
-  is stored in.
+  is stored in. What B6 did land is the side the loop will call: the
+  settlement of record, its consume and release legs and the bucket moves they
+  name ([accounting](accounting.md)) — a primitive with no caller yet. What the
+  loop needs from the fact feed is the open defect of
+  [issue #63](https://github.com/ecoma-io/llm-gateway/issues/63) (the
+  settlement-relevant columns and price provenance the current contract does
+  not carry), so B12 is blocked on that rather than on the ledger.
 - **mTLS or signed service credentials.** The mechanism today is a shared secret
   per hop, and either replacement proves the same identity cryptographically
   without changing application semantics (ADR 0006 §9).

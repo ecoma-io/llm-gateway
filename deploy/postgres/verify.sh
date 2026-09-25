@@ -14,9 +14,9 @@
 # database — the Data Plane's proofs run the fuller pipeline (apply,
 # validate, fail, recover); the Control Plane's run apply, re-apply and full
 # rollback on their lane, whose identity step additionally exercises the
-# identity schema's own rules at the SQL level — a constraint that has never
-# refused a row is a comment, not a constraint — and each lane then proves
-# the other plane's database untouched.
+# identity, commerce and accounting schemas' own rules at the SQL level — a
+# constraint that has never refused a row is a comment, not a constraint —
+# and each lane then proves the other plane's database untouched.
 #
 # The proofs, in order:
 #   1. both lanes' directories hold exactly what the runner will read —
@@ -29,14 +29,18 @@
 #      dirty;
 #   6. re-applying is a no-op, not an error;
 #   7. the Control Plane's lane applies into its own database — the
-#      ownership namespace with the identity schema inside it, re-applied as
-#      a no-op — and the two lanes are two databases: no history and no
-#      schema crosses the boundary, and one fixture credential opens both;
-#   8. the Control Plane's identity schema enforces its rules: lifecycle
-#      states, the live-email uniqueness and its re-invite exception, the
-#      revocation/state pairing, the token prefix grammar and its binding to
-#      the key's own id, and every foreign key including the creator edge's
-#      same-account rule;
+#      ownership namespace with the identity, commerce, projection and
+#      accounting schemas inside it, re-applied as a no-op — and the two
+#      lanes are two databases: no history and no schema crosses the
+#      boundary, and one fixture credential opens both;
+#   8. the Control Plane's schemas enforce their own rules: identity
+#      lifecycle states, the live-email uniqueness and its re-invite
+#      exception, the revocation/state pairing, the token prefix grammar and
+#      its binding to the key's own id, every foreign key including the
+#      creator edge's same-account rule, the funding buckets' owner
+#      exclusivity and balance projection, the ledger's per-kind algebra and
+#      idempotency keys, and the append-only, write-once, owner-match and
+#      leg-provenance triggers;
 #   9. PostgreSQL transaction semantics hold (rolled-back work leaves
 #      nothing behind, committed work survives);
 #  10. a migration that fails mid-file rolls back whole, records its target
@@ -489,11 +493,11 @@ assert_equals "the ownership namespace exists in the Control Plane's database" \
 assert_equals "the namespace carries the ownership comment, byte for byte" \
 	"$(psql_scalar "$control_db" "SELECT obj_description('$control_db'::regnamespace, 'pg_namespace')")" \
 	"Control Plane ownership namespace (ADR 0006 §7); owned by apps/console-api."
-assert_equals "the namespace holds exactly the identity, commerce and projection schemas' thirteen tables" \
-	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "13"
-assert_equals "the control tables are the identity, commerce and projection foundations' set" \
+assert_equals "the namespace holds exactly the identity, commerce, projection and accounting schemas' sixteen tables" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "16"
+assert_equals "the control tables are the identity, commerce, projection and accounting foundations' set" \
 	"$(psql_scalar "$control_db" "SELECT string_agg(tablename, ',' ORDER BY tablename COLLATE \"C\") FROM pg_tables WHERE schemaname = 'control'")" \
-	"account_payg,accounts,api_keys,entitlements,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,subscriptions,users"
+	"account_payg,accounts,api_keys,entitlements,funding_buckets,ledger_entries,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,settlements,subscriptions,users"
 assert_equals "the projection counter is a seeded singleton with a timeline epoch" \
 	"$(psql_scalar "$control_db" "SELECT count(*) FROM control.projection_revision WHERE id = 1 AND last_revision = (SELECT count(*) FROM control.accounts) AND epoch IS NOT NULL")" \
 	"1"
@@ -1113,6 +1117,463 @@ WITH account AS (
 INSERT INTO control.account_payg (account_id, enabled, funding_bucket_id, created_at, updated_at)
 SELECT id, true, 'b8000000-0000-4000-8000-0000000000b1', now(), now() FROM account"
 
+# The accounting half of the step, in the same voice: the funding buckets,
+# the settlements of record and the ledger legs enforce ADR 0004's rules at
+# the SQL level — the owner exclusivity, the projection equality and the
+# non-negative balances it makes transitive, the leg algebra that pins every
+# kind's deltas, the price provenance consume carries alone, the idempotency
+# keys, and the append-only, write-once, owner-match and leg-provenance
+# guards that make the promises structural rather than disciplined. The
+# probe ids carry fresh prefixes
+# (b9 buckets, c9 legs, d9 settlements, f9 reservations) in the v7 group the
+# accounting tables themselves demand, and every leg probe seeds its bucket
+# as an account-owned row — the cheapest owner a foreign key accepts.
+expect_constraint_failure "a bucket with no owner at all is refused" funding_buckets_owner_xor "
+INSERT INTO control.funding_buckets (id, entitlement_id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+VALUES ('b9000000-0000-7000-8000-0000000000b1', NULL, NULL, 'active', 0, 0, 0, 0, 0, now(), now())"
+
+expect_constraint_failure "a bucket owned by both an entitlement and an account is refused" funding_buckets_owner_xor "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), plan AS (
+  INSERT INTO control.plans (id, name, created_at)
+  VALUES ('b2000000-0000-7000-8000-0000000000b1', 'verify probe', now())
+  RETURNING id
+), version AS (
+  INSERT INTO control.plan_versions (id, plan_id, version_number, period, recurring_price_minor_units, state, published_at, retired_at, created_at, updated_at)
+  SELECT 'b3000000-0000-7000-8000-0000000000b1', id, 1, 'calendar_month', 4900, 'published', now(), NULL, now(), now() FROM plan
+  RETURNING id
+), definition AS (
+  INSERT INTO control.plan_grant_definitions (id, plan_version_id, alias_group_name, dimension, granted_amount, created_at)
+  SELECT 'b4000000-0000-7000-8000-0000000000b1', id, 'anthropic', 'cost', 100, now() FROM version
+  RETURNING id
+), subscription AS (
+  INSERT INTO control.subscriptions (id, account_id, plan_version_id, state, start_at, renewal_enabled, cancel_at, cancellation_mode, cycle_number, period_start, period_end, created_at, updated_at)
+  SELECT 'b5000000-0000-7000-8000-0000000000b1', account.id, version.id, 'active', now(), true, NULL, NULL, 1, now(), now() + interval '1 month', now(), now() FROM account, version
+  RETURNING id
+), entitlement AS (
+  INSERT INTO control.entitlements (id, subscription_id, cycle_number, grant_definition_id, alias_group_version_id, dimension, granted_amount, state, period_start, period_end, created_at, updated_at)
+  SELECT 'b6000000-0000-7000-8000-0000000000b1', subscription.id, 1, definition.id, 'b7000000-0000-7000-8000-0000000000b1', 'cost', 100, 'active', now(), now() + interval '1 month', now(), now() FROM subscription, definition
+  RETURNING id
+)
+INSERT INTO control.funding_buckets (id, entitlement_id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+SELECT 'b9000000-0000-7000-8000-0000000000b1', entitlement.id, account.id, 'active', 0, 0, 0, 0, 0, now(), now() FROM entitlement, account"
+
+expect_constraint_failure "a bucket whose available balance contradicts its projection is refused" funding_buckets_balance_projection "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+)
+INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 0, 0, 100, 0, 50, now(), now() FROM account"
+
+expect_constraint_failure "a bucket with a negative held balance is refused" funding_buckets_balance_projection "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+)
+INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 0, 0, 0, -10, 10, now(), now() FROM account"
+
+expect_constraint_failure "a bucket outside its lifecycle is refused" funding_buckets_status_valid "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+)
+INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'frozen', 0, 0, 0, 0, 0, now(), now() FROM account"
+
+expect_constraint_failure "a bucket id outside the v7 grammar is refused" funding_buckets_id_uuid_v7 "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+)
+INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+SELECT 'b9000000-0000-4000-8000-0000000000b1', id, 'active', 0, 0, 0, 0, 0, now(), now() FROM account"
+
+expect_constraint_failure "a bucket for an ungranted entitlement is refused" funding_buckets_entitlement_id_fkey "
+INSERT INTO control.funding_buckets (id, entitlement_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+VALUES ('b9000000-0000-7000-8000-0000000000b1', 'b6000000-0000-7000-8000-0000000000b1', 'active', 0, 0, 0, 0, 0, now(), now())"
+
+expect_constraint_failure "a second bucket for one entitlement is refused" funding_buckets_entitlement_id_key "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), plan AS (
+  INSERT INTO control.plans (id, name, created_at)
+  VALUES ('b2000000-0000-7000-8000-0000000000b1', 'verify probe', now())
+  RETURNING id
+), version AS (
+  INSERT INTO control.plan_versions (id, plan_id, version_number, period, recurring_price_minor_units, state, published_at, retired_at, created_at, updated_at)
+  SELECT 'b3000000-0000-7000-8000-0000000000b1', id, 1, 'calendar_month', 4900, 'published', now(), NULL, now(), now() FROM plan
+  RETURNING id
+), definition AS (
+  INSERT INTO control.plan_grant_definitions (id, plan_version_id, alias_group_name, dimension, granted_amount, created_at)
+  SELECT 'b4000000-0000-7000-8000-0000000000b1', id, 'anthropic', 'cost', 100, now() FROM version
+  RETURNING id
+), subscription AS (
+  INSERT INTO control.subscriptions (id, account_id, plan_version_id, state, start_at, renewal_enabled, cancel_at, cancellation_mode, cycle_number, period_start, period_end, created_at, updated_at)
+  SELECT 'b5000000-0000-7000-8000-0000000000b1', account.id, version.id, 'active', now(), true, NULL, NULL, 1, now(), now() + interval '1 month', now(), now() FROM account, version
+  RETURNING id
+), entitlement AS (
+  INSERT INTO control.entitlements (id, subscription_id, cycle_number, grant_definition_id, alias_group_version_id, dimension, granted_amount, state, period_start, period_end, created_at, updated_at)
+  SELECT 'b6000000-0000-7000-8000-0000000000b1', subscription.id, 1, definition.id, 'b7000000-0000-7000-8000-0000000000b1', 'cost', 100, 'active', now(), now() + interval '1 month', now(), now() FROM subscription, definition
+  RETURNING id
+), first_bucket AS (
+  INSERT INTO control.funding_buckets (id, entitlement_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 0, 0, 0, 0, 0, now(), now() FROM entitlement
+  RETURNING entitlement_id
+)
+INSERT INTO control.funding_buckets (id, entitlement_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+SELECT 'b9000000-0000-7000-8000-0000000000b2', entitlement_id, 'active', 0, 0, 0, 0, 0, now(), now() FROM first_bucket"
+
+expect_constraint_failure "a second bucket for one account is refused" funding_buckets_account_id_key "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), first_bucket AS (
+  INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 0, 0, 0, 0, 0, now(), now() FROM account
+  RETURNING account_id
+)
+INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+SELECT 'b9000000-0000-7000-8000-0000000000b2', account_id, 'active', 0, 0, 0, 0, 0, now(), now() FROM first_bucket"
+
+expect_constraint_failure "a settlement request id outside the grammar is refused" settlements_request_id_grammar "
+INSERT INTO control.settlements (id, request_id, settled_total, created_at)
+VALUES ('d9000000-0000-7000-8000-0000000000d1', repeat('a', 300), 0, now())"
+
+expect_constraint_failure "a second settlement for one request is refused" settlements_request_id_key "
+WITH first AS (
+  INSERT INTO control.settlements (id, request_id, settled_total, created_at)
+  VALUES ('d9000000-0000-7000-8000-0000000000d1', 'verify probe request', 100, now())
+  RETURNING request_id
+)
+INSERT INTO control.settlements (id, request_id, settled_total, created_at)
+SELECT 'd9000000-0000-7000-8000-0000000000d2', request_id, 100, now() FROM first"
+
+expect_constraint_failure "a negative settled total is refused" settlements_settled_total_nonnegative "
+INSERT INTO control.settlements (id, request_id, settled_total, created_at)
+VALUES ('d9000000-0000-7000-8000-0000000000d1', 'verify probe request', -1, now())"
+
+expect_constraint_failure "a leg whose deltas contradict its kind is refused" ledger_entries_leg_algebra "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), bucket AS (
+  INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 1, 1, 100, 0, 100, now(), now() FROM account
+  RETURNING id
+)
+-- A grant whose deltas read as a hold: the leg algebra exists precisely to
+-- stop a caller from filing one movement's deltas under another kind's name.
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, sequence, created_at)
+SELECT 'c9000000-0000-7000-8000-0000000000c1', id, 'grant', 100, 0, 100, 1, now() FROM bucket"
+
+expect_constraint_failure "a leg that consumes without its price snapshot is refused" ledger_entries_price_snapshot "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), bucket AS (
+  INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 1, 1, 100, 40, 60, now(), now() FROM account
+  RETURNING id
+), settlement AS (
+  INSERT INTO control.settlements (id, request_id, settled_total, created_at)
+  VALUES ('d9000000-0000-7000-8000-0000000000d1', 'verify probe request', 30, now())
+  RETURNING id
+)
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, settlement_id, sequence, created_at)
+SELECT 'c9000000-0000-7000-8000-0000000000c1', bucket.id, 'consume', 30, -30, -30, settlement.id, 1, now() FROM bucket, settlement"
+
+expect_constraint_failure "a non-consuming leg carrying a price snapshot is refused" ledger_entries_price_snapshot "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), bucket AS (
+  INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 0, 0, 0, 0, 0, now(), now() FROM account
+  RETURNING id
+)
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, command_key, price_revision_id, input_unit_price, output_unit_price, sequence, created_at)
+SELECT 'c9000000-0000-7000-8000-0000000000c1', id, 'topup', 100, 100, 0, 'verify probe key', 'verify probe revision', 1, 2, 1, now() FROM bucket"
+
+expect_constraint_failure "a hold without its reservation is refused" ledger_entries_reference_shape "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), bucket AS (
+  INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 0, 0, 100, 0, 100, now(), now() FROM account
+  RETURNING id
+)
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, reservation_id, sequence, created_at)
+SELECT 'c9000000-0000-7000-8000-0000000000c1', id, 'hold', 40, 0, 40, NULL, 1, now() FROM bucket"
+
+expect_constraint_failure "a consume without its settlement is refused" ledger_entries_reference_shape "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), bucket AS (
+  INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 1, 1, 100, 40, 60, now(), now() FROM account
+  RETURNING id
+)
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, price_revision_id, input_unit_price, output_unit_price, sequence, created_at)
+SELECT 'c9000000-0000-7000-8000-0000000000c1', id, 'consume', 30, -30, -30, 'verify probe revision', 1, 2, 1, now() FROM bucket"
+
+expect_constraint_failure "a topup without its command key is refused" ledger_entries_command_key_scope "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), bucket AS (
+  INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 0, 0, 0, 0, 0, now(), now() FROM account
+  RETURNING id
+)
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, command_key, sequence, created_at)
+SELECT 'c9000000-0000-7000-8000-0000000000c1', id, 'topup', 100, 100, 0, NULL, 1, now() FROM bucket"
+
+expect_constraint_failure "a hold carrying a command key is refused" ledger_entries_command_key_scope "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), bucket AS (
+  INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 0, 0, 100, 0, 100, now(), now() FROM account
+  RETURNING id
+)
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, reservation_id, command_key, sequence, created_at)
+SELECT 'c9000000-0000-7000-8000-0000000000c1', id, 'hold', 40, 0, 40, 'f9000000-0000-4000-8000-0000000000f1', 'verify probe key', 1, now() FROM bucket"
+
+expect_constraint_failure "an adjustment without a stated reason is refused" ledger_entries_adjustment_shape "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), bucket AS (
+  INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 1, 1, 100, 0, 100, now(), now() FROM account
+  RETURNING id
+), original AS (
+  INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, sequence, created_at)
+  SELECT 'c9000000-0000-7000-8000-0000000000c1', bucket.id, 'grant', 100, 100, 0, 1, now() FROM bucket
+  RETURNING id, funding_bucket_id
+)
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, original_entry_id, operator_id, sequence, created_at)
+SELECT 'c9000000-0000-7000-8000-0000000000c2', original.funding_bucket_id, 'adjustment', 10, -10, 0, original.id, 'verify operator', 2, now() FROM original"
+
+expect_constraint_failure "a leg under an unknown bucket is refused" ledger_entries_funding_bucket_id_fkey "
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, sequence, created_at)
+VALUES ('c9000000-0000-7000-8000-0000000000c1', 'b9000000-0000-7000-8000-0000000000b1', 'grant', 100, 100, 0, 1, now())"
+
+expect_constraint_failure "a second leg at one bucket sequence is refused" ledger_entries_bucket_sequence_key "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), bucket AS (
+  INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 1, 1, 100, 0, 100, now(), now() FROM account
+  RETURNING id
+), first_leg AS (
+  INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, sequence, created_at)
+  SELECT 'c9000000-0000-7000-8000-0000000000c1', id, 'grant', 100, 100, 0, 1, now() FROM bucket
+  RETURNING funding_bucket_id, sequence
+)
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, command_key, sequence, created_at)
+SELECT 'c9000000-0000-7000-8000-0000000000c2', funding_bucket_id, 'topup', 50, 50, 0, 'verify probe second key', sequence, now() FROM first_leg"
+
+expect_constraint_failure "a second leg under one command key is refused" ledger_entries_bucket_command_key "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), bucket AS (
+  INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 1, 1, 100, 0, 100, now(), now() FROM account
+  RETURNING id
+), first_leg AS (
+  INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, command_key, sequence, created_at)
+  SELECT 'c9000000-0000-7000-8000-0000000000c1', id, 'topup', 100, 100, 0, 'verify probe key', 1, now() FROM bucket
+  RETURNING funding_bucket_id, command_key
+)
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, command_key, sequence, created_at)
+SELECT 'c9000000-0000-7000-8000-0000000000c2', funding_bucket_id, 'topup', 50, 50, 0, command_key, 2, now() FROM first_leg"
+
+expect_constraint_failure "a second hold for one reservation and bucket is refused" ledger_entries_reservation_bucket_kind "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), bucket AS (
+  INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 1, 1, 100, 0, 100, now(), now() FROM account
+  RETURNING id
+), first_hold AS (
+  INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, reservation_id, sequence, created_at)
+  SELECT 'c9000000-0000-7000-8000-0000000000c1', id, 'hold', 40, 0, 40, 'f9000000-0000-4000-8000-0000000000f1', 1, now() FROM bucket
+  RETURNING funding_bucket_id, reservation_id, kind
+)
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, reservation_id, sequence, created_at)
+SELECT 'c9000000-0000-7000-8000-0000000000c2', funding_bucket_id, 'hold', 20, 0, 20, reservation_id, 2, now() FROM first_hold"
+
+expect_constraint_failure "a second consume for one settlement and bucket is refused" ledger_entries_settlement_bucket_kind "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), bucket AS (
+  INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b1', id, 'active', 1, 1, 100, 40, 60, now(), now() FROM account
+  RETURNING id
+), settlement AS (
+  INSERT INTO control.settlements (id, request_id, settled_total, created_at)
+  VALUES ('d9000000-0000-7000-8000-0000000000d1', 'verify probe request', 30, now())
+  RETURNING id
+), first_consume AS (
+  INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, settlement_id, price_revision_id, input_unit_price, output_unit_price, sequence, created_at)
+  SELECT 'c9000000-0000-7000-8000-0000000000c1', bucket.id, 'consume', 30, -30, -30, settlement.id, 'verify probe revision', 1, 2, 1, now() FROM bucket, settlement
+  RETURNING funding_bucket_id, settlement_id, kind
+)
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, settlement_id, price_revision_id, input_unit_price, output_unit_price, sequence, created_at)
+SELECT 'c9000000-0000-7000-8000-0000000000c2', funding_bucket_id, 'consume', 10, -10, -10, settlement_id, 'verify probe revision', 1, 2, 2, now() FROM first_consume"
+
+expect_constraint_failure "a PAYG row pointing at an unknown bucket is refused" account_payg_funding_bucket_fkey "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+)
+INSERT INTO control.account_payg (account_id, enabled, funding_bucket_id, created_at, updated_at)
+SELECT id, true, 'b9000000-0000-7000-8000-0000000000b9', now(), now() FROM account"
+
+expect_constraint_failure "an UPDATE of the ledger is refused" "ledger_entries is append-only" "
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now());
+INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+VALUES ('b9000000-0000-7000-8000-0000000000b1', 'a0000000-0000-4000-8000-0000000000a1', 'active', 1, 1, 100, 0, 100, now(), now());
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, sequence, created_at)
+VALUES ('c9000000-0000-7000-8000-0000000000c1', 'b9000000-0000-7000-8000-0000000000b1', 'grant', 100, 100, 0, 1, now());
+UPDATE control.ledger_entries SET amount = 200 WHERE id = 'c9000000-0000-7000-8000-0000000000c1'"
+
+expect_constraint_failure "a DELETE from the ledger is refused" "ledger_entries is append-only" "
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now());
+INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+VALUES ('b9000000-0000-7000-8000-0000000000b1', 'a0000000-0000-4000-8000-0000000000a1', 'active', 1, 1, 100, 0, 100, now(), now());
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, sequence, created_at)
+VALUES ('c9000000-0000-7000-8000-0000000000c1', 'b9000000-0000-7000-8000-0000000000b1', 'grant', 100, 100, 0, 1, now());
+DELETE FROM control.ledger_entries WHERE id = 'c9000000-0000-7000-8000-0000000000c1'"
+
+expect_constraint_failure "an UPDATE of a settlement is refused" "settlements is append-only" "
+INSERT INTO control.settlements (id, request_id, settled_total, created_at)
+VALUES ('d9000000-0000-7000-8000-0000000000d1', 'verify probe request', 100, now());
+UPDATE control.settlements SET settled_total = 200 WHERE id = 'd9000000-0000-7000-8000-0000000000d1'"
+
+expect_constraint_failure "a DELETE of a settlement is refused" "settlements is append-only" "
+INSERT INTO control.settlements (id, request_id, settled_total, created_at)
+VALUES ('d9000000-0000-7000-8000-0000000000d1', 'verify probe request', 100, now());
+DELETE FROM control.settlements WHERE id = 'd9000000-0000-7000-8000-0000000000d1'"
+
+# The provenance guards on the ledger's INSERT path: a release returns the
+# named reservation's hold, so that hold must be on file for the same
+# bucket, and a correction cites its own bucket's leg. Both echo the
+# conditions the ledger adapter's statements carry — these probes are the
+# same promises for writers that skip the echo.
+expect_constraint_failure "a release naming a reservation with no hold on file is refused" "has no hold leg on file here" "
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now());
+INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+VALUES ('b9000000-0000-7000-8000-0000000000b1', 'a0000000-0000-4000-8000-0000000000a1', 'active', 1, 2, 100, 0, 100, now(), now());
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, sequence, created_at)
+VALUES ('c9000000-0000-7000-8000-0000000000c1', 'b9000000-0000-7000-8000-0000000000b1', 'grant', 100, 100, 0, 1, now());
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, reservation_id, sequence, created_at)
+VALUES ('c9000000-0000-7000-8000-0000000000c2', 'b9000000-0000-7000-8000-0000000000b1', 'release', 40, 0, -40, 'f9000000-0000-4000-8000-0000000000f1', 2, now())"
+
+expect_constraint_failure "an adjustment citing another bucket's entry is refused" "is not this bucket's" "
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now()),
+       ('a0000000-0000-4000-8000-0000000000a2', 'verify probe other', 'active', now(), now());
+INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+VALUES ('b9000000-0000-7000-8000-0000000000b1', 'a0000000-0000-4000-8000-0000000000a1', 'active', 0, 0, 0, 0, 0, now(), now()),
+       ('b9000000-0000-7000-8000-0000000000b2', 'a0000000-0000-4000-8000-0000000000a2', 'active', 1, 1, 100, 0, 100, now(), now());
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, sequence, created_at)
+VALUES ('c9000000-0000-7000-8000-0000000000c1', 'b9000000-0000-7000-8000-0000000000b2', 'grant', 100, 100, 0, 1, now());
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, adjustment_reason, original_entry_id, operator_id, sequence, created_at)
+VALUES ('c9000000-0000-7000-8000-0000000000c2', 'b9000000-0000-7000-8000-0000000000b1', 'adjustment', 10, -10, 0, 'mispost correction', 'c9000000-0000-7000-8000-0000000000c1', 'ops-1', 1, now())"
+
+# The re-point and the delete are plain statements against a row the probe
+# seeds first, not one UPDATE driven from a data-modifying CTE: a CTE's
+# inserted rows are invisible to the UPDATE's own scan (UPDATE 0 is not a
+# refusal), and a probe that proves nothing is worse than no probe.
+expect_constraint_failure "a re-point of a filed PAYG bucket reference is refused" "funding_bucket_id is write-once: re-pointing" "
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now());
+INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+VALUES ('b9000000-0000-7000-8000-0000000000b1', 'a0000000-0000-4000-8000-0000000000a1', 'active', 0, 0, 0, 0, 0, now(), now());
+INSERT INTO control.account_payg (account_id, enabled, funding_bucket_id, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', true, 'b9000000-0000-7000-8000-0000000000b1', now(), now());
+UPDATE control.account_payg SET funding_bucket_id = 'b9000000-0000-7000-8000-0000000000b3'
+WHERE account_id = 'a0000000-0000-4000-8000-0000000000a1'"
+
+expect_constraint_failure "a DELETE of a referenced PAYG bucket edge is refused" "funding_bucket_id is write-once: deleting" "
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now());
+INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+VALUES ('b9000000-0000-7000-8000-0000000000b1', 'a0000000-0000-4000-8000-0000000000a1', 'active', 0, 0, 0, 0, 0, now(), now());
+INSERT INTO control.account_payg (account_id, enabled, funding_bucket_id, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', true, 'b9000000-0000-7000-8000-0000000000b1', now(), now());
+DELETE FROM control.account_payg WHERE account_id = 'a0000000-0000-4000-8000-0000000000a1'"
+
+# The edge's owner half: a filed reference names the PAYG row's own
+# account's bucket. The owner trigger passes unknown buckets through to the
+# foreign key and non-v7 values through to the grammar's CHECK — each guard
+# speaks for the violation that is its own — so these probes point at real
+# buckets with the wrong owner: another account's, and an entitlement
+# cycle's, which belongs to no account at all.
+expect_constraint_failure "a PAYG bucket reference to another account's bucket is refused" "must name a bucket owned by the PAYG row's account" "
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now()),
+       ('a0000000-0000-4000-8000-0000000000a2', 'verify probe other', 'active', now(), now());
+INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+VALUES ('b9000000-0000-7000-8000-0000000000b1', 'a0000000-0000-4000-8000-0000000000a2', 'active', 0, 0, 0, 0, 0, now(), now());
+INSERT INTO control.account_payg (account_id, enabled, funding_bucket_id, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', true, 'b9000000-0000-7000-8000-0000000000b1', now(), now())"
+
+expect_constraint_failure "a PAYG bucket reference to an entitlement's cycle bucket is refused" "must name a bucket owned by the PAYG row's account" "
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now());
+INSERT INTO control.plans (id, name, created_at)
+VALUES ('b2000000-0000-7000-8000-0000000000b1', 'verify probe', now());
+INSERT INTO control.plan_versions (id, plan_id, version_number, period, recurring_price_minor_units, state, published_at, retired_at, created_at, updated_at)
+VALUES ('b3000000-0000-7000-8000-0000000000b1', 'b2000000-0000-7000-8000-0000000000b1', 1, 'calendar_month', 4900, 'published', now(), NULL, now(), now());
+INSERT INTO control.plan_grant_definitions (id, plan_version_id, alias_group_name, dimension, granted_amount, created_at)
+VALUES ('b4000000-0000-7000-8000-0000000000b1', 'b3000000-0000-7000-8000-0000000000b1', 'anthropic', 'cost', 100, now());
+INSERT INTO control.subscriptions (id, account_id, plan_version_id, state, start_at, renewal_enabled, cancel_at, cancellation_mode, cycle_number, period_start, period_end, created_at, updated_at)
+VALUES ('b5000000-0000-7000-8000-0000000000b1', 'a0000000-0000-4000-8000-0000000000a1', 'b3000000-0000-7000-8000-0000000000b1', 'active', now(), true, NULL, NULL, 1, now(), now() + interval '1 month', now(), now());
+INSERT INTO control.entitlements (id, subscription_id, cycle_number, grant_definition_id, alias_group_version_id, dimension, granted_amount, state, period_start, period_end, created_at, updated_at)
+VALUES ('b6000000-0000-7000-8000-0000000000b1', 'b5000000-0000-7000-8000-0000000000b1', 1, 'b4000000-0000-7000-8000-0000000000b1', 'b7000000-0000-7000-8000-0000000000b1', 'cost', 100, 'active', now(), now() + interval '1 month', now(), now());
+INSERT INTO control.funding_buckets (id, entitlement_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+VALUES ('b9000000-0000-7000-8000-0000000000b1', 'b6000000-0000-7000-8000-0000000000b1', 'active', 0, 0, 0, 0, 0, now(), now());
+INSERT INTO control.account_payg (account_id, enabled, funding_bucket_id, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', true, 'b9000000-0000-7000-8000-0000000000b1', now(), now())"
+
 # The projection foundation's half of the step, in the same voice: the change
 # log, the materialized mirrors and the counter singleton, each rule a
 # refusal that names its constraint. Revisions here sit far past the
@@ -1182,8 +1643,11 @@ VALUES (2, false, 0, NULL)"
 
 # The positive proof of the whole chain, in one rolled-back transaction:
 # account -> plan -> published version -> grant definition -> active
-# subscription with its first cycle -> its entitlement -> its PAYG flag.
-assert_equals "a well-formed commerce chain all inserts" \
+# subscription with its first cycle -> its entitlement -> the funding bucket
+# that entitlement owns -> that bucket's four ledger legs (grant, hold,
+# consume under a settlement, release) at explicit sequences -> the
+# account-owned PAYG bucket the account's PAYG flag references.
+assert_equals "a well-formed commerce and accounting chain all inserts" \
 	"$(psql_scalar "$control_db" "
 BEGIN;
 INSERT INTO control.accounts (id, name, state, created_at, updated_at)
@@ -1198,15 +1662,41 @@ INSERT INTO control.subscriptions (id, account_id, plan_version_id, state, start
 VALUES ('b5000000-0000-7000-8000-0000000000b1', 'a0000000-0000-4000-8000-0000000000a1', 'b3000000-0000-7000-8000-0000000000b1', 'active', now(), true, NULL, NULL, 1, now(), now() + interval '1 month', now(), now());
 INSERT INTO control.entitlements (id, subscription_id, cycle_number, grant_definition_id, alias_group_version_id, dimension, granted_amount, state, period_start, period_end, created_at, updated_at)
 VALUES ('b6000000-0000-7000-8000-0000000000b1', 'b5000000-0000-7000-8000-0000000000b1', 1, 'b4000000-0000-7000-8000-0000000000b1', 'b7000000-0000-7000-8000-0000000000b1', 'cost', 100, 'active', now(), now() + interval '1 month', now(), now());
+-- The entitlement's funding bucket, cached at exactly the balances the four
+-- legs below imply: 100 granted, 40 held, 30 consumed off the hold, the last
+-- 10 released back — settled 70, held 0, available 70, four legs filed.
+INSERT INTO control.funding_buckets (id, entitlement_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+VALUES ('b9000000-0000-7000-8000-0000000000b1', 'b6000000-0000-7000-8000-0000000000b1', 'active', 4, 4, 70, 0, 70, now(), now());
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, sequence, created_at)
+VALUES ('c9000000-0000-7000-8000-0000000000c1', 'b9000000-0000-7000-8000-0000000000b1', 'grant', 100, 100, 0, 1, now());
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, reservation_id, sequence, created_at)
+VALUES ('c9000000-0000-7000-8000-0000000000c2', 'b9000000-0000-7000-8000-0000000000b1', 'hold', 40, 0, 40, 'f9000000-0000-4000-8000-0000000000f1', 2, now());
+INSERT INTO control.settlements (id, request_id, settled_total, created_at)
+VALUES ('d9000000-0000-7000-8000-0000000000d1', 'verify probe request', 30, now());
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, settlement_id, price_revision_id, input_unit_price, output_unit_price, sequence, created_at)
+VALUES ('c9000000-0000-7000-8000-0000000000c3', 'b9000000-0000-7000-8000-0000000000b1', 'consume', 30, -30, -30, 'd9000000-0000-7000-8000-0000000000d1', 'verify probe revision', 1, 2, 3, now());
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, reservation_id, sequence, created_at)
+VALUES ('c9000000-0000-7000-8000-0000000000c4', 'b9000000-0000-7000-8000-0000000000b1', 'release', 10, 0, -10, 'f9000000-0000-4000-8000-0000000000f1', 4, now());
+INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+VALUES ('b9000000-0000-7000-8000-0000000000b2', 'a0000000-0000-4000-8000-0000000000a1', 'active', 0, 0, 0, 0, 0, now(), now());
 INSERT INTO control.account_payg (account_id, enabled, funding_bucket_id, created_at, updated_at)
-VALUES ('a0000000-0000-4000-8000-0000000000a1', true, NULL, now(), now());
+VALUES ('a0000000-0000-4000-8000-0000000000a1', true, 'b9000000-0000-7000-8000-0000000000b2', now(), now());
 SELECT (SELECT count(*) FROM control.plans WHERE id = 'b2000000-0000-7000-8000-0000000000b1') || '|' ||
        (SELECT count(*) FROM control.plan_versions WHERE id = 'b3000000-0000-7000-8000-0000000000b1') || '|' ||
        (SELECT count(*) FROM control.plan_grant_definitions WHERE id = 'b4000000-0000-7000-8000-0000000000b1') || '|' ||
        (SELECT count(*) FROM control.subscriptions WHERE id = 'b5000000-0000-7000-8000-0000000000b1') || '|' ||
        (SELECT count(*) FROM control.entitlements WHERE id = 'b6000000-0000-7000-8000-0000000000b1') || '|' ||
-       (SELECT count(*) FROM control.account_payg WHERE account_id = 'a0000000-0000-4000-8000-0000000000a1');
-ROLLBACK;")" "1|1|1|1|1|1"
+       (SELECT count(*) FROM control.account_payg WHERE account_id = 'a0000000-0000-4000-8000-0000000000a1') || '|' ||
+       (SELECT count(*) FROM control.funding_buckets WHERE id IN ('b9000000-0000-7000-8000-0000000000b1', 'b9000000-0000-7000-8000-0000000000b2')) || '|' ||
+       (SELECT count(*) FROM control.ledger_entries WHERE funding_bucket_id = 'b9000000-0000-7000-8000-0000000000b1') || '|' ||
+       (SELECT count(*) FROM control.settlements WHERE id = 'd9000000-0000-7000-8000-0000000000d1') || '|' ||
+       -- The cached balances agree with the ledger they cache — settled sums
+       -- the settled deltas, held the held deltas, available their difference.
+       (SELECT settled_amount = (SELECT COALESCE(SUM(settled_delta), 0) FROM control.ledger_entries WHERE funding_bucket_id = 'b9000000-0000-7000-8000-0000000000b1')
+           AND held_amount = (SELECT COALESCE(SUM(held_delta), 0) FROM control.ledger_entries WHERE funding_bucket_id = 'b9000000-0000-7000-8000-0000000000b1')
+           AND available_amount = (SELECT COALESCE(SUM(settled_delta - held_delta), 0) FROM control.ledger_entries WHERE funding_bucket_id = 'b9000000-0000-7000-8000-0000000000b1')
+          FROM control.funding_buckets WHERE id = 'b9000000-0000-7000-8000-0000000000b1');
+ROLLBACK;")" "1|1|1|1|1|1|2|4|1|true"
 
 step "9/12 PostgreSQL transaction semantics hold"
 # Two probes, because the migration safety model rests on both: DDL rolled
@@ -1313,6 +1803,8 @@ assert_equals "the identity tables are gone after a full roll-back" \
 	"$(psql_scalar "$control_db" "SELECT to_regclass('control.accounts') IS NULL AND to_regclass('control.users') IS NULL AND to_regclass('control.api_keys') IS NULL")" "t"
 assert_equals "the commerce tables are gone after a full roll-back" \
 	"$(psql_scalar "$control_db" "SELECT to_regclass('control.plans') IS NULL AND to_regclass('control.subscriptions') IS NULL AND to_regclass('control.entitlements') IS NULL AND to_regclass('control.account_payg') IS NULL")" "t"
+assert_equals "the accounting tables are gone after a full roll-back" \
+	"$(psql_scalar "$control_db" "SELECT to_regclass('control.funding_buckets') IS NULL AND to_regclass('control.ledger_entries') IS NULL AND to_regclass('control.settlements') IS NULL")" "t"
 assert_equals "the projection tables are gone after a full roll-back" \
 	"$(psql_scalar "$control_db" "SELECT to_regclass('control.projection_revision') IS NULL AND to_regclass('control.projection_changes') IS NULL AND to_regclass('control.projection_api_keys') IS NULL AND to_regclass('control.projection_accounts') IS NULL")" "t"
 assert_equals "the ownership namespace and its comment are gone after a full roll-back" \

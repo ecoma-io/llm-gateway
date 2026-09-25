@@ -39,6 +39,10 @@ type commerceWorld struct {
 	subs     map[commerce.SubscriptionID]commerce.Subscription
 	ents     map[commerce.EntitlementID]commerce.Entitlement
 	paygRows map[commerce.AccountID]commerce.AccountPayg
+	// funded is the fake funder's durable state — the entitlements whose
+	// cycle buckets and grant legs landed. It belongs to the same snapshot
+	// story as the rest: a roll that fails after funding must unfund.
+	funded map[commerce.EntitlementID]int64
 
 	// now is the world's database clock: what transaction_timestamp() reads
 	// inside a unit of work and what the scans compare against outside one.
@@ -90,6 +94,7 @@ func newCommerceWorld(t *testing.T) *commerceWorld {
 		subs:          map[commerce.SubscriptionID]commerce.Subscription{},
 		ents:          map[commerce.EntitlementID]commerce.Entitlement{},
 		paygRows:      map[commerce.AccountID]commerce.AccountPayg{},
+		funded:        map[commerce.EntitlementID]int64{},
 		groupVersions: map[string]dataplane.GroupVersion{},
 		failOn:        map[string]error{},
 	}
@@ -97,7 +102,7 @@ func newCommerceWorld(t *testing.T) *commerceWorld {
 }
 
 // newCommerce wires the use case over one world, the way every commerce test
-// builds it: all nine ports answer from the same state.
+// builds it: all ten ports answer from the same state.
 func newCommerce(w *commerceWorld) *Commerce {
 	return NewCommerce(
 		fakeCommerceStore{world: w},
@@ -109,6 +114,7 @@ func newCommerce(w *commerceWorld) *Commerce {
 		fakePaygAccounts{world: w},
 		fakeClock{world: w},
 		fakeCatalog{world: w},
+		fakeFunder{world: w},
 	)
 }
 
@@ -245,10 +251,11 @@ func (s fakeCommerceStore) WithinTx(ctx context.Context, fn func(ctx context.Con
 	subs := copyMap(w.subs)
 	ents := copyMap(w.ents)
 	paygRows := copyMap(w.paygRows)
+	funded := copyMap(w.funded)
 
 	if err := fn(context.WithValue(ctx, txMarkerKey{}, true)); err != nil {
-		w.accounts, w.plans, w.versions, w.defs, w.subs, w.ents, w.paygRows =
-			accounts, plans, versions, defs, subs, ents, paygRows
+		w.accounts, w.plans, w.versions, w.defs, w.subs, w.ents, w.paygRows, w.funded =
+			accounts, plans, versions, defs, subs, ents, paygRows, funded
 		w.order = append(w.order, "rollback")
 		return err
 	}
@@ -773,6 +780,26 @@ func (f fakeClock) Now(_ context.Context) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return f.world.now, nil
+}
+
+// fakeFunder is the accounting seam's stand-in: it records each grant into
+// the world's durable funded map — snapshot and rollback apply to it, which
+// is what makes a failed roll demonstrably unfund what it funded — and
+// refuses by the funder.failOn key the way a real accounting refusal would
+// arrive.
+type fakeFunder struct {
+	world *commerceWorld
+}
+
+func (f fakeFunder) FundEntitlement(_ context.Context, entitlementID commerce.EntitlementID, grantedAmount int64) error {
+	if err := f.world.failOn["funder.fund"]; err != nil {
+		return err
+	}
+	if _, ok := f.world.funded[entitlementID]; ok {
+		return nil // a retried roll converges on the bucket already on file
+	}
+	f.world.funded[entitlementID] = grantedAmount
+	return nil
 }
 
 type fakeCatalog struct {

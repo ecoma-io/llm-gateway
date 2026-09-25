@@ -31,9 +31,22 @@ import (
 // the financial ledger and settlement (Accounting's, B6), the quota
 // projection and runtime admission (the Data Plane's, B8), and the funding
 // buckets whose ids this context stores as references and whose balances it
-// never reads. Entitlement here is the grant's authoritative record — what
-// was purchased, for which cycle, scoped to which catalog version — and
-// nothing about what was consumed.
+// never reads — the one touchpoint is the Funder seam below, through which
+// the roll asks Accounting to open each cycle's bucket and write its grant
+// leg inside the roll's own unit of work. Entitlement here is the grant's
+// authoritative record — what was purchased, for which cycle, scoped to
+// which catalog version — and nothing about what was consumed.
+
+// Funder is the accounting seam the cycle roll funds through (ADR 0004:
+// the cycle roll's bucket creation is an accounting flow). Commerce mints
+// the entitlement and inserts it; the funder opens the entitlement's cycle
+// bucket and writes its grant leg, joining the caller's unit of work — a
+// refusal to run outside one is the funder's business, not the roll's. The
+// granted amount travels as the definition's minor units; money-rule
+// refusals belong to the funder's domain.
+type Funder interface {
+	FundEntitlement(ctx context.Context, entitlementID commerce.EntitlementID, grantedAmount int64) error
+}
 
 // errDueWorldMoved reports a due-work verdict that did not fire: the guarded
 // statement's WHERE clause no longer holds because another writer moved the
@@ -82,6 +95,7 @@ type Commerce struct {
 	payg          persistence.PaygAccounts
 	clock         persistence.Clock
 	catalog       dataplane.CatalogReader
+	funder        Funder
 }
 
 // NewCommerce builds the commerce use cases around the ports they need. It
@@ -94,6 +108,9 @@ type Commerce struct {
 // cross-plane seam's group-version read (ADR 0006 §5), and the roll resolves
 // every grant scope through it before opening its unit of work, so a roll
 // never holds row locks while waiting on another process over a network.
+// The funder is the roll's other non-database dependency in spirit — the
+// accounting use cases that fund each cycle's bucket inside the roll's own
+// unit of work.
 func NewCommerce(
 	store persistence.Store,
 	accounts persistence.Accounts,
@@ -104,6 +121,7 @@ func NewCommerce(
 	payg persistence.PaygAccounts,
 	clock persistence.Clock,
 	catalog dataplane.CatalogReader,
+	funder Funder,
 ) *Commerce {
 	switch {
 	case store == nil:
@@ -124,6 +142,8 @@ func NewCommerce(
 		panic("application: NewCommerce requires a clock")
 	case catalog == nil:
 		panic("application: NewCommerce requires a catalog reader")
+	case funder == nil:
+		panic("application: NewCommerce requires a funder")
 	}
 	return &Commerce{
 		store:         store,
@@ -135,6 +155,7 @@ func NewCommerce(
 		payg:          payg,
 		clock:         clock,
 		catalog:       catalog,
+		funder:        funder,
 	}
 }
 
@@ -997,6 +1018,14 @@ func (c *Commerce) materialiseEntitlements(
 		}
 		if err := c.entitlements.Create(ctx, *entitlement); err != nil {
 			return fmt.Errorf("application: materialise cycle %d of subscription %s: insert entitlement %s: %w",
+				cycle, subscription.ID, entitlement.ID, err)
+		}
+		// The roll's accounting half, joined into this unit of work: the
+		// entitlement row, its cycle bucket and the grant leg commit or roll
+		// back together. A funding failure fails the roll — a cycle whose
+		// grants bought nothing must not exist half-funded.
+		if err := c.funder.FundEntitlement(ctx, entitlement.ID, definition.GrantedAmount); err != nil {
+			return fmt.Errorf("application: materialise cycle %d of subscription %s: fund entitlement %s: %w",
 				cycle, subscription.ID, entitlement.ID, err)
 		}
 	}

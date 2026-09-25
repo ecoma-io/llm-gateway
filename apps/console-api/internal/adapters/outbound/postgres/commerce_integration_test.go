@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/accounting"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/commerce"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/identity"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
@@ -1268,15 +1269,25 @@ func TestIntegrationCommercePaygIsARowPerAccountWithAWriteOnceBucket(t *testing.
 		t.Fatalf("updated_at = %s, want the update's instant %s", micros(stored.UpdatedAt), micros(disabledAt))
 	}
 
-	// The bucket: write-once, by the statement's own WHERE clause.
-	bucketOne := mustFundingBucketID(t)
+	// The bucket: write-once, by the statement's own WHERE clause — and, now
+	// that B6 has landed the buckets, a real row per account, because the
+	// reference is a foreign key into funding_buckets and the owner
+	// uniqueness makes each bucket its account's own.
+	bucketOne := integrationPaygBucket(t, c, account)
 	applied, err := c.payg.AssignFundingBucket(ctx, account, bucketOne, time.Now().UTC())
 	if err != nil || !applied {
 		t.Fatalf("assign the funding bucket = (%t, %v), want (true, nil)", applied, err)
 	}
-	bucketTwo := mustFundingBucketID(t)
-	if applied, err := c.payg.AssignFundingBucket(ctx, account, bucketTwo, time.Now().UTC()); err != nil || applied {
-		t.Fatalf("reassign the funding bucket = (%t, %v), want (false, nil) — one bucket per account, ever", applied, err)
+	bucketTwo := integrationPaygBucket(t, c, neverEnabled)
+	// Another account's bucket: the owner guard refuses the call outright —
+	// an edge into someone else's money is not a silent no-op.
+	if _, err := c.payg.AssignFundingBucket(ctx, account, bucketTwo, time.Now().UTC()); err == nil {
+		t.Fatal("assign another account's bucket = (nil error), want the owner guard's refusal")
+	}
+	// The row's own bucket re-offered is the write-once no-op that reports
+	// false — one bucket per account, ever.
+	if applied, err := c.payg.AssignFundingBucket(ctx, account, bucketOne, time.Now().UTC()); err != nil || applied {
+		t.Fatalf("re-offer the filed bucket = (%t, %v), want (false, nil)", applied, err)
 	}
 	stored, err = c.payg.ByAccount(ctx, account)
 	if err != nil {
@@ -1311,10 +1322,14 @@ func TestIntegrationCommercePaygIsARowPerAccountWithAWriteOnceBucket(t *testing.
 		t.Fatalf("the created PAYG row = %+v, want disabled, bucket %s, born at %s", stored, bucketTwo, micros(assignedAt))
 	}
 
-	// The row the creation path made is under the same one-bucket rule:
-	// a second assignment is refused and changes nothing.
-	if applied, err := c.payg.AssignFundingBucket(ctx, neverEnabled, bucketOne, time.Now().UTC()); err != nil || applied {
-		t.Fatalf("reassign the created row's bucket = (%t, %v), want (false, nil)", applied, err)
+	// The row the creation path made is under the same rules: another
+	// account's bucket is refused outright, and the row's own bucket
+	// re-offered is the write-once no-op that reports false.
+	if _, err := c.payg.AssignFundingBucket(ctx, neverEnabled, bucketOne, time.Now().UTC()); err == nil {
+		t.Fatal("assign the created row another account's bucket = (nil error), want the owner guard's refusal")
+	}
+	if applied, err := c.payg.AssignFundingBucket(ctx, neverEnabled, bucketTwo, time.Now().UTC()); err != nil || applied {
+		t.Fatalf("re-offer the created row's own bucket = (%t, %v), want (false, nil)", applied, err)
 	}
 	// Enabling the created row flips only the flag: the bucket survives it
 	// untouched, and the birth is never rewritten by an update-path upsert.
@@ -1373,15 +1388,25 @@ func TestIntegrationCommerceTheDatabaseClockIsStableInsideAUnitOfWork(t *testing
 // small helpers
 // ---------------------------------------------------------------------------
 
-func mustFundingBucketID(t *testing.T) commerce.FundingBucketID {
+// integrationPaygBucket opens the real funding_buckets row an account's
+// PAYG reference names, through Accounting's own port — the bucket is
+// Accounting's aggregate (B6), and since 000005 the reference is a foreign
+// key, so an assignment without the row is a schema refusal rather than a
+// fact. The owner uniqueness makes each bucket its account's own.
+func integrationPaygBucket(t *testing.T, c *commerceRepos, accountID commerce.AccountID) commerce.FundingBucketID {
 	t.Helper()
-	// The bucket is Accounting's aggregate (B6): another context's id, taken
-	// here from commerce's v7 minter for its form alone.
-	id, err := commerce.NewEntitlementID()
+	id, err := accounting.NewFundingBucketID()
 	if err != nil {
-		t.Fatalf("NewEntitlementID (bucket stand-in): %v", err)
+		t.Fatalf("NewFundingBucketID: %v", err)
 	}
-	return commerce.FundingBucketID(id)
+	bucket, err := accounting.NewAccountBucket(id, accounting.AccountID(accountID), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("NewAccountBucket: %v", err)
+	}
+	if err := NewFundingBuckets(c.store).Create(t.Context(), bucket); err != nil {
+		t.Fatalf("create funding bucket for %s: %v", accountID, err)
+	}
+	return commerce.FundingBucketID(bucket.ID)
 }
 
 // mustAbsentPlanID mints a well-formed uuid that names no row: a fresh v7 is

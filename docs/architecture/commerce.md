@@ -336,19 +336,24 @@ the bound. Consequences:
   as one guarded statement that refuses to re-point an assigned bucket, and
   enabling is refused while no reference is on file — a spending
   authorisation that names no bucket would authorise draws from nothing.
-  The bucket row the reference names remains the Accounting context's (B6).
-  That bucket row exists from account creation with a zero balance —
-  created as the Accounting-side write of the account-creation workflow, a
-  choreography over IDs rather than a shared transaction (ADR 0001; the
-  bucket is an Accounting aggregate) — so enabling is only a flag flip.
+  The named bucket is a real row by B6, and a real funding bucket by now: the
+  reference is a foreign key, so a PAYG flag cannot name a bucket that does
+  not exist. That bucket is opened with a zero balance from account creation —
+  the Accounting-side write of the account-creation workflow, a choreography
+  over IDs rather than a shared transaction (ADR 0001; the bucket is an
+  Accounting aggregate) — so enabling is only a flag flip.
   **Disabling** blocks new spills at admission
   (the waterfall treats PAYG as absent); holds already secured against the
   bucket settle normally against it.
 - **Funding** appends `topup` legs to the account's PAYG funding bucket
   (operator-recorded today; payment-provider webhooks later —
-  [request lifecycle](request-lifecycle.md)). Each topup/adjustment carries an
-  idempotency key unique per `(bucket, source, key)`, so a redelivered webhook
-  cannot fund twice.
+  [request lifecycle](request-lifecycle.md)). Every topup carries a command
+  key unique per `(bucket, command_key)` — a partial unique index in the
+  schema — so a redelivered webhook cannot fund twice: the same key converges
+  on the original leg, and the same key with a different amount is a named
+  contract defect rather than a second payment. The key is the caller's
+  idempotency identity, so each source (operator today, provider later)
+  namespaces its own keys into that one scope.
 - **Access**: an alias is servable iff a matching active entitlement exists
   **or** PAYG is enabled (ADR 0003). Client prices are **alias-exact** — the
   effective price revision prices every active alias exactly once, so a
@@ -363,6 +368,26 @@ the bound. Consequences:
   [accounting](accounting.md)).
 - **No expiry, no cycles**: PAYG is a balance, not a subscription; it never
   appears as "the current plan" because no such field exists.
+
+## How commerce funds, now that Accounting exists
+
+Commerce prices entitlements and authorises PAYG spending; it never moves
+money. Since B6, "moves money" is not a promise either — the roll calls
+Accounting's `Funder` port inside its own unit of work, so the entitlement
+row, its cycle's funding bucket and the bucket's `grant` leg commit or roll
+back as one fact, and a funding failure fails the whole roll: a cycle whose
+grants bought nothing must not exist half-funded. A retried roll finds the
+bucket already on file and moves on; the bucket's foreign key to its
+entitlement is what makes that convergence structural rather than a
+discipline.
+
+PAYG's funding is the same authority by another door: the account's bucket is
+opened with a zero balance and the write-once reference is filed in one unit
+of work (a choreography over IDs, not a shared transaction — the bucket is an
+Accounting aggregate), and funding appends keyed `topup` legs to it. An
+operator's topup today is the payment webhook's entry tomorrow, with the same
+key-same-payload convergence ([request lifecycle](request-lifecycle.md);
+[accounting](accounting.md)).
 
 ## Insufficient entitlement — decision table
 
