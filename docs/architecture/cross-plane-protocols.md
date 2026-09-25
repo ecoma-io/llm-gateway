@@ -281,6 +281,17 @@ below are the whole of it. Changing it is a change to the two protocol tests
 `apps/dataplane/internal/adapters/inbound/management/protocol_test.go`) and to
 this page, and no generated client moves (AGENTS.md rule 2).
 
+That is one instance of a roster every new management command answers to, and
+the roster is short enough to enumerate where the hop is defined. A command, a
+read or a fact moves three files, in one change, and the first of them landing
+alone is the stale page the list exists to prevent:
+
+- [ ] the section of this page that states the protocol;
+- [ ] the `dataplane.yaml` operation the façade publishes;
+- [ ] the two pinned protocol tests
+      (`apps/dataplane-api/internal/adapters/outbound/dataplane/protocol_test.go`,
+      `apps/dataplane/internal/adapters/inbound/management/protocol_test.go`).
+
 ### The private protocol, in full
 
 |                |                                                                                                                                                                                                                                                                                                                                                                    |
