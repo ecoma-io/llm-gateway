@@ -997,10 +997,11 @@ func TestIntegrationAdmissionReplaysEveryStoredFate(t *testing.T) {
 	fixture := newAdmissionFixture(t, 4)
 
 	cases := []struct {
-		name   string
-		body   func(t testing.TB, fixture *admissionFixture) []byte
-		seed   func(t testing.TB, fixture *admissionFixture, account string)
-		reason execution.RejectionReason
+		name       string
+		body       func(t testing.TB, fixture *admissionFixture) []byte
+		seed       func(t testing.TB, fixture *admissionFixture, account string)
+		reason     execution.RejectionReason
+		wantDetail application.RejectionDetail
 	}{
 		{
 			name: "unknown alias",
@@ -1021,6 +1022,22 @@ func TestIntegrationAdmissionReplaysEveryStoredFate(t *testing.T) {
 				return []byte("{not json at all")
 			},
 			reason: execution.RejectedInvalidRequest,
+		},
+		{
+			// The one fate the matrix carries a field name for: a ceiling past
+			// the alias's own bound refuses 400 with `max_tokens` named, and
+			// its replay must name the same field — the record keeps the
+			// reason, and the field is re-derived from the bytes the digest
+			// matched.
+			name: "a ceiling past the alias's own bound",
+			seed: func(t testing.TB, fixture *admissionFixture, account string) {
+				fixture.seedGrant(t, context.Background(), account, account+"-bucket", true, time.Now().UTC().Add(24*time.Hour), 100)
+			},
+			body: func(t testing.TB, fixture *admissionFixture) []byte {
+				return admissionBody(t, fixture.aliasName, 5000, "b8c3")
+			},
+			reason:     execution.RejectedInvalidRequest,
+			wantDetail: application.DetailMaxTokens,
 		},
 		{
 			name: "no eligible grant",
@@ -1129,6 +1146,15 @@ func TestIntegrationAdmissionReplaysEveryStoredFate(t *testing.T) {
 				}
 				if replay.Original == "" || string(replay.Original) != storedID {
 					t.Errorf("the replay names original %q, want the stored request %q", replay.Original, storedID)
+				}
+				if first.Detail != testCase.wantDetail {
+					t.Errorf("the original's detail = %q, want %q", first.Detail, testCase.wantDetail)
+				}
+				// A replayed field refusal names the same field the original
+				// did: the record keeps the reason, and the field is
+				// re-derived from the bytes the digest matched.
+				if replay.Detail != first.Detail {
+					t.Errorf("the replay's detail = %q, want the original's %q", replay.Detail, first.Detail)
 				}
 				if !finalStatus.Valid || finalStatus.String != string(execution.FinalRejected) || finalReason.String != string(testCase.reason) {
 					t.Errorf("the record reads (%s, %s), want rejected/%q", finalStatus.String, finalReason.String, testCase.reason)
@@ -1498,5 +1524,262 @@ func BenchmarkChatAdmissionServe(b *testing.B) {
 		if outcome.Kind != application.OutcomeRejected || outcome.Reason != execution.RejectedNoCandidate {
 			b.Fatalf("iteration %d: outcome %q/%q, want rejected/no_candidate — the benchmark's own arrival is wrong", i, outcome.Kind, outcome.Reason)
 		}
+	}
+}
+
+// TestIntegrationAdmissionRefusesARetiredAliasAsUnknown serves a retired
+// alias the way the catalog actually holds one: ByName resolves the row (the
+// name index is total — retired names resolve too), and the unit reads the
+// state and refuses it as `unknown_alias`, the same answer an absent name
+// gets, so a client cannot tell retirement from absence. The refusal is a
+// decision — the pair is recorded and the grant is never touched — and the
+// re-arrival answers the replayed cell with the original's identity.
+func TestIntegrationAdmissionRefusesARetiredAliasAsUnknown(t *testing.T) {
+	fixture := newAdmissionFixture(t, 4)
+	fixture.seedPrice(t, context.Background(), 1, 1)
+
+	// The row the Control Plane leaves behind: state retired, retired_at
+	// stamped — the schema's retirement-consistency check insists on both.
+	retiredName := "b8c3-retired-alias"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := fixture.store.Querier(ctx).ExecContext(ctx, `INSERT INTO model_aliases (id, name, state, max_output_tokens, reservation_cap, created_at, updated_at, retired_at)
+VALUES ($1, $2, 'retired', 4096, 4096, transaction_timestamp(), transaction_timestamp(), transaction_timestamp())
+ON CONFLICT (name) DO NOTHING`, string(identity.NewRequestID()), retiredName); err != nil {
+		t.Fatalf("seeding the retired alias: %v", err)
+	}
+
+	account := admissionAccount(t)
+	bucket := account + "-bucket"
+	key := account + "-key"
+	credential := account + "-api-key"
+	fixture.seedGrant(t, context.Background(), account, bucket, true, time.Now().UTC().Add(24*time.Hour), 100)
+
+	body := admissionBody(t, retiredName, 1, "b8c3")
+	first := admissionServe(t, fixture.admission,
+		admissionInput(identity.NewRequestID(), account, credential, key, admissionServeState("active"), body))
+	if first.Kind != application.OutcomeRejected || first.Reason != execution.RejectedUnknownAlias {
+		t.Fatalf("the first arrival = %q/%q, want rejected/unknown_alias", first.Kind, first.Reason)
+	}
+	if first.Detail != application.DetailNone {
+		t.Errorf("the refusal's detail = %q, want none — a retired alias is not a field refusal", first.Detail)
+	}
+
+	// The pair: the rejected row and its terminal record, one each.
+	requests, reservations, legSum, intakes, rejected := fixture.residue(t, account)
+	if requests != 1 || reservations != 0 || legSum != 0 || intakes != 1 || rejected != 1 {
+		t.Fatalf("the residue = (%d requests, %d reservations, %d legs, %d records, %d rejected), want the refusal's pair", requests, reservations, legSum, intakes, rejected)
+	}
+	if fixture.rejectedRows(t, account, string(execution.RejectedUnknownAlias)) != 1 {
+		t.Errorf("the rejected row does not read unknown_alias")
+	}
+	if available, _ := fixture.balance(t, bucket); available != 100 {
+		t.Errorf("available after the refused arrival = %d, want 100 — a refused arrival draws nothing", available)
+	}
+
+	// The same key and body again: the replayed 404, the original named.
+	replay := admissionServe(t, fixture.admission,
+		admissionInput(identity.NewRequestID(), account, credential, key, admissionServeState("active"), body))
+	if replay.Kind != application.OutcomeReplay || replay.Reason != execution.RejectedUnknownAlias {
+		t.Fatalf("the re-arrival = %q/%q, want replay/unknown_alias", replay.Kind, replay.Reason)
+	}
+	storedID, finalStatus, finalReason := fixture.intakeOf(t, account, key)
+	if replay.Original == "" || string(replay.Original) != storedID {
+		t.Errorf("the replay names original %q, want the stored request %q", replay.Original, storedID)
+	}
+	if !finalStatus.Valid || finalStatus.String != string(execution.FinalRejected) || finalReason.String != string(execution.RejectedUnknownAlias) {
+		t.Errorf("the record reads (%s, %s), want rejected/unknown_alias", finalStatus.String, finalReason.String)
+	}
+}
+
+// TestIntegrationAdmissionRefusesAModelOutsideTheGrammarWithARow serves a
+// `model` value too long for the alias grammar — 300 octets against the
+// 128-rune bound. The judgment sits inside the admission unit, so the answer
+// is the recorded refusal (400 with `model` named), never a 500: the row and
+// its terminal record exist, the grant is undisturbed, the replay re-derives
+// the same field from the digest-matched bytes, and a corrected body under
+// the spent key is a conflict, because the key bought one decision.
+func TestIntegrationAdmissionRefusesAModelOutsideTheGrammarWithARow(t *testing.T) {
+	fixture := newAdmissionFixture(t, 4)
+	fixture.seedPrice(t, context.Background(), 1, 1)
+
+	account := admissionAccount(t)
+	bucket := account + "-bucket"
+	key := account + "-key"
+	credential := account + "-api-key"
+	fixture.seedGrant(t, context.Background(), account, bucket, true, time.Now().UTC().Add(24*time.Hour), 100)
+
+	body := admissionBody(t, strings.Repeat("m", 300), 1, "b8c3")
+	first := admissionServe(t, fixture.admission,
+		admissionInput(identity.NewRequestID(), account, credential, key, admissionServeState("active"), body))
+	if first.Kind != application.OutcomeRejected || first.Reason != execution.RejectedInvalidRequest {
+		t.Fatalf("the first arrival = %q/%q, want rejected/invalid_request", first.Kind, first.Reason)
+	}
+	if first.Detail != application.DetailModel {
+		t.Fatalf("the refusal's detail = %q, want model", first.Detail)
+	}
+
+	requests, reservations, legSum, intakes, rejected := fixture.residue(t, account)
+	if requests != 1 || reservations != 0 || legSum != 0 || intakes != 1 || rejected != 1 {
+		t.Fatalf("the residue = (%d requests, %d reservations, %d legs, %d records, %d rejected), want the refusal's pair", requests, reservations, legSum, intakes, rejected)
+	}
+	if fixture.rejectedRows(t, account, string(execution.RejectedInvalidRequest)) != 1 {
+		t.Errorf("the rejected row does not read invalid_request")
+	}
+	if available, _ := fixture.balance(t, bucket); available != 100 {
+		t.Errorf("available after the refused arrival = %d, want 100", available)
+	}
+
+	replay := admissionServe(t, fixture.admission,
+		admissionInput(identity.NewRequestID(), account, credential, key, admissionServeState("active"), body))
+	if replay.Kind != application.OutcomeReplay || replay.Reason != execution.RejectedInvalidRequest {
+		t.Fatalf("the re-arrival = %q/%q, want replay/invalid_request", replay.Kind, replay.Reason)
+	}
+	if replay.Detail != application.DetailModel {
+		t.Errorf("the replay's detail = %q, want model — the field is re-derived from the bytes", replay.Detail)
+	}
+
+	// The key is spent: corrected bytes under it are a conflict, not a fresh
+	// judgment.
+	other := admissionBody(t, fixture.aliasName, 1, "b8c3-corrected")
+	conflict := admissionServe(t, fixture.admission,
+		admissionInput(identity.NewRequestID(), account, credential, key, admissionServeState("active"), other))
+	if conflict.Kind != application.OutcomeConflict {
+		t.Errorf("the corrected re-arrival = %q, want conflict — the key bought one decision", conflict.Kind)
+	}
+	if _, _, _, intakes, _ := fixture.residue(t, account); intakes != 1 {
+		t.Errorf("records after the conflict = %d, want the one — a conflict writes nothing", intakes)
+	}
+}
+
+// TestIntegrationAdmissionRefusalRaceRecordsOnePair races eight arrivals on
+// one key and one over-ceiling body. The intake unique admits exactly one
+// refusal; every loser re-probes outside its aborted unit and answers the
+// winner's decision as a replay — re-deriving the same field detail from the
+// same bytes. No arrival may come back an error (the wire's 500), and the
+// account's residue is one pair and nothing else.
+func TestIntegrationAdmissionRefusalRaceRecordsOnePair(t *testing.T) {
+	const arrivals = 8
+	fixture := newAdmissionFixture(t, arrivals)
+	fixture.seedPrice(t, context.Background(), 1, 1)
+
+	account := admissionAccount(t)
+	bucket := account + "-bucket"
+	key := account + "-key"
+	credential := account + "-api-key"
+	fixture.seedGrant(t, context.Background(), account, bucket, true, time.Now().UTC().Add(24*time.Hour), 100)
+
+	body := admissionBody(t, fixture.aliasName, 5000, "b8c3") // past the alias's own 4096 bound
+
+	outcomes := make([]application.ChatOutcome, arrivals)
+	var wg sync.WaitGroup
+	for i := 0; i < arrivals; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			outcome, err := fixture.admission.Serve(context.Background(),
+				admissionInput(identity.NewRequestID(), account, credential, key, admissionServeState("active"), body))
+			if err != nil {
+				t.Errorf("arrival %d: Serve error = %v — a refusal loses a race, never the caller's answer", i, err)
+				return
+			}
+			outcomes[i] = outcome
+		}(i)
+	}
+	wg.Wait()
+
+	decided := 0
+	for i, outcome := range outcomes {
+		switch outcome.Kind {
+		case application.OutcomeRejected:
+			decided++
+			if outcome.Reason != execution.RejectedInvalidRequest || outcome.Detail != application.DetailMaxTokens {
+				t.Errorf("arrival %d: %q/%q detail %q, want invalid_request naming max_tokens", i, outcome.Kind, outcome.Reason, outcome.Detail)
+			}
+		case application.OutcomeReplay:
+			if outcome.Reason != execution.RejectedInvalidRequest {
+				t.Errorf("arrival %d: replay reason %q, want the winner's invalid_request", i, outcome.Reason)
+			}
+			if outcome.Detail != application.DetailMaxTokens {
+				t.Errorf("arrival %d: replay detail %q, want the re-derived max_tokens", i, outcome.Detail)
+			}
+			if outcome.Original == "" {
+				t.Errorf("arrival %d: the replay names no original", i)
+			}
+		default:
+			t.Errorf("arrival %d: outcome %q, want the refusal or its replay", i, outcome.Kind)
+		}
+	}
+	if decided != 1 {
+		t.Fatalf("%d arrivals decided freshly, want exactly one — the rest must answer the winner", decided)
+	}
+
+	requests, reservations, legSum, intakes, rejected := fixture.residue(t, account)
+	if requests != 1 || reservations != 0 || legSum != 0 || intakes != 1 || rejected != 1 {
+		t.Fatalf("the residue = (%d requests, %d reservations, %d legs, %d records, %d rejected), want one pair total", requests, reservations, legSum, intakes, rejected)
+	}
+	if available, _ := fixture.balance(t, bucket); available != 100 {
+		t.Errorf("available after the race = %d, want 100", available)
+	}
+}
+
+// TestIntegrationAdmissionZeroPricedAliasStillAsksTheScopeQuestion serves an
+// alias priced at nothing. A zero hold is not a scope exemption: with no
+// grant the answer is the recorded no_access; with an eligible grant the
+// arrival is admitted, held at zero, and released by the seam with its fact —
+// the waterfall walked and answered, at a cost of nothing.
+func TestIntegrationAdmissionZeroPricedAliasStillAsksTheScopeQuestion(t *testing.T) {
+	fixture := newAdmissionFixture(t, 4)
+	fixture.seedPrice(t, context.Background(), 0, 0)
+
+	account := admissionAccount(t)
+	bucket := account + "-bucket"
+	credential := account + "-api-key"
+
+	// No grant: the scope answer, recorded, even though the hold is zero.
+	spentKey := account + "-spent-key"
+	body := admissionBody(t, fixture.aliasName, 1, "b8c3")
+	refused := admissionServe(t, fixture.admission,
+		admissionInput(identity.NewRequestID(), account, credential, spentKey, admissionServeState("active"), body))
+	if refused.Kind != application.OutcomeRejected || refused.Reason != execution.RejectedNoAccess {
+		t.Fatalf("the unentitled arrival = %q/%q, want rejected/no_access", refused.Kind, refused.Reason)
+	}
+	if fixture.rejectedRows(t, account, string(execution.RejectedNoAccess)) != 1 {
+		t.Errorf("the no-access refusal is not recorded")
+	}
+
+	// With an eligible grant: admitted at no cost, held at zero, released
+	// cleanly — the B8 ending, with the release fact appended.
+	fundedKey := account + "-funded-key"
+	fixture.seedGrant(t, context.Background(), account, bucket, true, time.Now().UTC().Add(24*time.Hour), 100)
+	funded := admissionServe(t, fixture.admission,
+		admissionInput(identity.NewRequestID(), account, credential, fundedKey, admissionServeState("active"), body))
+	if funded.Kind != application.OutcomeRejected || funded.Reason != execution.RejectedNoCandidate {
+		t.Fatalf("the funded arrival = %q/%q, want rejected/no_candidate — the seam's ending", funded.Kind, funded.Reason)
+	}
+	if funded.RuntimeRequestID == "" {
+		t.Fatalf("the no-candidate answer carries no runtime request id — the fact cannot be found without one")
+	}
+
+	requests, reservations, legSum, intakes, rejected := fixture.residue(t, account)
+	if requests != 2 || reservations != 1 || legSum != 0 || intakes != 2 || rejected != 2 {
+		t.Fatalf("the residue = (%d requests, %d reservations, %d legs, %d records, %d rejected), want both refusals recorded and one zero hold", requests, reservations, legSum, intakes, rejected)
+	}
+	if fixture.factCount(t, string(funded.RuntimeRequestID)) != 1 {
+		t.Errorf("the released hold has no fact — a closed hold answers with its fact or not at all")
+	}
+	if available, _ := fixture.balance(t, bucket); available != 100 {
+		t.Errorf("available after the zero-cost round = %d, want 100", available)
+	}
+
+	// And the no-candidate ending replays: the recorded 503, the original
+	// named, from the record.
+	replay := admissionServe(t, fixture.admission,
+		admissionInput(identity.NewRequestID(), account, credential, fundedKey, admissionServeState("active"), body))
+	if replay.Kind != application.OutcomeReplay || replay.Reason != execution.RejectedNoCandidate {
+		t.Errorf("the re-arrival = %q/%q, want replay/no_candidate", replay.Kind, replay.Reason)
+	}
+	if replay.Original == "" || string(replay.Original) != string(funded.RuntimeRequestID) {
+		t.Errorf("the replay names original %q, want the stored request %q", replay.Original, funded.RuntimeRequestID)
 	}
 }
