@@ -113,6 +113,16 @@ type GroupVersion struct {
 // so rather than spin.
 var ErrGroupNotFound = errors.New("the data plane's catalog holds no version of that alias group")
 
+// ErrMalformedAnswer reports that the Data Plane answered 200 with a body
+// that is not the group-version answer the contract describes — a field
+// absent or null, a version below the 1 the catalog's numbering starts at,
+// or an echo of a group this call did not ask about. It is the read's
+// counterpart of the fact feed's ErrMalformedPage, and exists for the same
+// reason: a consumer must be able to tell "the peer broke the contract"
+// apart from every transport failure, because the first is a version-skew
+// or a defect to stop on, and the second is a retry.
+var ErrMalformedAnswer = errors.New("the data plane answered with a malformed group-version body")
+
 // CatalogReader is the read this seam carries from the Data Plane's catalog:
 // the group-version lookup the commerce roll resolves its entitlement scopes
 // with. It stands beside Management rather than inside it on purpose —

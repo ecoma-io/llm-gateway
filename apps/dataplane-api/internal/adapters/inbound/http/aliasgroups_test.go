@@ -63,6 +63,33 @@ func TestTheCatalogReadIsTheThreeFields(t *testing.T) {
 	}
 }
 
+// TestANameWhoseDecodingLooksNonCanonicalStillReachesTheCatalog pins the
+// guard's segment discipline on the façade side: the structure of a request
+// is judged on its escaped path, so a legal name whose percent-encoded form
+// rides through — and whose decoded form merely resembles a doubled slash or
+// a dot segment — is one segment, and reaches the catalog as itself. A guard
+// on the decoded path would 404 it before the mux ever ran, and the caller
+// would read a provisioned group as "no version exists".
+func TestANameWhoseDecodingLooksNonCanonicalStillReachesTheCatalog(t *testing.T) {
+	catalog := &fakeCatalog{version: dataplane.GroupVersion{
+		GroupName: "a//b", Version: 2, GroupVersionID: "0197c1a2-7b31-7cc1-9e4e-6f5d2a1b3c4d",
+	}}
+	handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, authedCatalogRead("a//b"))
+
+	if rec.Code != stdhttp.StatusOK {
+		t.Fatalf("status = %d (body %s), want %d — the name is one escaped segment, not a non-canonical path", rec.Code, rec.Body.String(), stdhttp.StatusOK)
+	}
+	if want := `"group_name":"a//b"`; !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("body = %s, want it to name the group %s", rec.Body.String(), want)
+	}
+	if got := catalog.names; len(got) != 1 || got[0] != "a//b" {
+		t.Errorf("the port was asked about %v, want [a//b]", got)
+	}
+}
+
 // TestTheWildcardNameReachesTheCatalogAsItself is the catalog read's own
 // segment test, on the surface a caller actually reaches. The reserved name is
 // a single `*`, which is also wildcard syntax in the mux's pattern language —

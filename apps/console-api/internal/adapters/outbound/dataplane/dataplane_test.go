@@ -657,8 +657,15 @@ func TestCurrentGroupVersionWalksTheContractPath(t *testing.T) {
 	if seen == nil {
 		t.Fatal("the transport was never called")
 	}
-	if got, want := seen.URL.Path, "/management/internal/alias-groups/%2A/versions/current"; got != want {
-		t.Errorf("path = %q, want %q — the wildcard is one escaped segment, with the contract's suffix", got, want)
+	if got, want := seen.URL.Path, "/management/internal/alias-groups/*/versions/current"; got != want {
+		t.Errorf("decoded path = %q, want %q", got, want)
+	}
+	// The wire line is the assertion that matters: an escape carried in the
+	// decoded Path field alone is re-escaped by String() into %252A, and a
+	// test that read only the decoded field would stay green while the
+	// wildcard became unreachable.
+	if got, want := seen.URL.RequestURI(), "/management/internal/alias-groups/%2A/versions/current"; got != want {
+		t.Errorf("wire line = %q, want %q — the wildcard escapes exactly once", got, want)
 	}
 	if got, want := seen.URL.RawQuery, ""; got != want {
 		t.Errorf("raw query = %q, want none", got)
@@ -696,7 +703,12 @@ func TestCurrentGroupVersionDistinguishesAMissFromAFailure(t *testing.T) {
 	}
 	if _, err := newClient(jsonResponse(http.StatusOK,
 		`{"group_name":"other","version":1,"group_version_id":"0198f0a4-3f6c-7000-8000-000000000001"}`)).
-		CurrentGroupVersion(context.Background(), "api"); err == nil {
-		t.Fatal("an answer about a different group passed as an answer")
+		CurrentGroupVersion(context.Background(), "api"); !errors.Is(err, port.ErrMalformedAnswer) {
+		t.Fatalf("an answer about a different group = %v, want port.ErrMalformedAnswer", err)
+	}
+	if _, err := newClient(jsonResponse(http.StatusOK,
+		`{"version":1,"group_version_id":"0198f0a4-3f6c-7000-8000-000000000001"}`)).
+		CurrentGroupVersion(context.Background(), "api"); !errors.Is(err, port.ErrMalformedAnswer) {
+		t.Fatalf("an answer with no group_name = %v, want port.ErrMalformedAnswer", err)
 	}
 }

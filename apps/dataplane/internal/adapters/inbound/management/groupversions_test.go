@@ -191,6 +191,26 @@ func TestAGroupNameIsOneSegment(t *testing.T) {
 		}
 	})
 
+	t.Run("a name whose decoding looks non-canonical still reaches the catalog", func(t *testing.T) {
+		// The guard judges the escaped path, so an encoding that decodes to
+		// something resembling a doubled slash stays one segment — and a
+		// group the catalog legally holds under that name is readable, not
+		// answered with the structural 404.
+		versions := &stubVersions{
+			highest:  1,
+			snapshot: mustNamedSnapshot(t, "a//b", catalog.GroupVersionID("0197c1a2-7b31-7cc1-9e4e-6f5d2a1b3c4d")),
+		}
+
+		rec := serveCatalog(t, versions, authed(t, "/internal/alias-groups/a%2F%2Fb/versions/current"))
+
+		if rec.Code != stdhttp.StatusOK {
+			t.Fatalf("status = %d (body %s), want %d", rec.Code, rec.Body.String(), stdhttp.StatusOK)
+		}
+		if want := `"group_name":"a//b"`; !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("body = %s, want it to name the group %s", rec.Body.String(), want)
+		}
+	})
+
 	t.Run("an unencoded slash is a path this listener does not serve", func(t *testing.T) {
 		versions := &stubVersions{}
 

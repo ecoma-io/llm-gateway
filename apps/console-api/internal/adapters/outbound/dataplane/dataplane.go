@@ -358,15 +358,22 @@ func (r eventResponse) event() (port.Event, error) {
 // The group name is the request's one variable, and it travels as one escaped
 // path segment — url.PathEscape, not query or body, because that is where the
 // contract puts it and the wildcard group's name "*" must arrive as a
-// segment of its own. Nothing here interprets the name: whether a group
-// exists is the catalog's answer, and a group that has none is the one
-// status — 404 — this operation distinguishes, because it is the one its
-// caller acts on differently from every transport failure.
+// segment of its own. The escaped segment is therefore carried in RawPath
+// beside the decoded one in Path: String() emits RawPath when it is a valid
+// encoding of Path, and an escape carried in Path alone would be re-escaped
+// into %25 on the wire — the wildcard would travel as %252A, and the
+// catalog would look up a name its grammar cannot hold.
+//
+// Nothing here interprets the name: whether a group exists is the catalog's
+// answer, and a group that has none is the one status — 404 — this
+// operation distinguishes, because it is the one its caller acts on
+// differently from every transport failure.
 func (c *Client) CurrentGroupVersion(ctx context.Context, groupName string) (port.GroupVersion, error) {
 	if groupName == "" {
 		return port.GroupVersion{}, errors.New("dataplane: current group version requires a group name")
 	}
-	requestURL := c.url(currentGroupVersionPrefix + url.PathEscape(groupName) + currentGroupVersionSuffix)
+	requestURL := c.url(currentGroupVersionPrefix + groupName + currentGroupVersionSuffix)
+	requestURL.RawPath = currentGroupVersionPrefix + url.PathEscape(groupName) + currentGroupVersionSuffix
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
 	if err != nil {
@@ -394,9 +401,13 @@ func (c *Client) CurrentGroupVersion(ctx context.Context, groupName string) (por
 
 	var body groupVersionResponse
 	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
-		return port.GroupVersion{}, fmt.Errorf("dataplane: read current group version: the body would not decode as a group version: %w", err)
+		return port.GroupVersion{}, fmt.Errorf("dataplane: read current group version: %w: the body would not decode as a group version: %w", port.ErrMalformedAnswer, err)
 	}
-	return body.groupVersion(groupName)
+	groupVersion, err := body.groupVersion(groupName)
+	if err != nil {
+		return port.GroupVersion{}, fmt.Errorf("dataplane: read current group version: %w: %w", port.ErrMalformedAnswer, err)
+	}
+	return groupVersion, nil
 }
 
 // groupVersionResponse is the wire shape of the group-version read, field for
@@ -414,7 +425,9 @@ type groupVersionResponse struct {
 // least the 1 the catalog's numbering starts at, and the echoed group name
 // the one this request named — an answer about a different group is not an
 // answer, and a caller that pinned it would scope an entitlement by a
-// version the question was never about.
+// version the question was never about. Every refusal wraps the port's
+// ErrMalformedAnswer, so a caller distinguishes the peer breaking the
+// contract from a transport failure without parsing text.
 func (r groupVersionResponse) groupVersion(asked string) (port.GroupVersion, error) {
 	switch {
 	case r.GroupName == nil:
