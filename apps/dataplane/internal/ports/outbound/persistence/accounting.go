@@ -75,8 +75,16 @@ var ErrAppendOutsideUnitOfWork = errors.New("persistence: a fact append needs a 
 // fact derives from: the request it held for, the pricing basis it held
 // under, and the legs its hold was split into — the fact's allocation tail,
 // read in the same sweep that closed the hold, so the append needs no second
-// read. It is a read shape of the port, not a domain aggregate — the reaper
-// reads what it closed and appends from what it read, in one unit of work.
+// read. It also carries the request's replay identity — the account and
+// idempotency key the intake record was born under — because the hold is not
+// the only thing an expired close settles: the request row finalises (the
+// domain's FailAbandoned, through RequestRepository.Finalise) and the replay
+// record's pointer is written (IntakeRepository.Finalise, keyed exactly as
+// the release path keys it). The reaper has no ChatInput to carry those keys
+// in memory, so the sweep reads them where it reads the legs — one read, one
+// unit of work, no second lookup. It is a read shape of the port, not a
+// domain aggregate — the reaper reads what it closed and settles from what it
+// read.
 type ExpiredLease struct {
 	ID              identity.ReservationID
 	RequestID       identity.RequestID
@@ -86,6 +94,8 @@ type ExpiredLease struct {
 	InputTokens     int
 	MaxOutputTokens int
 	LeaseOwner      string
+	AccountID       string
+	IdempotencyKey  string
 	Allocations     []accounting.Allocation
 }
 
@@ -113,8 +123,10 @@ type ReservationRepository interface {
 	// ExpireLapsedLeases is the reaper's batch CAS: every hold still open
 	// whose hold window AND whose lease have both lapsed against the store's
 	// own clock moves to expired, up to limit, and the holds that moved come
-	// back whole — legs included — so their facts can be appended in the same
-	// unit of work: no completed close without its fact. Both clocks must
+	// back whole — legs and replay identity included — so their facts can be
+	// appended and their requests and replay records finalised in the same
+	// unit of work: no completed close without its fact, and no closed hold
+	// whose request row stays executing forever. Both clocks must
 	// have passed because they guard different disasters: a lapsed window is
 	// the caller walking away, a lapsed lease is the owner dying, and taking
 	// a hold on only one of them would close out a request that is still
@@ -125,6 +137,17 @@ type ReservationRepository interface {
 	// predicates. Contended rows are skipped, not waited on, so a reaper
 	// sweep never stands behind a settlement. A limit below one is refused —
 	// an unbounded sweep is how a backlog becomes a long transaction.
+	//
+	// The sweep fails whole, never in halves: a victim whose settlement tail
+	// the store cannot read back whole — a request id that is not an
+	// identity, a request row that does not exist, a replay record that does
+	// not exist or does not belong to the request's account — errors the
+	// sweep, and the unit it ran in rolls back with it. Victims come back
+	// oldest-lease-first, so one such row is by construction the first victim
+	// every later sweep picks: it stops all reaping until it is repaired.
+	// That wedge is the price of never settling a close in halves; a loop
+	// consuming this port treats the error as a page to an operator, not a
+	// reason to retry.
 	ExpireLapsedLeases(ctx context.Context, limit int) ([]ExpiredLease, error)
 
 	// RenewLease extends one open hold's lease to the caller's new expiry,
