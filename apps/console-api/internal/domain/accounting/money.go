@@ -46,8 +46,14 @@ func NewAmount(raw int64) (Amount, error) {
 // Int64 returns the amount as the plain integer the database stores.
 func (a Amount) Int64() int64 { return int64(a) }
 
-// Add returns a plus b, refusing to wrap past the int64 ceiling.
+// Add returns a plus b, refusing to wrap past the int64 ceiling. b is
+// required to be non-negative: Amount models magnitudes, and a negative
+// addend would turn a sum of movements into a difference without ever
+// touching the overflow guards that only look upward.
 func (a Amount) Add(b Amount) (Amount, error) {
+	if b < 0 {
+		return 0, fmt.Errorf("accounting: %w: %d is not a magnitude to add", ErrInvalidAmount, b)
+	}
 	if b > 0 && a > Amount(math.MaxInt64)-b {
 		return 0, fmt.Errorf("accounting: %w: %d + %d overflows int64", ErrAmountRange, a, b)
 	}
@@ -56,8 +62,14 @@ func (a Amount) Add(b Amount) (Amount, error) {
 
 // Sub returns a minus b, refusing to go below zero: the magnitudes this type
 // models are balances and movements, and a negative one is either a bug or —
-// deliberately — an adjustment, which travels as a Delta instead.
+// deliberately — an adjustment, which travels as a Delta instead. b is
+// required to be non-negative for the same reason Add requires it: a
+// negative subtrahend would negate into a negative result, and the
+// `b > a` guard above it cannot see a wrapped sum.
 func (a Amount) Sub(b Amount) (Amount, error) {
+	if b < 0 {
+		return 0, fmt.Errorf("accounting: %w: %d is not a magnitude to subtract", ErrInvalidAmount, b)
+	}
 	if b > a {
 		return 0, fmt.Errorf("accounting: %w: %d - %d would go below zero", ErrAmountRange, a, b)
 	}

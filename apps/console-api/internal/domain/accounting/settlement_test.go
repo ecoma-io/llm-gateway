@@ -2,6 +2,7 @@ package accounting
 
 import (
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -171,6 +172,22 @@ func TestBuildSettleRefusesLiteralStructShortcuts(t *testing.T) {
 	unformed.Consumed = mustAmount(t, 5) // price never recorded
 	if _, err := BuildSettle(mustSettlementID(t), "req-x", []Allocation{unformed}, NewLedgerEntryID, legNow); !errors.Is(err, ErrInvalidReference) {
 		t.Fatalf("a consumed allocation without its price = %v, want the price refusal", err)
+	}
+}
+
+func TestBuildSettleRefusesANegativeConsumption(t *testing.T) {
+	// The exported fields let a shortcut write a negative "consumed". Left
+	// unchecked, the tail arithmetic runs backwards: a small negative grew
+	// the release past the hold, and math.MinInt64 wrapped the tail negative
+	// so the plan came back as a header with NO legs and a total of zero —
+	// a request recorded as settled while its hold stayed booked forever.
+	for _, consumed := range []Amount{Amount(-1), Amount(math.MinInt64)} {
+		alloc := mustAllocation(t, mustBucketID(t), 10)
+		alloc.Consumed = consumed
+		if _, err := BuildSettle(mustSettlementID(t), "req-x", []Allocation{alloc}, NewLedgerEntryID, legNow); !errors.Is(err, ErrInvalidAmount) {
+			t.Fatalf("consumed %d against held 10 = %v, want ErrInvalidAmount: a settlement cannot spend less than nothing",
+				consumed, err)
+		}
 	}
 }
 

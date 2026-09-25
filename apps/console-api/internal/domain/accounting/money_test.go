@@ -35,6 +35,24 @@ func TestAmountAddRefusesTheOverflowInsteadOfWrapping(t *testing.T) {
 	}
 }
 
+func TestAmountArithmeticRefusesANegativeMagnitude(t *testing.T) {
+	// A negative Amount is not a direction, it is a bug: Add and Sub are the
+	// balance arithmetic, and a signed operand turns them into differences
+	// that no overflow guard looks at. The one place a negative amount is
+	// meaningful — a correction — travels as a Delta instead.
+	if _, err := Amount(20).Add(Amount(-5)); !errors.Is(err, ErrInvalidAmount) {
+		t.Fatalf("20 + (-5) = %v; want ErrInvalidAmount", err)
+	}
+	// 100 − (−50) would return 150, a release larger than the hold it came
+	// from; the MinInt64 case wraps the whole thing negative.
+	if _, err := Amount(100).Sub(Amount(-50)); !errors.Is(err, ErrInvalidAmount) {
+		t.Fatalf("100 - (-50) = %v; want ErrInvalidAmount", err)
+	}
+	if _, err := Amount(100).Sub(Amount(math.MinInt64)); !errors.Is(err, ErrInvalidAmount) {
+		t.Fatalf("100 - min int64 = %v; want ErrInvalidAmount, never a wrapped tail", err)
+	}
+}
+
 func TestAmountAddSumsOrdinaryMagnitudes(t *testing.T) {
 	a, _ := NewAmount(80)
 	b, _ := NewAmount(20)

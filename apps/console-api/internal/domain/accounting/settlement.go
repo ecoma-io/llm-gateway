@@ -125,6 +125,14 @@ func BuildSettle(settlementID SettlementID, requestID RequestID, allocations []A
 		if _, err := NewAmount(alloc.HeldBooked.Int64()); err != nil {
 			return SettlePlan{}, fmt.Errorf("accounting: build settle: allocation of bucket %s: %w", alloc.BucketID, err)
 		}
+		// Consumed is re-validated through NewAmount rather than only
+		// compared: the fields are exported, and a negative "consumed" is
+		// not a smaller settlement — it is a settlement whose tail
+		// arithmetic runs backwards. The refusal belongs here, in the
+		// words the caller reads, before any of it reaches the ledger.
+		if _, err := NewAmount(alloc.Consumed.Int64()); err != nil && alloc.Consumed != 0 {
+			return SettlePlan{}, fmt.Errorf("accounting: build settle: allocation of bucket %s: %w", alloc.BucketID, err)
+		}
 		if err := validateReservationID(alloc.ReservationID); err != nil {
 			return SettlePlan{}, fmt.Errorf("accounting: build settle: allocation of bucket %s: %w", alloc.BucketID, err)
 		}
