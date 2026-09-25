@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	stdhttp "net/http"
+	"strconv"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/identity"
@@ -53,24 +54,35 @@ const maxChatBodyBytes = 10485760
 // their key was bad when the defect is theirs-not.
 func newChatCompletionHandler(wiring wiring) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		// The correlation identifier is decided before any work runs and set
+		// before any byte is written — a streamed answer's headers freeze at
+		// its first content byte, so a guarantee that waits for the answer's
+		// writer is no guarantee at all. Every answer this handler produces,
+		// on either channel, inherits it by having been set here first.
+		requestID, ok := RequestIDFromContext(r.Context())
+		if !ok || requestID == "" {
+			requestID = newRequestID()
+		}
+		w.Header().Set(RequestIDHeader, requestID)
+
 		// The credential's header shape, before anything reads a mirror or a
 		// body: the cheapest refusal first, and the one that needs nothing
 		// from the application at all.
 		credential, ok := parseCredential(r)
 		if !ok {
-			writeChatAnswer(w, r, unauthenticatedAnswer(unauthenticatedRequest{label: "authorization_header"}))
+			writeChatAnswer(w, r, requestID, unauthenticatedAnswer(unauthenticatedRequest{label: "authorization_header"}))
 			return
 		}
 
 		// Verification. A refusal is an answer, not a failure; every other
 		// error is the mirror's own and lands on the internal one.
 		if wiring.auth == nil {
-			writeChatAnswer(w, r, chatAnswer{failure: internalFailure()})
+			writeChatAnswer(w, r, requestID, chatAnswer{failure: internalFailure()})
 			return
 		}
 		authenticated, err := authenticate(wiring.auth, r, credential)
 		if err != nil {
-			writeChatError(w, r, err, "")
+			writeChatError(w, r, nil, requestID, err, "")
 			return
 		}
 
@@ -81,7 +93,7 @@ func newChatCompletionHandler(wiring wiring) stdhttp.HandlerFunc {
 		// here, having presented no request the runtime could record.
 		keyValues := r.Header.Values(idempotencyKeyHeader)
 		if len(keyValues) > 1 {
-			writeChatAnswer(w, r, chatAnswer{
+			writeChatAnswer(w, r, requestID, chatAnswer{
 				failure: wireFailure{
 					status: stdhttp.StatusBadRequest,
 					body: runtimeErrorBody{
@@ -104,9 +116,13 @@ func newChatCompletionHandler(wiring wiring) stdhttp.HandlerFunc {
 		// it, and a refusal below is the first one that cost a byte. With it
 		// the request acquires its runtime identity — minted here, once, and
 		// carried by every answer from here on, because an operator reading a
-		// decision must be able to find the request row it decided.
+		// decision must be able to find the request row it decided. With it,
+		// too, the request acquires its reply: the channel over which an
+		// admitted request's answer travels, built here over this
+		// connection's writer and handed to the use case inside the input.
 		body := readChatBody(w, r)
 		runtimeID := identity.NewRequestID()
+		reply := newChatReply(w)
 
 		outcome, err := wiring.chat.Serve(r.Context(), application.ChatInput{
 			RequestID:      runtimeID,
@@ -115,13 +131,14 @@ func newChatCompletionHandler(wiring wiring) stdhttp.HandlerFunc {
 			AccountState:   authenticated.AccountState,
 			IdempotencyKey: idempotencyKey,
 			Body:           body,
+			Reply:          reply,
 		})
 		if err != nil {
 			// Admission could not reach a decision. That is never the
 			// caller's answer to give: the cause stays behind the boundary
 			// and the wire carries the one internal failure. The identity
 			// still rides the log — the use case may have left a row behind.
-			writeChatError(w, r, err, runtimeID)
+			writeChatError(w, r, reply, requestID, err, runtimeID)
 			return
 		}
 		answer := chatWireCell(outcome)
@@ -134,7 +151,7 @@ func newChatCompletionHandler(wiring wiring) stdhttp.HandlerFunc {
 		if outcome.RuntimeRequestID != "" {
 			answer.runtimeID = outcome.RuntimeRequestID
 		}
-		writeChatAnswer(w, r, answer)
+		writeChatAnswer(w, r, requestID, answer)
 	}
 }
 
@@ -172,26 +189,19 @@ func unauthenticatedAnswer(refusal unauthenticatedRequest) chatAnswer {
 	}
 }
 
-// writeChatAnswer is the one place an admission answer becomes bytes. It
-// sets the request identifier itself, the way writeError does — the
-// contract's header guarantee cannot depend on which function ran first —
-// then the answer's own headers, then the body, and the log line is built
-// from the same answer the wire carries so the two renderings cannot
-// disagree.
-func writeChatAnswer(w stdhttp.ResponseWriter, r *stdhttp.Request, answer chatAnswer) {
-	requestID, ok := RequestIDFromContext(r.Context())
-	if !ok || requestID == "" {
-		requestID = newRequestID()
-	}
-	w.Header().Set(RequestIDHeader, requestID)
-	if answer.retryAfter != "" {
-		w.Header().Set(retryAfterHeader, answer.retryAfter)
-	}
-	if answer.replay {
-		w.Header().Set(idempotentReplayHeader, idempotentReplayValue)
-		w.Header().Set(originalRequestIDHeader, string(answer.original))
-	}
-
+// writeChatAnswer is the one place a table answer becomes bytes and the log
+// line that answers for it. The request identifier is not set here — the
+// handler set it before any work ran, because a streamed answer's headers
+// freeze at its first content byte, and the answers written through the
+// reply channel inherit it by having been set first. A silent answer — one
+// whose bytes already travelled through the reply, or whose caller is gone —
+// becomes the log line only: its wire was the reply's to shape, and a second
+// write here would be a second answer for one request.
+//
+// The log line is built from the same answer the wire carries, so the two
+// renderings cannot disagree; the routing trace, when the answer names one,
+// rides the log beside them.
+func writeChatAnswer(w stdhttp.ResponseWriter, r *stdhttp.Request, requestID string, answer chatAnswer) {
 	line := serviceName + " request_id=" + requestID
 	if answer.runtimeID != "" {
 		line += " runtime_request_id=" + string(answer.runtimeID)
@@ -205,11 +215,34 @@ func writeChatAnswer(w stdhttp.ResponseWriter, r *stdhttp.Request, answer chatAn
 	if answer.reason != "" {
 		line += " reason=" + answer.reason
 	}
+	if answer.routing != nil {
+		line += " alias=" + answer.routing.Alias
+		line += " routing_attempts=" + strconv.Itoa(answer.routing.Attempts)
+		if answer.routing.LastPosition > 0 {
+			line += " last_position=" + strconv.Itoa(answer.routing.LastPosition)
+		}
+		if answer.routing.LastErrorClass != "" {
+			line += " last_error_class=" + string(answer.routing.LastErrorClass)
+		}
+		if answer.routing.Committed {
+			line += " committed=true"
+		}
+	}
 	if answer.failure.internal {
 		line += " internal error"
 	}
 	log.Print(line)
 
+	if answer.silent {
+		return
+	}
+	if answer.retryAfter != "" {
+		w.Header().Set(retryAfterHeader, answer.retryAfter)
+	}
+	if answer.replay {
+		w.Header().Set(idempotentReplayHeader, idempotentReplayValue)
+		w.Header().Set(originalRequestIDHeader, string(answer.original))
+	}
 	writeJSON(w, answer.failure.status, runtimeErrorResponse{Error: answer.failure.body})
 }
 
@@ -223,11 +256,25 @@ func writeChatAnswer(w stdhttp.ResponseWriter, r *stdhttp.Request, answer chatAn
 // The runtime identity rides along when the failure happened after one was
 // minted — a use case that failed midway may still have left a row behind,
 // and the log line is what finds it.
-func writeChatError(w stdhttp.ResponseWriter, r *stdhttp.Request, err error, runtimeID identity.RequestID) {
+//
+// The reply travels with the error for the one ending that outranks the
+// internal failure: an answer that already committed has frozen its status
+// line, and a second status written over it is not an answer but garbage
+// appended to one. There the transport's own failure frame is what the
+// client can still read, and the log line — still the internal failure — is
+// what says the caller never saw it as a status.
+func writeChatError(w stdhttp.ResponseWriter, r *stdhttp.Request, reply *chatReply, requestID string, err error, runtimeID identity.RequestID) {
 	var refusal unauthenticatedRequest
 	if errors.As(err, &refusal) {
-		writeChatAnswer(w, r, unauthenticatedAnswer(refusal))
+		writeChatAnswer(w, r, requestID, unauthenticatedAnswer(refusal))
 		return
 	}
-	writeChatAnswer(w, r, chatAnswer{failure: errorResponse(err), runtimeID: runtimeID})
+	answer := chatAnswer{failure: errorResponse(err), runtimeID: runtimeID}
+	if reply != nil && reply.Committed() {
+		answer.silent = true
+		writeChatAnswer(w, r, requestID, answer)
+		reply.ServeMidStreamFailure()
+		return
+	}
+	writeChatAnswer(w, r, requestID, answer)
 }

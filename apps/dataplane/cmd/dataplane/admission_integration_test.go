@@ -586,19 +586,19 @@ func (f *admissionFixture) factCount(t testing.TB, requestID string) int {
 
 // TestIntegrationAdmissionNeverOversubscribesUnderConcurrency races N
 // distinct arrivals over one grant and holds the invariant the build makes
-// observable at the use case's altitude: conservation. This milestone's seam
-// releases every admitted hold immediately, so capacity re-funds while the
-// race runs and a deterministic N-1 refusal cannot be forced through Serve —
-// that proof, holds persisting open against an exactly-exhausted grant, is
-// the store-level test against the same fixture
+// observable at the use case's altitude: conservation. The grant fits all but
+// one of the holds exactly, so the race is now a deterministic verdict —
+// admitted holds stay open on this path, every drawdown is permanent for the
+// round, and exactly capacity arrivals fit before the walk starts answering
+// shortages — which is the oversubscription proof the earlier milestones
+// could not force through Serve and left to the store-level suite
 // (TestIntegrationConcurrentAdmissionUnitsCannotOversubscribeTheGrant in
 // internal/adapters/outbound/postgres). What the use case must answer for is
 // the whole round: at every committed instant available is never negative and
 // available + open legs equals the capacity exactly — capacity is never
-// created, never lost — every arrival reaches a decision and is recorded once,
-// every hold that was opened is released exactly once, and the grant ends the
-// round as whole as it began. Three rounds shake the scheduler; the -race
-// lane runs the same test under the race detector.
+// created, never lost — every arrival reaches a decision and is recorded
+// once, and no arrival is answered twice. Three rounds shake the scheduler;
+// the -race lane runs the same test under the race detector.
 func TestIntegrationAdmissionNeverOversubscribesUnderConcurrency(t *testing.T) {
 	const arrivals = 24
 	capacity := int64(arrivals - 1)
@@ -628,10 +628,8 @@ func TestIntegrationAdmissionNeverOversubscribesUnderConcurrency(t *testing.T) {
 
 		// The sampler reads the conservation equation in ONE statement —
 		// available and the open legs share the statement's snapshot — so each
-		// sample is a committed instant judged whole. A shortage is a
-		// legitimate outcome here: when every other hold is open at an
-		// arrival's drawdown, the walk answers a shortage, and conservation
-		// must survive that too.
+		// sample is a committed instant judged whole. Every drawdown in this
+		// round is permanent, so the equation is the race's strictest witness.
 		stop := make(chan struct{})
 		samplerDone := make(chan struct{})
 		var (
@@ -704,9 +702,12 @@ func TestIntegrationAdmissionNeverOversubscribesUnderConcurrency(t *testing.T) {
 		if violation != "" {
 			t.Errorf("round %d: the sampler held %d instants and the conservation broke: %s", round, observedSamples, violation)
 		}
+		if observedSamples == 0 {
+			t.Errorf("round %d: the sampler held no instants — a witness that never looked proves nothing", round)
+		}
 
 		var (
-			released int
+			admitted int
 			shortage int
 			wrong    []string
 			firstErr error
@@ -717,8 +718,8 @@ func TestIntegrationAdmissionNeverOversubscribesUnderConcurrency(t *testing.T) {
 				if firstErr == nil {
 					firstErr = fmt.Errorf("arrival %d: %w", i, errs[i])
 				}
-			case outcomes[i].Kind == application.OutcomeRejected && outcomes[i].Reason == execution.RejectedNoCandidate:
-				released++
+			case outcomes[i].Kind == application.OutcomeAdmitted:
+				admitted++
 			case outcomes[i].Kind == application.OutcomeRejected && outcomes[i].Reason == execution.RejectedInsufficientEntitlement:
 				shortage++
 			default:
@@ -731,18 +732,20 @@ func TestIntegrationAdmissionNeverOversubscribesUnderConcurrency(t *testing.T) {
 		if len(wrong) != 0 {
 			t.Errorf("round %d: unexpected outcomes %v — a distinct-key arrival is answered admitted or refused, never replayed", round, wrong)
 		}
-		admitted := released + shortage
-		if admitted != arrivals {
-			t.Errorf("round %d: decided arrivals = %d of %d — every arrival reaches a decision", round, admitted, arrivals)
+		if admitted != int(capacity) || shortage != arrivals-int(capacity) {
+			t.Errorf("round %d: admitted %d and refused %d, want exactly the %d holds the grant fits and %d shortages — the verdict is the capacity, not the scheduler",
+				round, admitted, shortage, capacity, arrivals-int(capacity))
 		}
 
 		// The written memory of the round: every arrival decided and recorded,
-		// one hold per admitted arrival released exactly once, the feed
-		// carrying exactly that many released facts, and the grant restored
-		// whole.
-		requests, reservations, legSum, intakes, _ := fixture.residue(t, account)
+		// one open hold per admitted arrival — no release runs on this path —
+		// and the grant drawn down to exactly zero.
+		requests, reservations, legSum, intakes, rejected := fixture.residue(t, account)
 		if requests != arrivals || intakes != arrivals {
 			t.Errorf("round %d: rows read %d requests and %d records, want a decision for each of %d arrivals", round, requests, intakes, arrivals)
+		}
+		if rejected != shortage {
+			t.Errorf("round %d: rejected rows = %d, want one per refused arrival (%d)", round, rejected, shortage)
 		}
 		if reservations != admitted {
 			t.Errorf("round %d: holds on the record = %d, want one per admitted arrival (%d), never more", round, reservations, admitted)
@@ -750,18 +753,18 @@ func TestIntegrationAdmissionNeverOversubscribesUnderConcurrency(t *testing.T) {
 		if legSum != int64(admitted) {
 			t.Errorf("round %d: taken capacity across the legs = %d, want one unit per admitted hold (%d)", round, legSum, admitted)
 		}
-		if available, limit := fixture.balance(t, bucket); available != capacity || limit != capacity {
-			t.Errorf("round %d: balance reads (%d/%d), want the grant restored whole (%d/%d) — every released hold gave its units back", round, available, limit, capacity, capacity)
+		if available, limit := fixture.balance(t, bucket); available != 0 || limit != capacity {
+			t.Errorf("round %d: balance reads (%d/%d), want the grant drawn to (0/%d) — every admitted hold stays open", round, available, limit, capacity)
 		}
 		var facts int
 		if err := fixture.db.QueryRowContext(context.Background(),
 			`SELECT count(*) FROM public.usage_events e
 			 JOIN public.requests rq ON rq.id = e.request_id
-			 WHERE rq.account_id = $1 AND e.kind = 'released'`, account).Scan(&facts); err != nil {
-			t.Fatalf("round %d: counting the released facts: %v", round, err)
+			 WHERE rq.account_id = $1`, account).Scan(&facts); err != nil {
+			t.Fatalf("round %d: counting the facts: %v", round, err)
 		}
-		if facts != released {
-			t.Errorf("round %d: released facts = %d, want one per admitted-and-released arrival (%d)", round, facts, released)
+		if facts != 0 {
+			t.Errorf("round %d: facts on the feed = %d, want none — nothing has ended yet, the holds are the round's memory", round, facts)
 		}
 	}
 }
@@ -815,9 +818,13 @@ func TestIntegrationAdmissionRefusesNoAccessWhenNothingIsEligible(t *testing.T) 
 
 // TestIntegrationAdmissionAnswersOnceForOneKeyUnderARace races M arrivals
 // sharing one (account, idempotency key, body): exactly one admission lands,
-// and every other arrival is answered — in flight, or replayed from the
-// committed decision — never a second reservation, never an error. The
-// residue is the winner's one request, one hold, one record, one fact.
+// and every other arrival is answered in flight — never a second
+// reservation, never an error. The winner's hold stays open on this path:
+// the record is still open, so a replay cannot answer yet (a replay needs a
+// terminal decision to read — TestIntegrationAdmissionReplaysEveryStoredFate
+// drives those), and the residue is the winner's one request, one open hold,
+// one unit, one record with no final pointer, and a grant drawn by exactly
+// one unit.
 func TestIntegrationAdmissionAnswersOnceForOneKeyUnderARace(t *testing.T) {
 	const (
 		arrivals = 12
@@ -854,7 +861,6 @@ func TestIntegrationAdmissionAnswersOnceForOneKeyUnderARace(t *testing.T) {
 	var (
 		fresh    int
 		inFlight int
-		replays  int
 		firstErr error
 	)
 	for i := range outcomes {
@@ -863,14 +869,12 @@ func TestIntegrationAdmissionAnswersOnceForOneKeyUnderARace(t *testing.T) {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("arrival %d: %w", i, errs[i])
 			}
-		case outcomes[i].Kind == application.OutcomeRejected && outcomes[i].Reason == execution.RejectedNoCandidate:
+		case outcomes[i].Kind == application.OutcomeAdmitted:
 			fresh++
 		case outcomes[i].Kind == application.OutcomeInFlight:
 			inFlight++
-		case outcomes[i].Kind == application.OutcomeReplay && outcomes[i].Reason == execution.RejectedNoCandidate:
-			replays++
 		default:
-			t.Errorf("arrival %d: outcome %q/%q — a racing arrival is answered fresh, in flight, or as a replay, nothing else", i, outcomes[i].Kind, outcomes[i].Reason)
+			t.Errorf("arrival %d: outcome %q/%q — a racing arrival is answered admitted or in flight, nothing else: the winner never ends here, so no replay can answer", i, outcomes[i].Kind, outcomes[i].Reason)
 		}
 	}
 	if firstErr != nil {
@@ -879,27 +883,24 @@ func TestIntegrationAdmissionAnswersOnceForOneKeyUnderARace(t *testing.T) {
 	if fresh != 1 {
 		t.Errorf("arrivals answered with the fresh admission = %d, want exactly 1", fresh)
 	}
-	if fresh+inFlight+replays != arrivals {
-		t.Errorf("arrivals answered = %d (fresh %d, in flight %d, replay %d), want all %d", fresh+inFlight+replays, fresh, inFlight, replays, arrivals)
+	if fresh+inFlight != arrivals {
+		t.Errorf("arrivals answered = %d (fresh %d, in flight %d), want all %d", fresh+inFlight, fresh, inFlight, arrivals)
 	}
 
-	requests, reservations, legSum, intakes, _ := fixture.residue(t, account)
+	requests, reservations, legSum, intakes, rejected := fixture.residue(t, account)
 	if requests != 1 || reservations != 1 || legSum != 1 || intakes != 1 {
 		t.Errorf("residue reads %d requests, %d holds, %d taken unit, %d records — want one of each, the winner's", requests, reservations, legSum, intakes)
 	}
-	id, finalStatus, finalReason := fixture.intakeOf(t, account, key)
-	if !finalStatus.Valid || finalStatus.String != string(execution.FinalRejected) || finalReason.String != string(execution.RejectedNoCandidate) {
-		t.Errorf("the record's final pointer = (%s, %s), want rejected/no_candidate — the seam releases the hold and finalises the request as no_candidate in one ending",
+	if rejected != 0 {
+		t.Errorf("rejected rows on the record = %d, want none — the winner's decision is an admission, not an ending", rejected)
+	}
+	_, finalStatus, finalReason := fixture.intakeOf(t, account, key)
+	if finalStatus.Valid || finalReason.Valid {
+		t.Errorf("the record's final pointer = (%s, %s), want both null — the request is still in flight, and routing owns its ending",
 			finalStatus.String, finalReason.String)
 	}
-	if got := fixture.rejectedRows(t, account, string(execution.RejectedNoCandidate)); got != 1 {
-		t.Errorf("no_candidate rows on the record = %d, want the winner's one", got)
-	}
-	if facts := fixture.factCount(t, id); facts != 1 {
-		t.Errorf("facts on the winner = %d, want exactly the one released fact", facts)
-	}
-	if available, limit := fixture.balance(t, bucket); available != capacity || limit != capacity {
-		t.Errorf("balance reads (%d/%d), want the hold released back whole", available, limit)
+	if available, limit := fixture.balance(t, bucket); available != capacity-1 || limit != capacity {
+		t.Errorf("balance reads (%d/%d), want exactly the winner's one unit drawn and held", available, limit)
 	}
 }
 
@@ -918,15 +919,15 @@ func TestIntegrationAdmissionRefusesAKeySpentOnDifferentBytes(t *testing.T) {
 
 	first := admissionBody(t, fixture.aliasName, 1, "b8c3-first")
 	if outcome := admissionServe(t, fixture.admission,
-		admissionInput(identity.NewRequestID(), account, credential, key, admissionServeState("active"), first)); outcome.Kind != application.OutcomeRejected || outcome.Reason != execution.RejectedNoCandidate {
-		t.Fatalf("the first arrival = %q/%q, want rejected/no_candidate", outcome.Kind, outcome.Reason)
+		admissionInput(identity.NewRequestID(), account, credential, key, admissionServeState("active"), first)); outcome.Kind != application.OutcomeAdmitted {
+		t.Fatalf("the first arrival = %q/%q, want admitted", outcome.Kind, outcome.Reason)
 	}
 	requests, _, _, intakes, _ := fixture.residue(t, account)
 	if requests != 1 || intakes != 1 {
 		t.Fatalf("after the first arrival the residue reads %d requests and %d records, want one of each", requests, intakes)
 	}
-	if available, _ := fixture.balance(t, bucket); available != 100 {
-		t.Fatalf("balance after the first arrival = %d, want the grant whole (the hold was released)", available)
+	if available, _ := fixture.balance(t, bucket); available != 99 {
+		t.Fatalf("balance after the first arrival = %d, want the one unit drawn — the admitted hold stays open", available)
 	}
 
 	second := admissionBody(t, fixture.aliasName, 1, "b8c3-second")
@@ -939,8 +940,8 @@ func TestIntegrationAdmissionRefusesAKeySpentOnDifferentBytes(t *testing.T) {
 	if afterRequests != 1 || afterIntakes != 1 {
 		t.Errorf("after the conflict the residue reads %d requests and %d records, want the first arrival's one of each — a conflict writes nothing", afterRequests, afterIntakes)
 	}
-	if _, finalStatus, _ := fixture.intakeOf(t, account, key); !finalStatus.Valid || finalStatus.String != string(execution.FinalRejected) {
-		t.Errorf("the record's final pointer reads (%s, %v), want the first arrival's rejected — untouched by the conflict", finalStatus.String, finalStatus.Valid)
+	if _, finalStatus, _ := fixture.intakeOf(t, account, key); finalStatus.Valid {
+		t.Errorf("the record's final pointer reads (%s, %v), want it still unset — the original is in flight, and the conflict touched nothing", finalStatus.String, finalStatus.Valid)
 	}
 }
 
@@ -991,7 +992,11 @@ func TestIntegrationAdmissionRollsBackAnUnpricedAlias(t *testing.T) {
 // real rows: each fate the use case stores gets a first arrival, a replay of
 // the same key and body (answered from the record with the original's
 // decision), and a companion arrival under the same key with different bytes
-// (a conflict, writing nothing). Settlement-written fates are out of this
+// (a conflict, writing nothing). Two fates are seeded rather than served —
+// the in-flight record, and the released-as-no-candidate ending whose unit
+// belongs to the routing stage now — for the same reason: what this matrix
+// judges is what the replay answers FROM a stored fate, and the routing suite
+// proves how that fate gets written. Settlement-written fates are out of this
 // milestone's reach and say so.
 func TestIntegrationAdmissionReplaysEveryStoredFate(t *testing.T) {
 	fixture := newAdmissionFixture(t, 4)
@@ -1093,28 +1098,50 @@ func TestIntegrationAdmissionReplaysEveryStoredFate(t *testing.T) {
 			body := testCase.body(t, fixture)
 			digest := execution.SecretDigest(body)
 
-			// The in-flight fate is seeded, not served: a request whose record
-			// exists with no terminal pointer, the shape a concurrently
-			// executing original leaves behind.
-			if testCase.reason == "" {
+			// The in-flight and released fates are seeded, not served: an open
+			// record is the shape a concurrently executing original leaves
+			// behind, and the released ending is the routing stage's unit —
+			// admission writes neither on its own path any more.
+			if testCase.reason == "" || testCase.reason == execution.RejectedNoCandidate {
 				requestID := identity.NewRequestID()
-				price := execution.PriceSnapshot{RevisionID: "b8c3-inflight-revision", InputUnitPrice: 1, OutputUnitPrice: 1}
 				now := time.Now().UTC()
-				request, err := execution.NewRequest(requestID, account, credential, fixture.aliasName, 4, 1, price, now)
+				var (
+					request execution.Request
+					err     error
+				)
+				if testCase.reason == "" {
+					price := execution.PriceSnapshot{RevisionID: "b8c3-inflight-revision", InputUnitPrice: 1, OutputUnitPrice: 1}
+					request, err = execution.NewRequest(requestID, account, credential, fixture.aliasName, 4, 1, price, now)
+				} else {
+					request, err = execution.RejectNew(requestID, account, credential, fixture.aliasName, testCase.reason, now)
+				}
 				if err != nil {
-					t.Fatalf("forming the in-flight original: %v", err)
+					t.Fatalf("forming the seeded original: %v", err)
 				}
 				record, err := execution.NewIntake(account, key, digest, requestID, now)
 				if err != nil {
-					t.Fatalf("forming the in-flight record: %v", err)
+					t.Fatalf("forming the seeded record: %v", err)
 				}
 				if err := fixture.store.WithinTx(context.Background(), func(ctx context.Context) error {
 					if err := fixture.requests.Insert(ctx, request); err != nil {
 						return err
 					}
-					return fixture.intakes.Insert(ctx, record)
+					if err := fixture.intakes.Insert(ctx, record); err != nil {
+						return err
+					}
+					if testCase.reason == "" {
+						return nil
+					}
+					ok, err := fixture.intakes.Finalise(ctx, account, key, execution.FinalRejected, testCase.reason, "")
+					if err != nil {
+						return err
+					}
+					if !ok {
+						t.Error("the seeded record's final pointer was already written")
+					}
+					return nil
 				}); err != nil {
-					t.Fatalf("seeding the in-flight original: %v", err)
+					t.Fatalf("seeding the original: %v", err)
 				}
 			}
 
@@ -1124,6 +1151,10 @@ func TestIntegrationAdmissionReplaysEveryStoredFate(t *testing.T) {
 			case testCase.reason == "":
 				if first.Kind != application.OutcomeInFlight {
 					t.Fatalf("the first arrival = %q, want in_flight — the record has no terminal pointer to answer from", first.Kind)
+				}
+			case testCase.reason == execution.RejectedNoCandidate:
+				if first.Kind != application.OutcomeReplay || first.Reason != testCase.reason {
+					t.Fatalf("the first arrival = %q/%q, want replay/%q — the record predates the arrival, so even the first arrival is answered from it", first.Kind, first.Reason, testCase.reason)
 				}
 			default:
 				if first.Kind != application.OutcomeRejected || first.Reason != testCase.reason {
@@ -1425,11 +1456,13 @@ func TestIntegrationCredentialVerificationJudgesTheMirrorLifecycles(t *testing.T
 
 // BenchmarkChatAdmissionServe is the flagship number: one request's full
 // admission cost as the transport drives it — verification against the real
-// mirror, the probe, the alias and price reads, the waterfall, the writes,
-// the seam's release — everything but the provider call that does not exist
-// yet. The grant is seeded deep enough that capacity is never the variable;
-// every iteration is a fresh account-keyed arrival under a fresh key, so the
-// loop costs what a fresh request costs and not what a replay answers for.
+// mirror, the probe, the alias and price reads, the waterfall, the writes —
+// everything admission owns and nothing past it. The routing stage's walk and
+// endings are the next stage's cost, benchmarked in the routing package; what
+// is measured here stops at the hand-off. The grant is seeded deep enough
+// that capacity is never the variable; every iteration is a fresh
+// account-keyed arrival under a fresh key, so the loop costs what a fresh
+// request costs and not what a replay answers for.
 //
 // Run (from apps/dataplane):
 //
@@ -1521,8 +1554,8 @@ func BenchmarkChatAdmissionServe(b *testing.B) {
 		if err != nil {
 			b.Fatalf("iteration %d: %v", i, err)
 		}
-		if outcome.Kind != application.OutcomeRejected || outcome.Reason != execution.RejectedNoCandidate {
-			b.Fatalf("iteration %d: outcome %q/%q, want rejected/no_candidate — the benchmark's own arrival is wrong", i, outcome.Kind, outcome.Reason)
+		if outcome.Kind != application.OutcomeAdmitted || outcome.Admitted == nil {
+			b.Fatalf("iteration %d: outcome %q, want admitted — the benchmark's own arrival is wrong", i, outcome.Kind)
 		}
 	}
 }
@@ -1726,8 +1759,9 @@ func TestIntegrationAdmissionRefusalRaceRecordsOnePair(t *testing.T) {
 // TestIntegrationAdmissionZeroPricedAliasStillAsksTheScopeQuestion serves an
 // alias priced at nothing. A zero hold is not a scope exemption: with no
 // grant the answer is the recorded no_access; with an eligible grant the
-// arrival is admitted, held at zero, and released by the seam with its fact —
-// the waterfall walked and answered, at a cost of nothing.
+// arrival is admitted, held at zero, and stays in flight — the walk owns the
+// ending now — so the admission's whole verdict costs the account nothing and
+// draws nothing.
 func TestIntegrationAdmissionZeroPricedAliasStillAsksTheScopeQuestion(t *testing.T) {
 	fixture := newAdmissionFixture(t, 4)
 	fixture.seedPrice(t, context.Background(), 0, 0)
@@ -1748,38 +1782,35 @@ func TestIntegrationAdmissionZeroPricedAliasStillAsksTheScopeQuestion(t *testing
 		t.Errorf("the no-access refusal is not recorded")
 	}
 
-	// With an eligible grant: admitted at no cost, held at zero, released
-	// cleanly — the B8 ending, with the release fact appended.
+	// With an eligible grant: admitted at no cost, held at zero, still in
+	// flight — the ending is the routing stage's to run.
 	fundedKey := account + "-funded-key"
 	fixture.seedGrant(t, context.Background(), account, bucket, true, time.Now().UTC().Add(24*time.Hour), 100)
 	funded := admissionServe(t, fixture.admission,
 		admissionInput(identity.NewRequestID(), account, credential, fundedKey, admissionServeState("active"), body))
-	if funded.Kind != application.OutcomeRejected || funded.Reason != execution.RejectedNoCandidate {
-		t.Fatalf("the funded arrival = %q/%q, want rejected/no_candidate — the seam's ending", funded.Kind, funded.Reason)
+	if funded.Kind != application.OutcomeAdmitted {
+		t.Fatalf("the funded arrival = %q/%q, want admitted", funded.Kind, funded.Reason)
 	}
 	if funded.RuntimeRequestID == "" {
-		t.Fatalf("the no-candidate answer carries no runtime request id — the fact cannot be found without one")
+		t.Fatalf("the admission carries no runtime request id — nothing downstream could be correlated with it")
 	}
 
 	requests, reservations, legSum, intakes, rejected := fixture.residue(t, account)
-	if requests != 2 || reservations != 1 || legSum != 0 || intakes != 2 || rejected != 2 {
-		t.Fatalf("the residue = (%d requests, %d reservations, %d legs, %d records, %d rejected), want both refusals recorded and one zero hold", requests, reservations, legSum, intakes, rejected)
+	if requests != 2 || reservations != 1 || legSum != 0 || intakes != 2 || rejected != 1 {
+		t.Fatalf("the residue = (%d requests, %d reservations, %d legs, %d records, %d rejected), want the no-access refusal recorded and one open zero hold", requests, reservations, legSum, intakes, rejected)
 	}
-	if fixture.factCount(t, string(funded.RuntimeRequestID)) != 1 {
-		t.Errorf("the released hold has no fact — a closed hold answers with its fact or not at all")
+	if facts := fixture.factCount(t, string(funded.RuntimeRequestID)); facts != 0 {
+		t.Errorf("facts on the funded request = %d, want none — nothing has ended, the open hold is the memory", facts)
 	}
 	if available, _ := fixture.balance(t, bucket); available != 100 {
-		t.Errorf("available after the zero-cost round = %d, want 100", available)
+		t.Errorf("available after the zero-cost round = %d, want 100 — a zero hold draws nothing", available)
 	}
 
-	// And the no-candidate ending replays: the recorded 503, the original
-	// named, from the record.
+	// And the re-arrival reads the open record: in flight, still — no
+	// terminal decision exists to replay.
 	replay := admissionServe(t, fixture.admission,
 		admissionInput(identity.NewRequestID(), account, credential, fundedKey, admissionServeState("active"), body))
-	if replay.Kind != application.OutcomeReplay || replay.Reason != execution.RejectedNoCandidate {
-		t.Errorf("the re-arrival = %q/%q, want replay/no_candidate", replay.Kind, replay.Reason)
-	}
-	if replay.Original == "" || string(replay.Original) != string(funded.RuntimeRequestID) {
-		t.Errorf("the replay names original %q, want the stored request %q", replay.Original, funded.RuntimeRequestID)
+	if replay.Kind != application.OutcomeInFlight {
+		t.Errorf("the re-arrival = %q/%q, want in_flight — the original has no ending yet", replay.Kind, replay.Reason)
 	}
 }

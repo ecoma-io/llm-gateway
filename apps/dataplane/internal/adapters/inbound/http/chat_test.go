@@ -38,8 +38,11 @@ func TestTheHappyPathReachesAdmissionOnceWithTheBoundaryVocabulary(t *testing.T)
 	// boundary: the verified key identity — never the presented secret — the
 	// key header as presented, the body as read, and a runtime-minted request
 	// identity. What comes back is executed once, as the table rendered it.
+	// The composed contract, exactly as the stage plays it: the walk answers
+	// through the reply and returns the rejection for the log.
 	chat := &fakeChatCompletion{
 		outcome: application.ChatOutcome{Kind: application.OutcomeRejected, Reason: execution.RejectedNoCandidate},
+		act:     func(reply application.Reply) { reply.ServeNoCandidate() },
 	}
 	handler := newChatCompletionHandler(wiring{
 		auth: &fakeAuthenticator{credential: application.AuthenticatedCredential{KeyID: verifiedKey}},
@@ -192,6 +195,7 @@ func TestTheIdempotencyKeyHeadersShape(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			chat := &fakeChatCompletion{
 				outcome: application.ChatOutcome{Kind: application.OutcomeRejected, Reason: execution.RejectedNoCandidate},
+				act:     func(reply application.Reply) { reply.ServeNoCandidate() },
 			}
 			handler := newChatCompletionHandler(wiring{
 				auth: &fakeAuthenticator{credential: application.AuthenticatedCredential{KeyID: verifiedKey}},
@@ -385,6 +389,13 @@ func TestAFirstAnswerNeverClaimsToBeAReplay(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			chat := &fakeChatCompletion{outcome: tt.outcome}
+			// A fresh walk-produced rejection arrives composed with its
+			// reply write, exactly as the stage answers it; a replay or an
+			// admission decision is the handler's answer alone.
+			if tt.outcome.Kind == application.OutcomeRejected &&
+				(tt.outcome.Reason == execution.RejectedNoCandidate || tt.outcome.Reason == execution.RejectedNoCandidateSucceeded) {
+				chat.act = func(reply application.Reply) { reply.ServeNoCandidate() }
+			}
 			handler := newChatCompletionHandler(wiring{
 				auth: &fakeAuthenticator{credential: application.AuthenticatedCredential{KeyID: verifiedKey}},
 				chat: chat,
@@ -463,6 +474,13 @@ func TestTheDecisionLogCarriesTheSchemaTheContractNames(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			chat := &fakeChatCompletion{outcome: tt.outcome}
+			// A fresh walk-produced rejection arrives composed with its
+			// reply write, exactly as the stage answers it; a replay or an
+			// admission decision is the handler's answer alone.
+			if tt.outcome.Kind == application.OutcomeRejected &&
+				(tt.outcome.Reason == execution.RejectedNoCandidate || tt.outcome.Reason == execution.RejectedNoCandidateSucceeded) {
+				chat.act = func(reply application.Reply) { reply.ServeNoCandidate() }
+			}
 			auth := &fakeAuthenticator{credential: application.AuthenticatedCredential{KeyID: verifiedKey}}
 			if tt.refusal != nil {
 				auth = &fakeAuthenticator{refusal: tt.refusal}
@@ -551,6 +569,7 @@ func TestTheNoCandidateAnswerIsJSONNeverAStream(t *testing.T) {
 	// compatibility contract is written for.
 	chat := &fakeChatCompletion{
 		outcome: application.ChatOutcome{Kind: application.OutcomeRejected, Reason: execution.RejectedNoCandidate},
+		act:     func(reply application.Reply) { reply.ServeNoCandidate() },
 	}
 	handler := newChatCompletionHandler(wiring{
 		auth: &fakeAuthenticator{credential: application.AuthenticatedCredential{KeyID: verifiedKey}},

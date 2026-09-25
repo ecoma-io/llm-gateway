@@ -543,12 +543,13 @@ func TestAdmissionAnswersFromTheRecordBeforeAnyUnitOpens(t *testing.T) {
 // the admission unit, and the seam behind it
 // ---------------------------------------------------------------------------
 
-// TestAdmissionWritesTheRequestThenTheHoldThenTheReplayRecordLast walks the
-// one fully-happy path B8 has: admit, then release. The event sequence IS the
-// assertion — which unit opened, what it wrote and in which order, that the
-// replay record closed it, and that the release fact was the last word of the
-// compensation unit.
-func TestAdmissionWritesTheRequestThenTheHoldThenTheReplayRecordLast(t *testing.T) {
+// TestAdmissionHandsAnAdmittedRequestToTheRoutingStage walks the happy
+// admission path: the unit opens once, writes the order request-lifecycle.md
+// pins — drawdown, request row, hold, replay record last — commits, and hands
+// the caller an admission payload for the stage that routes it. What happens
+// after the hand-off is route_test.go's subject; this test pins that
+// admission alone writes no ending and states no answer.
+func TestAdmissionHandsAnAdmittedRequestToTheRoutingStage(t *testing.T) {
 	useCase, world := admissionFixture(t)
 	body := admissionBody("test-model")
 
@@ -556,29 +557,25 @@ func TestAdmissionWritesTheRequestThenTheHoldThenTheReplayRecordLast(t *testing.
 	if err != nil {
 		t.Fatalf("Serve: %v", err)
 	}
-	// B8 has no routing stage: an admitted request is completed by the seam as
-	// no_candidate, and the admission payload is built but never handed out.
-	if outcome.Kind != OutcomeRejected || outcome.Reason != execution.RejectedNoCandidate {
-		t.Fatalf("outcome = %s/%s, want rejected/no_candidate", outcome.Kind, outcome.Reason)
+	if outcome.Kind != OutcomeAdmitted || outcome.Admitted == nil {
+		t.Fatalf("outcome = %s, want admitted with a payload", outcome.Kind)
 	}
-	if outcome.Admitted != nil {
-		t.Fatalf("the outcome carries an admission payload, want none — nothing routes yet")
+	if outcome.Admitted.Alias != "test-model" || outcome.Admitted.InputTokens != 5 {
+		t.Fatalf("the admission payload lost its alias or its input count")
 	}
 
 	wantEvents(t, world, []string{
 		"begin", "ledger.drawdown", "request.insert", "reservation.insert", "intake.insert", "commit",
-		"begin", "reservation.close", "ledger.return", "request.finalise", "intake.finalise", "fact.append", "commit",
 	})
 
-	// The hold: drawn at 37, released by the seam, fenced by the configured
-	// horizons, leased to the derived owner, split into the legs the store
-	// granted.
+	// The hold: drawn at 37, still open — no ending has been stated, and
+	// stating one is the routing stage's job now.
 	reservation := admissionReservationRow(t, world)
 	if reservation.ReservedAmount != 37 {
 		t.Fatalf("the hold = %d, want 37", reservation.ReservedAmount)
 	}
-	if reservation.State != accounting.StateReleased {
-		t.Fatalf("the hold is %s, want released — the seam is the ending B8 admits into", reservation.State)
+	if reservation.State != accounting.StateOpen {
+		t.Fatalf("the hold is %s, want open — admission writes no ending", reservation.State)
 	}
 	if !reservation.ExpiresAt.Equal(world.now.Add(time.Minute)) {
 		t.Fatalf("expires_at is not the hold window past the unit's clock")
@@ -594,19 +591,11 @@ func TestAdmissionWritesTheRequestThenTheHoldThenTheReplayRecordLast(t *testing.
 		t.Fatalf("the hold's split does not name bucket-1 for all 37 at ordinal 1")
 	}
 
-	// The return went back in the legs' stored order, and the grant is whole.
-	if len(world.returned) != 1 || len(world.returned[0]) != 1 || world.returned[0][0].Ordinal != 1 {
-		t.Fatalf("the release returned %v, want the reservation's own legs in ordinal order", world.returned)
-	}
-	if got := world.available("bucket-1"); got != 10_000 {
-		t.Fatalf("the grant holds %d after the release, want 10000", got)
-	}
-
-	// The request row: born executing, finalised no_candidate, carrying the
-	// price basis it was admitted under.
+	// The request row: born executing, carrying the price basis and the
+	// bounds the eventual fact will be priced and audited from.
 	row := admissionRequestRow(t, world)
-	if row.Status != execution.StatusRejected || row.RejectionReason != execution.RejectedNoCandidate {
-		t.Fatalf("the request ended %s/%s, want rejected/no_candidate", row.Status, row.RejectionReason)
+	if row.Status != execution.StatusExecuting {
+		t.Fatalf("the request is %s, want executing", row.Status)
 	}
 	if row.Alias != "test-model" || row.InputTokens != 5 || row.MaxOutputTokens != 16 {
 		t.Fatalf("the request row's bounds drifted from the body and the alias")
@@ -615,25 +604,23 @@ func TestAdmissionWritesTheRequestThenTheHoldThenTheReplayRecordLast(t *testing.
 		t.Fatalf("the request row lost its pricing basis")
 	}
 
-	// The replay record: digested over the raw bytes, terminal no_candidate.
+	// The replay record: digested over the raw bytes, watching — terminal
+	// only when the ending's unit takes its pointer.
 	intake := admissionIntakeRow(t, world, admissionAccount, "replay-key-1")
 	if intake.RequestDigest != execution.SecretDigest(body) {
 		t.Fatalf("the replay record's digest is not the digest of the raw bytes")
 	}
-	if intake.FinalStatus == nil || *intake.FinalStatus != execution.FinalRejected ||
-		intake.FinalRejectionReason != execution.RejectedNoCandidate {
-		t.Fatalf("the replay record is not terminal no_candidate")
+	if intake.FinalStatus != nil {
+		t.Fatalf("the replay record is terminal, want it still waiting on the ending")
 	}
 
-	// The fact: one release, appended last, naming the request it closed.
-	if len(world.facts) != 1 {
-		t.Fatalf("the seam appended %d facts, want 1", len(world.facts))
+	// The payload carries what the routing stage needs and re-reads nothing
+	// for: the frozen price, the live reservation, the legs as granted.
+	if outcome.Admitted.ReservationID != reservation.ID || len(outcome.Admitted.Legs) != 1 {
+		t.Fatalf("the admission payload does not name the hold it opened")
 	}
-	if world.facts[0].Kind != accounting.KindReleased {
-		t.Fatalf("the fact is %s, want released", world.facts[0].Kind)
-	}
-	if world.facts[0].RequestID != row.ID {
-		t.Fatalf("the release fact names another request")
+	if outcome.Admitted.Price.RevisionID != "rev-1" || outcome.Admitted.Hold != 37 {
+		t.Fatalf("the admission payload's pricing drifted from the unit's decision")
 	}
 }
 
@@ -911,8 +898,8 @@ func TestAdmissionAcceptsAHoldAtExactlyTheCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Serve: %v", err)
 	}
-	if outcome.Kind != OutcomeRejected || outcome.Reason != execution.RejectedNoCandidate {
-		t.Fatalf("outcome = %s/%s, want the admit-then-release ending", outcome.Kind, outcome.Reason)
+	if outcome.Kind != OutcomeAdmitted {
+		t.Fatalf("outcome = %s, want admitted", outcome.Kind)
 	}
 	if !world.happened("ledger.drawdown") {
 		t.Fatalf("the hold at the cap was refused, want it drawn")
@@ -973,8 +960,8 @@ func TestAdmissionAnswersTheUniqueKeyRaceOutsideTheAbortedUnit(t *testing.T) {
 		{
 			name:       "a winner that aborted too leaves the field to a fresh attempt",
 			winner:     "",
-			wantKind:   OutcomeRejected,
-			wantReason: execution.RejectedNoCandidate,
+			wantKind:   OutcomeAdmitted,
+			wantReason: "",
 			freshRetry: true,
 		},
 	} {
@@ -1039,8 +1026,8 @@ func TestAdmissionRetriesTheUnitOnlyOnContention(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Serve: %v", err)
 			}
-			if outcome.Kind != OutcomeRejected || outcome.Reason != execution.RejectedNoCandidate {
-				t.Fatalf("outcome = %s/%s, want the admit-then-release ending", outcome.Kind, outcome.Reason)
+			if outcome.Kind != OutcomeAdmitted {
+				t.Fatalf("outcome = %s, want admitted after the retried unit", outcome.Kind)
 			}
 			if world.rollbackCount() != tt.failures {
 				t.Fatalf("the world rolled back %d units, want %d", world.rollbackCount(), tt.failures)
@@ -1061,88 +1048,6 @@ func TestAdmissionNeverRetriesACallerWhoLeft(t *testing.T) {
 	}
 	if world.rollbackCount() != 1 {
 		t.Fatalf("the unit ran %d times, want once", world.rollbackCount())
-	}
-}
-
-// TestAdmissionStrandsTheHoldWhenTheSeamExhaustsItsRetries: a seam that
-// cannot settle fails the request as an internal error and leaves the hold
-// stranded — admission committed, the reaper's to reclaim — and never
-// answers no_candidate for it, because that answer invites a second hold.
-func TestAdmissionStrandsTheHoldWhenTheSeamExhaustsItsRetries(t *testing.T) {
-	useCase, world := admissionFixture(t)
-	world.returnFailure = fakePGError{code: "40001"}
-	world.returnFailures = 99
-
-	_, err := useCase.Serve(context.Background(), admissionInput(admissionBody("test-model")))
-	if err == nil {
-		t.Fatalf("Serve answered a seam that never settled, want the internal failure")
-	}
-	if closes := strings.Count(strings.Join(world.events, ","), "reservation.close"); closes != 3 {
-		t.Fatalf("the seam attempted %d closes, want its whole budget of 3", closes)
-	}
-	if world.commitCount() != 1 {
-		t.Fatalf("the world committed %d units, want only admission's", world.commitCount())
-	}
-	reservation := admissionReservationRow(t, world)
-	if reservation.State != accounting.StateOpen {
-		t.Fatalf("the hold is %s, want open — stranded, the reaper's to reclaim", reservation.State)
-	}
-	row := admissionRequestRow(t, world)
-	if row.Status != execution.StatusExecuting {
-		t.Fatalf("the request is %s, want executing — the seam never stated an ending", row.Status)
-	}
-	intake := admissionIntakeRow(t, world, admissionAccount, "replay-key-1")
-	if intake.FinalStatus != nil {
-		t.Fatalf("the replay record is terminal, want it still waiting")
-	}
-	if len(world.facts) != 0 {
-		t.Fatalf("the stranded seam appended a fact, want none")
-	}
-	if got := world.available("bucket-1"); got != 10_000-37 {
-		t.Fatalf("the grant holds %d, want 9963 — the drawdown committed and the hold is out", got)
-	}
-}
-
-// TestAdmissionDoesNotRetryTheSeamOnAHardFailure: a seam failure that is not
-// contention is not retried — a second attempt would only repeat it.
-func TestAdmissionDoesNotRetryTheSeamOnAHardFailure(t *testing.T) {
-	useCase, world := admissionFixture(t)
-	world.returnFailure = fakePGError{code: "23514"}
-	world.returnFailures = 1
-
-	if _, err := useCase.Serve(context.Background(), admissionInput(admissionBody("test-model"))); err == nil {
-		t.Fatalf("Serve answered a seam that failed on its merits, want the failure")
-	}
-	if closes := strings.Count(strings.Join(world.events, ","), "reservation.close"); closes != 1 {
-		t.Fatalf("the seam attempted %d closes, want 1", closes)
-	}
-}
-
-// TestAdmissionSeamLossStillAnswersNoCandidate: when the seam's
-// compare-and-swap loses, someone else owns the hold's ending — the unit
-// stops having written nothing further, and this caller's answer is still the
-// one ending B8 has.
-func TestAdmissionSeamLossStillAnswersNoCandidate(t *testing.T) {
-	useCase, world := admissionFixture(t)
-	world.seamCloseLost = true
-
-	outcome, err := useCase.Serve(context.Background(), admissionInput(admissionBody("test-model")))
-	if err != nil {
-		t.Fatalf("Serve: %v", err)
-	}
-	if outcome.Kind != OutcomeRejected || outcome.Reason != execution.RejectedNoCandidate {
-		t.Fatalf("outcome = %s/%s, want rejected/no_candidate", outcome.Kind, outcome.Reason)
-	}
-	wantEvents(t, world, []string{
-		"begin", "ledger.drawdown", "request.insert", "reservation.insert", "intake.insert", "commit",
-		"begin", "reservation.close", "commit",
-	})
-	intake := admissionIntakeRow(t, world, admissionAccount, "replay-key-1")
-	if intake.FinalStatus != nil {
-		t.Fatalf("the lost CAS finalised the replay record anyway")
-	}
-	if len(world.facts) != 0 {
-		t.Fatalf("the loser of the CAS appended a fact, want none")
 	}
 }
 
@@ -1403,42 +1308,6 @@ func TestAdmissionRefusalThatLosesTheIntakeRaceAnswersTheWinner(t *testing.T) {
 // ---------------------------------------------------------------------------
 // the seam's own doctrine
 // ---------------------------------------------------------------------------
-
-// TestAdmissionSeamDoesNotCommitACloseWithoutItsFact: the release fact is the
-// close's receipt, and a close whose receipt never lands is the orphan the
-// doctrine forbids. When the request row will not take the ending, the whole
-// seam unit rolls back — the CAS's close included — leaving the hold open for
-// a whole retry or, at exhaustion, for the reaper.
-func TestAdmissionSeamDoesNotCommitACloseWithoutItsFact(t *testing.T) {
-	useCase, world := admissionFixture(t)
-	world.requestFinaliseLost = true
-
-	outcome, err := useCase.Serve(context.Background(), admissionInput(admissionBody("test-model")))
-	if err == nil {
-		t.Fatalf("Serve answered %s from a close whose fact never landed, want the error", outcome.Kind)
-	}
-	wantEvents(t, world, []string{
-		"begin", "ledger.drawdown", "request.insert", "reservation.insert", "intake.insert", "commit",
-		"begin", "reservation.close", "ledger.return", "request.finalise", "rollback",
-	})
-	if world.commitCount() != 1 || world.rollbackCount() != 1 {
-		t.Fatalf("the world committed %d and rolled back %d units, want the admission's one commit and the seam's one rollback", world.commitCount(), world.rollbackCount())
-	}
-	// Nothing stayed half-closed: the hold is back open, the row still
-	// executing, the record still in flight, and no fact exists.
-	if reservation := admissionReservationRow(t, world); reservation.State != accounting.StateOpen {
-		t.Fatalf("the hold is %s after the rollback, want open — the close went back with the unit", reservation.State)
-	}
-	if row := admissionRequestRow(t, world); row.Status != execution.StatusExecuting {
-		t.Fatalf("the request row is %s after the rollback, want executing", row.Status)
-	}
-	if intake := admissionIntakeRow(t, world, admissionAccount, "replay-key-1"); intake.FinalStatus != nil {
-		t.Fatalf("the replay record is terminal after the rollback, want still in flight")
-	}
-	if len(world.facts) != 0 {
-		t.Fatalf("the factless close appended %d facts, want none", len(world.facts))
-	}
-}
 
 // ---------------------------------------------------------------------------
 // the constructor's own bounds

@@ -63,6 +63,7 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/adapters/outbound/postgres"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/config"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/executors"
 )
 
 // version is stamped at build time:
@@ -287,6 +288,33 @@ func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
 		},
 	)
 
+	// The routing stage over the same store, wrapping admission as the chat
+	// route's use case: every admitted request is walked through the alias's
+	// candidate list and answered, and every other outcome passes through
+	// untouched. The executor registry starts empty — B9 owns the routing
+	// decision, not the provider calls, so today's walk resolves no
+	// candidate for any alias and every admitted request is released as a
+	// no-candidate answer, byte-identical to the endpoint's behaviour before
+	// this stage existed. B10 registers the first executor and the walk
+	// starts trying candidates; nothing here changes when it does.
+	//
+	// The repositories are the same postgres adapters over the same store —
+	// one database, one pool, and the ending units' transactions span them
+	// by construction rather than by a global.
+	routing := application.NewChatRouting(
+		catalogStore,
+		postgres.NewModelAliases(catalogStore),
+		postgres.NewBackends(catalogStore),
+		postgres.NewRequestRepository(catalogStore),
+		postgres.NewAttemptRepository(catalogStore),
+		postgres.NewIntakeRepository(catalogStore),
+		postgres.NewReservationRepository(catalogStore),
+		postgres.NewQuotaProjectionRepository(catalogStore),
+		postgres.NewFactRepository(catalogStore),
+		executors.NewRegistry(nil),
+		admission,
+	)
+
 	runtimeListener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return nil, err
@@ -294,7 +322,7 @@ func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
 
 	services := []service{{
 		name:     "runtime",
-		server:   newServer(http.New(app, http.WithChatAuthenticator(application.NewCredentialAuthenticator(credentials)), http.WithChatCompletion(admission)), cfg),
+		server:   newServer(http.New(app, http.WithChatAuthenticator(application.NewCredentialAuthenticator(credentials)), http.WithChatCompletion(routing)), cfg),
 		listener: runtimeListener,
 	}}
 

@@ -128,11 +128,17 @@ func (i Intake) Decided() bool {
 	return i.FinalStatus != nil
 }
 
-// failureKnown is request.go's rejection check's twin for the two-value
-// failure vocabulary.
+// failureKnown is request.go's rejection check's twin for the failure
+// vocabulary: the two stream-era reasons and the three surfaced refusals —
+// the same five values migration 000007_routing_failure_vocabulary widened
+// the intake table's own check to. A failed replay record is how every
+// surfaced ending is replayed byte for byte, so a refusal the database
+// accepts and this check refused would be a decision the record could never
+// carry.
 func failureKnown(reason FailureReason) bool {
 	switch reason {
-	case FailedStreamAfterCommitment, FailedGatewayAbandoned:
+	case FailedStreamAfterCommitment, FailedGatewayAbandoned,
+		FailedProviderRejectedRequest, FailedContextTooLarge, FailedUpstreamAuthentication:
 		return true
 	}
 	return false

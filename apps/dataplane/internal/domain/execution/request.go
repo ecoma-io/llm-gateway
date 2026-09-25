@@ -318,7 +318,7 @@ func (r *Request) FailBeforeCommitment(reason FailureReason, finishedAt time.Tim
 	if r.Status != StatusExecuting {
 		return ErrFinalised
 	}
-	if !reason.preCommitment() {
+	if !reason.Surfaced() {
 		return fmt.Errorf("execution: %q is not a failure reason a pre-commitment finalisation may carry", string(reason))
 	}
 	r.Status = StatusFailed
@@ -358,13 +358,15 @@ func (reason RejectionReason) known() bool {
 	return false
 }
 
-// preCommitment reports whether a failure reason is one of the surfaced
-// upstream refusals — the only failure reasons a pre-commitment finalisation
-// may carry. The two stream-era reasons have their own transitions
-// (FailAfterCommitment, FailAbandoned), so they are deliberately absent here:
-// a caller reaching for them through the pre-commitment door is making the
-// mistake the guard exists to catch.
-func (reason FailureReason) preCommitment() bool {
+// Surfaced reports whether a failure reason is one of the surfaced upstream
+// refusals — the only failure reasons a pre-commitment finalisation may
+// carry, and the only ones a failed replay record re-answers, because their
+// original answers were ordinary HTTP the wire can render again. The two
+// stream-era reasons have their own transitions (FailAfterCommitment,
+// FailAbandoned) and no answer this wire can re-serve, so they are
+// deliberately absent here: a caller reaching for them through the
+// pre-commitment door is making the mistake the guard exists to catch.
+func (reason FailureReason) Surfaced() bool {
 	switch reason {
 	case FailedProviderRejectedRequest, FailedContextTooLarge, FailedUpstreamAuthentication:
 		return true

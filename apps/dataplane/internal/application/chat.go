@@ -1,15 +1,15 @@
 // The admission boundary: the vocabulary the chat completion transport and
-// the admission use case meet at.
+// the use cases behind it meet at.
 //
 // This file is the seam of one endpoint. HTTP hands the runtime's request in
 // as a ChatInput and reads a ChatOutcome back; neither side names the other's
 // shape — no status code appears here, and no JSON field appears in the use
-// case. The outcome kinds are the decisions admission can reach: a request is
-// admitted, refused for a named reason, found already in flight under its
-// idempotency key, refused as a conflict with that key's history, or answered
-// again from a decision already made. What the wire does with each decision is
-// the transport's translation, and the transport is the only place that owns
-// it.
+// case. The outcome kinds are the decisions the pipeline can reach before an
+// answer exists: a request is admitted, refused for a named reason, found
+// already in flight under its idempotency key, refused as a conflict with
+// that key's history, or answered again from a decision already made. What
+// the wire does with each decision is the transport's translation, and the
+// transport is the only place that owns it.
 //
 // The vocabulary is deliberately small enough to read whole. A rejection
 // carries the admission step that refused it — execution.RejectionReason, the
@@ -25,9 +25,11 @@ import (
 	"context"
 	"time"
 
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/accounting"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/catalog"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/execution"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/identity"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/executors"
 )
 
 // ChatCompletion is the admission use case the chat completion transport
@@ -152,6 +154,14 @@ type ChatInput struct {
 	// use case decides what each means for admission; the transport decides
 	// nothing.
 	Body RequestBody
+
+	// Reply is the answer's channel, built by the transport over this
+	// request's connection. Admission's own outcomes are complete answers in
+	// themselves and never touch it; the routing stage delivers an admitted
+	// request's answer through it, which is why it is required — an input
+	// without one is a wiring defect the use cases refuse rather than an
+	// answer they cannot write.
+	Reply Reply
 }
 
 // RequestBody is the request body, read or refused. The split exists because
@@ -219,9 +229,74 @@ const (
 	// OutcomeReplay says this key and body match a request already decided,
 	// and the answer is that decision again. Original names the request
 	// whose decision is being re-answered; its wire shape is the original's,
-	// marked as a replay.
+	// marked as a replay. A replayed request that FAILED answers with its
+	// failure reason in Failure.
 	OutcomeReplay OutcomeKind = "replay"
+
+	// OutcomeServed says the answer travelled to the client through the
+	// request's reply while the routing stage ran — a completed answer, or
+	// one that failed after commitment with its failure frame already
+	// written into the stream. The transport writes nothing further; what
+	// happened is in Routing and, for a stream that ended in failure, in the
+	// bytes already gone.
+	OutcomeServed OutcomeKind = "served"
+
+	// OutcomeRefused says a candidate's upstream refused the request before
+	// any content was committed, and the refusal is surfaced to the caller —
+	// the one pre-commitment ending that is an answer, not a retry. Failure
+	// names the refusal; the cell it answers with is the transport's table.
+	OutcomeRefused OutcomeKind = "refused"
+
+	// OutcomeAbandoned says the routing walk stopped because the caller's
+	// context ended before any candidate produced an outcome. Nothing is
+	// finalised and nothing can be written — there is no channel left — so
+	// the request stays executing for the reaper, the same shape a dead
+	// process leaves, and the transport writes nothing.
+	OutcomeAbandoned OutcomeKind = "abandoned"
 )
+
+// Reply is the answer's channel: the transport builds one per request over
+// the caller's connection, and the routing stage delivers an admitted
+// request's answer through it. It extends the executors port's Sink — the
+// channel an executor writes content into — with the endings only the routing
+// stage may call, so the bytes of every ending travel the one channel and the
+// transport owns their framing in one place.
+//
+// The endings are named for what happened, never for what the bytes look
+// like: the transport's table (its wire map) decides status, body and
+// headers, and this interface never carries one.
+type Reply interface {
+	// Sink is the channel's executor-facing half: the routing stage hands
+	// the reply to every Executor it runs, and the executor writes content
+	// into it — the commitment point among those calls.
+	executors.Sink
+
+	// Open arms the reply for its answer: stream says whether the answer
+	// travels as a stream or as one body. The routing stage calls it before
+	// the first executor runs, because the framing is decided before the
+	// first byte is chosen.
+	Open(stream bool)
+
+	// ServeSucceeded closes a delivered answer. For a stream that is the
+	// terminal frame; for a body answer it is nothing, because the body was
+	// the whole answer.
+	ServeSucceeded()
+
+	// ServeMidStreamFailure writes a post-commitment failure into the stream
+	// it belongs to: the failure frame, then the terminal frame, then close.
+	// It has no meaning for a body answer, because a body answer is written
+	// once and complete.
+	ServeMidStreamFailure()
+
+	// ServeSurfaced answers a pre-commitment surfaced refusal: the refusal's
+	// own cell, status and all, nothing having been written before it.
+	ServeSurfaced(failure execution.FailureReason)
+
+	// ServeNoCandidate answers the no-candidate ending: the runtime could
+	// not route the request, the hold was released unused, and the caller
+	// retries later rather than differently.
+	ServeNoCandidate()
+}
 
 // RejectionDetail names the request field a rejection is about, when one
 // field is at fault. The values are the request's own field names — the
@@ -269,6 +344,14 @@ type ChatOutcome struct {
 	// replay re-answers.
 	Original identity.RequestID
 
+	// Failure is the upstream refusal an ending or a replay names: set on
+	// OutcomeRefused, where it is the refusal this arrival was just served,
+	// and on OutcomeReplay of a failed original, where it is the refusal the
+	// original was served and this arrival is answered with again. The three
+	// values it can carry are the surfaced refusals — the pre-commitment
+	// endings whose answers are ordinary HTTP.
+	Failure execution.FailureReason
+
 	// RuntimeRequestID is the runtime identity of the arrival this outcome
 	// answers — the attempt identity the decision was actually reached under:
 	// the transport-minted id for every decision made before a unit of work
@@ -281,6 +364,42 @@ type ChatOutcome struct {
 	// Admitted carries what an admitted request hands forward. It is set
 	// exactly on OutcomeAdmitted.
 	Admitted *Admission
+
+	// Routing carries what the routing stage did with an admitted request,
+	// set on OutcomeServed, OutcomeRefused and OutcomeAbandoned and nil on
+	// every decision admission reached alone. The transport logs it beside
+	// the answer; it names no candidate, no provider model and no provider
+	// handle — a wire-adjacent line is not the place for a provider's
+	// identity.
+	Routing *RoutingTrace
+}
+
+// RoutingTrace is what the routing stage did, for the log line that answers
+// for it. The counts are the walk's own — how many candidates were tried,
+// where the walk stopped, what the last failure was classified as, and
+// whether an answer crossed its commitment point — and they are the whole of
+// what a correlation question needs: which alias, how deep the walk went,
+// what stopped it, did the client get bytes.
+type RoutingTrace struct {
+	// Alias is the alias the walk resolved.
+	Alias string
+
+	// Attempts is how many candidates the walk tried, in total.
+	Attempts int
+
+	// LastPosition is the catalog position of the last candidate the walk
+	// tried — 1 for a first-try answer, higher when the walk fell through —
+	// and zero when no candidate was tried at all.
+	LastPosition int
+
+	// LastErrorClass is the class the last failure was classified as, empty
+	// when the walk ended any other way.
+	LastErrorClass execution.ErrorClass
+
+	// Committed reports whether an answer crossed its commitment point —
+	// the difference between a request whose failure is a surfaced refusal
+	// and one whose failure reached the client as bytes.
+	Committed bool
 }
 
 // Admission is what an admitted request hands to the pipeline stage that
@@ -302,8 +421,28 @@ type Admission struct {
 	// units.
 	Hold int64
 
+	// InputTokens is the input count admission priced the hold from — the
+	// gateway's own count of the request it read. A settled ending reports
+	// the provider's input figure when the provider gave one; this is what it
+	// claims when none arrived, so a settlement never needs to re-count a
+	// body the admission already counted.
+	InputTokens int
+
 	// ReservationID is the live reservation the request holds.
 	ReservationID identity.ReservationID
+
+	// Alias is the name of the alias the request was admitted against — the
+	// name the routing stage resolves to its candidate list. The stage
+	// re-reads the alias rather than trusting a snapshot of it: selection is
+	// a routing-time judgment over the catalog as it stands, and an alias
+	// edited between admission and routing is routed by its current list.
+	Alias string
+
+	// Legs is the waterfall split the hold was drawn down against, in the
+	// stored ordinal order. The release ending returns them and the settle
+	// ending closes them out in its fact; both need the split exactly as it
+	// was granted, never re-derived.
+	Legs []accounting.Allocation
 
 	// LeaseOwner and LeaseExpiresAt are the reservation lease's holder and
 	// deadline — the facts that let the runtime tell a reservation its

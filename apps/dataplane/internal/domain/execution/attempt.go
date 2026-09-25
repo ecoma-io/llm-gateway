@@ -65,6 +65,14 @@ var ErrUsageNegative = errors.New("execution: provider usage must not be negativ
 // error belongs at the write site, the constraint is the wall behind it.
 const maxProviderErrorOctets = 32768
 
+// MaxProviderRequestIDOctets is the bound the schema's CHECK puts on the
+// provider's own correlation handle. It is exported because the handle is the
+// one provider-controlled column written by direct assignment, so the writer
+// that composes the row is also the writer that keeps the handle inside the
+// wall — a provider echoing a verbose handle must cost the row a truncation,
+// never the settlement it rides on.
+const MaxProviderRequestIDOctets = 256
+
 // Attempt is one upstream call, appended as the call finishes and never while
 // it is in flight (ADR 0001 rule 4) — a crash mid-call leaves no row, and no
 // transaction is ever open across a provider call.
@@ -204,4 +212,24 @@ func errorClassKnown(class ErrorClass) bool {
 		return true
 	}
 	return false
+}
+
+// ErrorClasses is the whole vocabulary, in one slice, for the consumers that
+// must face every class a future edit could add — the disposition table and
+// the tests that pin it. A class appended to the constants above but not to
+// this slice is a lie the vocabulary checks below catch; a class appended to
+// both walks straight into every switch that asks this slice, which is the
+// point: the addition is a visible edit at each consumer, never a silent
+// fall-through.
+func ErrorClasses() []ErrorClass {
+	return []ErrorClass{
+		ErrorAuthentication,
+		ErrorRateLimited,
+		ErrorProviderUnavailable,
+		ErrorProviderRejectedRequest,
+		ErrorContextTooLarge,
+		ErrorInvalidUpstreamResponse,
+		ErrorUpstreamError,
+		ErrorStreamAfterCommitment,
+	}
 }

@@ -59,16 +59,6 @@ import (
 // win on a second run.
 const admissionMaxAttempts = 3
 
-const (
-	// seamMaxAttempts bounds the compensation unit's retries, and
-	// seamRetryBackoff is the pause between them. The seam runs after the
-	// caller's answer has effectively been decided, so its budget is measured
-	// against the request's own lifetime — three quick attempts, not a
-	// backoff ladder a client times out under.
-	seamMaxAttempts  = 3
-	seamRetryBackoff = 10 * time.Millisecond
-)
-
 // errIntakeRaced is the interior signal that the replay record's insert lost
 // its unique key: another unit wrote this (account, key) between the probe
 // and the insert. It never reaches a caller — Serve answers it by re-reading
@@ -308,10 +298,11 @@ func (a *ChatAdmission) refuseEarly(ctx context.Context, in ChatInput, reason ex
 // a nil error means this request is the first arrival, and admission goes on.
 // The raw bytes ride along for the one answer that needs them: a replayed
 // rejection re-derives its field detail from the same bytes the digest
-// matched. A record terminal in a way this build cannot answer is an error,
-// not an answer: succeeded and failed originals are the execution pipeline's
-// outcomes, and inventing an answer for them here would be vocabulary this
-// milestone has no transport for.
+// matched. Two terminal shapes remain that this build cannot answer — a
+// succeeded original, whose answer bytes were never a decision the record
+// could carry, and an original that failed with a stream-era reason, whose
+// answer lived inside a stream that died. Inventing an answer for either
+// would be vocabulary the wire has no cell for.
 func (a *ChatAdmission) probe(ctx context.Context, in ChatInput, digest string, raw []byte) (ChatOutcome, bool, error) {
 	record, err := a.intakes.Find(ctx, in.AccountID, in.IdempotencyKey)
 	if errors.Is(err, persistence.ErrNotFound) {
@@ -340,6 +331,19 @@ func (a *ChatAdmission) probe(ctx context.Context, in ChatInput, digest string, 
 			Kind:             OutcomeReplay,
 			Reason:           record.FinalRejectionReason,
 			Detail:           detail,
+			Original:         record.RequestID,
+			RuntimeRequestID: in.RequestID,
+		}, true, nil
+	}
+	if *record.FinalStatus == execution.FinalFailed && record.FinalFailureReason.Surfaced() {
+		// A failed original whose failure was one of the surfaced upstream
+		// refusals is answered again byte for byte: the refusal is a
+		// pre-commitment ending, its answer was ordinary HTTP, and the
+		// record carries the reason the cell is re-derived from. The two
+		// replay headers travel with it, as with every replay.
+		return ChatOutcome{
+			Kind:             OutcomeReplay,
+			Failure:          record.FinalFailureReason,
 			Original:         record.RequestID,
 			RuntimeRequestID: in.RequestID,
 		}, true, nil
@@ -550,30 +554,26 @@ func (a *ChatAdmission) admitOnce(ctx context.Context, in ChatInput, requestID i
 			Stream:           parsed.stream,
 			Price:            snapshot,
 			Hold:             hold,
+			InputTokens:      int(inputTokens),
 			ReservationID:    reservationID,
+			Alias:            model,
+			Legs:             legs,
 			LeaseOwner:       a.cfg.LeaseOwner,
 			LeaseExpiresAt:   now.Add(a.cfg.LeaseTTL),
 			RuntimeRequestID: requestID,
 		}
+		outcome = ChatOutcome{Kind: OutcomeAdmitted, RuntimeRequestID: requestID, Admitted: admitted}
 		return nil
 	})
 	if err != nil {
 		return ChatOutcome{}, err
 	}
-	if outcome.Kind == OutcomeRejected {
-		// A refusal decided inside the unit is a committed decision — the
-		// pair is on the record, and the outcome answers for it.
-		return outcome, nil
-	}
-
-	// The B8 seam: the stand-in for the routing stage. Nothing routes yet, so
-	// the admission this unit just committed is completed by releasing the
-	// hold and finishing the request as no_candidate — the one ending an
-	// admitted request can reach before there is a candidate to serve it to.
-	if err := a.complete(ctx, in, admitted, legs); err != nil {
-		return ChatOutcome{}, err
-	}
-	return ChatOutcome{Kind: OutcomeRejected, Reason: execution.RejectedNoCandidate, Detail: DetailNone, RuntimeRequestID: requestID}, nil
+	// Whatever the unit decided is now on the record, an admitted request as
+	// much as a refusal: both are committed decisions and both travel back as
+	// outcomes. What an admitted request is served by is not this use case's
+	// question — the routing stage that wraps it reads the admission out of
+	// the outcome and walks the alias's candidates.
+	return outcome, nil
 }
 
 // refuseInTx records the rejection pair inside the admission unit that
@@ -621,121 +621,6 @@ func (a *ChatAdmission) refuseInTx(
 	}
 	*outcome = ChatOutcome{Kind: OutcomeRejected, Reason: refusal.reason, Detail: refusal.detail, RuntimeRequestID: requestID}
 	return nil
-}
-
-// complete is the B8 seam, and it is deliberately shaped like the stage that
-// will replace it: handed exactly what an admitted request hands forward, it
-// finishes the request the only way this milestone can — the hold released,
-// the request finalised no_candidate, the replay record terminal, the release
-// fact the feed's last word. The next milestone's routing stage reads the
-// same hand-off and either routes the request or calls this same ending for
-// its own reasons.
-//
-// The unit is detached on purpose: the admission unit has committed, so the
-// compensation stands on its own — its own retry budget, its own clock, its
-// own commit. When the seam exhausts its retries the error is the answer: the
-// hold stays stranded (open reservation, executing request, the reaper's to
-// reclaim) and the caller is told nothing that invites a retry, because a
-// retry would draw a second hold. The no_candidate answer exists only for a
-// seam that committed — or lost its own CAS, in which case whoever won the
-// hold owns its ending and this caller still has no candidate.
-func (a *ChatAdmission) complete(ctx context.Context, in ChatInput, admitted *Admission, legs []accounting.Allocation) error {
-	for attempt := 0; attempt < seamMaxAttempts; attempt++ {
-		// The unit's own "completed" is not this loop's business: a seam that
-		// lost its CAS settled too — someone else owns the ending — and an
-		// error is the only thing left to retry.
-		_, err := a.completeOnce(ctx, in, admitted, legs)
-		if err == nil {
-			return nil
-		}
-		if !isRetryableStoreFailure(err) {
-			return err
-		}
-		if attempt+1 < seamMaxAttempts {
-			select {
-			case <-ctx.Done():
-				return fmt.Errorf("application: complete request %s: %w", admitted.RuntimeRequestID, ctx.Err())
-			case <-time.After(seamRetryBackoff << attempt):
-			}
-		}
-	}
-	return fmt.Errorf("application: complete request %s: the release unit did not settle after %d attempts", admitted.RuntimeRequestID, seamMaxAttempts)
-}
-
-// completeOnce runs the compensation unit once. Every step past the CAS is
-// guarded by the one before it: the CAS decides who owns the hold's ending,
-// and a lost CAS ends the unit with nothing written — the winner's ending
-// stands, and this caller's answer is unchanged.
-func (a *ChatAdmission) completeOnce(ctx context.Context, in ChatInput, admitted *Admission, legs []accounting.Allocation) (bool, error) {
-	var completed bool
-	err := a.store.WithinTx(ctx, func(txCtx context.Context) error {
-		now, err := a.clock.TransactionTimestamp(txCtx)
-		if err != nil {
-			return err
-		}
-		// The CAS is the whole claim to the compensation: only the writer
-		// that moves the hold out of open may return its legs and state the
-		// ending.
-		closed, err := a.reservations.Close(txCtx, admitted.ReservationID, accounting.StateReleased, now)
-		if err != nil {
-			return fmt.Errorf("application: complete request %s: release the hold: %w", admitted.RuntimeRequestID, err)
-		}
-		if !closed {
-			return nil
-		}
-		// The return, in the legs' stored ordinal order — the waterfall order
-		// every writer of the projection walks, and the order the fact
-		// publishes. The port's return is unconditional on the balances, so a
-		// publication that shrank a ceiling cannot turn a release into a
-		// failure.
-		if _, err := a.ledger.Return(txCtx, legs); err != nil {
-			return fmt.Errorf("application: complete request %s: return the hold: %w", admitted.RuntimeRequestID, err)
-		}
-		request := execution.Request{ID: admitted.RuntimeRequestID, Status: execution.StatusExecuting}
-		if err := request.Reject(execution.RejectedNoCandidate, now); err != nil {
-			return err
-		}
-		finalised, err := a.requests.Finalise(txCtx, request)
-		if err != nil {
-			return fmt.Errorf("application: complete request %s: finalise the request: %w", admitted.RuntimeRequestID, err)
-		}
-		if !finalised {
-			// The CAS gave this unit the ending, and the request row would not
-			// take it. That is not a quiet no-op: a closed hold with no
-			// deciding fact behind it is exactly the orphan the doctrine
-			// forbids (no closed hold without its fact). The unit errors and
-			// rolls back — the CAS's close included — leaving the hold open
-			// for a whole retry or, at exhaustion, for the reaper.
-			return fmt.Errorf("application: complete request %s: the request row did not finalise", admitted.RuntimeRequestID)
-		}
-		decided, err := a.intakes.Finalise(txCtx, in.AccountID, in.IdempotencyKey,
-			execution.FinalRejected, execution.RejectedNoCandidate, "")
-		if err != nil {
-			return fmt.Errorf("application: complete request %s: finalise the replay record: %w", admitted.RuntimeRequestID, err)
-		}
-		if !decided {
-			// Same verdict one step later: the record would not take its
-			// terminal pointer, so the release fact must not be appended.
-			// The unit rolls back whole and stays whole for its retry.
-			return fmt.Errorf("application: complete request %s: the replay record did not finalise", admitted.RuntimeRequestID)
-		}
-		fact, err := accounting.NewReleased(admitted.RuntimeRequestID, factLegs(legs), now)
-		if err != nil {
-			return err
-		}
-		// The append is the unit's LAST statement: the feed's row lock is
-		// held to the commit, so the order facts are allocated is the order
-		// they become visible, and this ending reads as one fact.
-		if _, err := a.facts.Append(txCtx, fact); err != nil {
-			return fmt.Errorf("application: complete request %s: append the release: %w", admitted.RuntimeRequestID, err)
-		}
-		completed = true
-		return nil
-	})
-	if err != nil {
-		return false, err
-	}
-	return completed, nil
 }
 
 // ---------------------------------------------------------------------------

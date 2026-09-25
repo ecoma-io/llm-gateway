@@ -21,7 +21,7 @@ extends:
 # The list below is every rule this corpus deliberately breaks, and it is short
 # on purpose. It was not written from the rule reference but from the linter's
 # own output: running `spectral:oas` unmodified over the three documents reports
-# exactly two classes of finding, and there are no others to silence. Every rule
+# exactly one class of finding, and there are no others to silence. Every rule
 # that is *not* here is a rule this repository passes — which is what makes an
 # entry below a decision a reviewer can read, rather than a habit.
 rules:
@@ -33,16 +33,3 @@ rules:
   # comes back on — the suppression is about publication, not about contact
   # information.
   info-contact: off
-
-  # Fires once, on `POST /v1/chat/completions`, which declares no 2xx response
-  # on purpose. The operation contracts admission — authentication, entitlement,
-  # quota and the reservation of spend — and every refusal that admission can
-  # produce is declared. What it deliberately does not declare is the successful
-  # completion: the runtime hands an admitted request to its routing half, and
-  # the shape routing streams back is contracted when routing lands. Declaring
-  # a 200 today would be the contract claiming a capability the code does not
-  # have, which is the one thing this repository's contract-first rule is meant
-  # to prevent — see AGENTS.md rule 2 and api/openapi/runtime.yaml's header.
-  # This is the suppression that should disappear first: the day the routing
-  # half lands, the rule goes back on and the document must have gained its 200.
-  operation-success-response: off
