@@ -37,6 +37,27 @@ tasks:
   # and one verdict per module with no concurrent writer to either. CI's
   # `verify-go` matrix never contends (one module per runner), so this costs
   # CI nothing and fixes the local run.
+  #
+  # GOLANGCI_LINT_CACHE is pinned below to a directory unique to this checkout.
+  # Sibling git worktrees of this repository share one home directory, and the
+  # linter's default cache — `~/.cache/golangci-lint` — is one directory for all
+  # of them. Its result cache is keyed on content while the issues it stores
+  # carry ABSOLUTE paths, so a run here can replay findings another checkout
+  # recorded: `pnpm lint` has failed with `../../../lobster/apps/…` findings for
+  # files this tree has never held, and golangci-lint's own warning that it
+  # could not open the reported file is the tell (issue #70).
+  #
+  # `cksum` is POSIX, and it is content independent for the reason that matters
+  # here: two checkouts of THIS repository share project basenames, so
+  # `basename $(pwd)` would collide where a checksum of the absolute path
+  # cannot.
+  #
+  # `${VAR:-default}` so the caller's value wins, because the environment
+  # overrides a script's own default and this is a default rather than a
+  # policy — the same `:-` read the integration targets below use for their
+  # required variables, minus the refusal, because here the default is a
+  # perfectly good value. CI runs these same targets in a single checkout,
+  # where the derived directory is simply a fresh one per runner.
   lint:
     script: |
       if [ -n "$(gofmt -l .)" ]; then
@@ -44,6 +65,7 @@ tasks:
         gofmt -l .
         exit 1
       fi
+      export GOLANGCI_LINT_CACHE="${GOLANGCI_LINT_CACHE:-$HOME/.cache/golangci-lint-$(pwd | cksum | cut -d' ' -f1)}"
       golangci-lint run --allow-serial-runners ./...
     inputs:
       - "**/*"
