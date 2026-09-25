@@ -26,11 +26,31 @@ type route struct {
 	handler stdhttp.HandlerFunc
 }
 
+// wiring is the pair of use cases the chat completion route is built over:
+// the authenticator that verifies a presented credential and the admission
+// use case that decides the request. They travel as one value because they
+// are one route's two halves, and a route table that took them separately
+// would let a composition root wire a verifier to one endpoint and an
+// admission to another — a failure the compiler cannot see and the surface's
+// shape would not either.
+//
+// Both are interfaces owned by the application, and this package reaches
+// inward at them and nowhere else: it asks what the caller is and what
+// admission decided, and it owns the answer's shape on the wire. The wiring
+// itself is the composition root's, in cmd/dataplane.
+type wiring struct {
+	auth application.Authenticator
+	chat application.ChatCompletion
+}
+
 // routes returns this application's HTTP surface, in the order a reader meets
 // it. Each handler owns the response *shape*; what the answer is belongs to
 // the application, and how it reaches the wire belongs to the kit in
-// server.go.
-func routes(app *application.App) []route {
+// server.go. The chat completion route is built over the wiring — the
+// authenticator and admission use case the composition root chose — and over
+// nothing on app: the probes read what this process holds, but the request
+// path is served from the use cases wired for it, or from nothing at all.
+func routes(app *application.App, wired wiring) []route {
 	return []route{
 		// Liveness: the process is up and its loop is turning. Anything about
 		// whether the gateway could do useful work — a dependency reachable, a
@@ -63,22 +83,17 @@ func routes(app *application.App) []route {
 				writeJSON(w, stdhttp.StatusOK, versionResponse{Version: app.Version()})
 			},
 		},
-		// The inference surface, contracted and not built. It is registered
-		// rather than left unrouted because the difference matters to a
-		// caller: 501 with `not_implemented` says the path belongs to this
-		// application and the capability does not exist yet, while the 404 an
-		// unrouted path would produce says the gateway has no such endpoint —
-		// and the second is a lie that costs someone an afternoon.
-		//
-		// The body is not read, parsed or forwarded. Reading it would be the
-		// first line of an implementation, and this endpoint's whole content
-		// today is the fact that there is not one.
+		// The inference surface, and the only route on it that authenticates,
+		// reads a body, and calls a use case. The handler is built over the
+		// wiring — the authenticator and admission use case the composition
+		// root handed New; what the endpoint owns — the credential header's
+		// shape, the body's bound, the wire answer for each decision — is in
+		// chat.go and wiremap.go, and nothing about the request crosses the
+		// boundary but the vocabulary application/chat.go declares.
 		{
-			method: stdhttp.MethodPost,
-			path:   "/v1/chat/completions",
-			handler: func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-				writeError(w, r, notImplementedError{})
-			},
+			method:  stdhttp.MethodPost,
+			path:    "/v1/chat/completions",
+			handler: newChatCompletionHandler(wired),
 		},
 	}
 }

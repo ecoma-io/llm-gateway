@@ -52,7 +52,7 @@ var foreignSurface = []string{
 // alone.
 func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 	got := []string{}
-	for _, rt := range routes(newTestApp(t, "test")) {
+	for _, rt := range routes(newTestApp(t, "test"), wiring{}) {
 		got = append(got, rt.method+" "+rt.path)
 	}
 	sort.Strings(got)
@@ -71,7 +71,7 @@ func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 // not allowed to be a hop on, and the way that fails in practice is a route
 // someone added here because it was the application already running.
 func TestTheRuntimeServesNoForeignRoute(t *testing.T) {
-	for _, rt := range routes(newTestApp(t, "test")) {
+	for _, rt := range routes(newTestApp(t, "test"), wiring{}) {
 		for _, foreign := range foreignSurface {
 			if strings.HasPrefix(rt.path, foreign) {
 				t.Errorf("the runtime declares %s %s: %s belongs to another application's surface (ADR 0006 §4, §11)", rt.method, rt.path, foreign)
@@ -103,7 +103,7 @@ func TestTheInferenceSurfaceIsTheRuntimes(t *testing.T) {
 // in server.go, so nothing downstream would correct it.
 func TestEveryRouteIsMountable(t *testing.T) {
 	seen := map[string]bool{}
-	for _, rt := range routes(newTestApp(t, "test")) {
+	for _, rt := range routes(newTestApp(t, "test"), wiring{}) {
 		if !strings.HasPrefix(rt.path, "/") {
 			t.Errorf("%s %s: a route path must begin with /", rt.method, rt.path)
 		}

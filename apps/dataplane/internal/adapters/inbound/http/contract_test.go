@@ -42,7 +42,7 @@ func TestTheRouteTableIsTheContract(t *testing.T) {
 	declared := contractOperations(t)
 
 	served := []string{}
-	for _, rt := range routes(newTestApp(t, "test")) {
+	for _, rt := range routes(newTestApp(t, "test"), wiring{}) {
 		served = append(served, rt.method+" "+rt.path)
 	}
 	sort.Strings(served)
