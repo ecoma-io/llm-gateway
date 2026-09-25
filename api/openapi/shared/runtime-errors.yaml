@@ -100,10 +100,21 @@ components:
     InternalError:
       description: >-
         The runtime failed in a way it cannot classify. The internal cause is
-        logged against the request identifier and never serialized.
+        logged against the request identifier and never serialized. One
+        classified case shares this answer on the chat-completion operation:
+        code `upstream_authentication`, when the upstream refused the
+        gateway's credentials — an operator problem, logged loudly and never
+        carrying credential material in the body. On that operation the answer
+        is a recorded ending, replayed byte-for-byte on a repeat of the same
+        key and body; the probes never replay and never carry the replay
+        headers.
       headers:
         X-Request-Id:
           $ref: "./probes.yaml#/components/headers/RequestId"
+        Idempotent-Replay:
+          $ref: "#/components/headers/IdempotentReplay"
+        X-Original-Request-Id:
+          $ref: "#/components/headers/OriginalRequestId"
       content:
         application/json:
           schema:
@@ -125,7 +136,7 @@ components:
             $ref: "#/components/schemas/RuntimeError"
     BadRequest:
       description: >-
-        The request is not a valid chat completion request and admission
+        The request was refused 400 in one of two situations. Admission
         refused it before spending anything: a missing or malformed `model`
         (including a value outside the model grammar), a missing, non-positive,
         disagreeing, or past-the-2147483647-bound output ceiling, a missing or
@@ -133,9 +144,18 @@ components:
         larger than the 10485760-byte bound the operation declares — an
         oversized body is refused 400 and never 413, because the runtime
         declines to admit it rather than declining to carry it. The `param`
-        names the field at fault when there is one. A refusal recorded in the
-        idempotency store is replayed on a repeat of the same key and body,
-        with the two replay headers beside it.
+        names the field at fault when there is one, and no code is attached.
+        Or the request was admitted and served by a candidate whose upstream
+        refused it before any content was sent: `provider_rejected_request`
+        when the upstream rejected the forwarded request (the client's request
+        is the one at fault — the same request against another candidate would
+        fail identically, so nothing is retried behind the answer), and
+        `context_too_large` when the request's context exceeds what the
+        upstream accepts (surfacing it beats silently truncating it). In that
+        second situation the reservation was released unused and the answer
+        names the refusal in `code`. A refusal recorded in the idempotency
+        store is replayed on a repeat of the same key and body, with the two
+        replay headers beside it.
       headers:
         X-Request-Id:
           $ref: "./probes.yaml#/components/headers/RequestId"
@@ -248,13 +268,19 @@ components:
     NoCandidate:
       description: >-
         The request was admitted — the hold it implied was reserved — and the
-        runtime matched no candidate to route it to, so the reservation was
-        released unused. The condition is expected to clear as capacity and
-        routes change, which is why the type is `overloaded_error` and the
-        answer carries a `Retry-After`: the caller retries later rather than
-        differently. A recorded no-candidate answer is replayed on a repeat of
-        the same key and body, with the two replay headers beside it and the
-        `Retry-After` hint still attached.
+        runtime could not route it, so the reservation was released unused,
+        under one of two conditions the answer does not distinguish. No
+        candidate matched the request: the alias carries none whose backend is
+        active and servable. Or candidates matched and every one of them
+        failed before the answer was committed: the runtime fell through the
+        whole list and reports that nothing served it, never the failure of
+        the last candidate alone. Either way the condition is expected to
+        clear as capacity and routes change, which is why the type is
+        `overloaded_error` and the answer carries a `Retry-After`: the caller
+        retries later rather than differently. A recorded answer of either
+        condition is replayed on a repeat of the same key and body, with the
+        two replay headers beside it and the `Retry-After` hint still
+        attached.
       headers:
         X-Request-Id:
           $ref: "./probes.yaml#/components/headers/RequestId"
@@ -332,7 +358,12 @@ components:
             one code a client resolves a name by); `invalid_request` (400,
             with `param` naming the field at fault);
             `idempotency_conflict` and `request_in_progress` (409, the two
-            ways an idempotency key refuses a request); and
-            `insufficient_quota` (429, capacity matched and short). Null when
-            `type` alone is the whole story.
+            ways an idempotency key refuses a request);
+            `insufficient_quota` (429, capacity matched and short);
+            `provider_rejected_request` and `context_too_large` (400, the
+            upstream refused the admitted request before any content was sent
+            — the caller's request is at fault, and the answer names which
+            refusal); and `upstream_authentication` (500, the upstream refused
+            the gateway's credentials — an operator problem, never naming
+            credential material). Null when `type` alone is the whole story.
       additionalProperties: false

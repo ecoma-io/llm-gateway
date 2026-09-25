@@ -18,14 +18,12 @@
 # client of this surface.
 #
 # `POST /v1/chat/completions` is the one operation on the LLM request path, and
-# what this document contracts of it is admission: who the caller is, what they
-# are entitled to, and whether the runtime reserves the spend the request
-# implies. Every refusal that admission can produce is declared, so a caller
-# can branch on the answer; the successful completion response is deliberately
-# absent — the runtime admits a request and hands it to its routing half, and
-# the shape of what routing streams back is contracted when that half lands. A
-# documented 200 this code cannot produce would be the contract claiming a
-# capability that does not exist.
+# what this document contracts of it is the whole pipeline a request walks:
+# admission (who the caller is, what they are entitled to, whether the spend is
+# reserved) and routing (which candidate serves it, when the answer is
+# committed, and what every terminal outcome looks like on the wire). Every
+# refusal and every failure the runtime can produce is declared, so a caller
+# can branch on any answer — including the success this operation exists for.
 openapi: 3.1.0
 info:
   title: Ecoma LLM Gateway — OpenAI-compatible runtime
@@ -41,9 +39,7 @@ info:
     `overloaded_error` type.
     A request that fails after the response has started streaming reports the
     failure inside the stream instead, because by then no HTTP status can be
-    revised — see the chat-completion operation. The runtime's routing,
-    provider and usage behaviour is not designed yet; this document carries the
-    surface that exists and the process every later endpoint follows.
+    revised — see the chat-completion operation.
 servers:
   - url: /
 tags:
@@ -243,8 +239,23 @@ paths:
           quantity is what was already forwarded.
 
 
-        The successful completion response is not part of this document yet: it
-        is contracted when the routing half that streams it lands.
+        **The successful response.** A completion is answered 200 in the shape
+        `stream` selects. `stream: false` answers one `application/json` body —
+        the OpenAI-compatible chat.completion object. `stream: true` answers
+        `text/event-stream`: `data:` frames whose payloads are
+        chat.completion.chunk objects, in the order the model produced them,
+        terminated by the `data: [DONE]` frame. The gateway is the stream's
+        framer — it emits the `data:` prefixes, the blank line between events
+        and the terminal `[DONE]`. A refusal the upstream itself produced is
+        surfaced rather than retried against another candidate — retrying
+        would fail identically or silently produce a different answer
+        (docs/architecture/routing.md): the upstream rejecting the forwarded
+        request, or a context larger than it accepts, answers 400 with the
+        `provider_rejected_request` or `context_too_large` code; the upstream
+        refusing the gateway's credentials answers 500 with
+        `upstream_authentication` and is logged for the operator. Every one of
+        these is a recorded ending, replayed byte-for-byte on a repeat of the
+        same key and body.
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
         - name: Idempotency-Key
@@ -335,10 +346,34 @@ paths:
                   description: >-
                     Whether the completion is to be streamed as Server-Sent
                     Events. Admission reserves the same hold either way; the
-                    streaming response shape itself is contracted with routing.
+                    two response shapes are declared in this operation's 200
+                    response.
               additionalProperties: true
       x-max-body-bytes: 10485760
       responses:
+        "200":
+          description: >-
+            The completion, in the shape the request's `stream` field selects:
+            one `application/json` chat.completion object, or a
+            `text/event-stream` of `data:` frames carrying
+            chat.completion.chunk objects terminated by the `data: [DONE]`
+            frame. A failure that arrives after a streamed response has begun
+            is reported inside the stream — one `data:` frame carrying the
+            same JSON error body this document declares for every other
+            failure, then the terminal `data: [DONE]`, then the stream closes
+            — because by then no HTTP status can be revised. A 200 that ends
+            in a failure frame is a committed answer: no candidate is retried
+            behind it.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletion"
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionStream"
         "400":
           $ref: "./shared/runtime-errors.yaml#/components/responses/BadRequest"
         "401":
@@ -371,3 +406,87 @@ components:
         declared here because this is the only surface a customer's key
         reaches; the management façade's service credential is a different
         scheme in a different document.
+  schemas:
+    ChatCompletion:
+      type: object
+      description: >-
+        The OpenAI-compatible completion object a non-streaming request is
+        answered with. The fields below are the ones an OpenAI-compatible
+        client branches on; the upstream may carry more, and the gateway
+        forwards what the serving candidate produced rather than rebuilding
+        it.
+      required:
+        - id
+        - object
+        - created
+        - model
+        - choices
+      properties:
+        id:
+          type: string
+          description: The serving upstream's identifier for the completion.
+        object:
+          type: string
+          enum:
+            - chat.completion
+        created:
+          type: integer
+          description: Unix time, in seconds, of when the completion was created.
+        model:
+          type: string
+          description: >-
+            The model that served the request, as the serving candidate's
+            upstream names it — which may differ from the requested alias.
+        choices:
+          type: array
+          items:
+            type: object
+            required:
+              - index
+              - message
+            properties:
+              index:
+                type: integer
+              message:
+                type: object
+                required:
+                  - role
+                  - content
+                properties:
+                  role:
+                    type: string
+                  content:
+                    type:
+                      - string
+                      - "null"
+                    description: >-
+                      The completion's content, or null when the completion
+                      produced none.
+              finish_reason:
+                type:
+                  - string
+                  - "null"
+                description: >-
+                  Why the completion ended: `stop` for a natural end, `length`
+                  when the output ceiling was reached, or null while the
+                  completion is still being produced.
+      additionalProperties: true
+    ChatCompletionStream:
+      type: string
+      description: >-
+        The Server-Sent Events body of a streamed completion. Each event is a
+        `data:` frame whose payload is the JSON serialization of one
+        chat.completion.chunk object — the completion's `id`, `object` (always
+        `chat.completion.chunk`), `created` and `model`, and a `choices` array
+        whose items carry the choice's `index`, its `delta` (the piece this
+        frame adds: `role` on the first frame, `content` on content frames,
+        and an empty delta on the frame that closes a choice) and its
+        `finish_reason` (`stop` for a natural end, `length` when the output
+        ceiling was reached, null on every frame before the last). Events are
+        separated by a blank line, and the body ends with a `data: [DONE]`
+        frame. A failure that arrives after the stream has begun replaces the
+        remaining answer: one `data:` frame whose payload is this document's
+        JSON error body (an `api_error` for a provider failure mid-stream),
+        then the terminal `data: [DONE]` frame, then the stream closes. The
+        frames' byte layout is pinned by a test in apps/dataplane rather than
+        modelled as a schema, exactly as the error channel's framing is.
