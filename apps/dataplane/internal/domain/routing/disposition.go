@@ -19,9 +19,14 @@ import (
 // the surfaced refusals are exactly the three failure reasons whose domain
 // transition is FailBeforeCommitment.
 //
-// The switch is exhaustive over the error-class vocabulary, spelled as a
-// default-less mapping between two functions so a class added to execution's
-// list without an entry here is a compile-visible decision rather than a
+// The table is exhaustive over the error-class vocabulary by test, not by
+// compilation: both functions carry trailing returns (a switch Go cannot
+// prove total must end somewhere), so a class added to execution's list
+// without an entry here compiles and fails closed — FallbackEligible says
+// walk on, which ends the walk at no-candidate rather than stranding a hold.
+// What actually holds the table shut is execution.ErrorClasses: the test
+// behind it walks every class in the vocabulary and demands an explicit
+// verdict from both functions, so the new class is a failing test, not a
 // silent fall-through. The table in routing.md is this switch's prose twin;
 // the two change together or the docs lie.
 

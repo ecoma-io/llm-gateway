@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"sync"
 	"testing"
@@ -493,6 +494,63 @@ func TestRoutingAbandonsWhenTheCallerLeaves(t *testing.T) {
 	}
 }
 
+// TestRoutingSettlesAnEndingTheCallerDidNotStayFor: a client that leaves
+// after the commitment does not take the settlement with them — the bytes
+// that arrived were delivered, and the ending that records them runs
+// detached from the connection that died. The failure arrives committed, the
+// walk settles it on a context the caller's cancellation cannot reach, and
+// the settled fact lands exactly as it does for a caller who stayed. This is
+// the test the fake store's own BeginTx refusal gives meaning to: on the
+// caller's context the unit would not even begin.
+func TestRoutingSettlesAnEndingTheCallerDidNotStayFor(t *testing.T) {
+	routing, world, reply, in := routingFixture(t)
+	world.seedCandidates("test-model",
+		catalog.Candidate{ID: "cand-a", BackendID: "backend-a", ProviderModel: "model-a", Position: 1},
+	)
+	world.seedBackend("backend-a", catalog.BackendActive)
+	ctx, cancel := context.WithCancel(context.Background())
+	routing.registry = executors.NewRegistry(map[catalog.BackendID]executors.Executor{
+		"backend-a": &fakeExecutor{
+			act: func(sink executors.Sink) {
+				_ = sink.Content([]byte(`{"delta":"par`)) // the commitment, then the client goes
+				cancel()
+			},
+			results: []executors.Result{failExec(execution.ErrorUpstreamError)},
+		},
+	})
+	defer cancel()
+
+	outcome, err := routing.Serve(ctx, in)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if outcome.Kind != OutcomeServed || !outcome.Routing.Committed {
+		t.Fatalf("outcome = %s committed=%v, want served of a committed answer", outcome.Kind, outcome.Routing.Committed)
+	}
+	if outcome.Routing.LastErrorClass != execution.ErrorStreamAfterCommitment {
+		t.Fatalf("the committed failure read %s, want the stream's own class", outcome.Routing.LastErrorClass)
+	}
+
+	wantEvents(t, world, []string{
+		"begin", "ledger.drawdown", "request.insert", "reservation.insert", "intake.insert", "commit",
+		"begin", "reservation.close", "attempt.insert", "request.finalise", "intake.finalise", "fact.append", "commit",
+	})
+	if reservation := admissionReservationRow(t, world); reservation.State != accounting.StateSettled {
+		t.Fatalf("the hold is %s, want settled — the ending outlived the connection", reservation.State)
+	}
+	fact := world.facts[len(world.facts)-1]
+	if fact.Kind != accounting.KindSettled {
+		t.Fatalf("the feed's last word is %s, want settled", fact.Kind)
+	}
+	if intake := admissionIntakeRow(t, world, admissionAccount, "replay-key-1"); intake.FinalStatus == nil ||
+		*intake.FinalStatus != execution.FinalFailed {
+		t.Fatalf("the replay record is not terminal failed")
+	}
+	if len(reply.served) != 1 || reply.served[0] != "mid_stream_failure" {
+		t.Fatalf("the reply served %v, want the mid-stream failure frames", reply.served)
+	}
+}
+
 // TestRoutingClassifiesABrokenExecutorContract: a nil result is the
 // executor's contract broken, not a verdict about any provider — classified
 // as an answer nobody could read, and walked like one.
@@ -521,6 +579,81 @@ func TestRoutingClassifiesABrokenExecutorContract(t *testing.T) {
 	}
 	if len(reply.served) != 1 || reply.served[0] != "no_candidate" {
 		t.Fatalf("the reply served %v, want the no-candidate cell", reply.served)
+	}
+}
+
+// TestRoutingDoesNotSettleASuccessTheSinkNeverCommitted: an executor's
+// Success claim is a settlement only when the sink's commitment stands behind
+// it — the client received nothing otherwise, and billing for bytes that
+// never crossed is the one lie a settlement must never tell. The claim is
+// re-classed as an answer nobody could read and walked like one; the hold
+// goes back released, never settled.
+func TestRoutingDoesNotSettleASuccessTheSinkNeverCommitted(t *testing.T) {
+	routing, world, reply, in := routingFixture(t)
+	world.seedCandidates("test-model",
+		catalog.Candidate{ID: "cand-a", BackendID: "backend-a", ProviderModel: "model-a", Position: 1},
+	)
+	world.seedBackend("backend-a", catalog.BackendActive)
+	routing.registry = executors.NewRegistry(map[catalog.BackendID]executors.Executor{
+		"backend-a": &fakeExecutor{results: []executors.Result{okExec(50, 70)}}, // Success, sink untouched
+	})
+
+	outcome, err := routing.Serve(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if outcome.Kind != OutcomeRejected || outcome.Reason != execution.RejectedNoCandidateSucceeded {
+		t.Fatalf("outcome = %s/%s, want the walk exhausted as no_candidate_succeeded", outcome.Kind, outcome.Reason)
+	}
+	if outcome.Routing.LastErrorClass != execution.ErrorInvalidUpstreamResponse {
+		t.Fatalf("the uncommitted success read %s, want invalid_upstream_response", outcome.Routing.LastErrorClass)
+	}
+	if reservation := admissionReservationRow(t, world); reservation.State != accounting.StateReleased {
+		t.Fatalf("the hold is %s, want released — nothing was delivered to settle", reservation.State)
+	}
+	if len(world.facts) != 1 || world.facts[0].Kind != accounting.KindReleased {
+		t.Fatalf("the feed holds %v, want one released fact and no settlement", world.facts)
+	}
+	if len(reply.served) != 1 || reply.served[0] != "no_candidate" {
+		t.Fatalf("the reply served %v, want the no-candidate cell", reply.served)
+	}
+}
+
+// TestRoutingFailsTheRequestWhenTheCatalogCannotAnswer: a backend read that
+// FAILED is not a catalog with nothing in it — answering it as no_candidate
+// would write a permanent rejection over a transient fault, and the honest
+// ending for a walk that never reached a decision is the error: the request
+// stays executing for the reaper, exactly as an admission that could not
+// read its catalog leaves it. Only the admission's unit is in the story.
+func TestRoutingFailsTheRequestWhenTheCatalogCannotAnswer(t *testing.T) {
+	routing, world, _, in := routingFixture(t)
+	world.seedCandidates("test-model",
+		catalog.Candidate{ID: "cand-a", BackendID: "backend-a", ProviderModel: "model-a", Position: 1},
+	)
+	world.seedBackend("backend-a", catalog.BackendActive)
+	routing.registry = executors.NewRegistry(map[catalog.BackendID]executors.Executor{
+		"backend-a": &fakeExecutor{act: func(sink executors.Sink) { _ = sink.Content([]byte(`{"answer":true}`)) }},
+	})
+	routing.backends = fakeRoutingBackends{
+		world:       world,
+		readFailure: fmt.Errorf("fake: the catalog read timed out"),
+	}
+
+	_, err := routing.Serve(context.Background(), in)
+	if err == nil {
+		t.Fatalf("Serve answered from a catalog it could not read, want the error")
+	}
+	wantEvents(t, world, []string{
+		"begin", "ledger.drawdown", "request.insert", "reservation.insert", "intake.insert", "commit",
+	})
+	if reservation := admissionReservationRow(t, world); reservation.State != accounting.StateOpen {
+		t.Fatalf("the hold is %s, want open — no ending was decided", reservation.State)
+	}
+	if row := admissionRequestRow(t, world); row.Status != execution.StatusExecuting {
+		t.Fatalf("the request is %s, want executing — the reaper's to reclaim", row.Status)
+	}
+	if len(world.facts) != 0 {
+		t.Fatalf("the undecided walk appended %d facts, want none", len(world.facts))
 	}
 }
 
@@ -717,7 +850,12 @@ func TestRoutingSettleToleratesARacedAttemptAppend(t *testing.T) {
 	world.seedBackend("backend-a", catalog.BackendActive)
 	world.attemptDuplicate = true
 	routing.registry = executors.NewRegistry(map[catalog.BackendID]executors.Executor{
-		"backend-a": &fakeExecutor{results: []executors.Result{okExec(9, 9)}},
+		"backend-a": &fakeExecutor{
+			// The answer commits — the sink's commitment is what makes the
+			// executor's Success a settlement, not a claim the walk re-classes.
+			act:     func(sink executors.Sink) { _ = sink.Content([]byte(`{"answer":true}`)) },
+			results: []executors.Result{okExec(9, 9)},
+		},
 	})
 
 	outcome, err := routing.Serve(context.Background(), in)

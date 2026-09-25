@@ -37,7 +37,29 @@ const (
 	// endingRetryBackoff is the pause between them.
 	endingMaxAttempts  = 3
 	endingRetryBackoff = 10 * time.Millisecond
+
+	// endingBudget bounds how long one ending's whole retry ladder may run
+	// once detached from the caller. The budget's floors and ceilings make it
+	// a rounding error against a request's lifetime; the point of the bound
+	// is that a detached ending still ends, rather than waiting on a
+	// connection that is never coming back.
+	endingBudget = 30 * time.Second
 )
+
+// endingContext detaches an ending from the caller's request context. The
+// caller may be gone — a stream the client closed after its commitment, a
+// body the proxy cut — and the ending is exactly the work that must survive
+// the going: settlement of the usage that arrived proceeds either way, and a
+// hold whose release died with the connection strands until the reaper
+// claims it, unbilled. WithoutCancel keeps the values the store's querier
+// resolution rides on while dropping the cancellation and the deadline; the
+// budget's own timeout takes their place, so a detached ending can still
+// fail rather than hang. Only the bookkeeping outlives the connection: the
+// provider call itself, and the walk's abandoned check, stay on the caller's
+// context.
+func endingContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), endingBudget)
+}
 
 // release finalises an admitted request without settleable usage. Exactly one
 // of rejection and failure is set: a rejection is the no-candidate answer's
@@ -45,6 +67,8 @@ const (
 // implies (request row reason, replay record pointer) travels with it, so the
 // ending reads as one decision everywhere it is later read.
 func (r *ChatRouting) release(ctx context.Context, in ChatInput, admitted *Admission, rejection execution.RejectionReason, failure execution.FailureReason) error {
+	ctx, cancel := endingContext(ctx)
+	defer cancel()
 	for attempt := 0; attempt < endingMaxAttempts; attempt++ {
 		// A unit that lost its CAS settled too — someone else owns the
 		// ending — and an error is the only thing left to retry.
@@ -161,6 +185,8 @@ func (r *ChatRouting) finaliseIntake(txCtx context.Context, in ChatInput, failur
 // settled too: the winner's ending stands, and this caller's answer already
 // left through the reply.
 func (r *ChatRouting) settle(ctx context.Context, in ChatInput, admitted *Admission, attempt execution.Attempt, usage settleUsage, succeeded bool) error {
+	ctx, cancel := endingContext(ctx)
+	defer cancel()
 	for budget := 0; budget < endingMaxAttempts; budget++ {
 		err := r.settleOnce(ctx, in, admitted, attempt, usage, succeeded)
 		if err == nil {

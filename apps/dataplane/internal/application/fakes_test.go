@@ -675,6 +675,13 @@ type fakeAdmissionStore struct {
 }
 
 func (s fakeAdmissionStore) WithinTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	// The real store's BeginTx refuses a context that is already done, and
+	// the fake refuses it the same way: it is what makes an ending's
+	// detachment visible — a settle that still runs after the caller's
+	// context died, and could not have run on it.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.world.note("begin")
 	snapshot := s.world.snapshot()
 	if err := fn(context.WithValue(ctx, admissionTxKey{}, true)); err != nil {
@@ -1167,9 +1174,16 @@ func (f fakeAdmissionAttempts) Insert(ctx context.Context, attempt execution.Att
 type fakeRoutingBackends struct {
 	persistence.Backends
 	world *admissionWorld
+
+	// readFailure, when set, is what ByID answers instead of the world: the
+	// read that failed, against which the servable question has no answer.
+	readFailure error
 }
 
 func (f fakeRoutingBackends) ByID(ctx context.Context, id catalog.BackendID) (*catalog.Backend, error) {
+	if f.readFailure != nil {
+		return nil, f.readFailure
+	}
 	f.world.mu.Lock()
 	defer f.world.mu.Unlock()
 	backend, ok := f.world.backends[id]

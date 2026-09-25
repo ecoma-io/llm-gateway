@@ -59,10 +59,18 @@ type fakeChatCompletion struct {
 	inputs  []application.ChatInput
 	outcome application.ChatOutcome
 	err     error
+	// act is what the use case does to the reply before answering, the way
+	// the routing stage's endings do. A fake that answers a walk-produced
+	// outcome without acting writes the answer from the wrong half — the
+	// exact seam the byte-identity suite pins.
+	act func(application.Reply)
 }
 
 func (f *fakeChatCompletion) Serve(ctx context.Context, in application.ChatInput) (application.ChatOutcome, error) {
 	f.inputs = append(f.inputs, in)
+	if f.act != nil {
+		f.act(in.Reply)
+	}
 	if f.err != nil {
 		return application.ChatOutcome{}, f.err
 	}

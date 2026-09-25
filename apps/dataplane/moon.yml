@@ -137,6 +137,16 @@ tasks:
   # variable is an admin DSN because its suite derives the `dataplane`
   # database from it, creating it when the cluster lacks it. VALKEY_USERNAME
   # and VALKEY_PASSWORD pass through untouched, as the valkey suite documents.
+  #
+  # The packages run one invocation each, not one invocation for the list: a
+  # combined run's output is one stream, and a guard over the stream can only
+  # prove that SOMETHING ran — a scope entry gone stale (a package renamed,
+  # its tagged files' constraint lost) would leave the other two packages'
+  # RUN lines vouching for a green that silently covered one package fewer.
+  # Per package, the guard is airtight: each package's own output must carry
+  # its own RUN lines, or the target fails naming the package that ran
+  # nothing. A failure is remembered and the loop continues, so one run still
+  # shows everything that is wrong.
   test-integration:
     script: |
       if [ -z "${VALKEY_ADDRESS:-}" ]; then
@@ -148,13 +158,15 @@ tasks:
         exit 1
       fi
       status=0
-      output="$(go test -v -tags=integration ./internal/adapters/outbound/valkey ./internal/adapters/outbound/postgres ./cmd/dataplane 2>&1)" || status=$?
-      printf '%s\n' "$output"
+      for pkg in ./internal/adapters/outbound/valkey ./internal/adapters/outbound/postgres ./cmd/dataplane; do
+        output="$(go test -v -tags=integration "$pkg" 2>&1)" || status=$?
+        printf '%s\n' "$output"
+        if [ "$status" -eq 0 ] && ! printf '%s\n' "$output" | grep -q '^=== RUN'; then
+          echo "go test -tags=integration $pkg executed no tests — a green target here would mean nothing ran"
+          status=1
+        fi
+      done
       [ "$status" -eq 0 ] || exit "$status"
-      if ! printf '%s\n' "$output" | grep -q '^=== RUN'; then
-        echo "go test -tags=integration executed no tests — a green target here would mean nothing ran"
-        exit 1
-      fi
     inputs:
       - "**/*"
       # The postgres suite applies the files under migrations/dataplane at run
@@ -189,13 +201,15 @@ tasks:
         exit 1
       fi
       status=0
-      output="$(go test -race -v -tags=integration ./internal/adapters/outbound/valkey ./internal/adapters/outbound/postgres ./cmd/dataplane 2>&1)" || status=$?
-      printf '%s\n' "$output"
+      for pkg in ./internal/adapters/outbound/valkey ./internal/adapters/outbound/postgres ./cmd/dataplane; do
+        output="$(go test -race -v -tags=integration "$pkg" 2>&1)" || status=$?
+        printf '%s\n' "$output"
+        if [ "$status" -eq 0 ] && ! printf '%s\n' "$output" | grep -q '^=== RUN'; then
+          echo "go test -race -tags=integration $pkg executed no tests — a green target here would mean nothing ran"
+          status=1
+        fi
+      done
       [ "$status" -eq 0 ] || exit "$status"
-      if ! printf '%s\n' "$output" | grep -q '^=== RUN'; then
-        echo "go test -race -tags=integration executed no tests — a green target here would mean nothing ran"
-        exit 1
-      fi
     inputs:
       - "**/*"
       - "/migrations/dataplane/**/*"
@@ -246,13 +260,15 @@ tasks:
         exit 1
       fi
       status=0
-      output="$(go test -run '^$' -bench . -benchmem -tags=integration ./internal/adapters/outbound/postgres ./internal/domain/routing 2>&1)" || status=$?
-      printf '%s\n' "$output"
+      for pkg in ./internal/adapters/outbound/postgres ./internal/domain/routing; do
+        output="$(go test -run '^$' -bench . -benchmem -tags=integration "$pkg" 2>&1)" || status=$?
+        printf '%s\n' "$output"
+        if [ "$status" -eq 0 ] && ! printf '%s\n' "$output" | grep -q '^Benchmark'; then
+          echo "go test -bench $pkg executed no benchmarks — a green target here would mean nothing ran"
+          status=1
+        fi
+      done
       [ "$status" -eq 0 ] || exit "$status"
-      if ! printf '%s\n' "$output" | grep -q '^Benchmark'; then
-        echo "go test -bench executed no benchmarks — a green target here would mean nothing ran"
-        exit 1
-      fi
     inputs:
       - "**/*"
       # The benchmarks share the suite's schema helper, so a migration edit

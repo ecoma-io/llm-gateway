@@ -82,7 +82,7 @@ func newChatCompletionHandler(wiring wiring) stdhttp.HandlerFunc {
 		}
 		authenticated, err := authenticate(wiring.auth, r, credential)
 		if err != nil {
-			writeChatError(w, r, requestID, err, "")
+			writeChatError(w, r, nil, requestID, err, "")
 			return
 		}
 
@@ -122,6 +122,7 @@ func newChatCompletionHandler(wiring wiring) stdhttp.HandlerFunc {
 		// connection's writer and handed to the use case inside the input.
 		body := readChatBody(w, r)
 		runtimeID := identity.NewRequestID()
+		reply := newChatReply(w)
 
 		outcome, err := wiring.chat.Serve(r.Context(), application.ChatInput{
 			RequestID:      runtimeID,
@@ -130,14 +131,14 @@ func newChatCompletionHandler(wiring wiring) stdhttp.HandlerFunc {
 			AccountState:   authenticated.AccountState,
 			IdempotencyKey: idempotencyKey,
 			Body:           body,
-			Reply:          newChatReply(w),
+			Reply:          reply,
 		})
 		if err != nil {
 			// Admission could not reach a decision. That is never the
 			// caller's answer to give: the cause stays behind the boundary
 			// and the wire carries the one internal failure. The identity
 			// still rides the log — the use case may have left a row behind.
-			writeChatError(w, r, requestID, err, runtimeID)
+			writeChatError(w, r, reply, requestID, err, runtimeID)
 			return
 		}
 		answer := chatWireCell(outcome)
@@ -255,11 +256,25 @@ func writeChatAnswer(w stdhttp.ResponseWriter, r *stdhttp.Request, requestID str
 // The runtime identity rides along when the failure happened after one was
 // minted — a use case that failed midway may still have left a row behind,
 // and the log line is what finds it.
-func writeChatError(w stdhttp.ResponseWriter, r *stdhttp.Request, requestID string, err error, runtimeID identity.RequestID) {
+//
+// The reply travels with the error for the one ending that outranks the
+// internal failure: an answer that already committed has frozen its status
+// line, and a second status written over it is not an answer but garbage
+// appended to one. There the transport's own failure frame is what the
+// client can still read, and the log line — still the internal failure — is
+// what says the caller never saw it as a status.
+func writeChatError(w stdhttp.ResponseWriter, r *stdhttp.Request, reply *chatReply, requestID string, err error, runtimeID identity.RequestID) {
 	var refusal unauthenticatedRequest
 	if errors.As(err, &refusal) {
 		writeChatAnswer(w, r, requestID, unauthenticatedAnswer(refusal))
 		return
 	}
-	writeChatAnswer(w, r, requestID, chatAnswer{failure: errorResponse(err), runtimeID: runtimeID})
+	answer := chatAnswer{failure: errorResponse(err), runtimeID: runtimeID}
+	if reply != nil && reply.Committed() {
+		answer.silent = true
+		writeChatAnswer(w, r, requestID, answer)
+		reply.ServeMidStreamFailure()
+		return
+	}
+	writeChatAnswer(w, r, requestID, answer)
 }

@@ -158,16 +158,11 @@ func TestEveryOutcomeKindHasItsWireCell(t *testing.T) {
 			wantBody:   quotaBody,
 		},
 		{
-			name: "no eligible candidate",
-			outcome: application.ChatOutcome{
-				Kind:   application.OutcomeRejected,
-				Reason: execution.RejectedNoCandidate,
-			},
-			wantStatus: stdhttp.StatusServiceUnavailable,
-			wantBody:   noCandidateBody,
-			wantRetry:  retryAfterNoCandidate,
-		},
-		{
+			// The walk's own no-candidate rejections are not in this table:
+			// the routing stage answers them through the reply, so the table's
+			// part is the log line — see TestTheRoutingOutcomesAreSilentAnswers.
+			// The replay row below renders because a replay is the handler's
+			// answer, re-read from a stored fate no reply wrote.
 			name:       "a request already in flight under its key",
 			outcome:    application.ChatOutcome{Kind: application.OutcomeInFlight},
 			wantStatus: stdhttp.StatusConflict,
@@ -260,20 +255,6 @@ func TestEveryOutcomeKindHasItsWireCell(t *testing.T) {
 			outcome:    application.ChatOutcome{Kind: application.OutcomeAdmitted},
 			wantStatus: stdhttp.StatusInternalServerError,
 			wantBody:   internalErrorBody,
-		},
-		{
-			// The exhausted walk answers exactly the cell an empty walk does:
-			// the caller's reading — come back later — does not depend on how
-			// deep the walk went before it knew, and which of the two produced
-			// an answer is the log line's fact.
-			name: "no candidate succeeded answers the same cell as no candidate",
-			outcome: application.ChatOutcome{
-				Kind:   application.OutcomeRejected,
-				Reason: execution.RejectedNoCandidateSucceeded,
-			},
-			wantStatus: stdhttp.StatusServiceUnavailable,
-			wantBody:   noCandidateBody,
-			wantRetry:  retryAfterNoCandidate,
 		},
 		{
 			name:       "a reason the vocabulary does not declare answers the internal failure",
@@ -437,12 +418,16 @@ func TestTheSurfacedRefusalCells(t *testing.T) {
 }
 
 // TestTheRoutingOutcomesAreSilentAnswers pins the shape the routing stage's
-// three outcomes take through the table: none of them writes a byte here.
-// The served answer's bytes already travelled through the request's reply,
-// the refused answer's cell was written through it as the walk reached the
-// refusal, and an abandoned request has no channel left to answer on — so
-// each arrives as a log line only, carrying the routing trace and the
-// runtime identity, and carrying no status, no body and no headers.
+// outcomes take through the table: none of them writes a byte here. The
+// served answer's bytes already travelled through the request's reply, the
+// refused answer's cell was written through it as the walk reached the
+// refusal, the two no-candidate rejections were written through it by the
+// same ServeNoCandidate call that closed the released request — the exhausted
+// walk answering exactly the cell an empty walk does, so the caller's reading
+// never depends on how deep the walk went — and an abandoned request has no
+// channel left to answer on. Each arrives as a log line only, carrying the
+// routing trace and the runtime identity, and carrying no status, no body and
+// no headers.
 func TestTheRoutingOutcomesAreSilentAnswers(t *testing.T) {
 	trace := &application.RoutingTrace{
 		Alias:          "test-model",
@@ -474,6 +459,26 @@ func TestTheRoutingOutcomesAreSilentAnswers(t *testing.T) {
 				Routing:          trace,
 			},
 			wantReason: "context_too_large",
+		},
+		{
+			name: "a walk that never began answers through the log alone",
+			outcome: application.ChatOutcome{
+				Kind:             application.OutcomeRejected,
+				Reason:           execution.RejectedNoCandidate,
+				RuntimeRequestID: identity.RequestID("01930000-0000-7000-8000-000000000042"),
+				Routing:          trace,
+			},
+			wantReason: string(execution.RejectedNoCandidate),
+		},
+		{
+			name: "a walk that ran out answers through the log alone",
+			outcome: application.ChatOutcome{
+				Kind:             application.OutcomeRejected,
+				Reason:           execution.RejectedNoCandidateSucceeded,
+				RuntimeRequestID: identity.RequestID("01930000-0000-7000-8000-000000000042"),
+				Routing:          trace,
+			},
+			wantReason: string(execution.RejectedNoCandidateSucceeded),
 		},
 		{
 			name: "an abandoned request answers through the log alone",

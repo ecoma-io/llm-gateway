@@ -13,7 +13,9 @@ package main
 //
 // What these tests prove is the walk's behaviour over the engine's
 // guarantees — that an unroutable admission is released whole in one
-// transaction, that a fall-through leaves both attempts recorded and settles
+// transaction, that a walk that exhausted every candidate releases under the
+// walk's own no-candidate name with its attempts standing behind it, that a
+// fall-through leaves both attempts recorded and settles
 // on the survivor, that a surfaced refusal is released under its failure
 // reason and replays as that refusal, and that a mid-stream death settles on
 // what was delivered with the hold as its ceiling. The walk's own judgment —
@@ -321,6 +323,71 @@ func TestIntegrationRoutingReleasesAnAdmittedRequestWhenNoExecutorExists(t *test
 	}
 	if n := f.factCount(t, requestID); n != 1 {
 		t.Errorf("the release appended %d facts, want exactly one", n)
+	}
+	kind, _, _, _, _, _ := f.latestFact(t, requestID)
+	if kind.String != "released" {
+		t.Errorf("the fact's kind = %s, want released", kind.String)
+	}
+}
+
+// TestIntegrationRoutingExhaustsTheWalkAndReleasesAsNoCandidateSucceeded: the
+// other no-candidate ending — not an empty registry but a walk that ran every
+// eligible candidate and watched each one fail with a fault another candidate
+// might have cleared. The answer names the walk, not any one provider's bad
+// day; the attempts stand as the observation that the walk really happened;
+// and the reply is told no_candidate after having been opened — the framing
+// was armed before the first candidate ran, and the ending arrived too late
+// to be anything but an error body written into it.
+func TestIntegrationRoutingExhaustsTheWalkAndReleasesAsNoCandidateSucceeded(t *testing.T) {
+	f := newRoutingFixture(t)
+	account, bucket := f.routeAccount(t)
+	first := f.seedBackend(t, "first-failure", &routingFakeExecutor{
+		results: []executors.Result{executors.Failure{Class: execution.ErrorRateLimited, ProviderRequestID: "prov-req-5"}},
+	})
+	f.seedCandidate(t, 1, first)
+	second := f.seedBackend(t, "second-failure", &routingFakeExecutor{
+		results: []executors.Result{executors.Failure{Class: execution.ErrorProviderUnavailable, ProviderRequestID: "prov-req-6"}},
+	})
+	f.seedCandidate(t, 2, second)
+
+	outcome, reply := f.routeServe(t, account, "b9c4-key-exhaustion", "b8c3")
+
+	if outcome.Kind != application.OutcomeRejected || outcome.Reason != execution.RejectedNoCandidateSucceeded {
+		t.Fatalf("outcome = %s/%s, want rejected/no_candidate_succeeded", outcome.Kind, outcome.Reason)
+	}
+	if reply.noCandidate != 1 {
+		t.Errorf("the reply was told no_candidate %d times, want exactly once", reply.noCandidate)
+	}
+	if !reply.opened || reply.committed {
+		t.Errorf("reply opened=%t committed=%t, want opened but never committed — the ending is an error body, not a stream", reply.opened, reply.committed)
+	}
+
+	requestID := string(outcome.RuntimeRequestID)
+	status, failure, rejection, committed := f.requestRow(t, requestID)
+	if status.String != "rejected" || rejection.String != string(execution.RejectedNoCandidateSucceeded) {
+		t.Errorf("request row = %s/%s, want rejected/no_candidate_succeeded", status.String, rejection.String)
+	}
+	if failure.Valid || committed.Valid {
+		t.Errorf("an exhausted walk names failure %v or attempt %v; it committed neither", failure, committed)
+	}
+	rows := f.attemptsOf(t, requestID)
+	if len(rows) != 2 {
+		t.Fatalf("the walk recorded %d attempts, want one per candidate it really tried", len(rows))
+	}
+	if rows[0].position != 0 || rows[0].errorClass.String != "rate_limited" {
+		t.Errorf("attempt 1 = %+v, want position 0/rate_limited", rows[0])
+	}
+	if rows[1].position != 1 || rows[1].errorClass.String != "provider_unavailable" {
+		t.Errorf("attempt 2 = %+v, want position 1/provider_unavailable", rows[1])
+	}
+	intakeRequestID, finalStatus, _ := f.intakeOf(t, account, "b9c4-key-exhaustion")
+	if intakeRequestID != requestID || finalStatus.String != "rejected" {
+		t.Errorf("intake = (%s, %s), want (%s, rejected)", intakeRequestID, finalStatus.String, requestID)
+	}
+
+	available, limit := f.balance(t, bucket)
+	if available != limit {
+		t.Errorf("available = %d with limit %d; an exhausted walk releases the hold whole", available, limit)
 	}
 	kind, _, _, _, _, _ := f.latestFact(t, requestID)
 	if kind.String != "released" {

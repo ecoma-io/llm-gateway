@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/catalog"
@@ -34,14 +35,19 @@ func candidateRow(backends ...catalog.BackendID) []catalog.Candidate {
 // authority over the fallback order is removal — what survives comes out in
 // the catalog's order, a disabled backend is skipped as if absent, a backend
 // id no row carries is skipped with it (fail-closed), and a candidate whose
-// driver is not wired is skipped the same way.
+// driver is not wired is skipped the same way. A predicate that could not
+// answer at all is the one thing that stops the filter: no list comes back,
+// because no decision was reached.
 func TestEligibleKeepsCatalogOrderAndDropsWhatCannotServe(t *testing.T) {
-	active := func(catalog.BackendID) bool { return true }
-	callable := func(catalog.BackendID) bool { return true }
+	active := func(catalog.BackendID) (bool, error) { return true, nil }
+	callable := func(catalog.BackendID) (bool, error) { return true, nil }
 
 	t.Run("every candidate stands", func(t *testing.T) {
 		in := candidateRow("a", "b", "c")
-		got := Eligible(in, active, callable)
+		got, err := Eligible(in, active, callable)
+		if err != nil {
+			t.Fatalf("eligible errored: %v", err)
+		}
 		if len(got) != 3 || got[0].BackendID != "a" || got[1].BackendID != "b" || got[2].BackendID != "c" {
 			t.Fatalf("eligible = %v, want the catalog's own order preserved", got)
 		}
@@ -49,8 +55,11 @@ func TestEligibleKeepsCatalogOrderAndDropsWhatCannotServe(t *testing.T) {
 
 	t.Run("a disabled backend is skipped as if absent", func(t *testing.T) {
 		in := candidateRow("a", "b", "c")
-		servable := func(id catalog.BackendID) bool { return id != "b" }
-		got := Eligible(in, servable, callable)
+		servable := func(id catalog.BackendID) (bool, error) { return id != "b", nil }
+		got, err := Eligible(in, servable, callable)
+		if err != nil {
+			t.Fatalf("eligible errored: %v", err)
+		}
 		if len(got) != 2 || got[0].BackendID != "a" || got[1].BackendID != "c" {
 			t.Fatalf("eligible = %v, want b gone and the order kept", got)
 		}
@@ -58,8 +67,11 @@ func TestEligibleKeepsCatalogOrderAndDropsWhatCannotServe(t *testing.T) {
 
 	t.Run("a backend no row carries is skipped too", func(t *testing.T) {
 		in := candidateRow("a", "ghost", "c")
-		servable := func(id catalog.BackendID) bool { return id != "ghost" }
-		got := Eligible(in, servable, callable)
+		servable := func(id catalog.BackendID) (bool, error) { return id != "ghost", nil }
+		got, err := Eligible(in, servable, callable)
+		if err != nil {
+			t.Fatalf("eligible errored: %v", err)
+		}
 		if len(got) != 2 || got[0].BackendID != "a" || got[1].BackendID != "c" {
 			t.Fatalf("eligible = %v, want the unknown backend gone, fail-closed", got)
 		}
@@ -67,24 +79,50 @@ func TestEligibleKeepsCatalogOrderAndDropsWhatCannotServe(t *testing.T) {
 
 	t.Run("a candidate with no driver wired is skipped", func(t *testing.T) {
 		in := candidateRow("a", "b", "c")
-		callers := func(id catalog.BackendID) bool { return id != "c" }
-		got := Eligible(in, active, callers)
+		callers := func(id catalog.BackendID) (bool, error) { return id != "c", nil }
+		got, err := Eligible(in, active, callers)
+		if err != nil {
+			t.Fatalf("eligible errored: %v", err)
+		}
 		if len(got) != 2 || got[0].BackendID != "a" || got[1].BackendID != "b" {
 			t.Fatalf("eligible = %v, want the unwired candidate gone", got)
 		}
 	})
 
 	t.Run("nothing survives says so as an empty list", func(t *testing.T) {
-		got := Eligible(candidateRow("a"), func(catalog.BackendID) bool { return false }, callable)
+		got, err := Eligible(candidateRow("a"), func(catalog.BackendID) (bool, error) { return false, nil }, callable)
+		if err != nil {
+			t.Fatalf("eligible errored: %v", err)
+		}
 		if len(got) != 0 {
 			t.Fatalf("eligible = %v, want empty", got)
 		}
 	})
 
 	t.Run("no candidates at all is an empty list", func(t *testing.T) {
-		got := Eligible(nil, active, callable)
+		got, err := Eligible(nil, active, callable)
+		if err != nil {
+			t.Fatalf("eligible errored: %v", err)
+		}
 		if len(got) != 0 {
 			t.Fatalf("eligible = %v, want empty", got)
+		}
+	})
+
+	t.Run("a predicate that cannot answer stops the filter", func(t *testing.T) {
+		in := candidateRow("a", "b", "c")
+		servable := func(id catalog.BackendID) (bool, error) {
+			if id == "b" {
+				return false, errors.New("the store could not answer")
+			}
+			return true, nil
+		}
+		got, err := Eligible(in, servable, callable)
+		if err == nil {
+			t.Fatalf("eligible = %v, want the read failure climbed, not a shorter list", got)
+		}
+		if got != nil {
+			t.Fatalf("eligible = %v alongside an error, want no list at all", got)
 		}
 	})
 }
@@ -189,24 +227,14 @@ func TestSurfacedRefusalTable(t *testing.T) {
 
 // TestEveryVocabularyClassIsDispositionedOrPrevented is the guard the
 // exhaustive switches cannot give themselves: the test walks execution's
-// whole class vocabulary and fails if a class appears that neither falls
-// through, nor surfaces, nor is the one class the walk prevents from ever
-// reaching this switch — a stream failure after commitment is decided by the
-// commitment gate above the disposition, never by it. A new class added
+// whole class vocabulary — as ErrorClasses declares it, so a class added
+// there arrives here whether or not anyone remembered this test — and fails
+// if a class appears that neither falls through, nor surfaces, nor is the one
+// class the walk prevents from ever reaching this switch. A new class added
 // without a disposition is a decision, and this test is where refusing to
 // make it silently happens.
 func TestEveryVocabularyClassIsDispositionedOrPrevented(t *testing.T) {
-	classes := []execution.ErrorClass{
-		execution.ErrorAuthentication,
-		execution.ErrorRateLimited,
-		execution.ErrorProviderUnavailable,
-		execution.ErrorProviderRejectedRequest,
-		execution.ErrorContextTooLarge,
-		execution.ErrorInvalidUpstreamResponse,
-		execution.ErrorUpstreamError,
-		execution.ErrorStreamAfterCommitment,
-	}
-	for _, class := range classes {
+	for _, class := range execution.ErrorClasses() {
 		_, surfaced := SurfacedRefusal(class)
 		if FallbackEligible(class) || surfaced {
 			continue

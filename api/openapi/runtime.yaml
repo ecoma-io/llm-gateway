@@ -180,12 +180,17 @@ paths:
         executing it twice, and the key is how the runtime tells a repeat from
         a new request: the key is stored with a digest of the request body, so
         the same key with the same body is answered from the original's
-        outcome — the response carries `Idempotent-Replay: true` and
+        recorded decision — the response carries `Idempotent-Replay: true` and
         `X-Original-Request-Id` whenever it is a replay — while the same key
         with a different body is refused with the `idempotency_conflict` code
         and never retried with the same key. A request whose key is still
         being processed is answered 409 `request_in_progress` with a short
-        `Retry-After` hint.
+        `Retry-After` hint. One edge is deliberately outside the replay: an
+        original that ended in delivered content — a success, or a failure
+        after the answer began — has no stored answer to re-serve, and the
+        runtime will neither execute the repeat a second time nor invent an
+        answer for it; the repeat is answered 500 and the original's identity
+        is in the logs, which is where correlating it lives.
 
 
         **The request body.** `model` and `messages` are required; at least one
@@ -264,8 +269,9 @@ paths:
           description: >-
             The client-chosen key that makes a retry after a timeout safe. The
             runtime stores it byte-for-byte beside a digest of the request
-            body: the same key with the same body replays the original's
-            outcome, the same key with a different body is refused. Refused
+            body: the same key with the same body is answered from the
+            original's recorded decision, the same key with a different body
+            is refused. Refused
             rather than truncated outside 1–256 printable ASCII characters, so
             two distinct client keys can never become one stored key.
           schema:

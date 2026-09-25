@@ -702,6 +702,9 @@ func TestIntegrationAdmissionNeverOversubscribesUnderConcurrency(t *testing.T) {
 		if violation != "" {
 			t.Errorf("round %d: the sampler held %d instants and the conservation broke: %s", round, observedSamples, violation)
 		}
+		if observedSamples == 0 {
+			t.Errorf("round %d: the sampler held no instants — a witness that never looked proves nothing", round)
+		}
 
 		var (
 			admitted int
@@ -1453,11 +1456,13 @@ func TestIntegrationCredentialVerificationJudgesTheMirrorLifecycles(t *testing.T
 
 // BenchmarkChatAdmissionServe is the flagship number: one request's full
 // admission cost as the transport drives it — verification against the real
-// mirror, the probe, the alias and price reads, the waterfall, the writes,
-// the seam's release — everything but the provider call that does not exist
-// yet. The grant is seeded deep enough that capacity is never the variable;
-// every iteration is a fresh account-keyed arrival under a fresh key, so the
-// loop costs what a fresh request costs and not what a replay answers for.
+// mirror, the probe, the alias and price reads, the waterfall, the writes —
+// everything admission owns and nothing past it. The routing stage's walk and
+// endings are the next stage's cost, benchmarked in the routing package; what
+// is measured here stops at the hand-off. The grant is seeded deep enough
+// that capacity is never the variable; every iteration is a fresh
+// account-keyed arrival under a fresh key, so the loop costs what a fresh
+// request costs and not what a replay answers for.
 //
 // Run (from apps/dataplane):
 //
@@ -1549,8 +1554,8 @@ func BenchmarkChatAdmissionServe(b *testing.B) {
 		if err != nil {
 			b.Fatalf("iteration %d: %v", i, err)
 		}
-		if outcome.Kind != application.OutcomeRejected || outcome.Reason != execution.RejectedNoCandidate {
-			b.Fatalf("iteration %d: outcome %q/%q, want rejected/no_candidate — the benchmark's own arrival is wrong", i, outcome.Kind, outcome.Reason)
+		if outcome.Kind != application.OutcomeAdmitted || outcome.Admitted == nil {
+			b.Fatalf("iteration %d: outcome %q, want admitted — the benchmark's own arrival is wrong", i, outcome.Kind)
 		}
 	}
 }

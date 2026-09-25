@@ -182,6 +182,23 @@ type chatAnswer struct {
 func chatWireCell(outcome application.ChatOutcome) chatAnswer {
 	switch outcome.Kind {
 	case application.OutcomeRejected:
+		// The two no-candidate rejections are the walk's own endings: the
+		// routing stage released the request and answered through the reply
+		// — status, Retry-After and body all travelled that channel — so the
+		// table's part is the log line only, exactly as for the served,
+		// refused and abandoned outcomes. Rendering them here too would write
+		// the cell a second time after the reply already wrote it. Every
+		// other rejection is admission's own decision, decided before a reply
+		// existed, and arrives here as the answer's only writer.
+		switch outcome.Reason {
+		case execution.RejectedNoCandidate, execution.RejectedNoCandidateSucceeded:
+			return chatAnswer{
+				reason:    string(outcome.Reason),
+				silent:    true,
+				runtimeID: outcome.RuntimeRequestID,
+				routing:   outcome.Routing,
+			}
+		}
 		cell, retryAfter := rejectionCell(outcome.Reason, outcome.Detail)
 		return chatAnswer{
 			failure:    cell,

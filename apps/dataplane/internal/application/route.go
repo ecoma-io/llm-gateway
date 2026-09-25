@@ -152,17 +152,32 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 	if err != nil && !errors.Is(err, persistence.ErrNotFound) {
 		return ChatOutcome{}, fmt.Errorf("application: route request %s: read the alias: %w", admitted.RuntimeRequestID, err)
 	}
-	servable := func(id catalog.BackendID) bool {
+	servable := func(id catalog.BackendID) (bool, error) {
 		backend, err := r.backends.ByID(ctx, id)
-		return err == nil && backend != nil && backend.State == catalog.BackendActive
+		if errors.Is(err, persistence.ErrNotFound) {
+			// No row carries the candidate's backend id — the foreign key
+			// should make it unreachable, and a catalog that surprised us is
+			// read fail-closed: the candidate is skipped, not failed over.
+			return false, nil
+		}
+		if err != nil {
+			// A read that failed is not a catalog with nothing in it: the
+			// error climbs, and the request ends the undecided way rather
+			// than as a determinate refusal written over a transient fault.
+			return false, fmt.Errorf("application: route request %s: read backend %s: %w", admitted.RuntimeRequestID, id, err)
+		}
+		return backend != nil && backend.State == catalog.BackendActive, nil
 	}
-	callable := func(id catalog.BackendID) bool {
+	callable := func(id catalog.BackendID) (bool, error) {
 		_, ok := r.registry.For(id)
-		return ok
+		return ok, nil
 	}
 	var eligible []catalog.Candidate
 	if err == nil && alias.State == catalog.AliasActive {
-		eligible = routing.Eligible(alias.Candidates, servable, callable)
+		eligible, err = routing.Eligible(alias.Candidates, servable, callable)
+		if err != nil {
+			return ChatOutcome{}, fmt.Errorf("application: route request %s: %w", admitted.RuntimeRequestID, err)
+		}
 	}
 	walk := routing.NewSelection(eligible)
 
@@ -235,11 +250,12 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 		trace.Attempts++
 		trace.LastPosition = candidate.Position
 
-		if success, ok := result.(executors.Success); ok {
-			// The answer was produced and delivered: the hold becomes the
-			// request's cost, the attempt names itself the committed one,
-			// and nothing about the walk is revisited — there is no better
-			// answer than the one the client is reading.
+		if success, ok := result.(executors.Success); ok && reply.Committed() {
+			// The answer was produced and delivered — the sink's commitment
+			// is the fact that makes it so, not the executor's claim — and
+			// the hold becomes the request's cost, the attempt names itself
+			// the committed one, and nothing about the walk is revisited —
+			// there is no better answer than the one the client is reading.
 			attempt, err := r.attemptRow(admitted, candidate, attemptID, started, finished,
 				execution.OutcomeSucceeded, "", success.ProviderRequestID, nil,
 				success.Usage.InputTokens, success.Usage.OutputTokens, deliveredTokens(reply))
@@ -261,9 +277,10 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 
 		failure, ok := result.(executors.Failure)
 		if !ok {
-			// A nil or foreign result is the executor's contract broken, not
-			// a verdict about the provider: classified as an answer nobody
-			// could read, and walked like one.
+			// A nil or foreign result — or a Success claimed over an answer
+			// the sink never committed — is the executor's contract broken,
+			// not a verdict about the provider: classified as an answer
+			// nobody could read, and walked like one.
 			failure = executors.Failure{Class: execution.ErrorInvalidUpstreamResponse}
 		}
 		class := failure.Class
@@ -295,6 +312,11 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 			}
 			reply.ServeMidStreamFailure()
 			trace.Committed = true
+			// The trace agrees with the row: whatever the provider called its
+			// fault, the walk's story of a committed failure is the stream's
+			// own class — the one word for "an answer died after the client
+			// started reading it".
+			trace.LastErrorClass = execution.ErrorStreamAfterCommitment
 			return ChatOutcome{
 				Kind:             OutcomeServed,
 				RuntimeRequestID: admitted.RuntimeRequestID,
@@ -368,7 +390,7 @@ func (r *ChatRouting) attemptRow(
 	if err != nil {
 		return execution.Attempt{}, fmt.Errorf("application: route request %s: form the attempt: %w", admitted.RuntimeRequestID, err)
 	}
-	attempt.ProviderRequestID = providerRequestID
+	attempt.ProviderRequestID = boundProviderRequestID(providerRequestID)
 	if len(providerError) > 0 {
 		// Telemetry never blocks the request path: a provider error that
 		// breaks the telemetry's own shape (not a json object, over the cap)
@@ -382,11 +404,30 @@ func (r *ChatRouting) attemptRow(
 	return attempt, nil
 }
 
+// boundProviderRequestID truncates the provider's own correlation handle to
+// the bound the schema's CHECK re-states. It is the one provider-controlled
+// column with no domain-side cap of its own, and the doctrine is the
+// telemetry cap's: a provider echoing a handle longer than the row can carry
+// must not be able to break the very unit that records what it did — the
+// handle is truncated, the row keeps everything else it knows.
+func boundProviderRequestID(handle string) string {
+	if len(handle) > execution.MaxProviderRequestIDOctets {
+		return handle[:execution.MaxProviderRequestIDOctets]
+	}
+	return handle
+}
+
 // appendAttempt writes one finished call's row on its own — outside any unit
 // of work, a single statement the engine makes atomic. It carries the ending
 // budget's retries for the same reason the endings do: a contention class
 // aborts a write that never happened, and a fresh one may win.
 func (r *ChatRouting) appendAttempt(ctx context.Context, attempt execution.Attempt) error {
+	// The row is the one observation the walk already made, so it is written
+	// detached, for the same reason the endings are: the caller's connection
+	// may close between the call's finish and this write, and the write is
+	// what outlives the connection.
+	ctx, cancel := endingContext(ctx)
+	defer cancel()
 	var err error
 	for budget := 0; budget < endingMaxAttempts; budget++ {
 		if err = r.attempts.Insert(ctx, attempt); err == nil {
@@ -441,10 +482,11 @@ type settleUsage struct {
 //   - output is the provider's report when it gave one, otherwise the
 //     delivered count — which can only understate, because generation that
 //     was never forwarded is unknowable;
-//   - capture is reported when the provider's report was whole (input and
-//     output both), gateway_observed whenever any figure is the gateway's
-//     own — the label is the consumer's confidence, and a mixed answer is
-//     not a report.
+//   - capture is reported when the provider reported both usage figures
+//     (input and output), gateway_observed otherwise. The label attests to
+//     the usage figures' provenance, and to nothing else: delivery is the
+//     gateway's own count by construction — the first bullet — reported or
+//     not, so it never decides the label.
 //
 // The reservation floor is deliberately out of reach on this path: a settled
 // ending always names a committed attempt, and a commitment means content
@@ -460,7 +502,13 @@ func settleBasis(admitted *Admission, delivered []byte, reportedInput, reportedO
 	}
 	output := reportedOutput
 	if output == nil {
-		output = &delivery
+		// The delivered count is copied, not aliased: the same octet count
+		// stands behind both the delivery figure and the output figure on
+		// purpose, but the fact's two pointers outlive this frame, and a
+		// shared variable is one future writer away from a fact whose output
+		// silently changed under it.
+		count := delivery
+		output = &count
 	}
 
 	capture := accounting.CaptureGatewayObserved

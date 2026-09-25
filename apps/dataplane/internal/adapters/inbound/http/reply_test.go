@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"errors"
 	stdhttp "net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,13 +31,14 @@ import (
 type fakeRoutingCompletion struct {
 	act     func(reply application.Reply)
 	outcome application.ChatOutcome
+	err     error
 }
 
 func (f *fakeRoutingCompletion) Serve(_ context.Context, in application.ChatInput) (application.ChatOutcome, error) {
 	if f.act != nil {
 		f.act(in.Reply)
 	}
-	return f.outcome, nil
+	return f.outcome, f.err
 }
 
 // routingHandler builds the handler over the fake walk, and runs one request
@@ -220,15 +222,21 @@ func TestASurfacedRefusalIsAnOrdinaryHTTPEntity(t *testing.T) {
 }
 
 // TestTheNoCandidateEndingIsByteIdenticalWithTheAdmissionCell pins today's
-// behaviour end to end: an admitted request the walk cannot route — the empty
-// registry answers before any candidate — is released and answered with the
-// same 503 the admission map always rendered, Retry-After and all. The
+// behaviour end to end, composed exactly as production composes it: the walk
+// releases the request, answers through the reply's ServeNoCandidate, and
+// returns the rejection for the log — and the client receives the same 503
+// the admission map always rendered, Retry-After and all, exactly once. The
 // routing stage's arrival at this endpoint must not move one byte of the
-// contract a client already retries against.
+// contract a client already retries against, and must not write it twice:
+// the outcome and the reply are one answer's two halves, not two answers.
 func TestTheNoCandidateEndingIsByteIdenticalWithTheAdmissionCell(t *testing.T) {
 	chat := &fakeRoutingCompletion{
-		// The empty walk touches no reply method: the answer is the
-		// admission-era cell, and the outcome is the rejection it always was.
+		// The walk's real contract: the reply writes the ending, the outcome
+		// reports it. A fake that skipped the reply would pin the transport's
+		// half against a walk that never exists.
+		act: func(reply application.Reply) {
+			reply.ServeNoCandidate()
+		},
 		outcome: application.ChatOutcome{
 			Kind:             application.OutcomeRejected,
 			Reason:           execution.RejectedNoCandidate,
@@ -246,10 +254,40 @@ func TestTheNoCandidateEndingIsByteIdenticalWithTheAdmissionCell(t *testing.T) {
 	}
 	want := "{\"error\":{\"message\":\"the runtime cannot serve this request right now\",\"type\":\"overloaded_error\",\"param\":null,\"code\":null}}\n"
 	if got := recorder.Body.String(); got != want {
-		t.Errorf("body = %q, want the admission-era cell byte for byte", got)
+		t.Errorf("body = %q, want the admission-era cell byte for byte, written once", got)
 	}
 	if got := recorder.Header().Get(RequestIDHeader); got != "chat-request" {
 		t.Errorf("X-Request-Id = %q, want the correlation identifier", got)
+	}
+}
+
+// TestAnErrorAfterCommitmentClosesTheStreamInsteadOfTheStatus pins the
+// handler's guard on the error path: a use case that fails after the answer
+// committed — an ending unit that spent its budget, say — cannot write a
+// second status over the frozen one. What the client can still read is the
+// stream's own failure frame and its terminal; what says the caller never
+// saw the failure as a status is the log line, which the guard still writes.
+func TestAnErrorAfterCommitmentClosesTheStreamInsteadOfTheStatus(t *testing.T) {
+	chat := &fakeRoutingCompletion{
+		err: errors.New("application: settle request X: the settle unit did not settle after 3 attempts"),
+		act: func(reply application.Reply) {
+			reply.Open(true)
+			if err := reply.Content([]byte(`{"delta":"par"}`)); err != nil {
+				t.Errorf("the delivered chunk's write failed: %v", err)
+			}
+		},
+	}
+
+	recorder := routingHandler(t, chat)
+
+	if recorder.Code != stdhttp.StatusOK {
+		t.Errorf("status = %d, want 200 — no status survives a commitment", recorder.Code)
+	}
+	want := "data: {\"delta\":\"par\"}\n\n" +
+		"data: {\"error\":{\"message\":\"internal error\",\"type\":\"api_error\",\"param\":null,\"code\":null}}\n\n" +
+		"data: [DONE]\n\n"
+	if got := recorder.Body.String(); got != want {
+		t.Errorf("body = %q, want the delivered content, the failure frame and the terminal frame", got)
 	}
 }
 

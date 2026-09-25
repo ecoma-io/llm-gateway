@@ -28,12 +28,15 @@ func BenchmarkRoutingDecisionPath(b *testing.B) {
 			for i := 3; i < size; i += 4 {
 				disabled[backends[i]] = true // every fourth backend is disabled
 			}
-			servable := func(id catalog.BackendID) bool { return !disabled[id] }
-			callable := func(catalog.BackendID) bool { return true }
+			servable := func(id catalog.BackendID) (bool, error) { return !disabled[id], nil }
+			callable := func(catalog.BackendID) (bool, error) { return true, nil }
 
 			b.ReportAllocs()
 			for b.Loop() {
-				eligible := Eligible(rows, servable, callable)
+				eligible, err := Eligible(rows, servable, callable)
+				if err != nil {
+					b.Fatal(err)
+				}
 				walk := NewSelection(eligible)
 				for step := 1; ; step++ {
 					if _, ok := walk.Next(step); !ok {
@@ -50,16 +53,7 @@ func BenchmarkRoutingDecisionPath(b *testing.B) {
 // may fall through and whether the failure surfaces — the two calls the stage
 // makes between one attempt's end and the next decision.
 func BenchmarkFailureDisposition(b *testing.B) {
-	classes := []execution.ErrorClass{
-		execution.ErrorAuthentication,
-		execution.ErrorRateLimited,
-		execution.ErrorProviderUnavailable,
-		execution.ErrorProviderRejectedRequest,
-		execution.ErrorContextTooLarge,
-		execution.ErrorInvalidUpstreamResponse,
-		execution.ErrorUpstreamError,
-		execution.ErrorStreamAfterCommitment,
-	}
+	classes := execution.ErrorClasses()
 	b.ReportAllocs()
 	for b.Loop() {
 		for _, class := range classes {
