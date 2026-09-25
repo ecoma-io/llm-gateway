@@ -87,6 +87,7 @@ func BenchmarkAdmissionUnit(b *testing.B) {
 
 	account := integrationRuntimeAccount(b, "bench-admission")
 	integrationSeedProjection(b, ctx, repos, account, true, time.Now().UTC().Add(24*time.Hour), 1_000_000_000_000_000)
+	scope := repos.catalogScope(b)
 	price := integrationPrice()
 
 	// Formed up front: the identity minting and struct building are not the
@@ -116,7 +117,7 @@ func BenchmarkAdmissionUnit(b *testing.B) {
 			if err := repos.requests.Insert(ctx, requests[i]); err != nil {
 				return err
 			}
-			drawn, err := repos.quota.Drawdown(ctx, account, 250)
+			drawn, err := repos.quota.Drawdown(ctx, account, scope.alias, 250)
 			if err != nil {
 				return err
 			}
@@ -155,6 +156,7 @@ func BenchmarkContendedDrawdown(b *testing.B) {
 	account := integrationRuntimeAccount(b, "bench-contended")
 	const draw = int64(40)
 	integrationSeedProjection(b, ctx, repos, account, true, time.Now().UTC().Add(24*time.Hour), 2*int64(b.N)*draw)
+	scope := repos.catalogScope(b)
 
 	var (
 		mu           sync.Mutex
@@ -167,7 +169,7 @@ func BenchmarkContendedDrawdown(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			err := store.WithinTx(ctx, func(ctx context.Context) error {
-				_, err := repos.quota.Drawdown(ctx, account, draw)
+				_, err := repos.quota.Drawdown(ctx, account, scope.alias, draw)
 				return err
 			})
 			switch {

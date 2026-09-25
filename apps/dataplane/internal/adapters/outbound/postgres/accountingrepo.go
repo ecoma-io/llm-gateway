@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/accounting"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/catalog"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/identity"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/persistence"
 )
@@ -395,15 +396,68 @@ func (repository *QuotaProjectionRepository) ApplyRefill(ctx context.Context, re
 	return accounting.RefillOutcome(outcome), nil
 }
 
+// drawdownEligibility is the eligibility predicate a grant must satisfy to
+// fund a request for one alias — the same conjuncts in projectionWalk's WHERE
+// and in projectionTake's. Their identity is load-bearing: the walk picks the
+// buckets it may draw from, and the take re-asserts, under the row lock,
+// that the bucket is still eligible before a unit of it moves. Never edit one
+// side without the other — a take that is looser than its walk can draw a
+// grant the walk would have passed by, and one that is stricter fails takes
+// the walk offered it for reasons the caller cannot see.
+//
+// The two conjuncts, in ADR 0003's words:
+//
+//   - the grant's cycle has not ended: an entitlement cycle is eligible only
+//     while its period_end is still ahead of the statement's own instant.
+//     transaction_timestamp() is transaction-stable, so the walk and every
+//     take of one Drawdown test "has the cycle ended" against the same
+//     instant and cannot disagree with each other, however long the unit
+//     runs;
+//   - the grant's stored scope contains the alias: the wildcard `*` version
+//     contains every alias by definition (000002 keeps no member rows for it),
+//     while a named version contains exactly the aliases its snapshot lists.
+//     A dangling alias_group_version_id — one no group version answers for —
+//     is simply ineligible, a treat-as-zero, never an error. The wildcard
+//     subquery returns NULL while no `*` row exists, and `= NULL` matches
+//     nothing: an absent wildcard is a normal state of an unseeded catalog,
+//     not a failure. The scope column is text while the group version's id is
+//     a uuid, so the comparison casts the uuid to text — a cast that can
+//     never fail on a stored value, where the reverse cast would turn one
+//     malformed scope value into a dead walk. The alias, by contrast, is
+//     caller-supplied and cast to uuid, the type its column and its index
+//     speak.
+const drawdownEligibility = `AND (q.period_end IS NULL OR q.period_end > transaction_timestamp())
+  AND (q.alias_group_version_id
+           = (SELECT g.id::text FROM public.alias_group_versions g WHERE g.group_name = '*')
+       OR EXISTS (SELECT 1
+                  FROM public.alias_group_members m
+                  WHERE m.group_version_id::text = q.alias_group_version_id
+                    AND m.alias_id = $2::uuid))`
+
 // projectionWalk reads one account's live projections in ADR 0003's waterfall
-// order — named scope before `*`, earliest period end, oldest subscription,
-// entitlement id, funding bucket id last. The order here is the canonical
-// lock order: every multi-row writer walks the same sequence, so two of them
-// can interleave without ever waiting on each other in opposite orders.
-const projectionWalk = `SELECT funding_bucket_id, available
-FROM public.quota_projections
-WHERE account_id = $1 AND state = 'active'
-ORDER BY named_scope DESC, period_end ASC NULLS LAST,
+// order — entitlement cycles before PAYG, named scope before `*`, earliest
+// period end, oldest subscription, entitlement id, funding bucket id last.
+// The order here is the canonical lock order: every multi-row writer walks
+// the same sequence, so two of them can interleave without ever waiting on
+// each other in opposite orders.
+//
+// The leading `(q.scope_kind = 'payg_balance')` key is deliberate
+// explicitness: `named_scope DESC` already happens to separate the two kinds
+// today (a PAYG row is never a named scope, and the schema now pins that with
+// quota_projections_payg_scope_wildcard), but the waterfall's entitlements-
+// before-PAYG rule is about the kind of the funding, not the shape of its
+// scope, and the order pins the rule it serves rather than borrowing one that
+// merely implies it.
+//
+// $1 is the account, $2 the alias the request asks as — the eligibility
+// conjuncts are drawdownEligibility, the same text projectionTake re-asserts
+// (the alias sits at $2 in both statements so that text can be shared whole).
+const projectionWalk = `SELECT q.funding_bucket_id, q.available
+FROM public.quota_projections q
+WHERE q.account_id = $1
+  AND q.state = 'active'
+  ` + drawdownEligibility + `
+ORDER BY (q.scope_kind = 'payg_balance'), named_scope DESC, period_end ASC NULLS LAST,
          subscription_created_at ASC, entitlement_id ASC, funding_bucket_id ASC`
 
 // projectionTake is the conditional drawdown of one bucket, and its predicate
@@ -411,14 +465,21 @@ ORDER BY named_scope DESC, period_end ASC NULLS LAST,
 // row, the row lock serialises them, and the second re-evaluates the whole
 // predicate against the first's committed write — the losing predicate
 // matches zero rows, and no available ever goes negative. The predicate also
-// re-checks `state = 'active'`: the walk read it, but a publication can
-// deactivate the grant between the walk and the take, and capacity the
-// Control Plane withdrew must not leave the row on a stale read's word. No
+// re-checks `state = 'active'` and the drawdown eligibility conjuncts: the
+// walk read them, but a publication can deactivate the grant, close its cycle
+// or re-scope it between the walk and the take, and capacity the Control
+// Plane withdrew must not leave the row on a stale read's word. The
+// eligibility conjuncts are drawdownEligibility — the walk's own text, since
+// predicate identity between walk and take is load-bearing. No
 // SELECT FOR UPDATE, no read-then-write window: the decision and the write
 // are one statement.
-const projectionTake = `UPDATE public.quota_projections
-SET available = available - $2, updated_at = clock_timestamp()
-WHERE funding_bucket_id = $1 AND state = 'active' AND available >= $2`
+//
+// $1 is the bucket, $2 the alias (the same slot the walk binds it to), $3 the
+// take.
+const projectionTake = `UPDATE public.quota_projections q
+SET available = q.available - $3, updated_at = clock_timestamp()
+WHERE q.funding_bucket_id = $1 AND q.state = 'active' AND q.available >= $3
+  ` + drawdownEligibility
 
 // projectionGiveback returns capacity drawn before a walk failed. It is the
 // unconditional return shape — a giveback must never fail for the same reason
@@ -435,19 +496,25 @@ WHERE funding_bucket_id = $1`
 // what the caller builds the reservation's allocations from.
 //
 // The read and the takes are separate statements by design: the takes are
-// conditional, so a stale read costs a failed walk and a giveback, never a
-// negative balance. Contended admission retries the walk; the row locks
-// serialise the contenders, and the waterfall order keeps that serialisation
-// deadlock-free.
-func (repository *QuotaProjectionRepository) Drawdown(ctx context.Context, accountID string, amount int64) ([]accounting.Allocation, error) {
+// conditional, so a stale read costs a passed-by bucket, never a negative
+// balance. A take that matches zero rows — a contender won the capacity, or
+// the grant's eligibility moved under the row lock — is a stale number, not a
+// failure: the walk passes the bucket by and continues down the waterfall,
+// and the shortfall check at the end is the one place that decides the hold's
+// fate. Contended admission retries the walk; the row locks serialise the
+// contenders, and the waterfall order keeps that serialisation deadlock-free.
+func (repository *QuotaProjectionRepository) Drawdown(ctx context.Context, accountID string, aliasID catalog.AliasID, amount int64) ([]accounting.Allocation, error) {
 	if amount < 0 {
 		return nil, accounting.ErrNegativeAmount
 	}
 	if amount == 0 {
 		return []accounting.Allocation{}, nil
 	}
+	if aliasID == "" {
+		return nil, errors.New("postgres: drawdown: a drawdown names the alias it serves")
+	}
 	querier := repository.store.Querier(ctx)
-	rows, err := querier.QueryContext(ctx, projectionWalk, accountID)
+	rows, err := querier.QueryContext(ctx, projectionWalk, accountID, string(aliasID))
 	if err != nil {
 		return nil, fmt.Errorf("postgres: drawdown walk: %w", err)
 	}
@@ -490,7 +557,7 @@ func (repository *QuotaProjectionRepository) Drawdown(ctx context.Context, accou
 		if take <= 0 {
 			continue
 		}
-		result, err := querier.ExecContext(ctx, projectionTake, one.id, take)
+		result, err := querier.ExecContext(ctx, projectionTake, one.id, string(aliasID), take)
 		if err != nil {
 			return nil, repository.giveback(ctx, querier, legs, fmt.Errorf("postgres: drawdown take from %q: %w", one.id, err))
 		}
@@ -499,12 +566,14 @@ func (repository *QuotaProjectionRepository) Drawdown(ctx context.Context, accou
 			return nil, repository.giveback(ctx, querier, legs, fmt.Errorf("postgres: drawdown take from %q: %w", one.id, err))
 		}
 		if affected == 0 {
-			// Another writer took this bucket's capacity between the walk and
-			// the take — or deactivated the grant. The walk's numbers are
-			// stale: fail the whole hold and let the caller retry against
-			// fresh numbers — a partial hold is money reserved against a
-			// request it will not cover.
-			return nil, repository.giveback(ctx, querier, legs, accounting.ErrInsufficientCapacity)
+			// This bucket's number went stale between the walk and the take —
+			// a contender took the capacity, or the grant's eligibility moved
+			// under the row lock. The bucket is passed by, not fatal: the walk
+			// continues down the waterfall, and either a later bucket covers
+			// the hold or the shortfall check below gives everything back and
+			// says ErrInsufficientCapacity — the same sentinel a walk with no
+			// eligible bucket at all raises.
+			continue
 		}
 		ordinal++
 		legs = append(legs, accounting.Allocation{FundingBucketID: one.id, Amount: take, Ordinal: ordinal})
