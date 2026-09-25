@@ -118,9 +118,13 @@ did not fit in it. The hold's own overflow or cap overflow is neither — it is
 
 The vocabulary this table uses is landed code, not a glossary to be honoured
 later: the terminal statuses and every rejection and failure reason are values
-of `migrations/dataplane/000003_runtime_storage`'s CHECK constraints and of the
-runtime's `execution` domain (`apps/dataplane/internal/domain/execution`), which
-refuses in Go what the database would refuse again in SQL. Three details in the
+of `migrations/dataplane/000003_runtime_storage`'s CHECK constraints — widened
+by `000007_routing_failure_vocabulary` with the three surfaced upstream
+refusals (`provider_rejected_request`, `context_too_large`,
+`upstream_authentication`), the pre-commitment endings that name no attempt —
+and of the runtime's `execution` domain
+(`apps/dataplane/internal/domain/execution`), which refuses in Go what the
+database would refuse again in SQL. Three details in the
 table are worth reading precisely because the landed schema fixes their shape.
 The rows of step 4's replay decision live in `request_intake`, keyed
 `(account_id, idempotency_key)` — the database's unique key on that pair is the

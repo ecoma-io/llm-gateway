@@ -3408,3 +3408,81 @@ func TestIntegrationPublicationRaceSeedsExactlyOnce(t *testing.T) {
 		t.Errorf("the bucket carries %d rows, want 1 — one funding bucket, one projection", rows)
 	}
 }
+
+// TestIntegrationSurfacedRefusalVocabularyWritesAndRefuses pins the widened
+// failure vocabulary on the row, where the domain's refusals are enforced a
+// second time: each surfaced pre-commitment refusal writes a failed request
+// that names no attempt; a spelling outside the vocabulary is refused; and a
+// refusal row that names a committed attempt is refused by the pairing
+// constraint, exactly as gateway_abandoned always was.
+func TestIntegrationSurfacedRefusalVocabularyWritesAndRefuses(t *testing.T) {
+	db, store := integrationPool(t)
+	repos := integrationRepos(t, store)
+	integrationRuntimeSchema(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	account := integrationRuntimeAccount(t, "surfacedrefusal")
+
+	// Each surfaced refusal finalises a failed request on the row: the write
+	// the vocabulary used to refuse is now the shape the database accepts.
+	for _, reason := range []execution.FailureReason{
+		execution.FailedProviderRejectedRequest,
+		execution.FailedContextTooLarge,
+		execution.FailedUpstreamAuthentication,
+	} {
+		request, err := execution.NewRequest(identity.NewRequestID(), account, account+"-api-key", "surfaced/alias", 120, 4096, integrationPrice(), time.Now().UTC())
+		if err != nil {
+			t.Fatalf("building the %s request: %v", reason, err)
+		}
+		if err := repos.requests.Insert(ctx, request); err != nil {
+			t.Fatalf("inserting the %s request: %v", reason, err)
+		}
+		if err := request.FailBeforeCommitment(reason, time.Now().UTC()); err != nil {
+			t.Fatalf("failing the request before commitment with %s: %v", reason, err)
+		}
+		if finalised, err := repos.requests.Finalise(ctx, request); err != nil || !finalised {
+			t.Fatalf("finalising the %s request: finalised=%v err=%v, want the row to take the refusal", reason, finalised, err)
+		}
+	}
+
+	// A spelling outside the widened vocabulary is refused by the same
+	// constraint that refuses every foreign word.
+	stranger, err := execution.NewRequest(identity.NewRequestID(), account, account+"-api-key", "surfaced/alias", 120, 4096, integrationPrice(), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("building the stranger request: %v", err)
+	}
+	if err := repos.requests.Insert(ctx, stranger); err != nil {
+		t.Fatalf("inserting the stranger request: %v", err)
+	}
+	stranger.Status = execution.StatusFailed
+	stranger.FailureReason = "upstream_refused"
+	stranger.FinishedAt = time.Now().UTC()
+	_, err = repos.requests.Finalise(ctx, stranger)
+	var pgErr *pgconn.PgError
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "requests_failed_shape" {
+		t.Fatalf("finalising an outside-vocabulary reason = %v, want a requests_failed_shape refusal", err)
+	}
+
+	// A refusal that names a committed attempt is a claim the vocabulary
+	// never allows: the pairing constraint refuses it as it refuses an
+	// abandoned row that names one.
+	claiming, err := execution.NewRequest(identity.NewRequestID(), account, account+"-api-key", "surfaced/alias", 120, 4096, integrationPrice(), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("building the claiming request: %v", err)
+	}
+	if err := repos.requests.Insert(ctx, claiming); err != nil {
+		t.Fatalf("inserting the claiming request: %v", err)
+	}
+	if err := claiming.FailBeforeCommitment(execution.FailedProviderRejectedRequest, time.Now().UTC()); err != nil {
+		t.Fatalf("failing the claiming request: %v", err)
+	}
+	claiming.CommittedAttemptID = identity.AttemptID("0198c0a8-5e7a-7c3e-8f4a-0000000000a1")
+	err = store.WithinTx(ctx, func(ctx context.Context) error {
+		_, finErr := repos.requests.Finalise(ctx, claiming)
+		return finErr
+	})
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "requests_failure_reason_attempt_pairing" {
+		t.Fatalf("finalising a refusal that names an attempt = %v, want a requests_failure_reason_attempt_pairing refusal", err)
+	}
+}
