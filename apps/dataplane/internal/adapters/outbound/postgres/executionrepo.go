@@ -140,15 +140,16 @@ const attemptInsert = `INSERT INTO public.request_attempts
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`
 
 // attemptUsageUpdate is the ONE sanctioned update to an attempt row, and
-// COALESCE is its whole discipline: a report writes the figures it carries
-// and leaves the ones it does not exactly as they were. Overwriting observed
-// telemetry with a NULL because a later report knew less would be a
-// settlement decision made by a COALESCE; instead the second report simply
-// never displaces the first.
+// COALESCE is its whole discipline: the first figure a row carries stands —
+// the column is the store side of keep-first, matching the domain's own
+// merge — and a later report writes only into the columns still NULL.
+// Overwriting observed telemetry, with a number or with a NULL, would be a
+// settlement decision made by an UPDATE; the second report simply never
+// displaces the first.
 const attemptUsageUpdate = `UPDATE public.request_attempts
-SET provider_input_tokens = COALESCE($2, provider_input_tokens),
-    provider_output_tokens = COALESCE($3, provider_output_tokens),
-    delivery_tokens = COALESCE($4, delivery_tokens)
+SET provider_input_tokens = COALESCE(provider_input_tokens, $2),
+    provider_output_tokens = COALESCE(provider_output_tokens, $3),
+    delivery_tokens = COALESCE(delivery_tokens, $4)
 WHERE id = $1`
 
 // AttemptRepository is the PostgreSQL implementation of the attempt half of

@@ -476,45 +476,69 @@ type settleUsage struct {
 // rules in one place, so the success and the mid-stream failure settle by the
 // same arithmetic:
 //
-//   - delivery is always the gateway's own count of what left the process;
-//   - input is the provider's report when it gave one, otherwise the count
-//     admission priced the hold from — the gateway's own observation of the
-//     input side;
-//   - output is the provider's report when it gave one, otherwise the
-//     delivered count — which can only understate, because generation that
-//     was never forwarded is unknowable;
-//   - capture is reported when the provider reported both usage figures
-//     (input and output), gateway_observed otherwise. The label attests to
+//   - delivery is always the gateway's own count of what left the process,
+//     recorded beside the settlement but never priced by it — ADR 0003
+//     prices input and output only, and a byte-count heuristic is not a
+//     tokenizer;
+//   - input is the provider's report bounded by the count admission priced
+//     the hold from: a report above it is clamped down to it, and no report
+//     falls back to it;
+//   - output is the provider's report bounded by the output basis the hold
+//     was sized with, and the basis itself when no report arrived — never
+//     the delivered count, which would price a transport estimate the
+//     provider's tokenizer never agreed to and could claim above the hold;
+//   - capture is reported when the provider's own figures stand as given,
+//     gateway_observed when a figure is missing but nothing was clamped
+//     (the input side's fallback is the gateway's own count — the basis
+//     bullet above — so the observation label stays honest there), and
+//     reservation_floor whenever a settled figure is the reservation's own:
+//     a clamp that bound, or an output nobody reported. The label attests to
 //     the usage figures' provenance, and to nothing else: delivery is the
 //     gateway's own count by construction — the first bullet — reported or
 //     not, so it never decides the label.
 //
-// The reservation floor is deliberately out of reach on this path: a settled
-// ending always names a committed attempt, and a commitment means content
-// reached the client, so there is always a delivered count to stand on.
+// With both figures bounded by the counts the hold was derived from, the
+// settled amount cannot exceed the hold — the hold formula is increasing in
+// both — so the ending's first law, settled ≤ hold, holds by construction.
+// The provider's own claims are not lost by the clamping: the attempt row
+// records them as the telemetry they are, and the fact prices only what the
+// reservation defends.
 func settleBasis(admitted *Admission, delivered []byte, reportedInput, reportedOutput *int64) settleUsage {
-	observed := accounting.CountDeliveredTokens(delivered)
-	delivery := observed
+	delivery := accounting.CountDeliveredTokens(delivered)
+	floor := false
 
 	input := reportedInput
+	if input != nil && *input > int64(admitted.InputTokens) {
+		count := int64(admitted.InputTokens)
+		input = &count
+		floor = true
+	}
 	if input == nil {
 		count := int64(admitted.InputTokens)
 		input = &count
 	}
 	output := reportedOutput
-	if output == nil {
-		// The delivered count is copied, not aliased: the same octet count
-		// stands behind both the delivery figure and the output figure on
-		// purpose, but the fact's two pointers outlive this frame, and a
-		// shared variable is one future writer away from a fact whose output
-		// silently changed under it.
-		count := delivery
+	if output != nil && *output > int64(admitted.OutputBasis) {
+		count := int64(admitted.OutputBasis)
 		output = &count
+		floor = true
+	}
+	if output == nil {
+		// The basis is copied, not aliased: the count the hold was sized
+		// with stands behind the output figure, and the fact's pointer
+		// outlives this frame — a shared variable is one future writer away
+		// from a fact whose output silently changed under it.
+		count := int64(admitted.OutputBasis)
+		output = &count
+		floor = true
 	}
 
 	capture := accounting.CaptureGatewayObserved
 	if reportedInput != nil && reportedOutput != nil {
 		capture = accounting.CaptureReported
+	}
+	if floor {
+		capture = accounting.CaptureReservationFloor
 	}
 	return settleUsage{
 		capture:  capture,

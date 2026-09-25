@@ -555,6 +555,7 @@ func (a *ChatAdmission) admitOnce(ctx context.Context, in ChatInput, requestID i
 			Price:            snapshot,
 			Hold:             hold,
 			InputTokens:      int(inputTokens),
+			OutputBasis:      ceiling,
 			ReservationID:    reservationID,
 			Alias:            model,
 			Legs:             legs,

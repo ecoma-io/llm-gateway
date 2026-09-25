@@ -2877,19 +2877,20 @@ func TestIntegrationAttemptUsageUpdateKeepsTheFirstReport(t *testing.T) {
 		t.Fatalf("RecordProviderUsage(the third report, which contradicts the first) = (%t, %v), want (true, nil)", written, err)
 	}
 	input, output, delivery = readFigures("after the third report")
-	// A report that CARRIES a figure writes it — the update's contract is
-	// "writes the figures it carries", and which claim stands when two
-	// reports disagree is the caller's decision, not the store's. What
-	// COALESCE protects is the figure the report does NOT carry: that one is
-	// never displaced by a NULL.
-	if !input.Valid || input.Int64 != 9 {
-		t.Errorf("provider_input_tokens = %v, want 9 — the third report carried it, and a carried figure is written", input)
+	// The update keeps the FIRST figure a column was given: which claim
+	// stands when two reports disagree was settled when the row took its
+	// first one, and a later report never reopens it — the store matches the
+	// domain's own merge, and an UPDATE that rewrote observed telemetry would
+	// be a settlement decision made by a WHERE clause. What a report writes
+	// into is the columns still NULL.
+	if !input.Valid || input.Int64 != 5 {
+		t.Errorf("provider_input_tokens = %v, want 5 — the third report's 9 must not displace the first report's figure", input)
 	}
 	if !output.Valid || output.Int64 != 7 {
 		t.Errorf("provider_output_tokens = %v, want 7 — the third report carried no output figure, and its NULL must not displace the second report's", output)
 	}
 	if !delivery.Valid || delivery.Int64 != 1 {
-		t.Errorf("delivery_tokens = %v, want 1 — the one other figure the third report carried", delivery)
+		t.Errorf("delivery_tokens = %v, want 1 — the one figure the third report carried into a column still NULL", delivery)
 	}
 
 	// The miss: a well-formed identity nobody inserted. An unparseable id

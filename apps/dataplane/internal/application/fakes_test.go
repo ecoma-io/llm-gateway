@@ -468,6 +468,7 @@ type admissionWorld struct {
 	seamCloseLost        bool
 	requestFinaliseLost  bool   // the compensation's CAS won, but the request row did not finalise
 	attemptDuplicate     bool   // the attempt insert races a writer that already persisted the row
+	intakePreFinalised   bool   // the replay record is already terminal when the orphan tail reads it
 	intakeRace           int    // the first N intake inserts lose the unique race
 	intakeRaceWinner     string // "", "in_flight", or "rejected"
 
@@ -971,6 +972,13 @@ func (f fakeAdmissionIntakes) Insert(ctx context.Context, intake execution.Intak
 			}
 		}
 		return fmt.Errorf("fake: intake for %s: %w", key, persistence.ErrDuplicateIntake)
+	}
+	if f.world.intakePreFinalised {
+		// The winner of the ending's race finalised this record between the
+		// loser's lost close and the orphan tail's read — the skip branch's
+		// premise, staged where that read will find it.
+		final := execution.FinalSucceeded
+		intake.FinalStatus = &final
 	}
 	f.world.intakes[key] = cloneAdmissionIntake(intake)
 	return nil

@@ -428,6 +428,16 @@ type Admission struct {
 	// body the admission already counted.
 	InputTokens int
 
+	// OutputBasis is the output count the hold was sized against — the bound
+	// admission put between the request and its answer. Seen from the provider
+	// side it is a ceiling; seen from the settlement side it is the floor the
+	// settled figure cannot fall below without undercharging and cannot rise
+	// above without overcharging: a settled ending reports the provider's
+	// output figure bounded by it, and claims the basis itself when no figure
+	// arrived, so what a settlement claims is always a number the hold
+	// already funded.
+	OutputBasis int
+
 	// ReservationID is the live reservation the request holds.
 	ReservationID identity.ReservationID
 
