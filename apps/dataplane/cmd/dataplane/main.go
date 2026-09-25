@@ -52,6 +52,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -81,6 +82,11 @@ var version = "dev"
 // whole of the patience a local database on the same plane owes a booting
 // process; it is not a retry budget.
 const postgresOpenTimeout = 5 * time.Second
+
+// maxLeaseOwnerOctets is the reservation lease owner's storage bound, the one
+// the runtime storage schema CHECKs. It lives here, beside the derivation, so
+// the truncation cannot drift from the column it serves.
+const maxLeaseOwnerOctets = 256
 
 const (
 	// readTimeout bounds one request's read — headers and body together — on
@@ -254,6 +260,32 @@ func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
 	)
 	app := application.New(version, postgres.NewUsageFacts(pool), catalog, postgres.NewProjectionApplier(pool))
 
+	// The admission use cases over the same store: credential verification
+	// and the admit-or-account-for-it decision behind the chat completion
+	// route. Every port reads the plane's own database — the credential
+	// mirror, the alias and price books, the runtime storage the migrations
+	// created — so one unit of work spans them, the same guarantee the
+	// catalog's repositories were given above. The horizons come from the
+	// validated configuration; the lease owner is derived, because a lease
+	// name a deployment could set twice is a lease name that means nothing.
+	credentials := postgres.NewCredentials(catalogStore)
+	admission := application.NewChatAdmission(
+		catalogStore,
+		credentials,
+		postgres.NewModelAliases(catalogStore),
+		postgres.NewPriceBook(catalogStore),
+		postgres.NewRequestRepository(catalogStore),
+		postgres.NewIntakeRepository(catalogStore),
+		postgres.NewReservationRepository(catalogStore),
+		postgres.NewQuotaProjectionRepository(catalogStore),
+		postgres.NewFactRepository(catalogStore),
+		application.AdmissionConfig{
+			HoldWindow: cfg.ReservationHoldWindow,
+			LeaseTTL:   cfg.ReservationLeaseTTL,
+			LeaseOwner: leaseOwner(),
+		},
+	)
+
 	runtimeListener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return nil, err
@@ -261,7 +293,7 @@ func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
 
 	services := []service{{
 		name:     "runtime",
-		server:   newServer(http.New(app), cfg),
+		server:   newServer(http.New(app, http.WithChatAuthenticator(application.NewCredentialAuthenticator(credentials)), http.WithChatCompletion(admission)), cfg),
 		listener: runtimeListener,
 	}}
 
@@ -281,6 +313,26 @@ func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
 		listener: managementListener,
 	})
 	return services, nil
+}
+
+// leaseOwner derives the name this process leases its reservations under:
+// hostname:pid, truncated hard to the schema's 256-octet bound with the pid
+// kept whole — the pid is the half that answers "is this lease mine", so the
+// host name absorbs the cut. It is derived rather than configured on purpose:
+// a lease name a deployment could set twice is two processes claiming one
+// lease, which is the confusion the lease exists to prevent. A host name that
+// cannot be learned is not a boot failure — the value only has to separate
+// processes from each other, and the pid half of it does.
+func leaseOwner() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown-host"
+	}
+	suffix := ":" + strconv.Itoa(os.Getpid())
+	if keep := maxLeaseOwnerOctets - len(suffix); len(host) > keep {
+		host = host[:keep]
+	}
+	return host + suffix
 }
 
 // newServer builds one listener's http.Server with the transport posture both

@@ -12,6 +12,7 @@ import (
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/execution"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/projection"
 )
 
 // The authentication matrix.
@@ -305,6 +306,41 @@ func TestTheMixedCaseSchemeIsAcceptedAndTheCredentialIsCarriedVerbatim(t *testin
 	}
 	if chat.inputs[0].Credential != "key-123" {
 		t.Errorf("admission received credential %q; it must receive the key identity, never the presented secret", chat.inputs[0].Credential)
+	}
+}
+
+// TestTheVerifiedAccountsFactsRideWithTheInput pins the two fields the handler
+// copies from what verification returned: the account the key belongs to, and
+// the account lifecycle read in the same statement. The use case gates on this
+// copy rather than re-reading the mirror — a re-read would straddle the mirror's
+// own write, and a gate taken on a second snapshot is not the gate verification
+// made — so the copy is asserted field by field, not assumed.
+func TestTheVerifiedAccountsFactsRideWithTheInput(t *testing.T) {
+	state := string(projection.LifecycleActive)
+	auth := &fakeAuthenticator{credential: application.AuthenticatedCredential{
+		KeyID:        "key-123",
+		AccountID:    "account-9",
+		AccountState: &state,
+	}}
+	chat := &fakeChatCompletion{
+		outcome: application.ChatOutcome{Kind: application.OutcomeRejected, Reason: execution.RejectedNoAccess},
+	}
+	handler := newChatCompletionHandler(wiring{auth: auth, chat: chat})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(stdhttp.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	request.Header.Set(authorizationHeader, "Bearer "+testAPIKey)
+	request.Header.Set(idempotencyKeyHeader, "key-1")
+	handler(recorder, request)
+
+	if len(chat.inputs) != 1 {
+		t.Fatalf("admission was called %d times, want 1", len(chat.inputs))
+	}
+	if chat.inputs[0].AccountID != "account-9" {
+		t.Errorf("admission received account id %q, want the verified credential's owner", chat.inputs[0].AccountID)
+	}
+	if chat.inputs[0].AccountState == nil || *chat.inputs[0].AccountState != string(projection.LifecycleActive) {
+		t.Errorf("admission received account state %v, want the lifecycle verification read", chat.inputs[0].AccountState)
 	}
 }
 

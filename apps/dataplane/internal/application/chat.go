@@ -59,13 +59,28 @@ type Authenticator interface {
 }
 
 // AuthenticatedCredential is what verification concluded: the key identity
-// behind the presented secret. The presented secret itself never crosses this
-// boundary — by the time it is resolved to a key id it has been reduced to a
-// digest comparison the runtime keeps no copy of.
+// behind the presented secret, and the account facts the same mirror read
+// carried beside it. The presented secret itself never crosses this boundary —
+// by the time it is resolved to a key id it has been reduced to a digest
+// comparison the runtime keeps no copy of.
 type AuthenticatedCredential struct {
 	// KeyID is the identity of the api_key_credentials row the presented
 	// secret verified against. It is the credential a rejection row records.
 	KeyID string
+
+	// AccountID is the identity of the account the credential belongs to, as
+	// the mirror's credential row states it. It is the owner every admission
+	// write keys on — the request row, the replay record and the drawdown all
+	// name this account, never one re-derived elsewhere.
+	AccountID string
+
+	// AccountState is the owning account's lifecycle state as the mirror read
+	// spelled it, nil only when the account row is absent — the
+	// integrity-violation case verification refuses closed. It rides beside
+	// the key identity because the mirror delivers both in one statement: the
+	// use case judges exactly the lifecycles verification saw, never a
+	// re-read that could straddle a projection apply.
+	AccountState *string
 }
 
 // UnauthenticatedReason names why a credential was refused. The values are
@@ -113,6 +128,18 @@ type ChatInput struct {
 	// against, as Authenticator returned it. The presented secret is not this
 	// field and never was.
 	Credential string
+
+	// AccountID is the account the verified credential belongs to, as
+	// Authenticator returned it. Every write admission makes keys on this
+	// owner.
+	AccountID string
+
+	// AccountState is the owning account's lifecycle as verification saw it,
+	// nil only on the integrity-violation shape verification already refused.
+	// The use case gates on this copy of the fact rather than re-reading the
+	// mirror, so the gate and the verification answer one instant of the
+	// mirror, not two.
+	AccountState *string
 
 	// IdempotencyKey is the request's key, byte-for-byte as presented — no
 	// trimming, no folding. Empty when the header was absent; the use case

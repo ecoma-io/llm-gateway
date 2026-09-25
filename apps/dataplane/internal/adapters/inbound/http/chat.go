@@ -111,6 +111,8 @@ func newChatCompletionHandler(wiring wiring) stdhttp.HandlerFunc {
 		outcome, err := wiring.chat.Serve(r.Context(), application.ChatInput{
 			RequestID:      runtimeID,
 			Credential:     authenticated.KeyID,
+			AccountID:      authenticated.AccountID,
+			AccountState:   authenticated.AccountState,
 			IdempotencyKey: idempotencyKey,
 			Body:           body,
 		})

@@ -20,6 +20,23 @@ import (
 // Handler behaviour belongs to internal/adapters/inbound/http and is tested there through
 // httptest, without a process.
 
+// TestLeaseOwnerStaysInsideTheSchemaBound pins the derivation the reservation
+// lease is claimed under: host name and pid, never a knob, and truncated —
+// when truncation is needed at all — in the host name rather than the pid,
+// because the pid is the half that answers "is this lease mine".
+func TestLeaseOwnerStaysInsideTheSchemaBound(t *testing.T) {
+	owner := leaseOwner()
+	if owner == "" {
+		t.Fatalf("the derived lease owner is empty")
+	}
+	if len(owner) > maxLeaseOwnerOctets {
+		t.Fatalf("the derived lease owner is %d octets, past the bound the schema CHECKs", len(owner))
+	}
+	if !strings.HasPrefix(owner, "unknown-host") && !strings.Contains(owner, ":") {
+		t.Fatalf("the derived lease owner carries no pid half: %d octets of host name only", len(owner))
+	}
+}
+
 // TestNewServerCarriesTheTransportPosture pins the fields both listeners are
 // built with. The WriteTimeout assertion is the one that matters: the runtime's
 // inference contract is a Server-Sent Events stream, and a write deadline would
