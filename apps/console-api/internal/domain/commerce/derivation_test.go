@@ -163,7 +163,7 @@ func TestWaterfallTieBreaks(t *testing.T) {
 
 		got := EffectiveEntitlements([]CandidateGrant{candidate(eB, subB), candidate(eA, subA)}, at)
 		first, second := got[0].EntitlementID, got[1].EntitlementID
-		if !(first < second) {
+		if first >= second {
 			t.Fatalf("order = [%s, %s], want ascending id", first, second)
 		}
 	})

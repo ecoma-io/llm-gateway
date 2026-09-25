@@ -342,7 +342,7 @@ func (r *planVersionRepo) ByID(ctx context.Context, id commerce.PlanVersionID) (
 	if err != nil {
 		return commerce.PlanVersion{}, nil, fmt.Errorf("postgres: plan version %s: read grant definitions: %w", id, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	definitions := make([]commerce.GrantDefinition, 0)
 	for rows.Next() {
 		var d commerce.GrantDefinition
@@ -787,7 +787,7 @@ func scanSubscriptionIDs(ctx context.Context, q persistence.Querier, query strin
 	if err != nil {
 		return nil, fmt.Errorf("postgres: %s: %w", what, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	ids := make([]commerce.SubscriptionID, 0)
 	for rows.Next() {
 		var id string
@@ -889,7 +889,7 @@ func (r *entitlementRepo) DueExpiryIDs(ctx context.Context, limit int) ([]commer
 	if err != nil {
 		return nil, fmt.Errorf("postgres: scan due entitlement expiry ids: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	ids := make([]commerce.EntitlementID, 0)
 	for rows.Next() {
 		var id string
@@ -909,7 +909,7 @@ func (r *entitlementRepo) ActiveCandidates(ctx context.Context, accountID commer
 	if err != nil {
 		return nil, fmt.Errorf("postgres: active candidates of account %s: %w", accountID, err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	candidates := make([]commerce.CandidateGrant, 0)
 	for rows.Next() {
 		var e commerce.Entitlement
