@@ -32,10 +32,12 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 		{
 			name: "uses explicit defaults when no variables are set",
 			want: Config{
-				Addr:              DefaultAddr,
-				ShutdownTimeout:   DefaultShutdownTimeout,
-				ReadHeaderTimeout: DefaultReadHeaderTimeout,
-				Postgres:          postgresDefaults(),
+				Addr:                  DefaultAddr,
+				ShutdownTimeout:       DefaultShutdownTimeout,
+				ReadHeaderTimeout:     DefaultReadHeaderTimeout,
+				ReservationHoldWindow: DefaultReservationHoldWindow,
+				ReservationLeaseTTL:   DefaultReservationLeaseTTL,
+				Postgres:              postgresDefaults(),
 			},
 		},
 		{
@@ -46,10 +48,12 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				"DATAPLANE_READ_HEADER_TIMEOUT": "3s",
 			},
 			want: Config{
-				Addr:              "127.0.0.1:9090",
-				ShutdownTimeout:   15 * time.Second,
-				ReadHeaderTimeout: 3 * time.Second,
-				Postgres:          postgresDefaults(),
+				Addr:                  "127.0.0.1:9090",
+				ShutdownTimeout:       15 * time.Second,
+				ReadHeaderTimeout:     3 * time.Second,
+				ReservationHoldWindow: DefaultReservationHoldWindow,
+				ReservationLeaseTTL:   DefaultReservationLeaseTTL,
+				Postgres:              postgresDefaults(),
 			},
 		},
 		{
@@ -102,15 +106,133 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			wantErr: "DATAPLANE_READ_HEADER_TIMEOUT must be a Go duration",
 		},
 		{
+			name: "keeps the reservation horizons at their defaults while other settings move",
+			env: map[string]string{
+				"DATAPLANE_SHUTDOWN_TIMEOUT": "15s",
+			},
+			want: Config{
+				Addr:                  DefaultAddr,
+				ShutdownTimeout:       15 * time.Second,
+				ReadHeaderTimeout:     DefaultReadHeaderTimeout,
+				ReservationHoldWindow: DefaultReservationHoldWindow,
+				ReservationLeaseTTL:   DefaultReservationLeaseTTL,
+				Postgres:              postgresDefaults(),
+			},
+		},
+		{
+			name: "configures the reservation horizons together",
+			env: map[string]string{
+				"DATAPLANE_RESERVATION_HOLD_WINDOW": "10m",
+				"DATAPLANE_RESERVATION_LEASE_TTL":   "45s",
+			},
+			want: Config{
+				Addr:                  DefaultAddr,
+				ShutdownTimeout:       DefaultShutdownTimeout,
+				ReadHeaderTimeout:     DefaultReadHeaderTimeout,
+				ReservationHoldWindow: 10 * time.Minute,
+				ReservationLeaseTTL:   45 * time.Second,
+				Postgres:              postgresDefaults(),
+			},
+		},
+		{
+			name: "uses a supplied hold window with the default lease ttl",
+			env: map[string]string{
+				"DATAPLANE_RESERVATION_HOLD_WINDOW": "1h",
+			},
+			want: Config{
+				Addr:                  DefaultAddr,
+				ShutdownTimeout:       DefaultShutdownTimeout,
+				ReadHeaderTimeout:     DefaultReadHeaderTimeout,
+				ReservationHoldWindow: time.Hour,
+				ReservationLeaseTTL:   DefaultReservationLeaseTTL,
+				Postgres:              postgresDefaults(),
+			},
+		},
+		{
+			name: "accepts a hold window at the ceiling",
+			env: map[string]string{
+				"DATAPLANE_RESERVATION_HOLD_WINDOW": "720h",
+				"DATAPLANE_RESERVATION_LEASE_TTL":   "1m",
+			},
+			want: Config{
+				Addr:                  DefaultAddr,
+				ShutdownTimeout:       DefaultShutdownTimeout,
+				ReadHeaderTimeout:     DefaultReadHeaderTimeout,
+				ReservationHoldWindow: MaxReservationHoldWindow,
+				ReservationLeaseTTL:   time.Minute,
+				Postgres:              postgresDefaults(),
+			},
+		},
+		{
+			name: "refuses a hold window one second past the ceiling",
+			env: map[string]string{
+				"DATAPLANE_RESERVATION_HOLD_WINDOW": "720h1s",
+			},
+			wantErr: "DATAPLANE_RESERVATION_HOLD_WINDOW (720h0m1s) must not be greater than 720h0m0s",
+		},
+		{
+			name: "rejects an explicitly empty reservation hold window",
+			env: map[string]string{
+				"DATAPLANE_RESERVATION_HOLD_WINDOW": "",
+			},
+			wantErr: "DATAPLANE_RESERVATION_HOLD_WINDOW must not be empty",
+		},
+		{
+			name: "rejects a zero reservation hold window",
+			env: map[string]string{
+				"DATAPLANE_RESERVATION_HOLD_WINDOW": "0s",
+			},
+			wantErr: "DATAPLANE_RESERVATION_HOLD_WINDOW must be greater than zero",
+		},
+		{
+			name: "rejects an explicitly empty reservation lease ttl",
+			env: map[string]string{
+				"DATAPLANE_RESERVATION_LEASE_TTL": "",
+			},
+			wantErr: "DATAPLANE_RESERVATION_LEASE_TTL must not be empty",
+		},
+		{
+			name: "rejects a negative reservation lease ttl",
+			env: map[string]string{
+				"DATAPLANE_RESERVATION_LEASE_TTL": "-1s",
+			},
+			wantErr: "DATAPLANE_RESERVATION_LEASE_TTL must be greater than zero",
+		},
+		{
+			name: "rejects a malformed reservation lease ttl",
+			env: map[string]string{
+				"DATAPLANE_RESERVATION_LEASE_TTL": "soon",
+			},
+			wantErr: "DATAPLANE_RESERVATION_LEASE_TTL must be a Go duration",
+		},
+		{
+			name: "refuses a lease ttl equal to the hold window",
+			env: map[string]string{
+				"DATAPLANE_RESERVATION_HOLD_WINDOW": "2m",
+				"DATAPLANE_RESERVATION_LEASE_TTL":   "2m",
+			},
+			wantErr: "DATAPLANE_RESERVATION_LEASE_TTL (2m0s) must be strictly shorter than DATAPLANE_RESERVATION_HOLD_WINDOW (2m0s); a lease must never outlive the hold it fences",
+		},
+		{
+			name: "refuses a lease ttl one second past the hold window",
+			env: map[string]string{
+				"DATAPLANE_RESERVATION_HOLD_WINDOW": "2m",
+				"DATAPLANE_RESERVATION_LEASE_TTL":   "2m1s",
+			},
+			wantErr: "DATAPLANE_RESERVATION_LEASE_TTL (2m1s) must be strictly shorter than DATAPLANE_RESERVATION_HOLD_WINDOW (2m0s); a lease must never outlive the hold it fences",
+		},
+		{
 			name: "serves no management surface unless one is configured",
 			env: map[string]string{
 				"DATAPLANE_ADDR": "127.0.0.1:9090",
 			},
 			want: Config{
-				Addr:              "127.0.0.1:9090",
-				ShutdownTimeout:   DefaultShutdownTimeout,
-				ReadHeaderTimeout: DefaultReadHeaderTimeout,
-				Postgres:          postgresDefaults(),
+				Addr:                  "127.0.0.1:9090",
+				ShutdownTimeout:       DefaultShutdownTimeout,
+				ReadHeaderTimeout:     DefaultReadHeaderTimeout,
+				ReservationHoldWindow: DefaultReservationHoldWindow,
+				ReservationLeaseTTL:   DefaultReservationLeaseTTL,
+				Postgres:              postgresDefaults(),
 			},
 		},
 		{
@@ -120,12 +242,14 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				"DATAPLANE_MANAGEMENT_TOKEN": "a-service-credential",
 			},
 			want: Config{
-				Addr:              DefaultAddr,
-				ShutdownTimeout:   DefaultShutdownTimeout,
-				ReadHeaderTimeout: DefaultReadHeaderTimeout,
-				ManagementAddr:    "127.0.0.1:9091",
-				ManagementToken:   "a-service-credential",
-				Postgres:          postgresDefaults(),
+				Addr:                  DefaultAddr,
+				ShutdownTimeout:       DefaultShutdownTimeout,
+				ReadHeaderTimeout:     DefaultReadHeaderTimeout,
+				ReservationHoldWindow: DefaultReservationHoldWindow,
+				ReservationLeaseTTL:   DefaultReservationLeaseTTL,
+				ManagementAddr:        "127.0.0.1:9091",
+				ManagementToken:       "a-service-credential",
+				Postgres:              postgresDefaults(),
 			},
 		},
 		{
@@ -134,9 +258,11 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				"DATAPLANE_POSTGRES_DSN": "postgresql://gateway:not-the-fixture-password@db.internal:5433/dataplane?sslmode=require",
 			},
 			want: Config{
-				Addr:              DefaultAddr,
-				ShutdownTimeout:   DefaultShutdownTimeout,
-				ReadHeaderTimeout: DefaultReadHeaderTimeout,
+				Addr:                  DefaultAddr,
+				ShutdownTimeout:       DefaultShutdownTimeout,
+				ReadHeaderTimeout:     DefaultReadHeaderTimeout,
+				ReservationHoldWindow: DefaultReservationHoldWindow,
+				ReservationLeaseTTL:   DefaultReservationLeaseTTL,
 				Postgres: Postgres{
 					DSN:             "postgresql://gateway:not-the-fixture-password@db.internal:5433/dataplane?sslmode=require",
 					MaxOpenConns:    DefaultPostgresMaxOpenConns,
@@ -155,9 +281,11 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				"DATAPLANE_POSTGRES_CONN_MAX_IDLE_TIME": "45s",
 			},
 			want: Config{
-				Addr:              DefaultAddr,
-				ShutdownTimeout:   DefaultShutdownTimeout,
-				ReadHeaderTimeout: DefaultReadHeaderTimeout,
+				Addr:                  DefaultAddr,
+				ShutdownTimeout:       DefaultShutdownTimeout,
+				ReadHeaderTimeout:     DefaultReadHeaderTimeout,
+				ReservationHoldWindow: DefaultReservationHoldWindow,
+				ReservationLeaseTTL:   DefaultReservationLeaseTTL,
 				Postgres: Postgres{
 					DSN:             DefaultPostgresDSN,
 					MaxOpenConns:    10,
