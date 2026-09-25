@@ -239,13 +239,13 @@ func (s *store) InUnitOfWork(ctx context.Context) bool {
 // port member: a pool answers a ping all day while the migration that creates
 // its tables has not run, and a process that discovers that on its first real
 // query turns a one-line deployment mistake into per-request failures. The
-// probe asks for the six objects whose absence breaks the very first
+// probe asks for the eight objects whose absence breaks the very first
 // statement of each repository — the feed's ordering authority, the request
-// family, the quota family, and the projection foundation's mirror and
-// position, whose absence would otherwise surface as per-delivery failures
-// after a boot that reported ready — and the error names the missing object
-// and nothing else: no SQL, no driver prose, the same discipline the
-// repositories' own failures follow.
+// family, the quota family, the projection foundation's mirror and position,
+// and the client price list, whose absence would otherwise surface as
+// per-delivery failures after a boot that reported ready — and the error
+// names the missing object and nothing else: no SQL, no driver prose, the
+// same discipline the repositories' own failures follow.
 func ValidateSchema(ctx context.Context, db *sql.DB) error {
 	if db == nil {
 		panic("postgres: ValidateSchema requires a non-nil *sql.DB — open the pool before validating")
@@ -258,6 +258,8 @@ func ValidateSchema(ctx context.Context, db *sql.DB) error {
 		{"public.api_key_credentials", "the credential mirror is missing"},
 		{"public.account_states", "the account mirror is missing"},
 		{"public.projection_state", "the projection position is missing"},
+		{"public.client_price_list_revisions", "the client price list has no revisions"},
+		{"public.client_price_list_entries", "the client price list has no entries"},
 	} {
 		var found *string
 		if err := db.QueryRowContext(ctx, probe, required.object).Scan(&found); err != nil {
