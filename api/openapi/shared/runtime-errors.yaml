@@ -88,6 +88,21 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/RuntimeError"
+    ServiceUnavailable:
+      description: >-
+        The runtime is up and not ready: one of its own dependencies is not
+        answering yet — its database unreachable, or its credential projection
+        not yet bootstrapped, meaning no snapshot has been applied and there is
+        no mirror to admit a request against (ADR 0007). The condition is
+        expected to clear, so a caller retries later rather than differently:
+        the type is `overloaded_error` and there is no code.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimeError"
   schemas:
     RuntimeError:
       type: object
