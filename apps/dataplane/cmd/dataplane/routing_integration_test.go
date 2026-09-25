@@ -30,12 +30,17 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	stdhttp "net/http"
+	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/adapters/outbound/postgres"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/application"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/config"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/catalog"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/execution"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/identity"
@@ -56,7 +61,7 @@ type routingFixture struct {
 
 	routeAliasID  catalog.AliasID
 	routePriceRev string
-	executorOf    map[catalog.BackendID]*routingFakeExecutor
+	executorOf    map[catalog.BackendID]executors.Executor
 	routing       *application.ChatRouting
 }
 
@@ -66,7 +71,7 @@ func newRoutingFixture(t *testing.T) *routingFixture {
 	f := &routingFixture{admissionFixture: base}
 	f.routeAliasID, _, _ = admissionSeedCatalog(t, base.store, routingFixtureAliasName)
 	f.routePriceRev = admissionSeedPrice(t, context.Background(), base.store, f.routeAliasID, 1_000_000, 2_000_000)
-	f.executorOf = map[catalog.BackendID]*routingFakeExecutor{}
+	f.executorOf = map[catalog.BackendID]executors.Executor{}
 	f.rewire(t)
 	return f
 }
@@ -282,6 +287,121 @@ func (f *routingFixture) latestFact(t *testing.T, requestID string) (kind, captu
 		t.Fatalf("reading the fact of %s: %v", requestID, err)
 	}
 	return kind, capture, providerInput, providerOutput, delivery, amount
+}
+
+// TestIntegrationRoutingServesThroughARegistryBuiltFromTheCatalog is the
+// wiring test the fake-executor scenarios cannot be: the registry here is
+// not a test's map but the composition root's own build — the rows read
+// back from the real catalog through the same List the refresh loop makes,
+// turned into executors by the same buildExecutors bind() calls — and the
+// executor at the end of it is the real openai-compatible one, calling a
+// real (httptest) provider over the wire. It proves the chain a serving
+// request actually travels: row → resolved target → one translated POST →
+// the verbatim answer delivered and committed → settled on the provider's
+// own report.
+func TestIntegrationRoutingServesThroughARegistryBuiltFromTheCatalog(t *testing.T) {
+	f := newRoutingFixture(t)
+	account, _ := f.routeAccount(t)
+
+	// The provider: one non-streaming completion, whose answer carries the
+	// usage report the settlement reads. It records what it was called
+	// with, so the test can hold the translation and the credential
+	// closure to their contracts.
+	var calls int32
+	var sawAuth, sawModel, sawStream atomic.Value
+	providerAnswer := []byte(`{"id":"chatcmpl-b10-1","object":"chat.completion","created":1,` +
+		`"choices":[{"index":0,"message":{"role":"assistant","content":"a settled answer"},"finish_reason":"stop"}],` +
+		`"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}`)
+	provider := httptest.NewServer(stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		atomic.AddInt32(&calls, 1)
+		if r.URL.Path != "/chat/completions" {
+			t.Errorf("the provider was called at %s, want the path the builder appends", r.URL.Path)
+		}
+		sawAuth.Store(r.Header.Get("Authorization"))
+		var translated map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&translated); err != nil {
+			t.Errorf("decoding the translated request: %v", err)
+			w.WriteHeader(stdhttp.StatusBadRequest)
+			return
+		}
+		sawModel.Store(translated["model"])
+		sawStream.Store(translated["stream"])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(providerAnswer)
+	}))
+	defer provider.Close()
+
+	// The catalog rows the registry will be built from: one openai-compatible
+	// backend pointing at the provider, a credential reference in the one
+	// grammar the resolver speaks, and the candidate that names it.
+	const credentialEnv = "B10_TEST_PROVIDER_CREDENTIAL"
+	t.Setenv(credentialEnv, "test-only-provider-material")
+	backendID := string(identity.NewRequestID())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := f.store.Querier(ctx).ExecContext(ctx, `INSERT INTO backends (id, adapter_type, endpoint, credentials_ref, state, created_at, updated_at)
+VALUES ($1, 'openai-compatible', $2, $3, 'active', transaction_timestamp(), transaction_timestamp())`,
+		backendID, provider.URL, "env:"+credentialEnv); err != nil {
+		t.Fatalf("seeding the provider backend: %v", err)
+	}
+	providerModel := "model-" + backendID[len(backendID)-8:]
+	f.seedCandidate(t, 1, catalog.BackendID(backendID))
+
+	// The composition root's own build, over the rows as the refresh loop
+	// reads them — not a test-scripted map.
+	rows, err := postgres.NewBackends(f.store).List(ctx)
+	if err != nil {
+		t.Fatalf("reading the backend catalog: %v", err)
+	}
+	entries := buildExecutors(rows, config.Config{})
+	// The catalog is shared and accumulates rows from every suite and run,
+	// so the honest assertion is this test's row resolving, not the
+	// snapshot's size — unresolvable rows belong to whomever seeded them.
+	if _, ok := entries[catalog.BackendID(backendID)]; !ok {
+		t.Fatalf("the builder left this test's backend out of the snapshot; it resolved %d callable row(s)", len(entries))
+	}
+	for id, executor := range entries {
+		f.executorOf[id] = executor
+	}
+	f.rewire(t)
+
+	outcome, reply := f.routeServe(t, account, "b9c4-key-registry", "b8c3")
+
+	if outcome.Kind != application.OutcomeServed {
+		t.Fatalf("outcome = %s/%s, want served through the built registry", outcome.Kind, outcome.Reason)
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Errorf("the provider was called %d times, want exactly one — the single-shot law holds over the real wire", n)
+	}
+	if auth, _ := sawAuth.Load().(string); auth != "Bearer test-only-provider-material" {
+		t.Errorf("the provider saw Authorization %q, want the material the environment resolved at use", auth)
+	}
+	if model, _ := sawModel.Load().(string); model != providerModel {
+		t.Errorf("the provider was asked for model %v, want the candidate's provider model %s", model, providerModel)
+	}
+	if stream, _ := sawStream.Load().(bool); stream {
+		t.Error("the translated request asked to stream, want the gateway's own switch at the body's preference")
+	}
+	if !reply.committed || string(reply.buf) != string(providerAnswer) {
+		t.Errorf("reply = committed:%t body:%q, want the provider's answer delivered verbatim and committed", reply.committed, reply.buf)
+	}
+
+	requestID := string(outcome.RuntimeRequestID)
+	if rows := f.attemptsOf(t, requestID); len(rows) != 1 || rows[0].outcome != "succeeded" {
+		t.Errorf("attempts = %+v, want the one succeeded attempt behind the committed answer", rows)
+	}
+	kind, capture, providerInput, providerOutput, _, amount := f.latestFact(t, requestID)
+	if kind.String != "settled" || capture.String != "reported" {
+		t.Errorf("fact = %s/%s, want settled/reported — both figures inside the basis stand as given", kind.String, capture.String)
+	}
+	if providerInput.Int64 != 3 || providerOutput.Int64 != 5 {
+		t.Errorf("provider figures = %d/%d, want the report 3/5", providerInput.Int64, providerOutput.Int64)
+	}
+	// ceil((3·1 + 5·2) minor units at the seeded millionth-scale prices) = 13
+	// — the report priced, not the hold's 132.
+	if amount.Int64 != 13 {
+		t.Errorf("settled amount = %d, want the report's 13", amount.Int64)
+	}
 }
 
 func TestIntegrationRoutingReleasesAnAdmittedRequestWhenNoExecutorExists(t *testing.T) {

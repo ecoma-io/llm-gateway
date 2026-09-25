@@ -23,8 +23,10 @@ import (
 // whose fact is the last word.
 
 // routeFixture builds the routing stage over the smallest world that admits:
-// no candidates on the alias and an empty executor registry, which is
-// today's runtime — every admission ends released as no_candidate. The input
+// no candidates on the alias and an empty executor registry — the walk has
+// nothing to try, so every admission ends released as no_candidate. The
+// scenarios that exercise the walk hand it candidates, backends and
+// executors through the same seams this fixture pokes. The input
 // comes with the fixture because a routing Serve without its reply is a
 // wiring defect the stage refuses.
 func routeFixture(t *testing.T) (*ChatRouting, *admissionWorld, *fakeReply, ChatInput) {

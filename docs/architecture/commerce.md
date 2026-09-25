@@ -380,9 +380,11 @@ is taken.
   cycle — and since there is no excess path, nothing ever needs to.
 - An executing request keeps its hold alive through a **renewed execution
   lease**; the reaper expires only `open` reservations whose lease is dead
-  and `expires_at` has passed. The maximum accepted request/stream duration
-  is strictly below the maximum lease, so a live stream never loses its hold
-  at a cycle boundary or TTL boundary (ADR 0004).
+  and `expires_at` has passed. The execution duration the process accepts is
+  validated strictly below the reservation hold window — the horizon
+  `expires_at` stamps, not the lease, which renewal keeps alive — so a live
+  stream never loses its hold at a cycle boundary or TTL boundary
+  (ADR 0004; [ADR 0009](../adr/0009-provider-adapters-and-egress.md)).
 
 ## PAYG activation and behaviour
 

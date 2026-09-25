@@ -239,9 +239,10 @@ tasks:
       - "/go.work"
       - "/go.work.sum"
   # The benchmarks: what the runtime storage's write paths and the fact feed
-  # cost against a real PostgreSQL, and what the routing decision path costs
+  # cost against a real PostgreSQL, what the routing decision path costs
   # on the serving path — eligibility, the walk, the disposition judgment —
-  # where no server is involved at all. A developer instrument, not a CI gate
+  # and what the first adapter's SSE reader costs per frame, where no server
+  # is involved at all. A developer instrument, not a CI gate
   # — a benchmark's numbers belong to the machine that produced them, and a
   # gate over them would fail on load rather than on regressions — so nothing
   # here compares a number against anything. What it does carry is the same
@@ -260,7 +261,7 @@ tasks:
         exit 1
       fi
       status=0
-      for pkg in ./internal/adapters/outbound/postgres ./internal/domain/routing; do
+      for pkg in ./internal/adapters/outbound/postgres ./internal/domain/routing ./internal/adapters/outbound/openaicompatible; do
         output="$(go test -run '^$' -bench . -benchmem -tags=integration "$pkg" 2>&1)" || status=$?
         printf '%s\n' "$output"
         if [ "$status" -eq 0 ] && ! printf '%s\n' "$output" | grep -q '^Benchmark'; then

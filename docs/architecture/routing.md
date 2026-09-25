@@ -162,14 +162,18 @@ answered through the request's reply. The reply is the transport's half of
 the same channel the executors write content into, which is what makes the
 commitment point real on the wire: the first content byte freezes the
 status line and the framing, and every ending after it knows which side of
-the gate it stands on. The candidate **execution** layer — the adapters that
-translate a request for a provider's protocol and call it — is deliberately
-absent: the registry the stage reads is empty until B10 lands the first
-executor, so today every admitted request is released as a no-candidate
-answer, byte-identical with the endpoint's behaviour before the stage
-existed. The walk, its dispositions, its endings and their transactions are
-landed and pinned by tests; B10 registers an executor and the walk starts
-trying candidates, and nothing above this paragraph changes when it does.
+the gate it stands on. The candidate **execution** layer stands behind the
+stage now ([ADR 0009](../adr/0009-provider-adapters-and-egress.md)): the
+registry the stage reads is a snapshot of the catalog's callable backends,
+built once by the composition root and refreshed on a timer — so the walk's
+lookup is a map read, never a catalog I/O — and the first adapter behind it
+speaks the OpenAI chat-completions wire. A lease renewer rides every call,
+extending the reservation's execution lease on the monotone chain admission
+opened, so a call that obeys its duration budget never loses its hold to the
+reaper mid-flight. The adapter rules are unchanged from the day they were
+written for an adapter that did not exist: one upstream call each, no
+retries, typed results only, and the reply's sink as the commitment point
+they write content into.
 
 ## Commitment
 
@@ -202,10 +206,14 @@ only — the hold is intact, the fallback restart is free to the account, and
 a release gives back exactly what was drawn. After commitment, usage settles
 on what was delivered against the hold admission secured
 ([commerce](commerce.md)): the hold is the ceiling the failure cannot exceed,
-and the lease renewed while the stream runs is what keeps the reaper from
-taking that ceiling back mid-flight. Admission sized the hold before any
-candidate ran precisely so that no routing outcome — fallback, exhaustion, or
-mid-stream death — ever needs to resize it.
+and the lease the walk renews while the call runs — stream or body alike —
+is what keeps the reaper from taking that ceiling back mid-flight. The
+renewal extends the lease only, never the hold window, so the bound that
+protects the call is the one the process validates at start: the execution
+duration sits strictly inside the hold window
+([ADR 0009](../adr/0009-provider-adapters-and-egress.md)). Admission sized
+the hold before any candidate ran precisely so that no routing outcome —
+fallback, exhaustion, or mid-stream death — ever needs to resize it.
 
 Consequence for clients: cross-provider resilience operates at request
 granularity. The gateway never splices two providers' output into one

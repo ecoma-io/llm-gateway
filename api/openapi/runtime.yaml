@@ -244,6 +244,16 @@ paths:
           quantity is what was already forwarded.
 
 
+        - *A hold reclaimed mid-flight* — the reservation's execution lease
+          lost despite its renewals, by a process paused past its lease — ends
+          the call before commitment with no failure report either: the
+          capacity that would have priced the answer is no longer the
+          runtime's to defend, so the connection closes without a body. The
+          ending is recorded as `gateway_abandoned` in the runtime's usage
+          facts, which is the operator's account of it, never the caller's
+          answer.
+
+
         **The successful response.** A completion is answered 200 in the shape
         `stream` selects. `stream: false` answers one `application/json` body —
         the OpenAI-compatible chat.completion object. `stream: true` answers
