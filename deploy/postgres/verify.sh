@@ -573,6 +573,10 @@ WITH plan AS (
 INSERT INTO control.plan_versions (id, plan_id, version_number, period, recurring_price_minor_units, state, published_at, retired_at, created_at, updated_at)
 SELECT 'b3000000-0000-7000-8000-0000000000b1', id, 1, 'calendar_month', -1, 'draft', NULL, NULL, now(), now() FROM plan"
 
+expect_constraint_failure "a plan version under an unknown plan is refused" plan_versions_plan_id_fkey "
+INSERT INTO control.plan_versions (id, plan_id, version_number, period, recurring_price_minor_units, state, published_at, retired_at, created_at, updated_at)
+VALUES ('b3000000-0000-7000-8000-0000000000b1', 'b2000000-0000-7000-8000-0000000000b1', 1, 'calendar_month', 4900, 'draft', NULL, NULL, now(), now())"
+
 expect_constraint_failure "a grant definition outside the group grammar is refused" plan_grant_definitions_group_name_grammar "
 WITH plan AS (
   INSERT INTO control.plans (id, name, created_at)
@@ -615,6 +619,10 @@ WITH plan AS (
 )
 INSERT INTO control.plan_grant_definitions (id, plan_version_id, alias_group_name, dimension, granted_amount, created_at)
 SELECT 'b4000000-0000-7000-8000-0000000000b2', plan_version_id, alias_group_name, dimension, 200, now() FROM definition"
+
+expect_constraint_failure "a grant definition under an unknown version is refused" plan_grant_definitions_plan_version_id_fkey "
+INSERT INTO control.plan_grant_definitions (id, plan_version_id, alias_group_name, dimension, granted_amount, created_at)
+VALUES ('b4000000-0000-7000-8000-0000000000b1', 'b3000000-0000-7000-8000-0000000000b1', 'anthropic', 'cost', 100, now())"
 
 expect_constraint_failure "a subscription state outside the lifecycle is refused" subscriptions_state_valid "
 WITH account AS (
@@ -709,6 +717,53 @@ WITH account AS (
 )
 INSERT INTO control.subscriptions (id, account_id, plan_version_id, state, start_at, renewal_enabled, cancel_at, cancellation_mode, cycle_number, period_start, period_end, created_at, updated_at)
 SELECT 'b5000000-0000-7000-8000-0000000000b1', id, 'b3000000-0000-7000-8000-0000000000b1', 'pending', now(), true, NULL, NULL, NULL, NULL, NULL, now(), now() FROM account"
+
+expect_constraint_failure "a subscription under an unknown account is refused" subscriptions_account_id_fkey "
+WITH plan AS (
+  INSERT INTO control.plans (id, name, created_at)
+  VALUES ('b2000000-0000-7000-8000-0000000000b1', 'verify probe', now())
+  RETURNING id
+), version AS (
+  INSERT INTO control.plan_versions (id, plan_id, version_number, period, recurring_price_minor_units, state, published_at, retired_at, created_at, updated_at)
+  SELECT 'b3000000-0000-7000-8000-0000000000b1', id, 1, 'calendar_month', 4900, 'published', now(), NULL, now(), now() FROM plan
+  RETURNING id
+)
+INSERT INTO control.subscriptions (id, account_id, plan_version_id, state, start_at, renewal_enabled, cancel_at, cancellation_mode, cycle_number, period_start, period_end, created_at, updated_at)
+SELECT 'b5000000-0000-7000-8000-0000000000b1', 'a0000000-0000-4000-8000-0000000000a1', version.id, 'pending', now(), true, NULL, NULL, NULL, NULL, NULL, now(), now() FROM version"
+
+expect_constraint_failure "a cancellation mode outside its enum is refused" subscriptions_cancellation_mode_valid "
+WITH plan AS (
+  INSERT INTO control.plans (id, name, created_at)
+  VALUES ('b2000000-0000-7000-8000-0000000000b1', 'verify probe', now())
+  RETURNING id
+), version AS (
+  INSERT INTO control.plan_versions (id, plan_id, version_number, period, recurring_price_minor_units, state, published_at, retired_at, created_at, updated_at)
+  SELECT 'b3000000-0000-7000-8000-0000000000b1', id, 1, 'calendar_month', 4900, 'published', now(), NULL, now(), now() FROM plan
+  RETURNING id
+), account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+)
+INSERT INTO control.subscriptions (id, account_id, plan_version_id, state, start_at, renewal_enabled, cancel_at, cancellation_mode, cycle_number, period_start, period_end, created_at, updated_at)
+SELECT 'b5000000-0000-7000-8000-0000000000b1', account.id, version.id, 'pending', now(), true, now(), 'whenever', NULL, NULL, NULL, now(), now() FROM account, version"
+
+expect_constraint_failure "an immediate cancellation beside a live subscription is refused" subscriptions_cancellation_consistency "
+WITH plan AS (
+  INSERT INTO control.plans (id, name, created_at)
+  VALUES ('b2000000-0000-7000-8000-0000000000b1', 'verify probe', now())
+  RETURNING id
+), version AS (
+  INSERT INTO control.plan_versions (id, plan_id, version_number, period, recurring_price_minor_units, state, published_at, retired_at, created_at, updated_at)
+  SELECT 'b3000000-0000-7000-8000-0000000000b1', id, 1, 'calendar_month', 4900, 'published', now(), NULL, now(), now() FROM plan
+  RETURNING id
+), account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+)
+INSERT INTO control.subscriptions (id, account_id, plan_version_id, state, start_at, renewal_enabled, cancel_at, cancellation_mode, cycle_number, period_start, period_end, created_at, updated_at)
+SELECT 'b5000000-0000-7000-8000-0000000000b1', account.id, version.id, 'active', now(), true, now(), 'immediate', 1, now(), now() + interval '1 month', now(), now() FROM account, version"
 
 expect_constraint_failure "an entitlement state outside its machine is refused" entitlements_state_valid "
 WITH account AS (
@@ -813,6 +868,69 @@ WITH account AS (
 )
 INSERT INTO control.entitlements (id, subscription_id, cycle_number, grant_definition_id, alias_group_version_id, dimension, granted_amount, state, period_start, period_end, created_at, updated_at)
 SELECT 'b6000000-0000-7000-8000-0000000000b2', subscription_id, cycle_number, grant_definition_id, 'b7000000-0000-7000-8000-0000000000b1', 'cost', 100, 'active', now(), now() + interval '1 month', now(), now() FROM first_grant"
+
+expect_constraint_failure "an entitlement under an unknown subscription is refused" entitlements_subscription_id_fkey "
+WITH plan AS (
+  INSERT INTO control.plans (id, name, created_at)
+  VALUES ('b2000000-0000-7000-8000-0000000000b1', 'verify probe', now())
+  RETURNING id
+), version AS (
+  INSERT INTO control.plan_versions (id, plan_id, version_number, period, recurring_price_minor_units, state, published_at, retired_at, created_at, updated_at)
+  SELECT 'b3000000-0000-7000-8000-0000000000b1', id, 1, 'calendar_month', 4900, 'published', now(), NULL, now(), now() FROM plan
+  RETURNING id
+), definition AS (
+  INSERT INTO control.plan_grant_definitions (id, plan_version_id, alias_group_name, dimension, granted_amount, created_at)
+  SELECT 'b4000000-0000-7000-8000-0000000000b1', id, 'anthropic', 'cost', 100, now() FROM version
+  RETURNING id
+)
+INSERT INTO control.entitlements (id, subscription_id, cycle_number, grant_definition_id, alias_group_version_id, dimension, granted_amount, state, period_start, period_end, created_at, updated_at)
+SELECT 'b6000000-0000-7000-8000-0000000000b1', 'b5000000-0000-7000-8000-0000000000b1', 1, definition.id, 'b7000000-0000-7000-8000-0000000000b1', 'cost', 100, 'active', now(), now() + interval '1 month', now(), now() FROM definition"
+
+expect_constraint_failure "an entitlement under an unknown grant definition is refused" entitlements_grant_definition_id_fkey "
+WITH plan AS (
+  INSERT INTO control.plans (id, name, created_at)
+  VALUES ('b2000000-0000-7000-8000-0000000000b1', 'verify probe', now())
+  RETURNING id
+), version AS (
+  INSERT INTO control.plan_versions (id, plan_id, version_number, period, recurring_price_minor_units, state, published_at, retired_at, created_at, updated_at)
+  SELECT 'b3000000-0000-7000-8000-0000000000b1', id, 1, 'calendar_month', 4900, 'published', now(), NULL, now(), now() FROM plan
+  RETURNING id
+), account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), subscription AS (
+  INSERT INTO control.subscriptions (id, account_id, plan_version_id, state, start_at, renewal_enabled, cancel_at, cancellation_mode, cycle_number, period_start, period_end, created_at, updated_at)
+  SELECT 'b5000000-0000-7000-8000-0000000000b1', account.id, version.id, 'active', now(), true, NULL, NULL, 1, now(), now() + interval '1 month', now(), now() FROM account, version
+  RETURNING id
+)
+INSERT INTO control.entitlements (id, subscription_id, cycle_number, grant_definition_id, alias_group_version_id, dimension, granted_amount, state, period_start, period_end, created_at, updated_at)
+SELECT 'b6000000-0000-7000-8000-0000000000b1', subscription.id, 1, 'b4000000-0000-7000-8000-0000000000b1', 'b7000000-0000-7000-8000-0000000000b1', 'cost', 100, 'active', now(), now() + interval '1 month', now(), now() FROM subscription"
+
+expect_constraint_failure "an entitlement with a zero grant is refused" entitlements_amount_positive "
+WITH plan AS (
+  INSERT INTO control.plans (id, name, created_at)
+  VALUES ('b2000000-0000-7000-8000-0000000000b1', 'verify probe', now())
+  RETURNING id
+), version AS (
+  INSERT INTO control.plan_versions (id, plan_id, version_number, period, recurring_price_minor_units, state, published_at, retired_at, created_at, updated_at)
+  SELECT 'b3000000-0000-7000-8000-0000000000b1', id, 1, 'calendar_month', 4900, 'published', now(), NULL, now(), now() FROM plan
+  RETURNING id
+), definition AS (
+  INSERT INTO control.plan_grant_definitions (id, plan_version_id, alias_group_name, dimension, granted_amount, created_at)
+  SELECT 'b4000000-0000-7000-8000-0000000000b1', id, 'anthropic', 'cost', 100, now() FROM version
+  RETURNING id
+), account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), subscription AS (
+  INSERT INTO control.subscriptions (id, account_id, plan_version_id, state, start_at, renewal_enabled, cancel_at, cancellation_mode, cycle_number, period_start, period_end, created_at, updated_at)
+  SELECT 'b5000000-0000-7000-8000-0000000000b1', account.id, version.id, 'active', now(), true, NULL, NULL, 1, now(), now() + interval '1 month', now(), now() FROM account, version
+  RETURNING id
+)
+INSERT INTO control.entitlements (id, subscription_id, cycle_number, grant_definition_id, alias_group_version_id, dimension, granted_amount, state, period_start, period_end, created_at, updated_at)
+SELECT 'b6000000-0000-7000-8000-0000000000b1', subscription.id, 1, definition.id, 'b7000000-0000-7000-8000-0000000000b1', 'cost', 0, 'active', now(), now() + interval '1 month', now(), now() FROM subscription, definition"
 
 expect_constraint_failure "a PAYG row under an unknown account is refused" account_payg_account_id_fkey "
 INSERT INTO control.account_payg (account_id, enabled, funding_bucket_id, created_at, updated_at)
@@ -956,6 +1074,8 @@ assert_equals "the Control Plane's recorded version is zero after a full roll-ba
 	"$(recorded_version "$control_db")" "0"
 assert_equals "the identity tables are gone after a full roll-back" \
 	"$(psql_scalar "$control_db" "SELECT to_regclass('control.accounts') IS NULL AND to_regclass('control.users') IS NULL AND to_regclass('control.api_keys') IS NULL")" "t"
+assert_equals "the commerce tables are gone after a full roll-back" \
+	"$(psql_scalar "$control_db" "SELECT to_regclass('control.plans') IS NULL AND to_regclass('control.subscriptions') IS NULL AND to_regclass('control.entitlements') IS NULL AND to_regclass('control.account_payg') IS NULL")" "t"
 assert_equals "the ownership namespace and its comment are gone after a full roll-back" \
 	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_namespace WHERE nspname = '$control_db'")" "0"
 assert_equals "the Control Plane's public schema is back to its migration history alone" \

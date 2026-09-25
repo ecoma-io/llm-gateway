@@ -51,7 +51,7 @@
 --                            The bucket table arrives with B6; the reference
 --                            is nullable until the account-creation
 --                            choreography assigns it, and the absent row
---                            means PAYG is disabled. This row is the
+--                            reads as disabled. This row is the
 --                            one-PAYG-source-per-account invariant, ever.
 --
 -- Conventions held across the lane, and the three places this file departs
@@ -64,13 +64,16 @@
 --     them, one-way exits included;
 --   * timestamptz everywhere, NOT NULL. Created/updated stamps remain
 --     application-supplied, and every application writer in this domain
---     mints them UTC. THE CYCLE BOUNDS ARE THE ONE EXCEPTION: start_at,
---     period_start and period_end decide cycle membership, and ADR 0003
---     decides membership by the database clock — the roll transaction reads
---     transaction_timestamp() inside itself and authors these bounds from
---     that instant, and the due-work scans compare against
---     transaction_timestamp() directly. No gateway node's clock authors a
---     boundary a boundary test is judged by.
+--     mints them UTC. THE CYCLE BOUNDS ARE CALENDAR ARITHMETIC, NOT A
+--     CLOCK READING: period_start and period_end are computed in the
+--     application from the subscription's start_at anchor
+--     (commerce.CycleBounds) — a clock-authored bound would drift with
+--     every writer that touched the row. The DATABASE CLOCK is what judges
+--     due: every due test — promotion, roll, expiry, cancellation
+--     completion — compares against transaction_timestamp() inside its
+--     statement, and the application's clock method reads the same
+--     transaction's timestamp when a writer needs the instant for a stamp.
+--     No gateway node's clock authors a stamp or judges a due test.
 --   * no DELETE path and no ON DELETE CASCADE anywhere: subscriptions,
 --     entitlements and their definitions are history immutable accounting
 --     rows reference; the foreign keys below are RESTRICT by default.
@@ -240,7 +243,11 @@ CREATE TABLE control.subscriptions (
     created_at timestamptz NOT NULL,
     updated_at timestamptz NOT NULL,
     CONSTRAINT subscriptions_cancellation_consistency
-        CHECK ((cancel_at IS NULL) = (cancellation_mode IS NULL)),
+        CHECK (
+            (cancel_at IS NULL) = (cancellation_mode IS NULL)
+            AND (cancellation_mode <> 'immediate' OR state = 'cancelled')
+            AND (state <> 'expired' OR cancel_at IS NULL)
+        ),
     CONSTRAINT subscriptions_pending_has_no_cycle
         CHECK (
             state <> 'pending'
@@ -248,7 +255,7 @@ CREATE TABLE control.subscriptions (
         ),
     CONSTRAINT subscriptions_rolled_have_cycle
         CHECK (
-            state NOT IN ('active', 'suspended', 'expired')
+            state NOT IN ('active', 'suspended', 'expired', 'cancelled')
             OR (cycle_number IS NOT NULL AND period_start IS NOT NULL AND period_end IS NOT NULL)
         ),
     CONSTRAINT subscriptions_period_bounds
@@ -259,7 +266,12 @@ CREATE TABLE control.subscriptions (
 -- the pending scan promotes subscriptions whose start_at the database clock
 -- has passed; the active scan finds cycles to roll and natural ends to
 -- expire; created_at is the waterfall's third key (oldest subscription
--- first) and is never rewritten.
+-- first) and is never rewritten. The last two partials serve the lanes the
+-- first two cannot: the cancellation scan reads only active rows with a
+-- scheduled instruction (the instruction is what orders the lane), and the
+-- fixed-term expiry scan spans active and suspended alike — an IN list over
+-- states would defeat a single-state partial, so this one carries the state
+-- pair in its predicate and renewal_enabled in it too.
 CREATE INDEX subscriptions_account_id_idx ON control.subscriptions (account_id);
 CREATE INDEX subscriptions_pending_due_idx
     ON control.subscriptions (start_at)
@@ -267,6 +279,12 @@ CREATE INDEX subscriptions_pending_due_idx
 CREATE INDEX subscriptions_active_period_end_idx
     ON control.subscriptions (period_end)
     WHERE state = 'active';
+CREATE INDEX subscriptions_scheduled_cancel_idx
+    ON control.subscriptions (cancel_at)
+    WHERE state = 'active' AND cancellation_mode = 'scheduled';
+CREATE INDEX subscriptions_fixed_term_due_idx
+    ON control.subscriptions (period_end)
+    WHERE state IN ('active', 'suspended') AND renewal_enabled = false;
 
 COMMENT ON TABLE control.subscriptions IS
     'Commerce (ADR 0003): one account''s pinning of one plan version, with its own cycle identity. Any number may be active concurrently — including two of the same version; they never merge, and no account carries a current_plan anywhere.';
@@ -283,7 +301,7 @@ COMMENT ON COLUMN control.subscriptions.cancellation_mode IS
 COMMENT ON COLUMN control.subscriptions.cycle_number IS
     'The current grant cycle, starting at 1 on the first roll. Null only while pending; never reused (subscriptions_pending_has_no_cycle, subscriptions_rolled_have_cycle).';
 COMMENT ON COLUMN control.subscriptions.period_start IS
-    'The current cycle''s start, authored by the roll transaction from transaction_timestamp(). Null only while pending.';
+    'The current cycle''s start, calendar arithmetic over the subscription''s start_at anchor (commerce.CycleBounds), authored by the transaction that rolled into the cycle. Null only while pending.';
 COMMENT ON COLUMN control.subscriptions.period_end IS
     'The current cycle''s end — a calendar month after period_start, day clipped at month end. Null only while pending. Capacity stops being available to new admissions at this instant.';
 
@@ -363,8 +381,10 @@ CREATE TABLE control.account_payg (
 );
 
 -- One row per account, ever: the primary key IS the invariant. The row is
--- created the first time PAYG is enabled for the account; no row means the
--- account has never enabled PAYG. This is Commerce's decision (ADR 0003: the
+-- created the first time PAYG state is recorded for the account — an enable
+-- or a disable alike, because the writer is one insert-or-update — and no
+-- row means PAYG state has never been recorded, which reads as disabled.
+-- This is Commerce's decision (ADR 0003: the
 -- flag is this context's) — deliberately not a column on control.accounts,
 -- which is Identity's aggregate and carries no billing state by design. The
 -- bucket it enables is Accounting's aggregate: funding_bucket_id holds the
@@ -372,7 +392,7 @@ CREATE TABLE control.account_payg (
 -- account-creation choreography assigns it, and the v7 form is pinned now so
 -- the reference discipline is fixed before the first bucket exists.
 COMMENT ON TABLE control.account_payg IS
-    'Commerce (ADR 0003): the per-account PAYG enablement flag and its Accounting bucket reference (ADR 0001 rule 5). Enabling authorises spending and funds nothing; no row means never enabled. One row per account, ever.';
+    'Commerce (ADR 0003): the per-account PAYG enablement flag and its Accounting bucket reference (ADR 0001 rule 5). Enabling authorises spending and funds nothing; no row means PAYG state was never recorded, and reads as disabled. One row per account, ever.';
 COMMENT ON COLUMN control.account_payg.enabled IS
     'Whether new admissions may spill to PAYG. Disabling blocks new spills; holds already secured settle normally.';
 COMMENT ON COLUMN control.account_payg.funding_bucket_id IS

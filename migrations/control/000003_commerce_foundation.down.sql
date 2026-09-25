@@ -16,6 +16,10 @@
 -- Like the up file, this file carries no BEGIN, COMMIT or ROLLBACK of its
 -- own, per migrations/README.md.
 
+DROP INDEX control.subscriptions_fixed_term_due_idx;
+
+DROP INDEX control.subscriptions_scheduled_cancel_idx;
+
 DROP TABLE control.account_payg;
 
 DROP TABLE control.entitlements;
