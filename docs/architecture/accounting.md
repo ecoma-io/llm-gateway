@@ -182,7 +182,9 @@ safe, and a convergence property that is named (ADR 0006).
 
 Concretely, a hold split S1: 20 + S2: 40 (S1 expires sooner) settling at 30
 writes: `Settlement S` → consume S1: 20, consume S2: 10, release S2: 30 —
-three legs, one settlement, one usage event. The per-bucket uniqueness on
+three settlement legs, plus the two `hold` legs the same fact's allocation
+tail delivers (see **Where ΣH comes from**, above); one settlement, one usage
+event. The per-bucket uniqueness on
 `(settlement, bucket, kind)` permits the split while blocking duplicate
 movement; the settlement's own `request_id` uniqueness blocks double
 settlement (invariant 4).
@@ -247,27 +249,28 @@ a hold leg, and no consumer of the feed can read a bucket's held amount at an
 instant. What reaches this plane instead is each terminal fact's allocation
 tail, whose per-bucket `amount` is the held amount that reservation booked
 ([cross-plane protocols](cross-plane-protocols.md)), and the `hold` leg is
-booked here from that tail — before the `release`/`consume` legs it funds,
-which the engine requires anyway (a release names a reservation that has a
-hold leg on file, and a consume draws against held). Idempotency runs through
-the fact: the applier keys on `request_id`, and a replayed leg collides on its
-own uniqueness — `(reservation_id, funding_bucket_id, kind)` for a hold —
-rather than moving money twice. B12's applier is the caller that will do it —
-B6 shipped the primitive and no caller, and no other channel exists: the feed
-is the only path by which a `dataplane` row becomes a `control` row ([data
-implications](data-implications.md)), and the management surface contracts no
-read of live reservations.
+booked here from that tail — before the `release`/`consume` legs it funds:
+required outright for a `release`, which names a reservation that has a `hold`
+leg on file, and in effect for a `consume`, which draws against `held`.
+Idempotency runs through the fact: the applier keys on `request_id`, and a
+replayed leg collides on its own uniqueness rather than moving money twice —
+for a `hold` leg, `(reservation_id, funding_bucket_id, kind)`. B12's applier
+is the caller that will do it — B6 shipped the primitive and no caller, and no
+other channel exists: the feed is the only path by which a `dataplane` row
+becomes a `control` row ([data implications](data-implications.md)), and the
+management surface contracts no read of live reservations.
 
 The consequence for the projection above is exact: a bucket's cached `held`
 is algebra over holds whose terminal fact has already been applied, never the
-runtime's in-flight total. The two differ by the reservations still open in
-the Data Plane, plus the delivery latency of those reservations' facts — the
-window between a committed reservation and its settlement that ADR 0006 names
-as a bounded property, for reconciliation (B13) to converge — and the hold
-guard's `available ≥ take` is judged against the bucket as the applied facts
-left it, not as admission left it. The guard that refuses an overdraw at
-admission is the runtime's projection, not this column; `held` is the ledger's
-record of what was held and how it ended.
+runtime's in-flight total. The two differ by exactly the holds the ledger has
+not yet heard the end of — reservations still open in the Data Plane, and
+closes whose facts are still in delivery. That is the window between a
+committed reservation and its settlement that ADR 0006 names as a bounded
+property, for reconciliation (B13) to converge, and the hold guard's
+`available ≥ take` is judged against the bucket as the applied facts left it,
+not as admission left it. The guard that refuses an overdraw at admission is
+the runtime's projection, not this column; `held` is the ledger's record of
+what was held and how it ended.
 
 No kind can make any of the three negative. The non-adjustment kinds cannot
 — consume's guard checks the take against held _and_ settled before either
@@ -343,8 +346,9 @@ drawn.
 
 ### Worked ledger sequences
 
-The left column names the **Data-Plane event** a leg is derived from, not when
-the Control Plane books it. Every leg of a request's money — its `hold` and the
+The left column names the **Data-Plane event** a leg is derived from — the
+reservation's opening, or the close that ended it — not when the Control Plane
+books it. Every leg of a request's money — its `hold` and the
 `release`/`consume` legs that end it — is booked in this plane when that
 request's terminal fact is applied, because that is the only thing the runtime
 publishes (see **Where ΣH comes from**, above). A bucket's committed `held`
