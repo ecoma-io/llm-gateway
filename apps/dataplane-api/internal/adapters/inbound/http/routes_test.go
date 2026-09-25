@@ -49,6 +49,7 @@ func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 
 	want := []string{
 		"GET /healthz",
+		"GET /internal/alias-groups/{group_name}/versions/current",
 		"GET /internal/usage-events",
 		"GET /readyz",
 		"GET /version",

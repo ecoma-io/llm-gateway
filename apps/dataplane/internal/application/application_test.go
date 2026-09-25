@@ -12,11 +12,29 @@ import (
 )
 
 func TestVersionReturnsTheBuildVersion(t *testing.T) {
-	app := New("v0.1.0", &stubFacts{})
+	app := newTestApp(&stubFacts{})
 
 	if got, want := app.Version(), "v0.1.0"; got != want {
 		t.Errorf("Version() = %q, want %q", got, want)
 	}
+}
+
+// newTestApp is the application the tests in this file drive: the real use
+// cases, the stub fact reader a test aims at, and the catalog over one empty
+// fake world — because a test of the fact reader has no opinion about the
+// catalog beyond its being present, and New refuses to build an App without
+// one for the reason its doc comment records.
+func newTestApp(facts *stubFacts) *App {
+	return New("v0.1.0", facts, newCatalog(newCatalogWorld()))
+}
+
+func TestNewPanicsOnAMissingCatalog(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("New with no catalog did not panic")
+		}
+	}()
+	New("v0.1.0", &stubFacts{}, nil)
 }
 
 // stubFacts is the fact reader the tests below drive the use case with. It
@@ -41,7 +59,7 @@ func (stub *stubFacts) Read(_ context.Context, after string, limit int) (usagefa
 
 func TestReadUsageEventsPassesTheCursorThroughUntouched(t *testing.T) {
 	facts := &stubFacts{}
-	app := New("v0.1.0", facts)
+	app := newTestApp(facts)
 
 	// A cursor is opaque, so the use case must not care what is in it — an
 	// awkward string with a space in it included. A use case that trimmed,
@@ -76,7 +94,7 @@ func TestReadUsageEventsPassesThePageSizeItIsGiven(t *testing.T) {
 	for _, limit := range []int{1, 250, usagefacts.DefaultLimit, usagefacts.MaxLimit, 0, -1, usagefacts.MaxLimit + 1} {
 		t.Run(strconv.Itoa(limit), func(t *testing.T) {
 			facts := &stubFacts{}
-			app := New("v0.1.0", facts)
+			app := newTestApp(facts)
 
 			if _, err := app.ReadUsageEvents(context.Background(), "", limit); err != nil {
 				t.Fatalf("ReadUsageEvents() error = %v", err)
@@ -105,7 +123,7 @@ func TestReadUsageEventsReturnsThePortsPageUnchanged(t *testing.T) {
 		HasMore:    true,
 	}
 
-	app := New("v0.1.0", &stubFacts{page: page})
+	app := newTestApp(&stubFacts{page: page})
 	got, err := app.ReadUsageEvents(context.Background(), "", usagefacts.DefaultLimit)
 	if err != nil {
 		t.Fatalf("ReadUsageEvents() error = %v", err)
@@ -124,7 +142,7 @@ func TestReadUsageEventsReportsASourceFailureRatherThanAnEmptyPage(t *testing.T)
 	// difference is a consumer's next move: advance, or retry. Collapsing the
 	// error into an empty page here would tell a consumer this Data Plane has
 	// recorded nothing — a claim no adapter is entitled to make.
-	app := New("v0.1.0", &stubFacts{err: usagefacts.ErrSourceUnavailable})
+	app := newTestApp(&stubFacts{err: usagefacts.ErrSourceUnavailable})
 
 	_, err := app.ReadUsageEvents(context.Background(), "", usagefacts.DefaultLimit)
 

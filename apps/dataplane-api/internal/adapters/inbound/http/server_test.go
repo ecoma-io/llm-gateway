@@ -18,7 +18,7 @@ import (
 const statusBody = "{\"status\":\"ok\"}\n"
 
 func TestServerServesTheContractedRoutes(t *testing.T) {
-	handler := New(application.New("v0.1.0", &fakeUsageFacts{}), NewServiceAuthenticator(testCredential))
+	handler := New(application.New("v0.1.0", &fakeUsageFacts{}, &fakeCatalog{}), NewServiceAuthenticator(testCredential))
 	tests := []struct {
 		name       string
 		method     string

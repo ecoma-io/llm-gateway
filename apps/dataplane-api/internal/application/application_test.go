@@ -25,10 +25,31 @@ func (f *fakeUsageFacts) ReadUsageEvents(_ context.Context, after string, limit 
 }
 
 func TestVersionReturnsTheBuildVersion(t *testing.T) {
-	app := New("v0.1.0", &fakeUsageFacts{})
+	app := New("v0.1.0", &fakeUsageFacts{}, &fakeCatalog{})
 
 	if got, want := app.Version(), "v0.1.0"; got != want {
 		t.Errorf("Version() = %q, want %q", got, want)
+	}
+}
+
+func TestNewPanicsOnAMissingPort(t *testing.T) {
+	tests := []struct {
+		name    string
+		usage   dataplane.UsageFacts
+		catalog dataplane.Catalog
+	}{
+		{name: "no usage-facts port", catalog: &fakeCatalog{}},
+		{name: "no catalog port", usage: &fakeUsageFacts{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("New with %s did not panic", tt.name)
+				}
+			}()
+			New("v0.1.0", tt.usage, tt.catalog)
+		})
 	}
 }
 

@@ -3,12 +3,13 @@
 //
 // The façade is a transport, and this package is what keeps it one. Nothing
 // here resolves a client, dials a socket or holds a byte: the port declares the
-// two things this application may ask of the Data Plane — read a page of usage
-// facts, and tell whether a caller is a service this deployment trusts — and
-// the adapter under internal/adapters/outbound decides how each is answered.
-// Because the port is an interface, the concrete HTTP client is chosen once, in
-// cmd/dataplane-api, and this package never learns that the answer arrives over
-// a network connection at all.
+// things this application may ask of the Data Plane — read a page of usage
+// facts, read the current version of an alias group, and tell whether a caller
+// is a service this deployment trusts — and the adapter under
+// internal/adapters/outbound decides how each is answered. Because the ports
+// are interfaces, the concrete HTTP client is chosen once, in cmd/dataplane-api,
+// and this package never learns that the answer arrives over a network
+// connection at all.
 //
 // The types are declared here rather than imported from apps/dataplane, and
 // that is the plane boundary rather than a copy that drifted apart. The two
@@ -118,6 +119,56 @@ type UsageFacts interface {
 	// A cursor the Data Plane can no longer place is ErrCursorExpired; anything
 	// that stops the page being read is ErrUpstreamUnavailable.
 	ReadUsageEvents(ctx context.Context, after string, limit int) (Page, error)
+}
+
+// GroupVersion is one version of a Data Plane alias group, as the catalog
+// reports it: the immutable snapshot a Control Plane entitlement pins.
+//
+// The three fields are the whole of what the read contracts (dataplane.yaml,
+// CurrentAliasGroupVersion), and the one a caller is expected to keep is the
+// id. The name and the number name what was read; the number in particular
+// describes the group as it stands now — highest of the group's versions — and
+// not the snapshot forever, which is why a scope that stored it instead of the
+// id would change meaning the next time the group rolled.
+type GroupVersion struct {
+	// GroupName is the alias-group name the version belongs to, as the catalog
+	// stores it — the requested name, and `*` for the wildcard group's
+	// singleton. The reserved name is an ordinary value here: this port carries
+	// group names and has no opinion about which of them are special.
+	GroupName string
+	// Version is the version's number within its group. Information rather
+	// than a handle.
+	Version int
+	// GroupVersionID is the version's immutable identifier, and the value an
+	// entitlement stores as its scope. A version, once issued, never changes.
+	GroupVersionID string
+}
+
+// ErrGroupVersionNotFound reports that the Data Plane holds no version of the
+// alias group a read named. It is an answer and not a failure: the read
+// completed, the catalog's answer is that there is nothing to pin, and the
+// caller's next move is to act on that — not to retry a condition no retry
+// changes. It is the one outcome of the catalog read that this façade is
+// allowed to describe to its caller in the caller's own vocabulary; everything
+// else about the read is this process's condition, not the caller's.
+var ErrGroupVersionNotFound = errors.New("the data plane holds no version of that alias group")
+
+// Catalog is the catalog half of the cross-plane seam: the read a Control
+// Plane commerce roll makes before it can write anything of its own.
+type Catalog interface {
+	// CurrentGroupVersion returns the alias group's current version — the
+	// group's highest, under the catalog's own rule that a membership change
+	// opens a new version rather than editing one. The name crosses exactly as
+	// it is given, `*` included: the wildcard is an ordinary group name to the
+	// catalog, and a façade that special-cased it would be deciding catalog
+	// policy the catalog owns.
+	//
+	// No version of the group is ErrGroupVersionNotFound; anything that stops
+	// the read — a listener that did not answer, an answer that is not a
+	// version — is ErrUpstreamUnavailable. The membership of the version does
+	// not cross this port at all: which aliases a snapshot contains is the
+	// runtime's question, and an entitlement resolves what it grants by id.
+	CurrentGroupVersion(ctx context.Context, groupName string) (GroupVersion, error)
 }
 
 // ServiceCaller identifies the peer application making a management call.

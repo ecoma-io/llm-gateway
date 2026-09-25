@@ -95,6 +95,20 @@ func routes(app *application.App) []route {
 			handler:       usageEventsHandler(app),
 			authenticated: true,
 		},
+		// The alias-group catalog read: the answer a commerce roll pins an
+		// entitlement's scope from, and the second row whose caller must
+		// authenticate and whose answer comes from another process. It is a
+		// second row on purpose rather than a parameter on the first: the two
+		// operations share the credential, the seam and the envelope, and
+		// nothing else — one is a page with a position in it, the other is one
+		// immutable fact — and a handler that served both would be a surface
+		// whose rows stopped being countable.
+		{
+			method:        stdhttp.MethodGet,
+			path:          aliasGroupsPath,
+			handler:       currentGroupVersionHandler(app),
+			authenticated: true,
+		},
 	}
 }
 

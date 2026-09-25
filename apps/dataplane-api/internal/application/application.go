@@ -18,6 +18,11 @@
 // What it deliberately does not do is hold a position, a page or a fact: the
 // Data Plane owns the feed and the Control Plane owns the cursor, so a copy
 // here would be a third party's guess at both.
+//
+// The second is the alias-group catalog read (aliasgroups.go), which follows
+// the same shape and adds one decision of its own: the version it returns is
+// carried as the catalog reported it, with its membership withheld — that
+// question belongs to the plane that evaluates containment.
 package application
 
 import (
@@ -102,10 +107,11 @@ func Internal(cause error) *Error {
 type App struct {
 	version string
 	usage   dataplane.UsageFacts
+	catalog dataplane.Catalog
 }
 
 // New constructs the dataplane-api application around the build version supplied
-// by cmd/dataplane-api and the outbound port its use cases read through. The
+// by cmd/dataplane-api and the outbound ports its use cases read through. The
 // command's package-level version variable remains the one ldflags source; this
 // package receives that value, never recreates it.
 //
@@ -113,11 +119,14 @@ type App struct {
 // dereference inside the first management request this process serves, which is
 // a 500 from a handler whose wiring could not have been tested; and a use case
 // with nothing behind it is not a state the composition root can mean.
-func New(version string, usage dataplane.UsageFacts) *App {
-	if usage == nil {
+func New(version string, usage dataplane.UsageFacts, catalog dataplane.Catalog) *App {
+	switch {
+	case usage == nil:
 		panic("application: New requires a UsageFacts port — the management surface has nothing to answer with without one")
+	case catalog == nil:
+		panic("application: New requires a Catalog port — the group-version route has nothing to answer with without one")
 	}
-	return &App{version: version, usage: usage}
+	return &App{version: version, usage: usage, catalog: catalog}
 }
 
 // Version returns the build version injected into the process. It is a plain

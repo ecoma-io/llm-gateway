@@ -53,6 +53,7 @@ type catalogWorld struct {
 	contendedAliasSwaps   int // the first N alias guards report "lost"
 	versionRace           int // the first N version inserts lose the race
 	aliasInsertFailure    error
+	highestReadFailure    error
 	nameTaken             bool
 }
 
@@ -381,6 +382,9 @@ func (f fakeVersions) ByGroupAndVersion(ctx context.Context, groupName string, v
 }
 
 func (f fakeVersions) HighestVersion(ctx context.Context, groupName string) (int, error) {
+	if f.world.highestReadFailure != nil {
+		return 0, f.world.highestReadFailure
+	}
 	highest := f.world.competitorFloor[groupName]
 	for _, version := range f.world.versions[groupName] {
 		if version.Version > highest {

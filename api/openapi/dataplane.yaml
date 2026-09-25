@@ -30,28 +30,33 @@
 # the LLM request path, and a contract that carried both would be the first
 # place that assumption stopped being visible.
 #
-# One operation here is unusual, and it is the one the Control Plane's money
-# depends on: `GET /internal/usage-events` reads facts *back* from the Data
-# Plane, where every other operation in this document asks it to change
-# something. The delivery model, its cursor, and why it is a pull rather than a
-# push are stated in `shared/usage-facts.yaml`; the shape of what crosses is
-# there too.
+# Two operations here are unusual, and they are the two the Control Plane's
+# money depends on: `GET /internal/usage-events` and
+# `GET /internal/alias-groups/{group_name}/versions/current` read facts *back*
+# from the Data Plane, where every other operation in this document asks it to
+# change something. The fact feed's delivery model, its cursor, and why it is a
+# pull rather than a push are stated in `shared/usage-facts.yaml`, and the shape
+# of what crosses is there too. The catalog read's answer is smaller and no
+# less load-bearing: the version of an alias group that is currently current,
+# whose immutable id is what an entitlement stores as its scope (ADR 0006 §7) —
+# and the immutability that makes storing it safe is the catalog's own (ADR
+# 0003), not this surface's promise.
 openapi: 3.1.0
 info:
   title: Ecoma LLM Gateway — Data Plane management façade API
   version: 0.1.0
   description: >-
-    Health and readiness probes, the usage-fact feed, and the common HTTP
-    boundary of the Ecoma LLM Gateway's Data Plane management façade. This
-    surface is internal: it is called by the Control Plane and is not published
-    to callers of the gateway. Every response returns X-Request-Id, and every
-    failure — including the ones no operation declares, a 404 for an unmatched
-    path and a 500 for an unclassifiable implementation failure — returns the
-    ErrorEnvelope. A management call identifies itself as a service; a browser
-    session or a customer API key is not a service identity and is refused. The
-    Data Plane's administrative endpoints beyond the fact feed are not designed
-    yet; this document carries the surface that exists and the process every
-    later endpoint follows.
+    Health and readiness probes, the usage-fact feed, the alias-group catalog
+    read, and the common HTTP boundary of the Ecoma LLM Gateway's Data Plane
+    management façade. This surface is internal: it is called by the Control
+    Plane and is not published to callers of the gateway. Every response returns
+    X-Request-Id, and every failure — including the ones no operation declares, a
+    404 for an unmatched path and a 500 for an unclassifiable implementation
+    failure — returns the ErrorEnvelope. A management call identifies itself as a
+    service; a browser session or a customer API key is not a service identity
+    and is refused. The Data Plane's administrative operations beyond the fact
+    feed and the catalog read are not designed yet; this document carries the
+    surface that exists and the process every later operation follows.
 
     This is a façade contract and not the Data Plane's own surface. The process
     behind it serves a private protocol that is not contracted here; what a
@@ -71,6 +76,13 @@ tags:
       The usage-fact feed: the one place a caller reads the Data Plane's
       recorded facts rather than asking it to change something. Its delivery
       model is stated in shared/usage-facts.yaml.
+  - name: catalog
+    description: >-
+      The model catalog facts a caller reads back: which version of an alias
+      group is currently current. The catalog itself — its members, its bounds
+      and its immutability — is Data Plane data (ADR 0006 §5); what crosses here
+      is the one fact a Control Plane commerce roll needs to pin an entitlement's
+      scope, and it arrives as a version's id and nothing else.
 paths:
   /healthz:
     get:
@@ -227,6 +239,89 @@ paths:
           $ref: "./shared/errors.yaml#/components/responses/InternalError"
         "502":
           $ref: "./shared/errors.yaml#/components/responses/UpstreamUnavailable"
+  /internal/alias-groups/{group_name}/versions/current:
+    get:
+      operationId: getCurrentAliasGroupVersion
+      tags:
+        - catalog
+      summary: Read the current version of an alias group
+      description: >-
+        Returns the version of the named alias group that is currently current —
+        the group's highest version, under the catalog's own rule that a
+        membership change opens a new version and never edits an existing one.
+        The answer is what a Control Plane commerce roll needs before it can
+        write anything of its own: an entitlement pins the returned
+        `group_version_id` as its scope, and the id — never the number — is what
+        it stores, because the number's meaning moves when the group rolls while
+        the id is contracted to keep naming the same membership forever.
+
+
+        The answer is read from the Data Plane and never from here, exactly as
+        the usage feed above is: this façade holds no catalog and no cache of
+        one, and when the process behind it cannot be reached the answer is a
+        502 rather than a stale guess. What it holds is a decision about the
+        answer's shape: the version's membership does not cross, because which
+        aliases a version contains is the runtime's question, asked inside the
+        Data Plane when it admits a request — the Control Plane resolves what an
+        entitlement grants by id, and never needs the member list to do it.
+
+
+        A 404 is an answer and not a failure: it says the catalog holds no
+        version of that group, which is the state of a group that has not been
+        provisioned. The wildcard name `*` is not special here — it is an
+        ordinary group name to the catalog and is read the same way, so a read
+        of it before the wildcard's singleton version was provisioned misses
+        exactly like any other unprovisioned group. A caller acts on a 404; it
+        does not retry it.
+
+
+        The name is carried as one path segment, percent-encoded by the caller
+        where its own characters would end the segment (`*` may travel raw or
+        as `%2A`; a `/` inside a name must be `%2F`). Nothing about the name is
+        validated beyond that structure: a name this catalog does not hold is
+        answered with the 404 above rather than a 400, because the group-name
+        grammar is the catalog's own and a façade that copied it would be a
+        second definition of it.
+
+
+        A management caller authenticates as a service — see the
+        `serviceCredential` scheme below. As with the usage feed, the 401 is
+        about *this* caller and the 502 is about the hop behind this façade.
+      security:
+        - serviceCredential: []
+      parameters:
+        - name: group_name
+          in: path
+          required: true
+          description: >-
+            The alias group's name, exactly as the catalog stores it — the
+            wildcard `*` included. One path segment; percent-encoded where the
+            name's own characters would end the segment.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The group's current version.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CurrentAliasGroupVersion"
+        "401":
+          $ref: "./shared/errors.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+        "502":
+          $ref: "./shared/errors.yaml#/components/responses/UpstreamUnavailable"
 components:
   securitySchemes:
     serviceCredential:
@@ -244,3 +339,42 @@ components:
         hop accepts the other's: a credential is per hop because a hop is where
         it is checked, and a single shared secret across two processes would
         multiply whatever one of them leaked by two.
+  schemas:
+    CurrentAliasGroupVersion:
+      type: object
+      description: >-
+        The alias group's current version, as the catalog holds it. The three
+        fields are the whole of what crosses: a caller that needs to know which
+        aliases the version contains asks the plane that evaluates containment,
+        and never this one. `group_version_id` is the only value a caller is
+        expected to keep; `group_name` and `version` name what was read, and
+        the number in particular describes the group as it stands now rather
+        than the snapshot forever.
+      required:
+        - group_name
+        - version
+        - group_version_id
+      properties:
+        group_name:
+          type: string
+          description: >-
+            The group's name as the catalog stores it — the requested name, and
+            `*` for the wildcard group's singleton.
+          minLength: 1
+        version:
+          type: integer
+          description: >-
+            The version's number within its group: the group's highest, which is
+            what "current" means here. Information rather than a handle — a
+            scope pins `group_version_id`.
+          minimum: 1
+        group_version_id:
+          type: string
+          format: uuid
+          description: >-
+            The version's immutable identifier, and the value an entitlement
+            stores as its scope. A version, once issued, never changes: a
+            membership edit opens a new version with a new id, and every id
+            ever returned keeps naming the snapshot it named when it was
+            returned.
+          minLength: 1

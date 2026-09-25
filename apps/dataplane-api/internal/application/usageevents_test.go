@@ -30,7 +30,7 @@ func TestUsageEventsReturnsTheDataPlanesPageUnchanged(t *testing.T) {
 		HasMore:    true,
 	}
 	usage := &fakeUsageFacts{page: page}
-	app := New("test", usage)
+	app := New("test", usage, &fakeCatalog{})
 
 	got, err := app.UsageEvents(context.Background(), cursor, 17)
 	if err != nil {
@@ -91,7 +91,7 @@ func TestUsageEventsKeepsThePortsFailureAsItsCause(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			app := New("test", &fakeUsageFacts{err: tt.portErr})
+			app := New("test", &fakeUsageFacts{err: tt.portErr}, &fakeCatalog{})
 
 			_, err := app.UsageEvents(context.Background(), cursor, 100)
 

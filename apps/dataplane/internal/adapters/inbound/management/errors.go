@@ -150,12 +150,20 @@ func writeFailure(w stdhttp.ResponseWriter, r *stdhttp.Request, f failure) {
 // failureFor maps an error the application returned onto this surface's
 // vocabulary.
 //
-// The two fact-feed errors are the only ones that carry meaning across the
-// boundary, and they do not share an answer: an expired cursor is a position
-// this Data Plane will never be able to replay and a human has to decide what
-// happens to the gap, while an unavailable source is a read that will succeed
-// later and should be retried. Collapsing them into one status would tell a
-// consumer either to retry forever or to give up on a transient failure.
+// The fact feed's two errors carry meaning across the boundary and do not share
+// an answer: an expired cursor is a position this Data Plane will never be able
+// to replay and a human has to decide what happens to the gap, while an
+// unavailable source is a read that will succeed later and should be retried.
+// Collapsing them into one status would tell a consumer either to retry forever
+// or to give up on a transient failure.
+//
+// The catalog read's not-found is categorised one layer down instead —
+// CurrentGroupVersion constructs the application's own NotFound, because
+// "this group has no version" is the application's answer and not this
+// transport's interpretation of a persistence sentinel — so the mapping below
+// reads the category and never a store's dialect. That ordering is what keeps
+// the two lanes apart on the wire: a miss is a 404 a caller acts on, and a
+// store that will not answer stays a 500 it retries.
 //
 // Anything unrecognised — including an internal application error — becomes the
 // generic 500 with the fixed public message. The cause is logged against the

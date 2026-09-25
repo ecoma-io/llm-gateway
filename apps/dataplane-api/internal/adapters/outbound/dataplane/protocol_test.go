@@ -131,6 +131,95 @@ func TestTheTranslationNeverRelaysTheListenersBody(t *testing.T) {
 	}
 }
 
+// TestTheCatalogReadIsThePrivateProtocols is the same pin for the second
+// operation the hop carries, and it exists for the same reason: the path this
+// adapter calls and the path the listener serves are one string agreed in two
+// modules, and only a test on each side can notice one of them moving.
+//
+// The three assertions are shaped differently on purpose. The path is checked
+// against the contract's operation list, because the façade publishes this
+// operation and the private hop carries it under the same spelling. The
+// placeholder is checked to still be *in* that path, because the substitution
+// below depends on it: a path edited to carry the group's name literally would
+// make the replacement a no-op and every read ask for `{group_name}`. And the
+// substituted form is driven through a live listener, because the two checks
+// above read constants while this one reads what the wire carried.
+func TestTheCatalogReadIsThePrivateProtocols(t *testing.T) {
+	declared := contractPaths(t)
+	if !slices.Contains(declared, currentGroupVersionPath) {
+		t.Fatalf("%s declares no %s operation (%v); the facade's contract and this adapter have drifted apart", contractPath, currentGroupVersionPath, declared)
+	}
+	if !strings.Contains(currentGroupVersionPath, groupNamePlaceholder) {
+		t.Fatalf("the path %s no longer carries %s; the substitution would silently ask for the placeholder itself", currentGroupVersionPath, groupNamePlaceholder)
+	}
+
+	up := &upstream{body: settledVersionBody}
+	client := up.server(t)
+
+	if _, err := client.CurrentGroupVersion(context.Background(), "frontier"); err != nil {
+		t.Fatalf("CurrentGroupVersion() error = %v", err)
+	}
+	calls := up.recorded()
+	if len(calls) != 1 {
+		t.Fatalf("the listener received %d calls, want 1", len(calls))
+	}
+	if got, want := calls[0].rawPath, "/internal/alias-groups/frontier/versions/current"; got != want {
+		t.Errorf("the listener was called at %q, want %q", got, want)
+	}
+	if calls[0].rawQuery != "" {
+		t.Errorf("the request carried the query %q; the private protocol declares none for this operation", calls[0].rawQuery)
+	}
+
+	// The wildcard, substituted rather than assumed: `*` is the one group name
+	// this seam is required to round-trip, and its escaped form is what the
+	// listener's own route has to be proved to accept — that proof lives on the
+	// other module, and this is the half this module owes.
+	request, err := client.groupVersionRequest(context.Background(), "*")
+	if err != nil {
+		t.Fatalf("building the request: %v", err)
+	}
+	if got, want := request.URL.EscapedPath(), "/internal/alias-groups/%2A/versions/current"; got != want {
+		t.Errorf("the wildcard's request path is %q, want %q — the name crosses as one escaped segment", got, want)
+	}
+	if got := request.Header.Get("Authorization"); got != "Bearer "+testCredential {
+		t.Errorf("the request carries Authorization = %q, want the service credential", got)
+	}
+}
+
+// TestTheCatalogReadsBoundsAreTheContracts pins the three bounds this adapter
+// enforces on the listener's answer to the document that declares them, for the
+// reason the cursor bound below is pinned: the checks live in
+// currentGroupVersionBody.groupVersion, the numbers live in the YAML, and
+// nothing else in this module would notice the two drifting apart.
+//
+// `format: uuid` is deliberately absent from the pin and from the code: it is
+// an annotation on the producer, not a bound this consumer keeps, and pinning
+// it would suggest a check this adapter does not make.
+func TestTheCatalogReadsBoundsAreTheContracts(t *testing.T) {
+	numbers := contractNumbers(t, contractPath)
+
+	tests := []struct {
+		name string
+		key  string
+	}{
+		{name: "the version's declared minimum", key: "components.schemas.CurrentAliasGroupVersion.properties.version.minimum"},
+		{name: "the group name's declared minimum length", key: "components.schemas.CurrentAliasGroupVersion.properties.group_name.minLength"},
+		{name: "the id's declared minimum length", key: "components.schemas.CurrentAliasGroupVersion.properties.group_version_id.minLength"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			declared, ok := numbers[tt.key]
+			if !ok {
+				t.Fatalf("%s declares no %s; this pin proves nothing until the scan finds it", contractPath, tt.key)
+			}
+			if declared != 1 {
+				t.Errorf("%s says %s is %d and this adapter refuses anything below 1; the answer it accepts and the answer it contracts have drifted apart", contractPath, tt.key, declared)
+			}
+		})
+	}
+}
+
 // usageFactsPath is the fragment both ends of this hop implement, relative to
 // this package's directory. This adapter holds the fragment's cursor bound as a
 // constant because the bound is what it enforces on the listener's answer, and
