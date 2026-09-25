@@ -17,10 +17,11 @@
 # and a code that appeared only in the document where it is returned would be a
 # code the other surface's client could not name. Some members are produced by
 # only one surface today — `cursor_expired` and `upstream_unavailable` by the
-# Data Plane management API, and the three projection codes
+# Data Plane management API, the three projection codes
 # (`unsupported_version`, `revision_gap`, `snapshot_required`) by the same
-# document's projection operations — and they are named here rather than in
-# that document alone so a Control Plane caller has one vocabulary for both.
+# document's projection operations, and `service_unavailable` by the Console
+# API's readiness probe — and they are named here rather than in the document
+# alone so a caller of either surface has one vocabulary for both.
 components:
   responses:
     MethodNotAllowed:
@@ -141,6 +142,21 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorEnvelope"
+    ServiceUnavailable:
+      description: >-
+        The service is up and not ready: one of its own dependencies is not
+        answering yet — for the Console API, its database. The condition is
+        expected to clear, so a caller retries later rather than differently,
+        and the code is `service_unavailable`. Which dependency is missing is
+        the operator's fact, logged against the request identifier, never the
+        client's.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
   schemas:
     ErrorEnvelope:
       type: object
@@ -171,15 +187,17 @@ components:
             - revision_gap
             - snapshot_required
             - upstream_unavailable
+            - service_unavailable
             - internal
           description: >-
             A stable machine-readable category for the failure, shared by both
             surfaces that return this envelope. `cursor_expired` and
             `upstream_unavailable` are produced by the Data Plane management
             API today, as are the three projection codes
-            (`unsupported_version`, `revision_gap`, `snapshot_required`); they
-            are named here rather than in that document alone so a Control
-            Plane caller has one vocabulary for both.
+            (`unsupported_version`, `revision_gap`, `snapshot_required`);
+            `service_unavailable` is produced by the Console API's readiness
+            probe. They are named here rather than in the document alone so a
+            caller of either surface has one vocabulary for both.
         message:
           type: string
           description: >-

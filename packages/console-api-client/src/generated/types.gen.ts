@@ -6,7 +6,7 @@ export type ClientOptions = {
 
 export type Error = {
   /**
-   * A stable machine-readable category for the failure, shared by both surfaces that return this envelope. `cursor_expired` and `upstream_unavailable` are produced by the Data Plane management API today, as are the three projection codes (`unsupported_version`, `revision_gap`, `snapshot_required`); they are named here rather than in that document alone so a Control Plane caller has one vocabulary for both.
+   * A stable machine-readable category for the failure, shared by both surfaces that return this envelope. `cursor_expired` and `upstream_unavailable` are produced by the Data Plane management API today, as are the three projection codes (`unsupported_version`, `revision_gap`, `snapshot_required`); `service_unavailable` is produced by the Console API's readiness probe. They are named here rather than in the document alone so a caller of either surface has one vocabulary for both.
    */
   code:
     | "not_found"
@@ -18,6 +18,7 @@ export type Error = {
     | "revision_gap"
     | "snapshot_required"
     | "upstream_unavailable"
+    | "service_unavailable"
     | "internal";
   /**
    * A human-readable explanation safe to present to a client. Internal implementation details and stack traces never appear here.
@@ -119,6 +120,10 @@ export type GetReadinessErrors = {
    * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
    */
   500: ErrorEnvelope;
+  /**
+   * The service is up and not ready: one of its own dependencies is not answering yet — for the Console API, its database. The condition is expected to clear, so a caller retries later rather than differently, and the code is `service_unavailable`. Which dependency is missing is the operator's fact, logged against the request identifier, never the client's.
+   */
+  503: ErrorEnvelope;
 };
 
 export type GetReadinessError = GetReadinessErrors[keyof GetReadinessErrors];
