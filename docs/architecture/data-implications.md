@@ -109,6 +109,47 @@ Notes for the schema designer:
 - `request_intake` — in `dataplane`, because the runtime writes it inside
   its own admission transaction: the row is one per accepted intake, keyed
   `(account_id, idempotency_key)`, and replay decisions read only this table.
+  Two write-ordering rules make it the race arbiter rather than a race
+  participant. On the **way in**, it is inserted **last**: the unique
+  `(account_id, idempotency_key)` key is what admits exactly one in-flight
+  intake, so a racing duplicate loses at the constraint and the whole unit of
+  work rolls back rather than half-committing. On the **way out**, the row's
+  `final_status` pointer is finalised by whichever unit of work closes the
+  request — the settlement close, the release compensation, or the reaper's
+  expiry — and a NULL pointer means the original is still executing, so a
+  replay arriving then is refused with retry-later semantics rather than
+  queued behind it. The replay **identity** is engine-immutable: a trigger
+  refuses any UPDATE that rewrites `account_id`, `idempotency_key`,
+  `request_digest` or `request_id`, and the reason columns exist only under
+  the status that names them. Intake rows exist from the admission
+  transaction onward, including for requests that transaction itself refuses
+  — an unknown alias, an invalid bound, a hold the waterfall cannot secure —
+  which are born terminal with `final_status = 'rejected'` and their reason,
+  so a replay of the same bytes re-answers the same refusal instead of
+  re-running admission. Refusals before that transaction — the account's
+  state, the key's grammar, a body the transport could not deliver — write a
+  `rejected` request row and no intake row: no digest exists to key a record
+  with, so the cheap refusals stay cheap, and the caller simply sends a fresh
+  request. A body that is _not JSON_ is not one of them: it is judged inside
+  the admission transaction, recorded as the pair, and its key is spent — a
+  corrected body under the same key is a different digest and answers 409
+  `idempotency_conflict`, so a caller that fixes its request mints a fresh
+  key.
+  The crash window between admission's COMMIT and the client's answer leaves
+  exactly the state the NULL pointer describes — intake row in flight, request
+  row `executing`, hold drawn, no candidate ever chosen. That window is not
+  papered over: the retrying client is told to retry later for as long as it
+  lasts, and when the lease dies the reaper's `expired` close finalises both
+  rows, so the next replay re-answers the expiry instead of re-admitting. The
+  capacity is never lost by it — a `still-open` reservation the process can no
+  longer renew is precisely what the reaper exists to reclaim — and it is
+  never double-spent by it, because the second admission of the same bytes is
+  the replay the pointer refuses.
+  The `request_digest` column is the SHA-256 of the request's **raw** body
+  bytes as received, not of any re-serialised or parsed form — two requests
+  are the same request iff their bytes are the same bytes, and a field order
+  or a whitespace difference is therefore a different digest and an explicit
+  conflict, not a silent replay.
 - The serving configuration is the runtime's own row rather than a copy of a
   Control-Plane one: the catalogue, the price revisions it prices with and the
   key records it authenticates against all live in `dataplane` and are read
@@ -231,11 +272,23 @@ through a distributed commit (ADR 0006 §5, §7).
 
 | Transaction                                             | Plane                 | Tables written                                                                                                                                                                                                                                                                                                                         | Guarded invariants     |
 | ------------------------------------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
-| Admission                                               | Data Plane (local)    | `request_intake` (insert), `requests` (shell), `reservations` + allocation legs (insert), the quota projection (conditional drawdown)                                                                                                                                                                                                  | 3, 6, 10               |
-| Settlement — the runtime's close                        | Data Plane (local)    | `usage_events` (append), `reservations` (close, state-guarded), `requests` (finalise)                                                                                                                                                                                                                                                  | 1, 6, 7                |
+| Admission                                               | Data Plane (local)    | `requests` (shell), `reservations` + allocation legs (insert), the quota projection (conditional drawdown), `request_intake` (insert **last**)                                                                                                                                                                                         | 3, 6, 10               |
+| Settlement — the runtime's close                        | Data Plane (local)    | `usage_events` (append), `reservations` (close, state-guarded), `requests` (finalise), `request_intake` (terminal pointer)                                                                                                                                                                                                             | 1, 6, 7                |
 | Settlement — settlement from the fact                   | Control Plane (local) | `settlements` (insert), `ledger_entries` (`consume`/`release` legs), `funding_buckets` (projections)                                                                                                                                                                                                                                   | 2, 4, 8, 10            |
-| Release (explicit compensation, or the reaper's expiry) | Data Plane (local)    | `reservations` (close, state-guarded), the quota projection (capacity returned, leg by leg), `usage_events` (append, the `released`/`expired` fact — same unit of work), `requests` (finalise with failure reason)                                                                                                                     | 3, 6                   |
+| Release (explicit compensation, or the reaper's expiry) | Data Plane (local)    | `reservations` (close, state-guarded), the quota projection (capacity returned, leg by leg), `requests` (finalise with failure reason), `request_intake` (terminal pointer), `usage_events` (append, the `released`/`expired` fact — **last**)                                                                                         | 3, 6                   |
 | Cycle roll                                              | Control Plane (local) | `entitlements` (create) + `subscriptions` (cycle fields) — keyed `(subscription, cycle)`; `funding_buckets` (create) and the `ledger_entries` `grant` legs join the same unit of work at settlement (B6) — the commerce foundation ships the Commerce half. The new capacity then reaches the runtime's projection as a published fact | 3 (grant exactly once) |
+
+The release row is one unit of work, and its internal order is not a matter of
+taste. It **enters** through the reservation's close — a compare-and-set on
+the open state, so exactly one of the releaser and the settler ever wins a
+given reservation — and the capacity return is **unconditional** once that
+CAS has won it: running the giveback outside the winning close would mint
+capacity, never return it, so the return belongs to the winner and to nobody
+else. From there the legs are returned in their stored waterfall order, the
+request and its intake pointer are finalised, and the fact — already
+described below as the last statement — closes the unit. The reaper's
+`expired` close is the same unit with a different trigger and failure reason:
+one composition, two doors into it.
 
 The two settlement rows are one logical settlement split by the plane that
 owns each row, not one transaction failing: the runtime closes its reservation

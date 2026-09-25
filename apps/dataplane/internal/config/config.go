@@ -38,6 +38,43 @@ const (
 	// sizes; inventing them before that is guessing with a straight face.
 	DefaultReadHeaderTimeout = 5 * time.Second
 
+	// DefaultReservationHoldWindow is how long an admitted request's
+	// reservation may remain open before it becomes eligible for lease-expiry
+	// recovery — the horizon the reaper sweeps against. Five minutes is the
+	// trade-off between capacity wasted and capacity stuck: long enough to
+	// cover a slow streaming response plus the settlement that follows it,
+	// short enough that a process which dies holding a reservation has it
+	// recovered in minutes rather than hours.
+	DefaultReservationHoldWindow = 5 * time.Minute
+
+	// DefaultReservationLeaseTTL is how long one worker's claim (lease) on an
+	// open reservation stays valid. Thirty seconds is the trade-off between a
+	// lease lost mid-work and a hold recovered late: long enough to survive a
+	// garbage-collection pause or a scheduler stall, short enough that a
+	// crashed worker's hold is recovered quickly rather than after the whole
+	// hold window has run.
+	DefaultReservationLeaseTTL = 30 * time.Second
+
+	// MaxReservationHoldWindow is the ceiling a configured hold window may
+	// reach. The real constraint is the request-duration ceiling: a hold only
+	// has to outlive one admitted request plus its settlement, and no request
+	// this runtime admits runs for thirty days. The bound is stated anyway,
+	// far inside anything the arithmetic could reach, because the adapters
+	// derive a reservation's expiry by adding the hold to the database's own
+	// clock — transaction_timestamp() + hold — and that addition must never
+	// overflow the timestamp the database stores. A conservative ceiling makes
+	// that a load-time fact instead of a per-deployment hope.
+	MaxReservationHoldWindow = 30 * 24 * time.Hour
+
+	// minReservationHorizon is the floor both reservation horizons share. A
+	// horizon this short cannot do the work it exists for: the reaper's
+	// reclaim test and the lease's fence both compare timestamps written by
+	// more than one process, and a window measured in milliseconds expires
+	// between the write of a stamp and the read of it. Below this, a
+	// deployment is not tuned, it is broken — so the loader refuses rather
+	// than runs.
+	minReservationHorizon = time.Second
+
 	// ownedDatabase is the only database this application may be pointed at —
 	// the plane binding of ADR 0006 §7, checked in validatePostgresDSN and
 	// again by the persistence adapter (which carries a constant of the same
@@ -98,6 +135,24 @@ type Config struct {
 	ShutdownTimeout   time.Duration
 	ReadHeaderTimeout time.Duration
 
+	// ReservationHoldWindow is how long an admitted request's reservation may
+	// remain open before it becomes eligible for lease-expiry recovery — the
+	// horizon the reaper sweeps against. The admission use case reads it at
+	// reservation creation, when it stamps the expiry the recovery sweep
+	// compares against. It is an operational horizon, not a contract constant:
+	// no response the runtime sends ever states it, and retuning it changes
+	// only how quickly capacity comes back, never what a reservation means.
+	ReservationHoldWindow time.Duration
+
+	// ReservationLeaseTTL is how long one worker's claim (lease) on an open
+	// reservation stays valid. Like ReservationHoldWindow it is consumed by
+	// the admission use case at reservation creation and honoured by the
+	// recovery sweep, and like that one it is an operational horizon, not a
+	// contract constant. It must sit strictly inside the hold window — a lease
+	// that outlives the hold it fences is a configuration the process refuses
+	// to start with, in validateReservationHorizons.
+	ReservationLeaseTTL time.Duration
+
 	// ManagementAddr is the private listener the Data Plane's management
 	// surface is served from. An empty value means this process serves no
 	// management surface at all, which is the default: a runtime that has not
@@ -142,9 +197,11 @@ type Postgres struct {
 // caller owns its copy.
 func Defaults() Config {
 	return Config{
-		Addr:              DefaultAddr,
-		ShutdownTimeout:   DefaultShutdownTimeout,
-		ReadHeaderTimeout: DefaultReadHeaderTimeout,
+		Addr:                  DefaultAddr,
+		ShutdownTimeout:       DefaultShutdownTimeout,
+		ReadHeaderTimeout:     DefaultReadHeaderTimeout,
+		ReservationHoldWindow: DefaultReservationHoldWindow,
+		ReservationLeaseTTL:   DefaultReservationLeaseTTL,
 		Postgres: Postgres{
 			DSN:             DefaultPostgresDSN,
 			MaxOpenConns:    DefaultPostgresMaxOpenConns,
@@ -185,6 +242,20 @@ func Load(lookup LookupEnv) (Config, error) {
 			return Config{}, err
 		}
 		cfg.ReadHeaderTimeout = duration
+	}
+	if value, ok := lookup("DATAPLANE_RESERVATION_HOLD_WINDOW"); ok {
+		duration, err := parsePositiveDuration("DATAPLANE_RESERVATION_HOLD_WINDOW", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ReservationHoldWindow = duration
+	}
+	if value, ok := lookup("DATAPLANE_RESERVATION_LEASE_TTL"); ok {
+		duration, err := parsePositiveDuration("DATAPLANE_RESERVATION_LEASE_TTL", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ReservationLeaseTTL = duration
 	}
 
 	if value, ok := lookup("DATAPLANE_MANAGEMENT_ADDR"); ok {
@@ -252,6 +323,9 @@ func Load(lookup LookupEnv) (Config, error) {
 	}
 
 	if err := validateAddr("DATAPLANE_ADDR", cfg.Addr); err != nil {
+		return Config{}, err
+	}
+	if err := validateReservationHorizons(cfg.ReservationHoldWindow, cfg.ReservationLeaseTTL); err != nil {
 		return Config{}, err
 	}
 	if err := validatePostgres(cfg.Postgres); err != nil {
@@ -359,6 +433,44 @@ func validateAddr(name, addr string) error {
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 0 || portNumber > 65535 {
 		return fmt.Errorf("%s must contain a numeric port", name)
+	}
+	return nil
+}
+
+// validateReservationHorizons checks the two admission horizons as a set. The
+// per-variable rules — a Go duration at all, greater than zero — are applied
+// where each variable is read, by parsePositiveDuration like every other
+// duration this file reads; what needs both values in hand lives here: the
+// ceiling that keeps the adapters' database-clock arithmetic safe, and the
+// ordering that keeps a lease inside the hold it fences. The variable names
+// are spelled rather than inferred because a message that named the wrong
+// variable would send an operator to the wrong line of their deployment.
+func validateReservationHorizons(hold, lease time.Duration) error {
+	// Both horizons carry a one-second floor on top of "positive". These are
+	// clocks a distributed invariant rides on — the reaper reclaims what the
+	// hold window has expired, the lease fences whoever may close the hold —
+	// and a sub-second value there is not a tuning choice, it is a
+	// misreading: two processes would disagree about expiry by more than the
+	// horizon itself.
+	if hold < minReservationHorizon {
+		return fmt.Errorf(
+			"DATAPLANE_RESERVATION_HOLD_WINDOW (%s) must not be shorter than %s",
+			hold, minReservationHorizon)
+	}
+	if lease < minReservationHorizon {
+		return fmt.Errorf(
+			"DATAPLANE_RESERVATION_LEASE_TTL (%s) must not be shorter than %s",
+			lease, minReservationHorizon)
+	}
+	if hold > MaxReservationHoldWindow {
+		return fmt.Errorf(
+			"DATAPLANE_RESERVATION_HOLD_WINDOW (%s) must not be greater than %s",
+			hold, MaxReservationHoldWindow)
+	}
+	if lease >= hold {
+		return fmt.Errorf(
+			"DATAPLANE_RESERVATION_LEASE_TTL (%s) must be strictly shorter than DATAPLANE_RESERVATION_HOLD_WINDOW (%s); a lease must never outlive the hold it fences",
+			lease, hold)
 	}
 	return nil
 }

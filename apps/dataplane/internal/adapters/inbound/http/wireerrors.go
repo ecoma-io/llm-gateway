@@ -62,9 +62,8 @@ const (
 	typeNotFound = "not_found_error"
 
 	// typeAPIError says the runtime failed at something the request was entitled
-	// to ask for. It is the bucket for an unclassifiable implementation failure
-	// and for a contracted operation that is not built, because in both cases
-	// the caller's request was not what failed.
+	// to ask for. It is the bucket for an unclassifiable implementation failure,
+	// because the caller's request was not what failed.
 	typeAPIError = "api_error"
 
 	// typeOverloadedError says the runtime cannot take the request right now.
@@ -73,13 +72,6 @@ const (
 	// advice the class carries is retry later, not retry differently.
 	typeOverloadedError = "overloaded_error"
 )
-
-// codeNotImplemented is the one machine-readable refinement this runtime
-// produces today; the schema's `code` is otherwise null. It exists so a caller
-// can tell "this surface owns the path and the capability does not exist yet"
-// from "this surface does not own the path" — both of which are non-retryable,
-// and only one of which is worth a bug report.
-const codeNotImplemented = "not_implemented"
 
 // runtimeErrorBody is the JSON body of every runtime failure, on either
 // channel: `error.message` and `error.type` are required by the schema, `param`
@@ -217,36 +209,6 @@ func (notFoundError) wireFailure() wireFailure {
 		body: runtimeErrorBody{
 			Message: "the requested path is not served by this runtime",
 			Type:    typeNotFound,
-		},
-	}
-}
-
-// notImplementedError is the transport fact that the path is contracted and the
-// operation behind it is not built. Like notFoundError it maps itself: the
-// application has no use-case to refuse with, because there is no use-case —
-// answering 501 is the transport telling the truth about a surface the contract
-// describes and the code does not yet provide.
-//
-// It is a transport error rather than an application one for the same reason it
-// exists: the day the runtime routes a completion, this disappears, and an
-// application error code would have to be deleted along with it. The class is
-// api_error rather than invalid_request_error because the request was not what
-// failed — which is the difference between a caller retrying with a different
-// body and a caller giving up, and the one distinction this error exists to
-// make.
-type notImplementedError struct{}
-
-func (notImplementedError) Error() string {
-	return "not implemented"
-}
-
-func (notImplementedError) wireFailure() wireFailure {
-	return wireFailure{
-		status: stdhttp.StatusNotImplemented,
-		body: runtimeErrorBody{
-			Message: "this operation is contracted and not implemented",
-			Type:    typeAPIError,
-			Code:    stringCode(codeNotImplemented),
 		},
 	}
 }

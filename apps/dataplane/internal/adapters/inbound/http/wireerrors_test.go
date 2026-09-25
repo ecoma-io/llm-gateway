@@ -20,11 +20,12 @@ import (
 const (
 	notFoundBody         = "{\"error\":{\"message\":\"the requested path is not served by this runtime\",\"type\":\"not_found_error\",\"param\":null,\"code\":null}}\n"
 	methodNotAllowedBody = "{\"error\":{\"message\":\"this path does not accept the request method\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}\n"
-	notImplementedBody   = "{\"error\":{\"message\":\"this operation is contracted and not implemented\",\"type\":\"api_error\",\"param\":null,\"code\":\"not_implemented\"}}\n"
 	internalErrorBody    = "{\"error\":{\"message\":\"internal error\",\"type\":\"api_error\",\"param\":null,\"code\":null}}\n"
 
-	notImplementedFrame = "data: {\"error\":{\"message\":\"this operation is contracted and not implemented\",\"type\":\"api_error\",\"param\":null,\"code\":\"not_implemented\"}}\n\n" +
-		"data: [DONE]\n\n"
+	// The stream pins speak the admission vocabulary, because streaming is
+	// where an admitted request goes once routing exists — the first wire cell
+	// reachable on that channel is one admission already refused.
+	methodNotAllowedFrame = "data: " + methodNotAllowedBody + "\ndata: [DONE]\n\n"
 )
 
 func TestTheRuntimeErrorBodyIsTheOpenAICompatibleShape(t *testing.T) {
@@ -42,7 +43,6 @@ func TestTheRuntimeErrorBodyIsTheOpenAICompatibleShape(t *testing.T) {
 	}{
 		{name: "an unmatched path", err: notFoundError{}, wantCode: stdhttp.StatusNotFound, wantBody: notFoundBody},
 		{name: "a disallowed method", err: methodNotAllowedError{}, wantCode: stdhttp.StatusMethodNotAllowed, wantBody: methodNotAllowedBody},
-		{name: "a contracted operation that is not built", err: notImplementedError{}, wantCode: stdhttp.StatusNotImplemented, wantBody: notImplementedBody},
 		{name: "an unclassified failure", err: errors.New("any cause at all"), wantCode: stdhttp.StatusInternalServerError, wantBody: internalErrorBody},
 	}
 
@@ -119,7 +119,6 @@ func TestARuntimeErrorFrameUsesTheManagementEnvelopeVocabularyNever(t *testing.T
 	failures := []error{
 		notFoundError{},
 		methodNotAllowedError{},
-		notImplementedError{},
 		application.NotFound("nothing here"),
 		application.Internal(errors.New("cause")),
 		errors.New("bare"),
@@ -139,7 +138,7 @@ func TestACommittedStreamFailureEndsInTheDoneFrame(t *testing.T) {
 	// terminal frame, close. A client that has already rendered content must be
 	// able to tell "the answer ended in failure" from "the answer ended", and
 	// `[DONE]` is how it does.
-	for _, err := range []error{notImplementedError{}, application.Internal(errors.New("cause"))} {
+	for _, err := range []error{methodNotAllowedError{}, application.Internal(errors.New("cause"))} {
 		frame := string(streamErrorFrame(err))
 		if !strings.HasPrefix(frame, "data: {") {
 			t.Errorf("the error frame does not begin as an SSE data frame: %q", frame)
@@ -164,10 +163,10 @@ func TestACommittedStreamFailureWritesBothFramesAndFlushes(t *testing.T) {
 	// client waits for a connection the runtime has already given up on.
 	recorder := newFlushRecorder()
 
-	writeStreamError(recorder, notImplementedError{})
+	writeStreamError(recorder, methodNotAllowedError{})
 
-	if got := recorder.Body.String(); got != notImplementedFrame {
-		t.Errorf("stream error = %q, want %q", got, notImplementedFrame)
+	if got := recorder.Body.String(); got != methodNotAllowedFrame {
+		t.Errorf("stream error = %q, want %q", got, methodNotAllowedFrame)
 	}
 	if !recorder.flushed {
 		t.Error("the stream error was written without flushing")
@@ -185,7 +184,7 @@ func TestACommittedStreamFailureLeavesTheCommittedHeadersAlone(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(stdhttp.StatusOK)
 		_, _ = w.Write([]byte("data: {\"choices\":[]}\n\n"))
-		writeStreamError(w, notImplementedError{})
+		writeStreamError(w, methodNotAllowedError{})
 	}))
 	t.Cleanup(server.Close)
 
@@ -205,8 +204,8 @@ func TestACommittedStreamFailureLeavesTheCommittedHeadersAlone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the streamed body error = %v", err)
 	}
-	if got := string(body); !strings.HasSuffix(got, notImplementedFrame) {
-		t.Errorf("body = %q, want it to end with %q", got, notImplementedFrame)
+	if got := string(body); !strings.HasSuffix(got, methodNotAllowedFrame) {
+		t.Errorf("body = %q, want it to end with %q", got, methodNotAllowedFrame)
 	}
 }
 

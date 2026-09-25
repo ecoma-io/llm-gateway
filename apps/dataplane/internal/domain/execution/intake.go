@@ -44,9 +44,17 @@ var ErrIntakePairing = errors.New("execution: final status and reason disagree")
 type Intake struct {
 	AccountID      string
 	IdempotencyKey string
-	// RequestDigest is the canonicalised request body's digest: the replay's
-	// sameness test. Two arrivals with one key but different digests are a
-	// conflict, refused with no second row and no overwrite.
+	// RequestDigest is the SHA-256 of the request body's raw bytes, exactly as
+	// they were read under the body cap: the replay's sameness test. Same
+	// bytes, same digest; any byte difference — a reordered JSON key, added
+	// whitespace, an escaped character spelled differently — is a different
+	// request and answers idempotency_conflict. Canonicalisation was
+	// considered and refused on purpose: a canonical form would erase exactly
+	// the differences that can change an execution (whitespace inside a
+	// provider's opaque parameter passthrough, an escaped `stream` field), so
+	// it would call two requests the same on grounds the runtime never
+	// inspected. The digest is over what arrived, not over an interpretation
+	// of it.
 	RequestDigest string
 	RequestID     identity.RequestID
 

@@ -7,9 +7,10 @@
 // readiness gates on the runtime's own dependencies answered through the
 // application, GET /version proves the HTTP → application → response
 // path every domain endpoint will follow, and POST /v1/chat/completions is
-// contracted and answers 501 — the inference surface's address, held open
-// before anything behind it is built. The public contract is
-// api/openapi/runtime.yaml; it changes before this package does, never after.
+// admission: it authenticates a presented credential, bounds the body, and
+// answers what the application's admission use case decided. The public
+// contract is api/openapi/runtime.yaml; it changes before this package does,
+// never after.
 //
 // Nothing here decides a business rule. A handler translates a request into a
 // call, and the application's answer or typed error back into a response; the
@@ -52,15 +53,42 @@ const (
 	internalErrorMessage = "internal error"
 )
 
+// Option is a piece of the composition root's wiring, applied before the
+// routes are built. The alternative — a method on application.App returning
+// the use cases — would put a transport concern on an application type, and
+// this transport reaches inward only to ask what a decision is; choosing which
+// implementation answers is the composition root's job, and options keep that
+// choice there and visible at the one call site that makes it.
+type Option func(*wiring)
+
+// WithChatAuthenticator wires the credential verifier the chat completion
+// route authenticates with. Without it that route answers every request as the
+// internal failure it is.
+func WithChatAuthenticator(auth application.Authenticator) Option {
+	return func(w *wiring) { w.auth = auth }
+}
+
+// WithChatCompletion wires the admission use case the chat completion route
+// admits through. Without it that route answers every request as the internal
+// failure it is.
+func WithChatCompletion(chat application.ChatCompletion) Option {
+	return func(w *wiring) { w.chat = chat }
+}
+
 // New returns the dataplane's HTTP handler: middleware first, routes after.
 //
 // The surface itself is declared in routes.go and mounted here; this function
-// owns everything around it — the middleware, the two fallbacks below, and the
-// order they are composed in.
-func New(app *application.App) stdhttp.Handler {
+// owns everything around it — the wiring the options carry, the middleware,
+// the two fallbacks below, and the order they are composed in.
+func New(app *application.App, opts ...Option) stdhttp.Handler {
+	var wired wiring
+	for _, opt := range opts {
+		opt(&wired)
+	}
+
 	mux := stdhttp.NewServeMux()
 
-	for _, rt := range routes(app) {
+	for _, rt := range routes(app, wired) {
 		register(mux, rt)
 	}
 

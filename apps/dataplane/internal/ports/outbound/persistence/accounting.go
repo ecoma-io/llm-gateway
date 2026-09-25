@@ -10,6 +10,44 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/identity"
 )
 
+// InsufficientCapacityError is a Drawdown shortfall, carried typed so the
+// caller can read the one fact the bare sentinel cannot tell it: whether the
+// walk saw any grant eligible to fund the request at all. The bit is set
+// inside the walk itself — the walk's statement returns exactly the buckets
+// eligible to fund this request — so reading it costs no second query and
+// cannot drift from the predicate that decided it.
+//
+// A shortfall with an eligible row seen is a shortage: the account owns
+// funding for this alias and it did not cover the hold. A shortfall without
+// one is a scope answer: no grant's stored scope contained the alias, or every
+// grant whose scope did had already ended its cycle — a treat-as-zero, not a
+// ran-out. The two are different answers to a client, and re-deriving the
+// difference outside this error would mean re-running the eligibility
+// predicate the walk already evaluated.
+type InsufficientCapacityError struct {
+	// EligibleRowSeen reports whether the walk saw at least one grant
+	// eligible to fund this request — its scope containing the alias and its
+	// cycle still live — whether or not any of them had the capacity.
+	EligibleRowSeen bool
+}
+
+// Error is one sentence for the log. The two shapes read differently because
+// they are different facts about the account; neither names the account, the
+// alias or the amount, which are the caller's sentence to write.
+func (e *InsufficientCapacityError) Error() string {
+	if e.EligibleRowSeen {
+		return "persistence: the account's eligible grants could not cover the hold"
+	}
+	return "persistence: no grant of the account is eligible to fund this request"
+}
+
+// Is reports membership of the capacity sentinel: every caller that matched
+// the bare ErrInsufficientCapacity keeps matching the typed error, which is
+// what lets the port's existing tests and callers read unchanged.
+func (e *InsufficientCapacityError) Is(target error) bool {
+	return target == accounting.ErrInsufficientCapacity
+}
+
 // ErrDuplicateReservation says a hold already exists for the request — the
 // reservation table's UNIQUE(request_id), the engine half of "one reservation
 // per request" (ADR 0004 invariant 6). Like the intake's duplicate it is an
@@ -138,10 +176,14 @@ type QuotaProjectionRepository interface {
 	// waterfall order; they are the reservation's allocations, built from what
 	// the store granted, never from what the caller hoped.
 	// ErrInsufficientCapacity means the whole order fell short, with nothing
-	// drawn — the walk gives back what it took before saying so. A grant that
-	// is ineligible (or lost its capacity to a contender) is not an error of
-	// its own: the walk simply passes it by, and only a final shortfall
-	// surfaces.
+	// drawn — the walk gives back what it took before saying so. The shortfall
+	// arrives as an InsufficientCapacityError (which matches the sentinel, so
+	// errors.Is reads either): its EligibleRowSeen records whether the walk saw
+	// any grant eligible to fund this request, which is the difference between
+	// a shortage and a scope answer, read off the walk that already ran. A
+	// grant that is ineligible (or lost its capacity to a contender) is not an
+	// error of its own: the walk simply passes it by, and only a final
+	// shortfall surfaces.
 	//
 	// The walk, the takes and the giveback run through the Querier ctx
 	// resolves, so they are one atomic unit of work exactly when ctx carries

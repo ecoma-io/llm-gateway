@@ -243,12 +243,23 @@ func validateOverrides(raw json.RawMessage) (json.RawMessage, error) {
 	return json.RawMessage(trimmed), nil
 }
 
+// ValidAliasName reports whether name is inside the alias-name grammar — one
+// alphanumeric head, then alphanumerics, dots, underscores, slashes and
+// dashes, at most 128 runes. It is the judgment validateAliasName enforces,
+// exported for callers that must classify a name without an error to attach
+// to it: admission judges the client-sent model field against this same
+// grammar before it reaches the catalog, so a malformed name is refused as a
+// malformed request rather than resolved into an unknown-alias answer.
+func ValidAliasName(name string) bool {
+	return aliasNamePattern.MatchString(name)
+}
+
 // validateAliasName enforces the name grammar. The name is matched exactly
 // as registered — no case folding — because clients send it verbatim and a
 // gateway that quietly lowercased it would own a normalisation rule its
 // operators never wrote.
 func validateAliasName(name string) error {
-	if !aliasNamePattern.MatchString(name) {
+	if !ValidAliasName(name) {
 		return fmt.Errorf("catalog: new alias: %w: %q is outside the alias grammar", ErrInvalidAliasName, name)
 	}
 	if n := utf8.RuneCountInString(name); n > maxAliasNameLen {

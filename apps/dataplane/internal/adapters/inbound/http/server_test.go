@@ -20,13 +20,18 @@ const statusBody = "{\"status\":\"ok\"}\n"
 func TestServerServesTheContractedRoutes(t *testing.T) {
 	handler := New(newTestApp(t, "v0.1.0"))
 	tests := []struct {
-		name       string
-		method     string
-		path       string
-		requestID  string
-		wantStatus int
-		wantAllow  string
-		wantBody   string
+		name string
+		// authorization is the credential header the row presents, when it
+		// presents one. Empty means no header at all, which is what every
+		// probe row wants and what the admission row would otherwise answer
+		// before it ever reached its wiring.
+		authorization string
+		method        string
+		path          string
+		requestID     string
+		wantStatus    int
+		wantAllow     string
+		wantBody      string
 	}{
 		{
 			name:       "healthz reports ok",
@@ -78,16 +83,20 @@ func TestServerServesTheContractedRoutes(t *testing.T) {
 			wantBody:   methodNotAllowedBody,
 		},
 		{
-			// The exact bytes api/openapi/runtime.yaml contracts for the one
-			// operation on this surface. A 404 would be the wrong answer here
-			// and a plausible one — the path would look unrouted — which is
-			// why the status is asserted rather than only the envelope.
-			name:       "the contracted inference endpoint reports not implemented",
-			method:     stdhttp.MethodPost,
-			path:       "/v1/chat/completions",
-			requestID:  "inference-request",
-			wantStatus: stdhttp.StatusNotImplemented,
-			wantBody:   notImplementedBody,
+			// The server built with no admission wired — which is what the
+			// process before the composition root passes its use cases is. The
+			// endpoint then cannot do its one job, and the honest answer is the
+			// internal failure: a fabricated 401 would tell a caller with a
+			// perfect key that their key was bad when the defect is the
+			// wiring. Pinned here so the fail-closed behaviour has a home in
+			// the server's own test, not only in the handler's.
+			name:          "an unwired admission endpoint answers the internal failure",
+			authorization: "Bearer any-credential",
+			method:        stdhttp.MethodPost,
+			path:          "/v1/chat/completions",
+			requestID:     "inference-request",
+			wantStatus:    stdhttp.StatusInternalServerError,
+			wantBody:      internalErrorBody,
 		},
 		{
 			name:       "the inference endpoint refuses the methods it does not accept",
@@ -105,6 +114,9 @@ func TestServerServesTheContractedRoutes(t *testing.T) {
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			req.Header.Set(RequestIDHeader, tt.requestID)
+			if tt.authorization != "" {
+				req.Header.Set(authorizationHeader, tt.authorization)
+			}
 			handler.ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {

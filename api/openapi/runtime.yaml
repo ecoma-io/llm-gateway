@@ -17,13 +17,15 @@
 # move independently, and a change to the console's envelope cannot reach a
 # client of this surface.
 #
-# Exactly one runtime operation exists today, and it is not implemented. It is
-# contracted anyway, as a 501, because the alternative — omitting it — would
-# make the boundary invisible: `POST /v1/chat/completions` belongs to this
-# application, and a caller who sends one gets an answer that says so rather
-# than a 404 that says the path is nothing. The success path is deliberately
-# absent: a documented 200 this code cannot produce would be the contract
-# claiming a capability that does not exist.
+# `POST /v1/chat/completions` is the one operation on the LLM request path, and
+# what this document contracts of it is admission: who the caller is, what they
+# are entitled to, and whether the runtime reserves the spend the request
+# implies. Every refusal that admission can produce is declared, so a caller
+# can branch on the answer; the successful completion response is deliberately
+# absent — the runtime admits a request and hands it to its routing half, and
+# the shape of what routing streams back is contracted when that half lands. A
+# documented 200 this code cannot produce would be the contract claiming a
+# capability that does not exist.
 openapi: 3.1.0
 info:
   title: Ecoma LLM Gateway — OpenAI-compatible runtime
@@ -33,11 +35,10 @@ info:
     Plane, plus the process probes this application serves. Every response
     returns X-Request-Id. Failures are reported in the OpenAI-compatible shape
     from shared/runtime-errors.yaml: an unmatched path returns it with HTTP 404
-    and the `not_found_error` type, a method unsupported by a known path with
-    HTTP 405 and `invalid_request_error`, and a contracted operation that is
-    not built with HTTP 501, `api_error` and the `not_implemented` code. A
-    probe taken while the runtime's own dependencies are not yet answering
-    returns HTTP 503 and the `overloaded_error` type.
+    and the `not_found_error` type, and a method unsupported by a known path
+    with HTTP 405 and `invalid_request_error`. A probe taken while the
+    runtime's own dependencies are not yet answering returns HTTP 503 and the
+    `overloaded_error` type.
     A request that fails after the response has started streaming reports the
     failure inside the stream instead, because by then no HTTP status can be
     revised — see the chat-completion operation. The runtime's routing,
@@ -157,17 +158,59 @@ paths:
       tags:
         - runtime
       summary: Create a chat completion
+      security:
+        - runtimeCredential: []
       description: >-
-        The OpenAI-compatible chat completion endpoint. It is contracted and
-        not implemented: the routing, provider and accounting behaviour behind
-        it is not designed yet, and this operation answers 501 with the
-        `not_implemented` code until it is.
+        The OpenAI-compatible chat completion endpoint. Sending one is how a
+        caller asks the runtime to admit and serve a completion, and admission
+        is what this operation contracts: the presented API key is verified
+        against the Data Plane's own credential mirror, the requested model is
+        resolved through the plane-local catalog, the caller's entitlements and
+        pay-as-you-go balance are walked for capacity, and the spend the
+        request implies is reserved atomically before any upstream is contacted.
 
 
-        The request body is a pass-through — the OpenAI-compatible request
-        shape, forwarded as received — and is not asserted on, because the
-        scaffold neither validates nor forwards it. Whatever the caller sends
-        gets the same 501.
+        **Authentication.** The caller presents its API key as a bearer
+        credential. A request whose credential the runtime cannot verify is
+        answered 401 with the `invalid_api_key` code — one message for every
+        cause, so the answer never says which part of verification failed. A
+        key whose account is suspended or closed is answered 403 instead: the
+        caller is known, and the refusal is an account decision, not a
+        verification failure.
+
+
+        **Idempotency.** The `Idempotency-Key` header is required. A client
+        retrying after a timeout must be able to repeat its request without
+        executing it twice, and the key is how the runtime tells a repeat from
+        a new request: the key is stored with a digest of the request body, so
+        the same key with the same body is answered from the original's
+        outcome — the response carries `Idempotent-Replay: true` and
+        `X-Original-Request-Id` whenever it is a replay — while the same key
+        with a different body is refused with the `idempotency_conflict` code
+        and never retried with the same key. A request whose key is still
+        being processed is answered 409 `request_in_progress` with a short
+        `Retry-After` hint.
+
+
+        **The request body.** `model` and `messages` are required; at least one
+        of `max_tokens` and `max_completion_tokens` must be present, and when
+        both are, they must agree — the pair is one ceiling on generated
+        output. A body larger than 10485760 bytes is refused with HTTP 400 and
+        never with 413: the request was not read to be forwarded, and an
+        oversized body is an invalid request, not a payload the runtime chose
+        not to carry. A body that cannot be read or parsed is refused 400 the
+        same way, and no idempotency record is written for a request refused
+        before its body was accepted.
+
+
+        **Capacity.** Admission walks the caller's entitlements first and
+        pay-as-you-go balance second, and reserves what the request can spend
+        — priced from the catalog's effective price list at the moment of
+        admission. A request whose capacity comes up short is answered 429
+        `insufficient_quota`; a caller holding no entitlement and no balance at
+        all is answered 403 `no_access`. A request the runtime cannot route to
+        any candidate is answered 503 with a `Retry-After`, because the
+        condition is expected to clear.
 
 
         **How a failure is reported depends on whether the response has been
@@ -198,24 +241,133 @@ paths:
           to report on, and a caller that has gone away cannot read a report.
           The observation belongs to the runtime's usage facts, and the billable
           quantity is what was already forwarded.
+
+
+        The successful completion response is not part of this document yet: it
+        is contracted when the routing half that streams it lands.
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: >-
+            The client-chosen key that makes a retry after a timeout safe. The
+            runtime stores it byte-for-byte beside a digest of the request
+            body: the same key with the same body replays the original's
+            outcome, the same key with a different body is refused. Refused
+            rather than truncated outside 1–256 printable ASCII characters, so
+            two distinct client keys can never become one stored key.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+            pattern: "^[!-~]+$"
       requestBody:
-        required: false
+        required: true
         description: >-
-          The OpenAI-compatible chat completion request. Forwarded as received
-          once this operation is implemented; not inspected today.
+          The OpenAI-compatible chat completion request. The runtime reads it
+          to admit it — who is asking, for which model, at what ceiling — and
+          digests the raw bytes for idempotency; it forwards nothing it has not
+          admitted.
         content:
           application/json:
             schema:
               type: object
+              required:
+                - model
+                - messages
+              properties:
+                model:
+                  type: string
+                  maxLength: 128
+                  pattern: "^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$"
+                  description: >-
+                    The model alias requested. A value outside this grammar is
+                    a malformed request, answered 400 with `model` named in
+                    `param`; a well-formed name no alias carries is answered
+                    404 with the `model_not_found` code.
+                messages:
+                  type: array
+                  description: >-
+                    The conversation so far, in the OpenAI-compatible message
+                    shape. The runtime prices the prompt from what it actually
+                    reads once routing is built; today the count must be
+                    non-empty for a request to be admissible.
+                  items:
+                    type: object
+                    properties:
+                      role:
+                        type: string
+                      content:
+                        type:
+                          - string
+                          - "null"
+                        description: >-
+                          The message's content as a string, or null when the
+                          part carries none. Admission prices string content
+                          only: a part whose content is an array of typed
+                          chunks is outside this contract, and a null part
+                          contributes nothing to the hold.
+                max_tokens:
+                  type: integer
+                  minimum: 1
+                  maximum: 2147483647
+                  description: >-
+                    The ceiling on generated output. Optional when
+                    `max_completion_tokens` is present; when both are present
+                    they must agree, and a disagreement is refused 400. The
+                    value is a positive 32-bit integer — a ceiling outside the
+                    bound is refused 400 with `max_tokens` named in `param`.
+                max_completion_tokens:
+                  type: integer
+                  minimum: 1
+                  maximum: 2147483647
+                  description: >-
+                    The OpenAI-compatible spelling of the same ceiling.
+                    Optional when `max_tokens` is present; when both are
+                    present they must agree, and a disagreement is refused 400.
+                    The value is a positive 32-bit integer — a ceiling outside
+                    the bound is refused 400 with `max_completion_tokens` named
+                    in `param`.
+                stream:
+                  type: boolean
+                  default: false
+                  description: >-
+                    Whether the completion is to be streamed as Server-Sent
+                    Events. Admission reserves the same hold either way; the
+                    streaming response shape itself is contracted with routing.
               additionalProperties: true
+      x-max-body-bytes: 10485760
       responses:
+        "400":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/BadRequest"
+        "401":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/Unauthorized"
+        "403":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/Forbidden"
         "404":
-          $ref: "./shared/runtime-errors.yaml#/components/responses/NotFound"
+          $ref: "./shared/runtime-errors.yaml#/components/responses/ModelNotFound"
         "405":
           $ref: "./shared/runtime-errors.yaml#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/Conflict"
+        "429":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/InsufficientQuota"
         "500":
           $ref: "./shared/runtime-errors.yaml#/components/responses/InternalError"
-        "501":
-          $ref: "./shared/runtime-errors.yaml#/components/responses/NotImplemented"
+        "503":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/NoCandidate"
+components:
+  securitySchemes:
+    runtimeCredential:
+      type: http
+      scheme: bearer
+      description: >-
+        A customer API key minted by the Control Plane, presented as the bearer
+        credential. The runtime never mints keys and never sees a secret — only
+        the digest the credential mirror projects — so the key is verified
+        against the Data Plane's own mirror and no Control Plane call sits on
+        this path (ADR 0007). This scheme is the runtime's customer credential,
+        declared here because this is the only surface a customer's key
+        reaches; the management façade's service credential is a different
+        scheme in a different document.

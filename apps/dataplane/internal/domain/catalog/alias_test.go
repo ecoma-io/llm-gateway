@@ -73,6 +73,36 @@ func TestNewAliasRefusesNamesOutsideTheGrammar(t *testing.T) {
 	}
 }
 
+// TestValidAliasNameIsTheGrammarAdmissionJudges: the exported predicate is
+// the same judgment NewAlias enforces — one grammar, two callers — so a name
+// the catalog would refuse at birth is exactly a name admission refuses at
+// the parse, and nothing that NewAlias accepts can be refused as malformed by
+// the runtime.
+func TestValidAliasNameIsTheGrammarAdmissionJudges(t *testing.T) {
+	for name, bad := range map[string]string{
+		"blank":          "",
+		"wildcard":       "*",
+		"leading dot":    ".gpt-5",
+		"unicode":        "mô-hình",
+		"interior space": "gpt 5",
+		"too long":       strings.Repeat("a", 129),
+		"control char":   "gpt-\x005",
+	} {
+		if ValidAliasName(bad) {
+			t.Errorf("%s: ValidAliasName accepted %q, want the grammar's refusal", name, bad)
+		}
+	}
+	for name, good := range map[string]string{
+		"plain":             "gpt-5",
+		"slashed":           "meta.llama3/70b",
+		"exactly 128 runes": strings.Repeat("a", 128),
+	} {
+		if !ValidAliasName(good) {
+			t.Errorf("%s: ValidAliasName refused %q, want acceptance", name, good)
+		}
+	}
+}
+
 func TestNewAliasAcceptsTheNamesClientsActuallySend(t *testing.T) {
 	for name, good := range map[string]string{
 		"plain":             "gpt-5",

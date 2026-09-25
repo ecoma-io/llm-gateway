@@ -84,6 +84,17 @@ type ModelAliases interface {
 	// does not promise.
 	ByID(ctx context.Context, id catalog.AliasID) (*catalog.ModelAlias, error)
 
+	// ByName returns the same whole aggregate as ByID, looked up the way
+	// requests arrive: by the client-facing name, served by the schema's
+	// total unique index. A retired alias is RETURNED, with its state and
+	// its frozen candidate list — retirement is the caller's decision to
+	// turn into an unknown_alias, not this read's, and a replay of an
+	// original request admitted against an alias that has since retired must
+	// still be able to resolve the alias from the request's recorded intake
+	// rather than from today's catalog. ErrNotFound means no alias has ever
+	// carried the name: the names are never reissued, so a miss is final.
+	ByName(ctx context.Context, name string) (*catalog.ModelAlias, error)
+
 	// Retire applies the one-way active → retired move, compare-and-swapped
 	// like every transition: it flips the state and stamps both retired_at
 	// and updated_at only while the row still shows `from`. The candidates

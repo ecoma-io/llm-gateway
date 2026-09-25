@@ -34,6 +34,40 @@
 # stated in runtime.yaml's operation description and pinned by a test in
 # apps/dataplane rather than modelled as a schema here.
 components:
+  headers:
+    RetryAfterHint:
+      description: >-
+        The runtime's hint, in seconds, of how long a caller should wait
+        before retrying. It is advice about a condition expected to clear, not
+        a rate-limit sentence: a `request_in_progress` answer carries a short
+        hint because the original request is already being processed, and a
+        no-candidate answer carries a longer one because capacity and routes
+        change on their own.
+      required: false
+      schema:
+        type: string
+        example: "1"
+    IdempotentReplay:
+      description: >-
+        Present, with the value "true", when this response is a replay: the
+        same `Idempotency-Key` and the same request body as a request the
+        runtime has already decided, answered again from that decision rather
+        than executed a second time. The body is byte-for-byte the answer the
+        original request received.
+      required: false
+      schema:
+        type: string
+        enum:
+          - "true"
+    OriginalRequestId:
+      description: >-
+        The runtime's own identifier for the request whose decision this
+        replay re-answers — the identity the runtime's usage facts and
+        reservations carry. It is not the caller's X-Request-Id, which stays
+        the correlation handle for this attempt alone.
+      required: false
+      schema:
+        type: string
   responses:
     MethodNotAllowed:
       description: The resource exists but does not accept the request method.
@@ -63,20 +97,6 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/RuntimeError"
-    NotImplemented:
-      description: >-
-        The endpoint is part of the contract and is not implemented. The
-        runtime answers it rather than leaving it unrouted, so a caller can tell
-        "not built yet" apart from "not a path" — the first is a 501 whose type
-        is `api_error` and whose code is `not_implemented` (the request was not
-        what failed); the second is a 404 whose type is `not_found_error`.
-      headers:
-        X-Request-Id:
-          $ref: "./probes.yaml#/components/headers/RequestId"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/RuntimeError"
     InternalError:
       description: >-
         The runtime failed in a way it cannot classify. The internal cause is
@@ -99,6 +119,151 @@ components:
       headers:
         X-Request-Id:
           $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimeError"
+    BadRequest:
+      description: >-
+        The request is not a valid chat completion request and admission
+        refused it before spending anything: a missing or malformed `model`
+        (including a value outside the model grammar), a missing, non-positive,
+        disagreeing, or past-the-2147483647-bound output ceiling, a missing or
+        malformed `Idempotency-Key`, a body that cannot be parsed, or a body
+        larger than the 10485760-byte bound the operation declares — an
+        oversized body is refused 400 and never 413, because the runtime
+        declines to admit it rather than declining to carry it. The `param`
+        names the field at fault when there is one. A refusal recorded in the
+        idempotency store is replayed on a repeat of the same key and body,
+        with the two replay headers beside it.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+        Idempotent-Replay:
+          $ref: "#/components/headers/IdempotentReplay"
+        X-Original-Request-Id:
+          $ref: "#/components/headers/OriginalRequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimeError"
+    Unauthorized:
+      description: >-
+        The request presented no credential the runtime could verify: no
+        Authorization header, more than one, something other than a bearer
+        credential, a credential outside the key grammar, a key the mirror
+        does not hold, or a key that has been revoked. Every one of these
+        causes is answered with the same message and the same
+        `invalid_api_key` code — the answer never says which part of
+        verification failed, because a differential answer is a probe. No
+        request is recorded, so a retry with a good key is a first attempt,
+        never a replay.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimeError"
+    Forbidden:
+      description: >-
+        The caller is known and the refusal is an account decision, not a
+        verification failure. The code names the decision: `account_suspended`
+        while the owning account is suspended, `account_closed` once it is
+        closed, and `no_access` when the account holds no entitlement to the
+        requested model and no pay-as-you-go balance at all. A recorded
+        refusal is replayed on a repeat of the same key and body, with the two
+        replay headers beside it.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+        Idempotent-Replay:
+          $ref: "#/components/headers/IdempotentReplay"
+        X-Original-Request-Id:
+          $ref: "#/components/headers/OriginalRequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimeError"
+    ModelNotFound:
+      description: >-
+        The `model` the request names is not an alias this runtime serves. The
+        runtime distinguishes this from a 400 on purpose: a client that
+        resolves a model name before using it branches on the code, and
+        `model_not_found` with `param` "model" is the OpenAI-compatible
+        spelling of that branch. A recorded refusal is replayed on a repeat of
+        the same key and body, with the two replay headers beside it.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+        Idempotent-Replay:
+          $ref: "#/components/headers/IdempotentReplay"
+        X-Original-Request-Id:
+          $ref: "#/components/headers/OriginalRequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimeError"
+    Conflict:
+      description: >-
+        The request was not admitted because of its `Idempotency-Key`, under
+        one of two codes. `idempotency_conflict`: the key was already stored
+        with a different body, so the runtime refuses rather than guessing
+        which request the caller meant — the caller retries with a fresh key
+        and never with the same one, so there is no Retry-After.
+        `request_in_progress`: a request with this key and body is still being
+        processed, and the caller retries the same request with the same key
+        once it completes — the answer carries a short `Retry-After` hint
+        saying so.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+        Retry-After:
+          $ref: "#/components/headers/RetryAfterHint"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimeError"
+    InsufficientQuota:
+      description: >-
+        The caller's entitlements and pay-as-you-go balance were matched, and
+        every match came up short of the spend the request implies, so nothing
+        was reserved and no upstream was contacted. The `type` is
+        `insufficient_quota` — the class an OpenAI-compatible client already
+        treats as capacity, not correctness — and the code says the same, so
+        the client's retry decision is its own: back off, or come back with a
+        smaller request. A recorded refusal is replayed on a repeat of the
+        same key and body, with the two replay headers beside it.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+        Idempotent-Replay:
+          $ref: "#/components/headers/IdempotentReplay"
+        X-Original-Request-Id:
+          $ref: "#/components/headers/OriginalRequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RuntimeError"
+    NoCandidate:
+      description: >-
+        The request was admitted — the hold it implied was reserved — and the
+        runtime matched no candidate to route it to, so the reservation was
+        released unused. The condition is expected to clear as capacity and
+        routes change, which is why the type is `overloaded_error` and the
+        answer carries a `Retry-After`: the caller retries later rather than
+        differently. A recorded no-candidate answer is replayed on a repeat of
+        the same key and body, with the two replay headers beside it and the
+        `Retry-After` hint still attached.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+        Idempotent-Replay:
+          $ref: "#/components/headers/IdempotentReplay"
+        X-Original-Request-Id:
+          $ref: "#/components/headers/OriginalRequestId"
+        Retry-After:
+          $ref: "#/components/headers/RetryAfterHint"
       content:
         application/json:
           schema:
@@ -136,6 +301,7 @@ components:
             - rate_limit_error
             - api_error
             - overloaded_error
+            - insufficient_quota
           description: >-
             The caller-facing failure class, in the vocabulary an
             OpenAI-compatible client already branches on. The list is the
@@ -143,7 +309,11 @@ components:
             and a class this runtime cannot yet produce is declared only
             because a caller written elsewhere already handles it — the
             gateway must not answer `api_error` for a condition the caller
-            would have retried had it been named correctly.
+            would have retried had it been named correctly. `insufficient_quota`
+            is the declared-this-generation member: the runtime matches
+            entitlements and balance and comes up short, and a client written
+            against the OpenAI API treats that class as capacity rather than
+            correctness.
         param:
           type: [string, "null"]
           description: >-
@@ -153,6 +323,16 @@ components:
           type: [string, "null"]
           description: >-
             An optional machine-readable refinement of `type`, for the cases
-            this runtime can name precisely. `not_implemented` is the one code
-            in use today. Null when `type` alone is the whole story.
+            this runtime can name precisely. The codes in use are:
+            `invalid_api_key` (401, the presented credential could not be
+            verified — one answer for every cause, so the answer is not a
+            probe); `account_suspended`, `account_closed` and `no_access`
+            (403, the account decision that refused a known caller);
+            `model_not_found` (404, the requested alias does not exist — the
+            one code a client resolves a name by); `invalid_request` (400,
+            with `param` naming the field at fault);
+            `idempotency_conflict` and `request_in_progress` (409, the two
+            ways an idempotency key refuses a request); and
+            `insufficient_quota` (429, capacity matched and short). Null when
+            `type` alone is the whole story.
       additionalProperties: false
