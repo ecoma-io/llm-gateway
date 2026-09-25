@@ -13,7 +13,7 @@ import (
 )
 
 // commercePorts is the constructor's argument list as one value, so the
-// nil-port test can nil one port at a time without repeating nine arguments.
+// nil-port test can nil one port at a time without repeating ten arguments.
 type commercePorts struct {
 	store         persistence.Store
 	accounts      persistence.Accounts
@@ -24,6 +24,7 @@ type commercePorts struct {
 	payg          persistence.PaygAccounts
 	clock         persistence.Clock
 	catalog       dataplane.CatalogReader
+	funder        Funder
 }
 
 func commercePortsFor(w *commerceWorld) commercePorts {
@@ -37,11 +38,12 @@ func commercePortsFor(w *commerceWorld) commercePorts {
 		payg:          fakePaygAccounts{world: w},
 		clock:         fakeClock{world: w},
 		catalog:       fakeCatalog{world: w},
+		funder:        fakeFunder{world: w},
 	}
 }
 
 // TestNewCommerceRefusesAnyNilPort pins the constructor's wiring contract:
-// nine ports, every one required, and a nil anywhere is a panic at the
+// ten ports, every one required, and a nil anywhere is a panic at the
 // composition root rather than a nil dereference in the middle of a roll.
 func TestNewCommerceRefusesAnyNilPort(t *testing.T) {
 	world := newCommerceWorld(t)
@@ -59,6 +61,7 @@ func TestNewCommerceRefusesAnyNilPort(t *testing.T) {
 		{"payg", func(p *commercePorts) { p.payg = nil }},
 		{"clock", func(p *commercePorts) { p.clock = nil }},
 		{"catalog", func(p *commercePorts) { p.catalog = nil }},
+		{"funder", func(p *commercePorts) { p.funder = nil }},
 	}
 	for _, port := range nilOne {
 		t.Run(port.name, func(t *testing.T) {
@@ -71,7 +74,8 @@ func TestNewCommerceRefusesAnyNilPort(t *testing.T) {
 					}
 				}()
 				NewCommerce(broken.store, broken.accounts, broken.plans, broken.versions,
-					broken.subscriptions, broken.entitlements, broken.payg, broken.clock, broken.catalog)
+					broken.subscriptions, broken.entitlements, broken.payg, broken.clock, broken.catalog,
+					broken.funder)
 			}()
 		})
 	}
@@ -688,6 +692,55 @@ func TestPromotionLane(t *testing.T) {
 		delete(world.groupVersions, "api")
 		if _, err := commerceUse.PromoteDueSubscriptions(t.Context(), 10); !errors.Is(err, dataplane.ErrGroupNotFound) {
 			t.Fatalf("missing group error = %v, want dataplane.ErrGroupNotFound", err)
+		}
+	})
+
+	t.Run("promotion funds each materialised cycle's bucket", func(t *testing.T) {
+		world := newCommerceWorld(t)
+		commerceUse := newCommerce(world)
+		accountID := world.seedAccount(t)
+		defs := definitions()
+		_, versionID := world.seedPublishedVersion(t, defs...)
+		world.seedSubscription(t, accountID, versionID, world.now.Add(-time.Hour), true)
+
+		if _, err := commerceUse.PromoteDueSubscriptions(t.Context(), 10); err != nil {
+			t.Fatalf("PromoteDueSubscriptions returned error: %v", err)
+		}
+		if len(world.funded) != len(defs) {
+			t.Fatalf("funded entitlements = %d, want one per definition", len(world.funded))
+		}
+		for entitlementID, granted := range world.funded {
+			if granted != 5000 {
+				t.Fatalf("entitlement %s funded with %d, want the definition's 5000", entitlementID, granted)
+			}
+		}
+	})
+
+	t.Run("a funder refusal fails the roll and unfunds the cycle", func(t *testing.T) {
+		world := newCommerceWorld(t)
+		commerceUse := newCommerce(world)
+		accountID := world.seedAccount(t)
+		_, versionID := world.seedPublishedVersion(t, definitions()...)
+		world.seedSubscription(t, accountID, versionID, world.now.Add(-time.Hour), true)
+		// The accounting half refuses inside the unit of work: a cycle whose
+		// grants bought nothing must not exist half-funded, so the
+		// entitlements and the promotion roll back with the funding.
+		world.failOn["funder.fund"] = errors.New("the ledger refused the grant")
+
+		if _, err := commerceUse.PromoteDueSubscriptions(t.Context(), 10); err == nil {
+			t.Fatal("a funding failure returned nil — the roll must fail loudly")
+		}
+		if len(world.ents) != 0 || len(world.funded) != 0 {
+			t.Fatalf("after the failed roll: %d entitlements, %d funded — want both empty",
+				len(world.ents), len(world.funded))
+		}
+		for _, subscription := range world.subs {
+			if subscription.State != commerce.SubscriptionPending {
+				t.Fatalf("state after the failed roll = %q, want pending", subscription.State)
+			}
+		}
+		if !slices.Contains(world.order, "rollback") {
+			t.Fatalf("the world never rolled back: %v", world.order)
 		}
 	})
 }
