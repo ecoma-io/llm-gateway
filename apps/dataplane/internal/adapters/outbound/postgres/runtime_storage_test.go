@@ -59,6 +59,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/accounting"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/catalog"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/execution"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/identity"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/persistence"
@@ -480,17 +481,111 @@ func integrationRepos(t testing.TB, store persistence.Store) integrationReposito
 // chose — named scope and period end — and not by an accident of seeding.
 var integrationSubscriptionCreatedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
+// integrationScope is the catalog scaffolding a drawdown is granted against:
+// the alias the suite's requests ask as, the wildcard `*` group version's id,
+// and a named group version that contains that alias. Grants published with
+// named_scope = true pin the named version, grants published with
+// named_scope = false pin the wildcard one — so every seeded grant is one a
+// drawdown for the alias may actually draw under the eligibility rule the
+// waterfall walks by (a grant funds a request only when its stored scope
+// contains the requesting alias and its cycle has not ended).
+type integrationScope struct {
+	alias    catalog.AliasID
+	wildcard string
+	named    string
+}
+
+// integrationScopeAliasName is the fixed name of the suite's one alias. Fixed
+// on purpose: the fixture database keeps its rows forever, so convergence on
+// one row is what makes re-seeding idempotent — a second run adopts the alias
+// the first run minted instead of minting another.
+const integrationScopeAliasName = "b7it-drawdown-alias"
+
+// The scope's seeding statements. The alias converges by its unique name;
+// the wildcard row is the schema's singleton (the partial unique admits
+// exactly one `*` row, and the loser of a race adopts the winner's); the
+// named version rides a freshly minted group name on every call, so two
+// suites racing never contend for a version number — a named group is any
+// name matching the grammar, and nothing reuses one.
+const (
+	integrationScopeAliasSeed = `INSERT INTO model_aliases (id, name, state, max_output_tokens, reservation_cap, created_at, updated_at)
+VALUES ($1, $2, 'active', 4096, 4096, transaction_timestamp(), transaction_timestamp())
+ON CONFLICT (name) DO NOTHING`
+
+	integrationScopeAliasRead = `SELECT id FROM model_aliases WHERE name = $1`
+
+	integrationScopeWildcardSeed = `INSERT INTO alias_group_versions (id, group_name, version, created_at)
+VALUES ($1, '*', 1, transaction_timestamp())
+ON CONFLICT DO NOTHING`
+
+	integrationScopeWildcardRead = `SELECT id FROM alias_group_versions WHERE group_name = '*'`
+
+	integrationScopeNamedSeed = `INSERT INTO alias_group_versions (id, group_name, version, created_at)
+VALUES ($1, $2, 1, transaction_timestamp())`
+
+	integrationScopeMemberSeed = `INSERT INTO alias_group_members (group_version_id, alias_id)
+VALUES ($1, $2)`
+)
+
+// catalogScope resolves the scope, seeding whatever is missing. It is
+// idempotent by construction and safe to call repeatedly — the fixture
+// database retains its rows, so every call must converge, not accumulate.
+// It runs through the store's Querier on a context of its own: no unit of
+// work in that context means the pool, which is where fixture writes belong.
+// It must never be called inside a caller's unit of work — the scaffolding
+// is fixture, not part of the unit under test, and seeding it through a
+// transaction that may roll back would publish catalog rows the rollback
+// would take back.
+func (r integrationRepositories) catalogScope(t testing.TB) integrationScope {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	querier := r.store.Querier(ctx)
+	if _, err := querier.ExecContext(ctx, integrationScopeAliasSeed, string(identity.NewRequestID()), integrationScopeAliasName); err != nil {
+		t.Fatalf("seeding the suite's alias: %v", err)
+	}
+	var alias catalog.AliasID
+	if err := querier.QueryRowContext(ctx, integrationScopeAliasRead, integrationScopeAliasName).Scan(&alias); err != nil {
+		t.Fatalf("reading the suite's alias id: %v", err)
+	}
+	if _, err := querier.ExecContext(ctx, integrationScopeWildcardSeed, string(identity.NewRequestID())); err != nil {
+		t.Fatalf("seeding the wildcard group's version: %v", err)
+	}
+	var wildcard string
+	if err := querier.QueryRowContext(ctx, integrationScopeWildcardRead).Scan(&wildcard); err != nil {
+		t.Fatalf("reading the wildcard group version's id: %v", err)
+	}
+	namedVersion := string(identity.NewRequestID())
+	namedGroup := "b7it-named-group-" + namedVersion[len(namedVersion)-8:]
+	if _, err := querier.ExecContext(ctx, integrationScopeNamedSeed, namedVersion, namedGroup); err != nil {
+		t.Fatalf("seeding a named group version: %v", err)
+	}
+	if _, err := querier.ExecContext(ctx, integrationScopeMemberSeed, namedVersion, string(alias)); err != nil {
+		t.Fatalf("seeding the named group version's membership: %v", err)
+	}
+	return integrationScope{alias: alias, wildcard: wildcard, named: namedVersion}
+}
+
 // integrationPublish delivers one grant through the repository — the same
 // statement the Control Plane's publications arrive through. A zero period
 // end publishes the PAYG scope, a non-zero one an entitlement cycle; the
 // revision is the caller's because the publication algebra is ordered by it
-// and the algebra test redelivers and supersedes on purpose.
+// and the algebra test redelivers and supersedes on purpose. The grant's
+// stored scope resolves through the suite's scaffolding: a named grant pins
+// the named version containing the alias, an unscoped one the wildcard `*`
+// version — which is what makes every grant this helper seeds one the
+// drawdown may actually draw.
 func integrationPublish(t testing.TB, ctx context.Context, repos integrationRepositories, account, bucket string, namedScope bool, periodEnd time.Time, limit, revision int64, state accounting.ProjectionState) accounting.PublicationOutcome {
 	t.Helper()
+	scope := repos.catalogScope(t)
+	versionID := scope.wildcard
+	if namedScope {
+		versionID = scope.named
+	}
 	publication := accounting.Publication{
 		AccountID:             account,
 		FundingBucketID:       bucket,
-		AliasGroupVersionID:   "b7it-alias-group-1",
+		AliasGroupVersionID:   versionID,
 		ScopeKind:             accounting.ScopePayGBalance,
 		NamedScope:            namedScope,
 		PeriodEnd:             periodEnd,
@@ -579,6 +674,9 @@ func integrationSettlement(t testing.TB, ctx context.Context, repos integrationR
 		t.Fatalf("building an attempt: %v", err)
 	}
 	integrationSeedProjection(t, ctx, repos, account, true, now.Add(24*time.Hour), 1000)
+	// The scope resolves before the unit opens: the drawdown names the alias
+	// it serves, and the scaffolding is fixture work, not part of the unit.
+	scope := repos.catalogScope(t)
 
 	var (
 		fact accounting.Fact
@@ -591,7 +689,7 @@ func integrationSettlement(t testing.TB, ctx context.Context, repos integrationR
 		if err := repos.attempts.Insert(ctx, attempt); err != nil {
 			return err
 		}
-		drawn, err := repos.quota.Drawdown(ctx, account, 250)
+		drawn, err := repos.quota.Drawdown(ctx, account, scope.alias, 250)
 		if err != nil {
 			return err
 		}
@@ -1269,6 +1367,7 @@ func TestIntegrationContendedDrawdownAdmitsExactlyTheCapacityThereIs(t *testing.
 
 	account := integrationRuntimeAccount(t, "drawdown")
 	bucket := integrationSeedProjection(t, ctx, repos, account, true, time.Now().UTC().Add(24*time.Hour), 100)
+	scope := repos.catalogScope(t)
 
 	const contenders = 8
 	const draw = int64(40)
@@ -1288,7 +1387,7 @@ func TestIntegrationContendedDrawdownAdmitsExactlyTheCapacityThereIs(t *testing.
 			// giveback are one atomic unit, so a losing walk leaves the
 			// bucket exactly as it found it.
 			err := store.WithinTx(ctx, func(ctx context.Context) error {
-				got, err := repos.quota.Drawdown(ctx, account, draw)
+				got, err := repos.quota.Drawdown(ctx, account, scope.alias, draw)
 				if err != nil {
 					return err
 				}
@@ -1627,6 +1726,7 @@ func TestIntegrationSettlementUnitIsAllOrNothing(t *testing.T) {
 	// One account, one grant, enough capacity for both twins.
 	account := integrationRuntimeAccount(t, "atomicity")
 	integrationSeedProjection(t, ctx, repos, account, true, time.Now().UTC().Add(24*time.Hour), 5000)
+	scope := repos.catalogScope(t)
 	price := integrationPrice()
 	now := time.Now().UTC()
 	request, err := execution.NewRequest(identity.NewRequestID(), account, account+"-api-key", "bench/alias", 120, 4096, price, now)
@@ -1649,7 +1749,7 @@ func TestIntegrationSettlementUnitIsAllOrNothing(t *testing.T) {
 	)
 	err = store.WithinTx(ctx, func(ctx context.Context) error {
 		var unitErr error
-		drawn, unitErr = repos.quota.Drawdown(ctx, account, 250)
+		drawn, unitErr = repos.quota.Drawdown(ctx, account, scope.alias, 250)
 		if unitErr != nil {
 			return unitErr
 		}
@@ -1680,7 +1780,7 @@ func TestIntegrationSettlementUnitIsAllOrNothing(t *testing.T) {
 	// was never offered to a request that does not exist.
 	boom := errors.New("the unit failed after its statements ran")
 	err = store.WithinTx(ctx, func(ctx context.Context) error {
-		if _, drawErr := repos.quota.Drawdown(ctx, account, 250); drawErr != nil {
+		if _, drawErr := repos.quota.Drawdown(ctx, account, scope.alias, 250); drawErr != nil {
 			return drawErr
 		}
 		return boom
@@ -1762,6 +1862,7 @@ func TestIntegrationPublicationAlgebraKeepsSpentCapacitySpent(t *testing.T) {
 	account := integrationRuntimeAccount(t, "publication")
 	bucket := account + "-bucket"
 	periodEnd := time.Now().UTC().Add(24 * time.Hour)
+	scope := repos.catalogScope(t)
 
 	// Fresh: seeded, available starts at the limit — a new grant's whole
 	// ceiling is offerable.
@@ -1774,7 +1875,7 @@ func TestIntegrationPublicationAlgebraKeepsSpentCapacitySpent(t *testing.T) {
 
 	// Spend a fifth of it, so every later no-op has something it must not
 	// resurrect.
-	legs, err := repos.quota.Drawdown(ctx, account, 100)
+	legs, err := repos.quota.Drawdown(ctx, account, scope.alias, 100)
 	if err != nil {
 		t.Fatalf("Drawdown(100): %v", err)
 	}
@@ -1857,7 +1958,7 @@ func TestIntegrationPublicationAlgebraKeepsSpentCapacitySpent(t *testing.T) {
 	if available, _, _, _ := integrationProjectionRow(t, db, bucket); available != 450 {
 		t.Fatalf("the reactivation moved available to %d, want 450 — a publication never touches the runtime's number", available)
 	}
-	drained, err := repos.quota.Drawdown(ctx, account, 450)
+	drained, err := repos.quota.Drawdown(ctx, account, scope.alias, 450)
 	if err != nil {
 		t.Fatalf("Drawdown(450): %v", err)
 	}
@@ -1933,7 +2034,8 @@ func TestIntegrationWaterfallDrawdownMatchesTheDomainOrder(t *testing.T) {
 	// The drawdown walks the order and records it in its legs: 50 against a
 	// waterfall of 40, 100, 100, 100 must take the named-early grant whole
 	// and finish on the named-late one.
-	legs, err := repos.quota.Drawdown(ctx, account, 50)
+	scope := repos.catalogScope(t)
+	legs, err := repos.quota.Drawdown(ctx, account, scope.alias, 50)
 	if err != nil {
 		t.Fatalf("Drawdown(50): %v", err)
 	}
@@ -2008,17 +2110,17 @@ func TestIntegrationWaterfallDrawdownMatchesTheDomainOrder(t *testing.T) {
 	}
 
 	// The SQL half: the adapter's own order by, spelled here exactly as
-	// projectionWalk spells it — the trailing funding-bucket tiebreak
-	// included, the one that makes the order total and the lock order
-	// deadlock-free. One order, two spellings, one proof: this query and
-	// ByWaterfall disagreeing is the bug this test exists to catch, and it is
-	// asserted against the domain's answer rather than against a hardcoded
-	// list so the two halves are pinned to each other, not merely to the
-	// test's expectations.
-	sqlOrdered := `SELECT funding_bucket_id
-	FROM public.quota_projections
-	WHERE account_id = $1 AND state = 'active'
-	ORDER BY named_scope DESC, period_end ASC NULLS LAST,
+	// projectionWalk spells it — the leading entitlements-before-PAYG key and
+	// the trailing funding-bucket tiebreak included, the one that makes the
+	// order total and the lock order deadlock-free. One order, two spellings,
+	// one proof: this query and ByWaterfall disagreeing is the bug this test
+	// exists to catch, and it is asserted against the domain's answer rather
+	// than against a hardcoded list so the two halves are pinned to each
+	// other, not merely to the test's expectations.
+	sqlOrdered := `SELECT q.funding_bucket_id
+	FROM public.quota_projections q
+	WHERE q.account_id = $1 AND q.state = 'active'
+	ORDER BY (q.scope_kind = 'payg_balance'), named_scope DESC, period_end ASC NULLS LAST,
 	         subscription_created_at ASC, entitlement_id ASC, funding_bucket_id ASC`
 	sqlRows, err := db.QueryContext(ctx, sqlOrdered, account)
 	if err != nil {
@@ -2045,7 +2147,7 @@ func TestIntegrationWaterfallDrawdownMatchesTheDomainOrder(t *testing.T) {
 	// of a dry bucket) and the ordinals restart at 1 — an ordinal is the
 	// position within its own drawdown's tail, never a global counter, or two
 	// facts could never both carry the leg that drew first.
-	more, err := repos.quota.Drawdown(ctx, account, 30)
+	more, err := repos.quota.Drawdown(ctx, account, scope.alias, 30)
 	if err != nil {
 		t.Fatalf("Drawdown(30): %v", err)
 	}

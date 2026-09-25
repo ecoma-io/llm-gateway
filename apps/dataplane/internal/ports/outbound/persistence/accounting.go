@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/accounting"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/catalog"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/identity"
 )
 
@@ -123,14 +124,24 @@ type QuotaProjectionRepository interface {
 	// has already superseded.
 	ApplyRefill(ctx context.Context, refill accounting.Refill) (accounting.RefillOutcome, error)
 
-	// Drawdown takes `amount` of minor units from one account's projections,
-	// walking them in ADR 0003's waterfall order and drawing each bucket
-	// conditionally — the update carries `available >= take`, so exactly one
-	// contender wins each unit under concurrency. The legs it actually drew
-	// come back in waterfall order; they are the reservation's allocations,
-	// built from what the store granted, never from what the caller hoped.
+	// Drawdown takes `amount` of minor units from one account's projections
+	// on behalf of `aliasID`, walking them in ADR 0003's waterfall order and
+	// drawing each bucket conditionally — the update carries `available >=
+	// take`, so exactly one contender wins each unit under concurrency. Only
+	// grants that may fund this request are eligible: the grant's stored scope
+	// must contain the alias (the wildcard `*` version contains every alias; a
+	// named version only the aliases its snapshot lists) and the grant's cycle
+	// must not have ended at the transaction's own instant. The take
+	// re-asserts the identical eligibility predicate under the row lock, so a
+	// grant whose eligibility moved between the walk and the take is never
+	// drawn on a stale read's word. The legs it actually drew come back in
+	// waterfall order; they are the reservation's allocations, built from what
+	// the store granted, never from what the caller hoped.
 	// ErrInsufficientCapacity means the whole order fell short, with nothing
-	// drawn — the walk gives back what it took before saying so.
+	// drawn — the walk gives back what it took before saying so. A grant that
+	// is ineligible (or lost its capacity to a contender) is not an error of
+	// its own: the walk simply passes it by, and only a final shortfall
+	// surfaces.
 	//
 	// The walk, the takes and the giveback run through the Querier ctx
 	// resolves, so they are one atomic unit of work exactly when ctx carries
@@ -140,7 +151,7 @@ type QuotaProjectionRepository interface {
 	// three writes where a rollback would have been one. The store's doctrine
 	// is that the caller owns the boundary; this is the method where forgetting
 	// it would look like it worked.
-	Drawdown(ctx context.Context, accountID string, amount int64) ([]accounting.Allocation, error)
+	Drawdown(ctx context.Context, accountID string, aliasID catalog.AliasID, amount int64) ([]accounting.Allocation, error)
 
 	// Return puts drawn-down capacity back, one leg at a time, each update
 	// unconditional on the balance: a publication that shrank the ceiling
