@@ -204,6 +204,17 @@ func (a *accountingRepos) adjustEntry(t *testing.T, bucketID accounting.FundingB
 	return entry
 }
 
+func (a *accountingRepos) consumeEntry(t *testing.T, bucketID accounting.FundingBucketID, raw int64,
+	settlementID accounting.SettlementID) accounting.LedgerEntry {
+	t.Helper()
+	entry, err := accounting.NewConsumeEntry(acctEntryID(t), bucketID, acctAmount(t, raw), settlementID,
+		acctPrice(t), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("consume entry: %v", err)
+	}
+	return entry
+}
+
 // newAccountBucket opens a PAYG bucket through the ports: an identity
 // account row first (every accounting foreign key is RESTRICT and the owner
 // must exist), then the bucket itself.
@@ -458,6 +469,77 @@ func TestIntegrationAccountingGuardMissesClassifyAndLeaveTheWorkAlive(t *testing
 		a.assertBalances(t, bucket.ID, 7000, 0, 7000, 2, 2)
 	})
 
+	t.Run("a consume above held is refused", func(t *testing.T) {
+		bucket := a.newAccountBucket(t, "it-accounting consume guard")
+		a.appendCommitted(t, a.topupEntry(t, bucket.ID, 10000, acctCommandKey(t, "seed-")))
+		a.appendCommitted(t, a.holdEntry(t, bucket.ID, 4000, acctReservation(t)))
+		settlement := acctSettlementID(t)
+		// A consume leg names a settlement header on file — the foreign key
+		// the ledger carries — so the header exists before the legs do.
+		if _, err := a.settlements.Create(ctx, accounting.Settlement{
+			ID:           settlement,
+			RequestID:    acctRequestID(t),
+			SettledTotal: 0,
+			CreatedAt:    time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("seed the settlement header: %v", err)
+		}
+
+		err := a.store.WithinTx(ctx, func(ctx context.Context) error {
+			_, _, err := a.ledger.Append(ctx, a.consumeEntry(t, bucket.ID, 5000, settlement))
+			if !errors.Is(err, accounting.ErrInsufficientHeld) {
+				t.Fatalf("consume 5000 against held 4000 = %v, want ErrInsufficientHeld", err)
+			}
+			_, _, err = a.ledger.Append(ctx, a.consumeEntry(t, bucket.ID, 3000, settlement))
+			return err
+		})
+		if err != nil {
+			t.Fatalf("the unit of work that suffered a guard miss must commit: %v", err)
+		}
+		a.assertBalances(t, bucket.ID, 7000, 1000, 6000, 3, 3)
+	})
+
+	t.Run("an adjustment that underflows held is refused", func(t *testing.T) {
+		bucket := a.newAccountBucket(t, "it-accounting held underflow")
+		seed, _ := a.appendCommitted(t, a.topupEntry(t, bucket.ID, 10000, acctCommandKey(t, "seed-")))
+		a.appendCommitted(t, a.holdEntry(t, bucket.ID, 4000, acctReservation(t)))
+
+		err := a.store.WithinTx(ctx, func(ctx context.Context) error {
+			_, _, err := a.ledger.Append(ctx, a.adjustEntry(t, bucket.ID, 0, -5000, seed.ID, ""))
+			if !errors.Is(err, accounting.ErrInvalidAdjustment) {
+				t.Fatalf("adjustment of held −5000 against held 4000 = %v, want ErrInvalidAdjustment", err)
+			}
+			_, _, err = a.ledger.Append(ctx, a.adjustEntry(t, bucket.ID, 0, -1000, seed.ID, ""))
+			return err
+		})
+		if err != nil {
+			t.Fatalf("the unit of work that suffered a guard miss must commit: %v", err)
+		}
+		a.assertBalances(t, bucket.ID, 10000, 3000, 7000, 3, 3)
+	})
+
+	t.Run("an adjustment that underflows available is refused", func(t *testing.T) {
+		bucket := a.newAccountBucket(t, "it-accounting available underflow")
+		seed, _ := a.appendCommitted(t, a.topupEntry(t, bucket.ID, 5000, acctCommandKey(t, "seed-")))
+		a.appendCommitted(t, a.holdEntry(t, bucket.ID, 4000, acctReservation(t)))
+
+		err := a.store.WithinTx(ctx, func(ctx context.Context) error {
+			// One delta alone can still leave the algebra negative: settled
+			// 2000 under held 4000 is an available the no-credit rule
+			// refuses, though neither balance itself went below zero.
+			_, _, err := a.ledger.Append(ctx, a.adjustEntry(t, bucket.ID, -3000, 0, seed.ID, ""))
+			if !errors.Is(err, accounting.ErrInvalidAdjustment) {
+				t.Fatalf("adjustment to available −2000 = %v, want ErrInvalidAdjustment", err)
+			}
+			_, _, err = a.ledger.Append(ctx, a.adjustEntry(t, bucket.ID, -500, 0, seed.ID, ""))
+			return err
+		})
+		if err != nil {
+			t.Fatalf("the unit of work that suffered a guard miss must commit: %v", err)
+		}
+		a.assertBalances(t, bucket.ID, 4500, 4000, 500, 3, 3)
+	})
+
 	t.Run("a topup on a closed bucket is refused", func(t *testing.T) {
 		bucket := a.newAccountBucket(t, "it-accounting closed gate")
 		stored := a.assertBalances(t, bucket.ID, 0, 0, 0, 0, 0)
@@ -644,6 +726,70 @@ func TestIntegrationAccountingCollisionsMapToTheirSentinels(t *testing.T) {
 			t.Fatalf("the unit of work that lost the collision must commit: %v", err)
 		}
 		a.assertBalances(t, bucket.ID, 10000, 3000, 7000, 3, 3)
+	})
+
+	t.Run("the same settlement leg twice is a duplicate movement", func(t *testing.T) {
+		bucket := a.newAccountBucket(t, "it-accounting settlement collision")
+		a.appendCommitted(t, a.topupEntry(t, bucket.ID, 10000, acctCommandKey(t, "seed-")))
+		reservation := acctReservation(t)
+		a.appendCommitted(t, a.holdEntry(t, bucket.ID, 4000, reservation))
+		allocation, err := accounting.NewAllocation(bucket.ID, reservation, acctAmount(t, 4000))
+		if err != nil {
+			t.Fatalf("allocation: %v", err)
+		}
+		allocation, err = allocation.SettleConsumed(acctAmount(t, 1000), acctPrice(t))
+		if err != nil {
+			t.Fatalf("settle consumed: %v", err)
+		}
+		plan, err := accounting.BuildSettle(acctSettlementID(t), acctRequestID(t),
+			[]accounting.Allocation{allocation}, accounting.NewLedgerEntryID, time.Now().UTC())
+		if err != nil {
+			t.Fatalf("build settle: %v", err)
+		}
+
+		// The settlement's own legs land once, behind their header — the
+		// settle choreography's shape.
+		err = a.store.WithinTx(ctx, func(ctx context.Context) error {
+			created, err := a.settlements.Create(ctx, plan.Settlement)
+			if err != nil || !created {
+				if err == nil {
+					err = errors.New("integration: the first acknowledgement must create the header")
+				}
+				return err
+			}
+			for _, entry := range plan.Entries {
+				if _, _, err := a.ledger.Append(ctx, entry); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("settle: %v", err)
+		}
+
+		// The settle left the bucket with nothing held, and the guards speak
+		// before the uniqueness does — a fresh hold gives the replayed leg
+		// balances the guards admit, so the constraint is what refuses it.
+		a.appendCommitted(t, a.holdEntry(t, bucket.ID, 1000, acctReservation(t)))
+
+		// The settlement re-booked — a fresh leg carrying the same settlement
+		// id and kind on the same bucket — is the uniqueness constraint's
+		// duplicate movement (the original leg's own id would only reach the
+		// primary key first), and the unit of work that lost it still
+		// commits a leg of its own.
+		err = a.store.WithinTx(ctx, func(ctx context.Context) error {
+			_, _, err := a.ledger.Append(ctx, a.consumeEntry(t, bucket.ID, 1000, plan.Settlement.ID))
+			if !errors.Is(err, accounting.ErrDuplicateMovement) {
+				t.Fatalf("a replayed settlement leg = %v, want ErrDuplicateMovement", err)
+			}
+			_, _, err = a.ledger.Append(ctx, a.topupEntry(t, bucket.ID, 500, acctCommandKey(t, "topup-")))
+			return err
+		})
+		if err != nil {
+			t.Fatalf("the unit of work that lost the collision must commit: %v", err)
+		}
+		a.assertBalances(t, bucket.ID, 9500, 1000, 8500, 6, 6)
 	})
 
 	t.Run("the same command key on another bucket is no collision", func(t *testing.T) {

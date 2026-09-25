@@ -6,7 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/accounting"
+	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
 // The ledger adapter's unit-of-work rule and its savepoint bracket, pinned
@@ -53,6 +56,31 @@ func TestALedgerAppendBracketsAFailedEchoInItsSavepoint(t *testing.T) {
 	}
 	if got := of(events, evRollback); len(got) != 1 {
 		t.Fatalf("the failed unit of work must roll back exactly once: %v", events)
+	}
+}
+
+func TestConflictOfNamesTheStoreRaceAndPassesEverythingElse(t *testing.T) {
+	// The two SQLSTATEs the helper exists for: a write that lost the store's
+	// own race is the port's retryable conflict, whatever its wording.
+	for _, code := range []string{pgSerializationFailure, pgDeadlockDetected} {
+		lost := &pgconn.PgError{Code: code, Message: "the store race spoke"}
+		if err := conflictOf(lost); !errors.Is(err, persistence.ErrConflict) {
+			t.Fatalf("conflictOf(%s) = %v, want ErrConflict", code, err)
+		}
+	}
+	// Everything else keeps its own words: the guards' P0001 verdicts, the
+	// port's own sentinels, a driver's plain error — none of them is the
+	// store race, and none may borrow its name.
+	other := &pgconn.PgError{Code: "P0001", Message: "raise_exception"}
+	if err := conflictOf(other); errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("conflictOf(P0001) = %v, want the guard's verdict untouched", err)
+	}
+	if err := conflictOf(persistence.ErrNotFound); errors.Is(err, persistence.ErrConflict) {
+		t.Fatalf("conflictOf(ErrNotFound) = %v, want it passed through", err)
+	}
+	plain := errors.New("driver died")
+	if err := conflictOf(plain); !errors.Is(err, plain) {
+		t.Fatalf("conflictOf(plain error) = %v, want the error itself", err)
 	}
 }
 

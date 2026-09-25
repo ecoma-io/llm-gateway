@@ -47,6 +47,11 @@ type accountingWorld struct {
 	appendFailOnCall int
 	appendCalls      int
 
+	// closeLoses refuses that many compare-and-swaps first — legs landing
+	// under the closer's feet — without moving the row, the mechanical way
+	// to walk the close loop's retry and exhaustion paths.
+	closeLoses int
+
 	outsideTx int
 }
 
@@ -211,10 +216,16 @@ func (f fakeFundingBuckets) ByAccountID(_ context.Context, id accounting.Account
 }
 
 // Close is the CAS: the predicate — active, the caller's version, nothing
-// held — is the statement's WHERE clause, and the bool is its verdict.
+// held — is the statement's WHERE clause, and the bool is its verdict. A
+// world primed with closeLoses loses that many swaps first, the row untouched,
+// exactly as a leg landing between the read and the write presents.
 func (f fakeFundingBuckets) Close(_ context.Context, id accounting.FundingBucketID, fromVersion int64, updatedAt time.Time) (bool, error) {
 	bucket, ok := f.world.buckets[id]
 	if !ok || bucket.Status != accounting.BucketActive || bucket.Version != fromVersion || bucket.Held != 0 {
+		return false, nil
+	}
+	if f.world.closeLoses > 0 {
+		f.world.closeLoses--
 		return false, nil
 	}
 	bucket.Status = accounting.BucketClosed
@@ -443,11 +454,13 @@ func (f fakeAccountingPayg) ByAccount(_ context.Context, accountID commerce.Acco
 	return payg, nil
 }
 
-// AssignFundingBucket is the port's write-once verdict: a row already
-// carrying a reference is left untouched and answers false.
+// AssignFundingBucket is the port's write-once verdict, faithful to the
+// statement's WHERE clause: a row that already carries any reference — its
+// own bucket re-offered included — matches nothing and answers false; only a
+// rowless row or an empty reference takes the bucket and answers true.
 func (f fakeAccountingPayg) AssignFundingBucket(_ context.Context, accountID commerce.AccountID, bucketID commerce.FundingBucketID, updatedAt time.Time) (bool, error) {
 	payg, ok := f.world.paygRows[accountID]
-	if ok && payg.FundingBucketID != "" && payg.FundingBucketID != bucketID {
+	if ok && payg.FundingBucketID != "" {
 		return false, nil
 	}
 	if !ok {

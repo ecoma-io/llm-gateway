@@ -345,12 +345,16 @@ func TestReleaseHoldReturnsExactlyWhatWasHeld(t *testing.T) {
 		t.Fatalf("after the release: held %d, available %d, want 0, 100", after.Held, after.Available)
 	}
 
-	if _, err := use.ReleaseHold(t.Context(), bucket.ID, reservation, 40); err != nil {
+	converged, err := use.ReleaseHold(t.Context(), bucket.ID, reservation, 40)
+	if err != nil {
 		t.Fatalf("re-run of the same release must converge: %v", err)
 	}
-	if after.Held != 0 || after.Available != accounting.Balance(100) {
-		t.Fatalf("the ledger after the converged re-release: held %d, available %d, want 0, 100",
-			after.Held, after.Available)
+	if converged.Held != 0 || converged.Available != accounting.Balance(100) {
+		t.Fatalf("the converged re-release answered held %d, available %d, want 0, 100",
+			converged.Held, converged.Available)
+	}
+	if len(world.legs) != 3 {
+		t.Fatalf("the converged re-release moved %d legs, want the original three and no more", len(world.legs))
 	}
 }
 
@@ -620,6 +624,34 @@ func TestCloseBucketIsBlockedWhileFundsAreHeld(t *testing.T) {
 	// Closing a closed bucket is the converged no-op.
 	if err := use.CloseBucket(t.Context(), bucket.ID); err != nil {
 		t.Fatalf("close of a closed bucket: %v", err)
+	}
+}
+
+func TestCloseBucketRetriesThroughContentionAndGivesUpBounded(t *testing.T) {
+	world := newAccountingWorld(t)
+	use := newAccounting(world)
+	bucket := world.seedAccountFunding(t, "account-payg-1")
+
+	// Two legs land under the closer's feet: each swap loses its predicate,
+	// the loop re-reads the fresh row, and the third attempt closes.
+	world.closeLoses = 2
+	if err := use.CloseBucket(t.Context(), bucket.ID); err != nil {
+		t.Fatalf("close through two lost swaps: %v", err)
+	}
+	if world.buckets[bucket.ID].Status != accounting.BucketClosed {
+		t.Fatalf("the bucket after the contended close = %s, want closed", world.buckets[bucket.ID].Status)
+	}
+
+	// Contention that never relents is named, not endlessly retried: all of
+	// the bounded attempts lose and the caller keeps the sentinel, the row
+	// still active.
+	world.closeLoses = casMaxAttempts
+	other := world.seedAccountFunding(t, "account-payg-2")
+	if err := use.CloseBucket(t.Context(), other.ID); !errors.Is(err, ErrTransitionContended) {
+		t.Fatalf("close under permanent contention = %v, want ErrTransitionContended", err)
+	}
+	if world.buckets[other.ID].Status != accounting.BucketActive {
+		t.Fatalf("the contended bucket = %s, want still active", world.buckets[other.ID].Status)
 	}
 }
 

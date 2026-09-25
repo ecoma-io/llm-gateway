@@ -862,6 +862,28 @@ func TestRollLane(t *testing.T) {
 		}
 	})
 
+	t.Run("a funder that refuses fails the roll whole", func(t *testing.T) {
+		world, commerceUse, subscription := seedActive(t, true)
+		before := len(world.ents)
+		fundedBefore := len(world.funded)
+		fundErr := errors.New("fakes: the accounting seam is down")
+		world.failOn["funder.fund"] = fundErr
+
+		// The roll's accounting half is inside the unit of work, so a refusing
+		// funder takes the whole roll with it: a cycle whose grants bought
+		// nothing must not exist half-funded.
+		if _, err := commerceUse.RollDueSubscriptions(t.Context(), 10); !errors.Is(err, fundErr) {
+			t.Fatalf("the roll over a refusing funder = %v, want the funder's error", err)
+		}
+		if len(world.ents) != before || *world.subs[subscription.ID].CycleNumber != 1 {
+			t.Fatal("the failed roll advanced the subscription or left entitlements behind")
+		}
+		if len(world.funded) != fundedBefore {
+			t.Fatalf("funded = %d entries, want the seeded %d — the rolled-back unit of work unfunded what it granted",
+				len(world.funded), fundedBefore)
+		}
+	})
+
 	t.Run("a retired version still feeds its subscribers' rolls", func(t *testing.T) {
 		// Retirement stops new sales; it rewrites nothing. The subscription
 		// pinned the version forever, so its cycles keep rolling on the
