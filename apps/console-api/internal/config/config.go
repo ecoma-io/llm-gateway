@@ -69,6 +69,21 @@ const (
 	// minutes, so a console nobody is using holds no connections the database
 	// could otherwise hand to someone who is.
 	DefaultPostgresConnMaxIdleTime = 5 * time.Minute
+
+	// DefaultProjectionInterval is how often the projection producer wakes to
+	// reconcile the Data Plane's credential mirror with the Control Plane's
+	// log (ADR 0007). Five seconds is a management-paced cadence — the loop
+	// carries identity decisions, not request-path answers, and the delivery
+	// is at-least-once against a durable log, so a slow tick costs freshness
+	// and never correctness.
+	DefaultProjectionInterval = 5 * time.Second
+
+	// DefaultProjectionTimeout bounds one reconcile cycle: the log reads, the
+	// position read, and every delivery inside it. Thirty seconds is far more
+	// than a healthy cycle needs and far less than forever; a cycle that hits
+	// the bound fails the way any failed cycle does — logged, and retried by
+	// the next tick — instead of wedging the loop behind one hung call.
+	DefaultProjectionTimeout = 30 * time.Second
 )
 
 // ownedDatabase is the only database this application may open — the plane
@@ -91,6 +106,56 @@ type Config struct {
 	// the thing that keeps the DSN's credential out of logs — travels with
 	// the value it protects.
 	Postgres Postgres
+
+	// DataPlane is how this process reaches the Data Plane's management
+	// surface: where it is, what it presents, and the projection loop's two
+	// cadences. URL and Credential are required — the process has no default
+	// for where the other plane is, and a management surface it cannot
+	// authenticate to is a projection that can never deliver.
+	DataPlane DataPlane
+}
+
+// DataPlane holds the settings for the Control → Data projection's producer
+// and the usage-fact feed's client — everything this process points at the
+// Data Plane's management façade (ADR 0006 §5, ADR 0007).
+//
+// The credential is a secret-bearing value and is redacted by LogValue, the
+// same enforcement Postgres carries for its DSN. It is also this hop's own:
+// the façade's `DATAPLANE_API_DATAPLANE_CREDENTIAL` and the Data Plane's
+// runtime consumer key are different secrets on different hops, and a
+// deployment that shares one string across them turns three independent
+// refusals into one key that opens everything — the reuse the two-plane
+// protocol forbids.
+type DataPlane struct {
+	// URL is the façade's base URL. A path prefix is allowed — a deployment
+	// behind a gateway serves the management surface under one — but no query
+	// or fragment: either would be silently merged into, or dropped from,
+	// every request the outbound adapter builds.
+	URL string
+
+	// Credential is the bearer token this process presents on the management
+	// channel. It never reaches a log line or an error.
+	Credential string
+
+	// ProjectionInterval is how often the projection producer wakes to
+	// reconcile the mirror with the log. It must be positive.
+	ProjectionInterval time.Duration
+
+	// ProjectionTimeout bounds one reconcile cycle. It must be positive.
+	ProjectionTimeout time.Duration
+}
+
+// LogValue renders the settings safe for logs: the target and the two
+// cadences are visible; the credential is not. DataPlane satisfies
+// slog.LogValuer for the same reason Postgres does — redaction by
+// construction, not by call-site discipline.
+func (d DataPlane) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("url", d.URL),
+		slog.String("credential", "[redacted]"),
+		slog.Duration("projection_interval", d.ProjectionInterval),
+		slog.Duration("projection_timeout", d.ProjectionTimeout),
+	)
 }
 
 // Postgres holds the connection settings for this application's own plane's
@@ -178,10 +243,94 @@ func Load(lookup LookupEnv) (Config, error) {
 	}
 	cfg.Postgres = postgres
 
+	dataPlane, err := loadDataPlane(lookup)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.DataPlane = dataPlane
+
 	if err := validateAddr(cfg.Addr); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// loadDataPlane reads where the Data Plane's management surface is and how
+// the projection loop paces itself. The URL and the credential are required
+// rather than defaulted — this process has no guess for where the other
+// plane is, and a default credential would be a credential printed in this
+// file — while the two cadences are durations with documented defaults,
+// because a tick nobody tuned is survivable and a credential nobody set is
+// not.
+func loadDataPlane(lookup LookupEnv) (DataPlane, error) {
+	cfg := DataPlane{
+		ProjectionInterval: DefaultProjectionInterval,
+		ProjectionTimeout:  DefaultProjectionTimeout,
+	}
+
+	url, ok := lookup("CONSOLE_API_DATAPLANE_URL")
+	if !ok {
+		return DataPlane{}, fmt.Errorf("CONSOLE_API_DATAPLANE_URL must be set: this process has no default for where the Data Plane's management surface is")
+	}
+	if err := validateDataPlaneURL(url); err != nil {
+		return DataPlane{}, err
+	}
+	cfg.URL = url
+
+	credential, ok := lookup("CONSOLE_API_DATAPLANE_CREDENTIAL")
+	if !ok {
+		return DataPlane{}, fmt.Errorf("CONSOLE_API_DATAPLANE_CREDENTIAL must be set: the management surface authenticates this process, and a projection that cannot authenticate never delivers")
+	}
+	if credential == "" {
+		return DataPlane{}, fmt.Errorf("CONSOLE_API_DATAPLANE_CREDENTIAL must not be empty")
+	}
+	cfg.Credential = credential
+
+	if value, ok := lookup("CONSOLE_API_PROJECTION_INTERVAL"); ok {
+		duration, err := parsePositiveDuration("CONSOLE_API_PROJECTION_INTERVAL", value)
+		if err != nil {
+			return DataPlane{}, err
+		}
+		cfg.ProjectionInterval = duration
+	}
+	if value, ok := lookup("CONSOLE_API_PROJECTION_TIMEOUT"); ok {
+		duration, err := parsePositiveDuration("CONSOLE_API_PROJECTION_TIMEOUT", value)
+		if err != nil {
+			return DataPlane{}, err
+		}
+		cfg.ProjectionTimeout = duration
+	}
+	return cfg, nil
+}
+
+// validateDataPlaneURL accepts an absolute http(s) URL naming a host, with no
+// query or fragment. Unlike the dataplane-api's validator it allows a path
+// prefix — the outbound adapter builds its requests by appending to whatever
+// base it is given, so a deployment behind a gateway can name the management
+// surface under the gateway's prefix — but the trailing slash is the
+// adapter's to trim, and a query or fragment would be merged into, or
+// dropped from, every request: those are refused here, where the failure is
+// a startup line, rather than at the first cycle, where it would be a
+// projection that delivers nothing.
+//
+// The value is never echoed in a failure: these messages reach the process
+// log, and a URL is the one configuration value that could carry a
+// credential inside it if an operator pasted one in by mistake.
+func validateDataPlaneURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("CONSOLE_API_DATAPLANE_URL must be an absolute http(s) URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("CONSOLE_API_DATAPLANE_URL must use the http or https scheme")
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("CONSOLE_API_DATAPLANE_URL must name a host")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("CONSOLE_API_DATAPLANE_URL must carry no query or fragment")
+	}
+	return nil
 }
 
 // loadPostgres reads the CONSOLE_API_POSTGRES_* variables — this process's

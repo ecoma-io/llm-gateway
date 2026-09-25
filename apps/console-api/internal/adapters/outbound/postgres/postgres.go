@@ -256,6 +256,19 @@ func (s *store) Querier(ctx context.Context) persistence.Querier {
 	return s.db
 }
 
+// InUnitOfWork reports whether ctx carries a unit of work this store opened
+// or joined — the same lookup Querier and WithinTx make, so the three can
+// never disagree about which unit of work a context belongs to. The
+// projection change recorder is the caller whose contract is
+// unit-of-work-shaped and who must refuse rather than silently degrade: the
+// fact append's sequence-allocation argument, applied to a counter whose
+// gaplessness and whose log/mirror atomicity are the projection's
+// correctness.
+func (s *store) InUnitOfWork(ctx context.Context) bool {
+	_, ok := ctx.Value(txKey{db: s.db}).(*sql.Tx)
+	return ok
+}
+
 // WithinTx honours persistence.Store's contract: commit on nil, roll back on
 // error and on panic, join a transaction already in flight on this store's
 // own pool.

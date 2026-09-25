@@ -1,0 +1,383 @@
+# The shape of the Control → Data credential projection: what the Control
+# Plane sends when it delivers the identity decisions it owns to the Data
+# Plane's credential mirror. It is the second cross-plane contract, and its
+# direction is the opposite of `usage-facts.yaml`: there the Control Plane
+# reads what the runtime recorded; here it pushes what it has decided, because
+# the authority over who may call the gateway is the Control Plane's and the
+# database the request path reads is the Data Plane's (ADR 0006 §3, §5, §8).
+#
+# This is a fragment like its siblings — a `components:` tree `dataplane.yaml`
+# references by relative path — and it is contracted at the façade because the
+# façade is where the Control Plane's delivery loop arrives. The process behind
+# the façade applies the same shapes over a private protocol, and that
+# agreement is pinned by a protocol test on each side rather than by this
+# document describing both ends (docs/architecture/cross-plane-protocols.md).
+# The fragment names the schemas both hops speak; the operations live in
+# `dataplane.yaml`, because a document exists to state what a caller outside
+# this repository may rely on, and only the façade hop has one.
+#
+# The delivery model is **push with replay**, chosen rather than inherited
+# (ADR 0006 §5, ADR 0007):
+#
+#   - the runtime must admit requests from its own database alone, so the
+#     credential facts it verifies against must be local, and reconciling them
+#     with the Control Plane's decisions may never be a call made per request;
+#   - the Control Plane already owns the decisions, so it is the side that
+#     speaks first — but nothing on its request path waits on delivery, which
+#     is why the producer is a stateless reconciliation loop and not a
+#     synchronous hop inside the mint;
+#   - retry and crash recovery are trivial against a durable, ordered feed and
+#     a consumer-side position, and the position advancing in the same
+#     transaction as the rows it describes is what makes a crash between the
+#     two a replay rather than a loss.
+#
+# Five rules follow, and they are the whole protocol:
+#
+#   1. **Order is a revision, never a clock.** Every entry carries a revision
+#      drawn from a gapless counter the Control Plane advances once per
+#      recorded change, inside the same transaction as the authoritative write
+#      and the Control Plane's own projection tables. Revisions order delivery,
+#      guards, and the consumer's position; `recorded_at` is carried for
+#      operators and is never an ordering key.
+#   2. **The producer's timeline is named.** The `epoch` field identifies the
+#      producer timeline a position was earned on. A Control Plane database
+#      restored to an earlier instant rewinds its counter; without a timeline
+#      identity the consumer's position would silently name revisions that will
+#      never be re-issued, and every credential change after the restore would
+#      be skipped forever. A position whose epoch or revision no longer joins
+#      the producer's log is answered with a re-snapshot, never with guesses.
+#   3. **Bootstrap is a snapshot; everything after is a batch.** A consumer
+#      that has never applied a snapshot is offered one: the Control Plane's
+#      whole projection at a named `snapshot_revision`. Applying it is
+#      unconditional — a snapshot means "be this state at this boundary", so it
+#      consults no per-row history — and it sets the consumer's position to
+#      `snapshot_revision` in the same transaction. The producer may re-snapshot
+#      at any time, for a wiped consumer, for a dead timeline, or for a position
+#      that no longer joins its log.
+#   4. **Delivery is at-least-once; application is idempotent.** Every entry is
+#      a self-contained full-state row for one resource, never a delta, so a
+#      redelivered batch is harmless by construction. Incremental batches join
+#      the consumer's position exactly: a batch whose first revision is the
+#      position's successor is applied with per-row `source_revision` guards and
+#      advances the position to its last revision; a batch entirely behind the
+#      position is the lost-ack case and is acknowledged without work; a batch
+#      that straddles or overshoots the position is refused whole — never
+#      partially applied, never silently skipped.
+#   5. **The consumer's position advances in the same transaction as the rows
+#      it describes.** A crash before the commit replays; a crash after it
+#      re-acknowledges. There is no state in which rows are applied and the
+#      position does not say so, which is the property that makes every other
+#      rule's recovery story safe.
+#
+# The secret's plaintext never appears in any schema here, and no schema ever
+# will carry it. What crosses is the SHA-256 digest of the key's secret —
+# verification material the runtime needs to admit a credential and the
+# Control Plane needs to deliver it. The boundary the two-record model draws
+# (ADR 0006 §8, as amended by ADR 0007) is that the ownership record never
+# mixes with the credential record and the plaintext never leaves the mint;
+# the delivery pipeline is the one named place the digest transits the Control
+# Plane's own database on its way to the plane that verifies it.
+#
+# Versioning: `protocol_version` is `1` and every hop fails closed against a
+# version it does not know. Within a version, additive fields are tolerated
+# and ignored — and nothing ordering- or state-bearing may arrive that way:
+# a new resource kind, a new state value, or a new required field is a new
+# protocol version and a reviewed migration of every hop, consumer first.
+# The `additionalProperties: false` on the schemas below is the contract's
+# word for the closed field set — the fields this version defines and a
+# caller may rely on — not a claim about decoder bytes: an in-process decoder
+# that refused an unnamed extra would break exactly the upgrade ordering the
+# version rule requires, so tolerance of one is pinned by both ends' protocol
+# tests rather than by these schemas.
+components:
+  schemas:
+    ProjectionProtocolVersion:
+      type: integer
+      const: 1
+      description: >-
+        The protocol version this request or answer was written for. A hop that
+        receives a version it does not support refuses the message outright
+        rather than guessing: the failure is loud, the position and the rows are
+        untouched, and the delivery loop resumes when both ends speak the same
+        version.
+    ProjectionEpoch:
+      type: string
+      maxLength: 36
+      description: >-
+        The producer timeline this message belongs to. A Control Plane database
+        restored from an earlier backup is a new timeline even though its
+        counter restarted low: the epoch is how the pair notices, because a
+        position earned on one timeline is meaningless on another. A consumer
+        that has never bootstrapped reports an empty epoch — which is why this
+        schema declares a length bound and no `format: uuid`: the empty value
+        is a legal epoch only here, on a position read, and both ends' own
+        protocol rules enforce the UUID grammar where a real timeline name is
+        required.
+    ApiKeyCredential:
+      type: object
+      required:
+        - key_id
+        - account_id
+        - digest
+        - state
+        - revoked_at
+      properties:
+        key_id:
+          type: string
+          format: uuid
+          description: >-
+            The API key this credential verifies, the same identifier the
+            Control Plane's ownership record carries. It is the row's identity
+            on both sides of the split, which is what makes redelivery a
+            no-op and revocation a state change on an existing row.
+        account_id:
+          type: string
+          format: uuid
+          description: >-
+            The account the key belongs to. Carried for the runtime's
+            admission decisions; the credential row keeps no foreign key to an
+            account row, because the two rows may arrive in either order.
+        digest:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: >-
+            The lowercase hex SHA-256 of the key's secret — the only form of
+            the secret that exists outside the mint call, and the only thing
+            this protocol delivers. The runtime verifies a presented credential
+            by digesting it and comparing against this value; it can confirm a
+            secret, never reconstruct one.
+        state:
+          type: string
+          enum:
+            - active
+            - revoked
+          description: >-
+            The credential's lifecycle state. `revoked` is terminal: there is
+            no un-revoke, and a key that revokes is a key whose mirror row must
+            stop admitting, however the revocation reaches the runtime.
+        revoked_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+          description: >-
+            When the key was revoked, and `null` exactly when `state` is
+            `active` — the pairing is validated, not conventional, because a
+            revoked row without an instant is a revocation nobody can audit.
+      additionalProperties: false
+    AccountState:
+      type: object
+      required:
+        - account_id
+        - state
+      properties:
+        account_id:
+          type: string
+          format: uuid
+          description: >-
+            The account whose lifecycle state the runtime mirrors. Carries no
+            billing data and no ownership edges: only whether credentials
+            derived from this account may be admitted.
+        state:
+          type: string
+          enum:
+            - active
+            - suspended
+            - closed
+          description: >-
+            The account's lifecycle state. `closed` is terminal; `suspended`
+            stops admission while keeping the account's history intact.
+      additionalProperties: false
+    ProjectionPosition:
+      type: object
+      required:
+        - protocol_version
+        - epoch
+        - bootstrapped
+        - applied_revision
+      properties:
+        protocol_version:
+          $ref: "#/components/schemas/ProjectionProtocolVersion"
+        epoch:
+          $ref: "#/components/schemas/ProjectionEpoch"
+        bootstrapped:
+          type: boolean
+          description: >-
+            Whether this consumer has applied a snapshot. `false` means the
+            consumer holds no projection at all: the producer's answer is a
+            snapshot, not a batch, because an incremental batch needs a
+            position to join and there is none.
+        applied_revision:
+          type: integer
+          minimum: 0
+          maximum: 9223372036854775807
+          description: >-
+            The highest revision whose effect the consumer has applied and
+            committed — zero only while unbootstrapped. It is the consumer's
+            own fact, advanced in the same transaction as the rows it
+            describes; the producer treats it as the resume point and the
+            consumer treats it as the guard against stale batches. The
+            ceiling is the signed 64-bit maximum every revision eventually
+            rests in: both planes store revisions in `bigint` columns, so a
+            revision past it could not be stored by a conforming producer
+            and the grammar refuses it rather than letting it fail as a
+            storage error.
+      additionalProperties: false
+    ProjectionSnapshot:
+      type: object
+      required:
+        - protocol_version
+        - epoch
+        - snapshot_revision
+        - api_keys
+        - accounts
+      properties:
+        protocol_version:
+          $ref: "#/components/schemas/ProjectionProtocolVersion"
+        epoch:
+          $ref: "#/components/schemas/ProjectionEpoch"
+        snapshot_revision:
+          type: integer
+          minimum: 0
+          maximum: 9223372036854775807
+          description: >-
+            The producer revision at which this state was cut. Applying the
+            snapshot moves the consumer's position here — forward or backward,
+            because recovery may have to reach a timeline that rewound. Zero
+            is a legitimate boundary: an empty projection is a snapshot too.
+            The ceiling is the signed 64-bit maximum, for the same
+            `bigint`-storage reason as every other revision here.
+        api_keys:
+          type: array
+          maxItems: 5000
+          items:
+            $ref: "#/components/schemas/ApiKeyCredential"
+          description: >-
+            Every credential in the producer's projection at
+            `snapshot_revision`. The array is whole on purpose — a snapshot is
+            atomic and cannot chunk — and bounded by contract rather than by
+            whatever the producer happens to hold: past this bound bootstrap
+            is impossible by design until the bound is raised, which is a
+            reviewed contract change and not a deployment surprise.
+        accounts:
+          type: array
+          maxItems: 5000
+          items:
+            $ref: "#/components/schemas/AccountState"
+          description: >-
+            Every account state in the producer's projection at
+            `snapshot_revision`, bounded for the same reason as `api_keys`.
+      additionalProperties: false
+    ProjectionChange:
+      type: object
+      required:
+        - revision
+        - resource_kind
+        - resource_id
+        - recorded_at
+        - payload
+      properties:
+        revision:
+          type: integer
+          minimum: 1
+          maximum: 9223372036854775807
+          description: >-
+            The gapless producer revision at which this change was recorded.
+            Revisions in a batch are contiguous and strictly ascending, which
+            is what lets the consumer detect a batch that does not join its
+            position before applying any of it. The ceiling is the signed
+            64-bit maximum every revision eventually rests in: both planes
+            store revisions in `bigint` columns, and the grammar refuses a
+            larger value rather than letting it fail as a storage error.
+        resource_kind:
+          type: string
+          enum:
+            - api_key
+            - account
+          description: >-
+            Which projection table the entry belongs to. The set is closed:
+            a resource the runtime does not mirror must not be smuggled in as
+            a tolerated unknown — a new kind is a new protocol version.
+        resource_id:
+          type: string
+          format: uuid
+          description: >-
+            The projected row's identity: the key id for `api_key`, the
+            account id for `account`.
+        recorded_at:
+          type: string
+          format: date-time
+          description: >-
+            When the Control Plane recorded the change. Informational — it
+            orders nothing, deduplicates nothing, and is never compared
+            against any clock at the consumer.
+        payload:
+          type: object
+          additionalProperties: true
+          description: >-
+            The full state of the projected row at `revision` — never a delta.
+            For `api_key` it carries `account_id`, `digest`, `state` and
+            `revoked_at`; for `account` it carries `state`. The envelope is
+            contracted here and the fields' grammar is enforced fail-closed by
+            both ends' own protocol rules; unknown fields inside the payload
+            are tolerated and ignored, which is the one direction this
+            protocol may evolve without a version bump.
+      additionalProperties: false
+    ProjectionChangesBatch:
+      type: object
+      required:
+        - protocol_version
+        - epoch
+        - from_revision
+        - changes
+      properties:
+        protocol_version:
+          $ref: "#/components/schemas/ProjectionProtocolVersion"
+        epoch:
+          $ref: "#/components/schemas/ProjectionEpoch"
+        from_revision:
+          type: integer
+          minimum: 0
+          maximum: 9223372036854775807
+          description: >-
+            The position the producer believed the consumer held when it read
+            the feed — the revision strictly after which `changes` begins.
+            The consumer judges the batch by its own stored position, not by
+            this field; the field is here so a refusal can name what the
+            producer thought it was doing. The ceiling is the signed 64-bit
+            maximum, for the same `bigint`-storage reason as every other
+            revision here.
+        changes:
+          type: array
+          maxItems: 200
+          items:
+            $ref: "#/components/schemas/ProjectionChange"
+          description: >-
+            The batch: contiguous revisions, strictly ascending, starting at
+            or before the consumer's next expected revision. Whole or nothing:
+            a batch that cannot join the position is refused in full, because
+            applying the entries that happen to fit would strand the rest
+            behind a position that has moved past them.
+      additionalProperties: false
+    ProjectionAppliedAck:
+      type: object
+      required:
+        - protocol_version
+        - applied_revision
+      properties:
+        protocol_version:
+          $ref: "#/components/schemas/ProjectionProtocolVersion"
+        applied_revision:
+          type: integer
+          minimum: 0
+          maximum: 9223372036854775807
+          description: >-
+            The consumer's position after the operation: the snapshot boundary
+            for a snapshot, the last revision of an applied batch, or the
+            unchanged position for a duplicate delivered after a lost
+            acknowledgement. There is no separate acknowledgement call — this
+            answer is the acknowledgement, and a producer that never receives
+            it simply delivers again. The ceiling is the signed 64-bit
+            maximum, for the same `bigint`-storage reason as every other
+            revision here.
+      additionalProperties: false

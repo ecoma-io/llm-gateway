@@ -72,7 +72,7 @@ func newStubCatalog(versions *stubVersions) *application.Catalog {
 // feed.
 func serveCatalog(t *testing.T, versions *stubVersions, request *stdhttp.Request) *httptest.ResponseRecorder {
 	t.Helper()
-	handler := New(application.New("v0.1.0", &stubFacts{}, newStubCatalog(versions)), serviceCredential)
+	handler := New(application.New("v0.1.0", &stubFacts{}, newStubCatalog(versions), &stubProjection{}), serviceCredential)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, request)
 	return rec

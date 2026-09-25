@@ -80,12 +80,13 @@ func rules(self string) []rule {
 			forbidden: []string{"github.com/valkey-io/valkey-go"},
 		},
 		// Both adapter trees, and the symmetry is the point: whether HTTP is
-		// arriving (an inbound surface) or leaving (the usage-fact call to the
-		// Data Plane's internal surface), it is the boundary that speaks it and
-		// the boundary is where the standard library belongs. What the rule
-		// keeps out has not changed — an application that speaks HTTP is an
-		// application whose use-cases cannot be called any other way, and whose
-		// port is only reachable over a socket.
+		// arriving (an inbound surface) or leaving (the calls to the Data
+		// Plane's internal surface — the usage-fact read and the projection
+		// protocol alike), it is the boundary that speaks it and the boundary is
+		// where the standard library belongs. What the rule keeps out has not
+		// changed — an application that speaks HTTP is an application whose
+		// use-cases cannot be called any other way, and whose port is only
+		// reachable over a socket.
 		{
 			why:       "HTTP is a transport concern: the composition root and adapters on either side of the application may import it, and the application itself may not — an application that speaks HTTP is an application whose use-cases cannot be called any other way",
 			allowed:   []string{"cmd", "internal/adapters/inbound", "internal/adapters/outbound"},

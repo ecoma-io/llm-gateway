@@ -25,9 +25,13 @@ import (
 // memory-hard function's cost on the runtime hot path. A preimage-resistant
 // digest of a high-entropy secret is the standard machinery, and ADR 0006 §9
 // already pins exactly this shape for the management-plane service
-// credentials. Why the digest lives outside this database: ADR 0006 §8 — the
-// Control Plane keeps the ownership record; the Data Plane's credential
-// record keeps the digest, unreachable from here.
+// credentials. Why the digest lives off the ownership record: ADR 0006 §8, as
+// amended by ADR 0007 — the Control Plane keeps the ownership record
+// digest-free, and the digest exists on this side of the split only inside the
+// credential projection's own tables (the change log and its mirror, ADR 0007
+// §1–2), through which it transits to the Data Plane's credential record. The
+// ownership aggregate does not carry it, and nothing that reads one reaches
+// it.
 
 const (
 	// TokenBrand is the fixed first segment of every token this gateway
@@ -115,8 +119,8 @@ func (s Secret) MarshalText() ([]byte, error) {
 // Digest is a SHA-256 output: fixed-width, byte-comparable, and not itself
 // secret material — knowing it does not let anyone present the key, which is
 // exactly why it may be stored in a credential record while the secret may
-// not. Hex is provided for the places a digest must be rendered (the future
-// credential projection delivers it in this form).
+// not. Hex is provided for the places a digest must be rendered (the
+// credential projection delivers and stores it in this form — ADR 0007).
 type Digest [sha256.Size]byte
 
 // Hex renders the digest lowercase-hex, the canonical text form for storage

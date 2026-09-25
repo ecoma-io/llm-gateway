@@ -6,10 +6,13 @@
 // service-caller check and wire errors — then calls the application for
 // use-case work. Health and readiness remain infrastructure-level; GET /version
 // proves the HTTP → application → response path every domain endpoint follows;
-// and GET /internal/usage-events is the first operation that answers from the
-// Data Plane rather than from this process, reached through the outbound port
-// rather than read here. The public contract is api/openapi/dataplane.yaml; it
-// changes before this package does, never after.
+// GET /internal/usage-events is the operation that answers from the Data Plane
+// rather than from this process; and the three projection operations are the
+// façade's half of the private control-to-data protocol, where the message is
+// the caller's bytes and the judgement happens at the mirror. Everything is
+// reached through the outbound ports rather than read here. The public contract
+// is api/openapi/dataplane.yaml; it changes before this package does, never
+// after.
 //
 // Nothing here decides a business rule. A handler translates a request into a
 // call, and the application's answer or typed error back into a response; the
@@ -207,6 +210,32 @@ func errorResponse(err error) (status int, code string, message string) {
 		// alternative — a 500 — would blame this process for a failure that is
 		// not its own, and would tell the caller to look in the wrong place.
 		return stdhttp.StatusBadGateway, string(application.CodeUpstreamUnavailable), applicationError.Message
+	case application.CodeUnsupportedVersion:
+		// 400: the delivery is the caller's request, and a version this
+		// process's Data Plane does not speak is a property of the message the
+		// caller sent. A caller that retries unchanged gets the same answer,
+		// which is the point — the delivery halts until both ends are upgraded,
+		// and nothing about the status suggests skipping it.
+		return stdhttp.StatusBadRequest, string(application.CodeUnsupportedVersion), applicationError.Message
+	case application.CodeInvalidRequest:
+		// 400 under the contract's shared "invalid_request" shape: the message
+		// did not satisfy the protocol's grammar, as the Data Plane judged it.
+		// The judgement belongs to the mirror; the message here is the
+		// application's fixed text, carrying no word of the listener's refusal.
+		return stdhttp.StatusBadRequest, string(application.CodeInvalidRequest), applicationError.Message
+	case application.CodeRevisionGap:
+		// 409: two timelines disagree about what happens next, and no retry of
+		// the same delivery can repair that. It is not a 400 — the message was
+		// grammatical — and not a 500 — nothing here is broken; it is the
+		// conflict status for a gap a human decides about.
+		return stdhttp.StatusConflict, string(application.CodeRevisionGap), applicationError.Message
+	case application.CodeSnapshotRequired:
+		// 409 as well, and deliberately the same status as the gap: both are
+		// conflicts between the producer's timeline and the mirror's position.
+		// The codes differ — snapshot_required is the one the producer resolves
+		// by itself on its next cycle, revision_gap is the one that halts for a
+		// human — and the code is what a producer acts on, never the status.
+		return stdhttp.StatusConflict, string(application.CodeSnapshotRequired), applicationError.Message
 	default:
 		return stdhttp.StatusInternalServerError, string(application.CodeInternal), internalErrorMessage
 	}

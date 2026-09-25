@@ -11,8 +11,9 @@ import (
 // The authentication decision belongs to the route rather than to the listener,
 // because the contract makes it per operation: the probes declare `security: []`
 // — an orchestrator asking whether this process is alive should not have to hold
-// a deployment secret to be told "ok" — while the fact feed declares the service
-// credential. A listener-wide guard would contradict the document in one
+// a deployment secret to be told "ok" — while every cross-plane operation (the
+// fact feed and the projection operations) declares the service credential.
+// A listener-wide guard would contradict the document in one
 // direction or the other, and the document is the source.
 type route struct {
 	method        string
@@ -62,15 +63,17 @@ func routes(app *application.App) []route {
 			},
 		},
 		// The fact feed: the first cross-plane operation, and the first one on
-		// this surface that a caller authenticates for. The
-		// path string is the one the façade contracts, and it is the same
-		// string here on purpose rather than by coincidence — the façade names
-		// the path itself rather than rewriting one it was given, so there is
-		// no translation step for the two ends to disagree about. What the
-		// façade does rewrite is the answer: it builds its own envelope and its
-		// own statuses from what this listener said. The protocol itself,
-		// and the reason it is a page in a document rather than a fourth
-		// OpenAPI file, are in docs/architecture/cross-plane-protocols.md.
+		// this surface that a caller authenticates for. It is the cross-plane
+		// read this plane serves — the Control Plane reconciling what the
+		// runtime recorded. The path string is the one the façade contracts,
+		// and it is the same string here on purpose rather than by coincidence
+		// — the façade names the path itself rather than rewriting one it was
+		// given, so there is no translation step for the two ends to disagree
+		// about. What the façade does rewrite is the answer: it builds its own
+		// envelope and its own statuses from what this listener said. The
+		// protocol itself, and the reason it is a page in a document rather
+		// than a fourth OpenAPI file, are in
+		// docs/architecture/cross-plane-protocols.md.
 		{
 			method:        stdhttp.MethodGet,
 			path:          "/internal/usage-events",
@@ -98,6 +101,30 @@ func routes(app *application.App) []route {
 			method:        stdhttp.MethodGet,
 			path:          groupVersionPath,
 			handler:       currentGroupVersion(app),
+			authenticated: true,
+		},
+		// The projection operations: the other direction of the same private
+		// channel — the Control Plane delivering the identity decisions this
+		// plane's request path verifies against (ADR 0007). Read the position,
+		// apply a snapshot, apply a batch: the whole of the delivery loop's
+		// side of the protocol, authenticated like the fact feed because the
+		// credential mirror is exactly the data an attacker wants to write.
+		{
+			method:        stdhttp.MethodGet,
+			path:          "/internal/projection/position",
+			handler:       projectionPosition(app),
+			authenticated: true,
+		},
+		{
+			method:        stdhttp.MethodPost,
+			path:          "/internal/projection/snapshot",
+			handler:       projectionSnapshot(app),
+			authenticated: true,
+		},
+		{
+			method:        stdhttp.MethodPost,
+			path:          "/internal/projection/changes",
+			handler:       projectionChanges(app),
 			authenticated: true,
 		},
 	}

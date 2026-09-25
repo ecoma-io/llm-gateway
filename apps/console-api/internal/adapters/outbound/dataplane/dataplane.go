@@ -1,8 +1,9 @@
 // Package dataplane is the console-api's outbound HTTP adapter for the
-// cross-plane seam's spoken operations (ADR 0006 §5), over the management
-// contract in api/openapi/dataplane.yaml: the usage fact feed's pages (Data →
-// Control) and the alias-group version read the commerce roll resolves its
-// scopes with (Control → Data).
+// cross-plane seam's spoken operations (ADR 0006 §5, ADR 0007), over the
+// management contract in api/openapi/dataplane.yaml: the usage fact feed's
+// pages (Data → Control), the alias-group version read the commerce roll
+// resolves its scopes with (Control → Data), and the projection protocol's
+// position read and deliveries (Control → Data).
 //
 // It is the mirror of this module's other outbound adapters in everything but
 // its dependency: postgres and valkey reach infrastructure this deployment
@@ -88,7 +89,9 @@ const (
 // as a page every other hop accepts and this one rejects.
 const usageCursorMaxLength = 512
 
-// Client reads pages of usage facts from a Data Plane's management surface.
+// Client is this application's transport to a Data Plane's management
+// surface: it reads pages of usage facts and delivers projection messages
+// (ADR 0006 §5, ADR 0007), one package for both directions of the seam.
 type Client struct {
 	// httpClient is injected rather than built here, so timeouts, transport,
 	// redirect policy and connection pooling are the composition root's
@@ -97,12 +100,13 @@ type Client struct {
 	// adapter should hold an opinion about.
 	httpClient *http.Client
 
-	// endpoint is the feed's URL, parsed once at construction: the base URL is
-	// configuration and its shape is fixed for the life of the client, so the
-	// only thing a call appends is the query. Keeping a *url.URL rather than a
-	// string is what makes building a request a copy-and-set instead of string
-	// concatenation, and string concatenation here would be how a cursor with
-	// an `&` in it rewrites the request's parameters.
+	// endpoint is the management surface's base URL, parsed once at
+	// construction: the base URL is configuration and its shape is fixed for
+	// the life of the client, so the only thing a call appends is its own
+	// operation's path and, for the feed, the query. Keeping a *url.URL
+	// rather than a string is what makes building a request a copy-and-set
+	// instead of string concatenation, and string concatenation here would be
+	// how a cursor with an `&` in it rewrites the request's parameters.
 	endpoint url.URL
 
 	// credential is the service credential the management surface authenticates
@@ -147,6 +151,7 @@ func New(httpClient *http.Client, baseURL, credential string) *Client {
 		panic("dataplane: New requires a service credential")
 	}
 
+	base.Path = strings.TrimSuffix(base.Path, "/")
 	return &Client{httpClient: httpClient, endpoint: *base, credential: credential}
 }
 
@@ -159,8 +164,10 @@ var (
 )
 
 // url returns the client's endpoint with path appended — one operation path
-// per call, because the client now speaks two of the contract's operations
-// and a base URL pre-joined to one of them would be wrong for the other.
+// per call, because the client speaks two of the contract's read operations
+// and a base URL pre-joined to one of them would be wrong for the other. The
+// projection deliveries in projection.go join their own paths the same way,
+// onto the trailing slash New trims off the base.
 func (c *Client) url(path string) url.URL {
 	joined := c.endpoint
 	joined.Path = strings.TrimSuffix(joined.Path, "/") + path

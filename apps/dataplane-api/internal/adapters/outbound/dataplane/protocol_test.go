@@ -82,6 +82,58 @@ func TestTheRequestIsThePrivateProtocols(t *testing.T) {
 	}
 }
 
+// TestTheProjectionRequestsAreThePrivateProtocols is the projection half of
+// the pin above: the three operations this adapter calls — the position read
+// and the two deliveries — are the three the façade's contract declares, and
+// they are driven once each so the paths are read back off the wire rather
+// than asserted as constants alone.
+//
+// The counterpart is apps/dataplane/internal/adapters/inbound/management/
+// protocol_test.go, which pins the same paths against the same document from
+// the listener's side; neither module can see the other's constants, so each
+// names the strings and each fails when its own side moves.
+func TestTheProjectionRequestsAreThePrivateProtocols(t *testing.T) {
+	for _, path := range []string{
+		"/internal/projection/position",
+		"/internal/projection/snapshot",
+		"/internal/projection/changes",
+	} {
+		if !slices.Contains(contractPaths(t), path) {
+			t.Fatalf("%s declares no %s operation; the façade's contract and this adapter have drifted apart", contractPath, path)
+		}
+	}
+
+	// The fake answers every operation with one body that is a valid position
+	// *and* a valid acknowledgement — the ack's decoder ignores the two extra
+	// fields, which is the additive tolerance itself.
+	up := &upstream{body: settledPositionBody}
+	client := up.server(t)
+
+	if _, err := client.ProjectionPosition(context.Background()); err != nil {
+		t.Fatalf("ProjectionPosition() error = %v", err)
+	}
+	if _, err := client.ApplyProjectionSnapshot(context.Background(), []byte(`{}`)); err != nil {
+		t.Fatalf("ApplyProjectionSnapshot() error = %v", err)
+	}
+	if _, err := client.ApplyProjectionChanges(context.Background(), []byte(`{}`)); err != nil {
+		t.Fatalf("ApplyProjectionChanges() error = %v", err)
+	}
+
+	got := []string{}
+	for _, call := range up.recorded() {
+		got = append(got, call.method+" "+call.path)
+	}
+	slices.Sort(got)
+	want := []string{
+		"GET /internal/projection/position",
+		"POST /internal/projection/changes",
+		"POST /internal/projection/snapshot",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("the adapter called %v, want %v", got, want)
+	}
+}
+
 // TestTheTranslationNeverRelaysTheListenersBody is the "translate, do not
 // relay" rule asserted on the one thing that could break it: the error text.
 //

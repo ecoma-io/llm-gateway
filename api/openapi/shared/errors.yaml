@@ -15,7 +15,12 @@
 # exists in the contract before it can be returned, and the list is short on
 # purpose: every member below is produced by a response this document declares,
 # and a code that appeared only in the document where it is returned would be a
-# code the other surface's client could not name.
+# code the other surface's client could not name. Some members are produced by
+# only one surface today — `cursor_expired` and `upstream_unavailable` by the
+# Data Plane management API, and the three projection codes
+# (`unsupported_version`, `revision_gap`, `snapshot_required`) by the same
+# document's projection operations — and they are named here rather than in
+# that document alone so a Control Plane caller has one vocabulary for both.
 components:
   responses:
     MethodNotAllowed:
@@ -51,7 +56,11 @@ components:
         The request is well-formed HTTP but a parameter does not satisfy this
         surface's contract — an unparseable value, a value outside its declared
         bounds, or an unknown parameter the caller cannot be allowed to believe
-        took effect.
+        took effect. On the projection operations this response also carries
+        `unsupported_version`: the message was written for a protocol version
+        this surface does not support, so its meaning cannot be vouched for and
+        nothing about it is applied — the sender succeeds unchanged once both
+        ends speak the same version.
       headers:
         X-Request-Id:
           $ref: "./probes.yaml#/components/headers/RequestId"
@@ -78,6 +87,27 @@ components:
         the range it names can no longer be replayed. The request fails rather
         than resuming from a newer position: silently skipping facts a consumer
         has not read would turn a retention decision into lost settlement.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    ProjectionConflict:
+      description: >-
+        The delivered batch cannot join the position this consumer holds, and
+        nothing about it was applied. `revision_gap` names a batch that
+        straddles the position or starts past the revision the consumer expects
+        next — applying it would strand entries behind a moved position or
+        silently skip history, so the batch is refused whole and the producer
+        re-reads the position to deliver what actually joins it.
+        `snapshot_required` names a timeline that cannot be continued: the
+        consumer has never bootstrapped, or the entries name a producer
+        timeline other than the one its position was earned on, and the
+        producer's answer is a snapshot rather than a retry — replaying
+        entries against a dead timeline is the failure this response exists
+        to prevent.
       headers:
         X-Request-Id:
           $ref: "./probes.yaml#/components/headers/RequestId"
@@ -137,14 +167,19 @@ components:
             - invalid_request
             - unauthenticated
             - cursor_expired
+            - unsupported_version
+            - revision_gap
+            - snapshot_required
             - upstream_unavailable
             - internal
           description: >-
             A stable machine-readable category for the failure, shared by both
             surfaces that return this envelope. `cursor_expired` and
             `upstream_unavailable` are produced by the Data Plane management
-            API today; they are named here rather than in that document alone
-            so a Control Plane caller has one vocabulary for both.
+            API today, as are the three projection codes
+            (`unsupported_version`, `revision_gap`, `snapshot_required`); they
+            are named here rather than in that document alone so a Control
+            Plane caller has one vocabulary for both.
         message:
           type: string
           description: >-

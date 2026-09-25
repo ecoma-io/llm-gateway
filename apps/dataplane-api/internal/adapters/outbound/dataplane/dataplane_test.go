@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	stdhttp "net/http"
 	"net/http/httptest"
 	"slices"
@@ -40,11 +41,16 @@ const settledPageBody = `{"events":[{"request_id":"req_01HZ","kind":"settled","s
 // adapter escapes before sending, and `*` arriving as `%2A` and `team/model`
 // arriving as `team%2Fmodel` is precisely the fact the wire-level test wants —
 // the decoded path cannot tell those two spellings apart from any other.
+//
+// The body is kept as the exact bytes the listener read, because the projection
+// deliveries' whole claim is that the producer's message crosses untouched.
 type recordedCall struct {
+	method        string
 	authorization string
 	path          string
 	rawPath       string
 	rawQuery      string
+	body          string
 	after         []string
 	limit         []string
 }
@@ -65,12 +71,15 @@ func (u *upstream) record(r *stdhttp.Request) recordedCall {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
+	body, _ := io.ReadAll(r.Body)
 	query := r.URL.Query()
 	call := recordedCall{
+		method:        r.Method,
 		authorization: r.Header.Get("Authorization"),
 		path:          r.URL.Path,
 		rawPath:       r.URL.EscapedPath(),
 		rawQuery:      r.URL.RawQuery,
+		body:          string(body),
 		after:         query["after"],
 		limit:         query["limit"],
 	}

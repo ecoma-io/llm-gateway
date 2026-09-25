@@ -1,7 +1,6 @@
 // Package dataplane is the console-api's outbound port to the Data Plane's
 // management surface: the one seam between the two planes, the only place the
-// Control Plane asks the Data Plane to change something the Data Plane owns,
-// and the only place it reads back what the Data Plane already recorded.
+// Control Plane and the Data Plane change anything about each other.
 //
 // It is a port in this module rather than a shared package on purpose. The two
 // planes are separate Go modules (ADR 0006 §1), so there is no import path
@@ -12,11 +11,13 @@
 // the day it changes, this package does not.
 //
 // The directions are not symmetric, and the asymmetry is the architecture:
-// configuration and credential decisions flow Control → Data (Management),
-// while facts flow Data → Control (UsageFacts), which the Control Plane
-// reconciles from at its own pace. Credit, quota and subscription state travel
-// as grants, not as shared tables, because neither plane may read the other's
-// database (ADR 0006 §5, §7).
+// credential decisions flow Control → Data (Projection, ADR 0007) — pushed,
+// because the authority over who may call the gateway is this plane's and the
+// database the request path reads is the other's — while facts flow Data →
+// Control (UsageFacts), which the Control Plane reconciles from at its own
+// pace. Credit, quota and subscription state travel as grants, not as shared
+// tables, because neither plane may read the other's database (ADR 0006 §5,
+// §7).
 //
 // Exactly two operations were enumerated here when the seam was drawn, because
 // they were the two the architecture already fixed end to end: a credential
@@ -24,21 +25,27 @@
 // within a bounded staleness window rather than the moment the withdrawal
 // commits (ADR 0006 §8); and the usage facts the runtime recorded must be
 // readable by the Control Plane, idempotently and with replay, so that
-// settlement survives either side crashing (ADR 0006 §5). The commerce roll
-// is the third caller the seam has been waiting for, and it arrives with the
-// one read its transaction needs: which alias-group version is current for a
-// group name, answered by the Data Plane that owns the catalog (ADR 0006 §5),
-// so an entitlement can pin a scope by id without this plane ever reading the
+// settlement survives either side crashing (ADR 0006 §5). The revocation
+// story's spelling is the projection (ADR 0007, declared beside this file in
+// projection.go): a withdrawn credential reaches the runtime as a projected
+// state change on a durable, ordered, replayable feed — pushed by this plane,
+// not asked — rather than as a notification call whose failure would leave a
+// revoked key authenticating indefinitely. The commerce roll is the third
+// caller the seam has been waiting for, and it arrives with the one read its
+// transaction needs: which alias-group version is current for a group name,
+// answered by the Data Plane that owns the catalog (ADR 0006 §5), so an
+// entitlement can pin a scope by id without this plane ever reading the
 // catalog's tables. The other operations a management surface will eventually
 // need — a grant, a capacity publication, a cache invalidation — are still not
 // declared as guesses: each arrives with the use case that has to make it,
 // and a port method with no caller is a shape invented twice.
 //
-// The fact half is implemented, and the seam's wire half is served by the
-// adapter beside it in internal/adapters/outbound/dataplane, which claims
-// UsageFacts and CatalogReader. Management as a whole still has no full
-// implementation: WithdrawCredential remains a declared callerless method —
-// the credential projection that needs it is a later phase's designed change
+// The fact half and the projection are implemented, and the seam's wire half
+// is served by the adapter beside it in internal/adapters/outbound/dataplane,
+// which claims UsageFacts, CatalogReader and Projection. Management as a whole
+// still has no full implementation: WithdrawCredential remains a declared
+// callerless method — the projection carries the revocation over its own
+// contract instead, and the notification's one caller has not arrived
 // (ADR 0006 §8) — while CurrentGroupVersion is spoken over the management
 // contract in api/openapi/dataplane.yaml by the commerce roll, which takes the
 // narrow CatalogReader rather than the whole interface it does not use. The
@@ -126,9 +133,10 @@ var ErrMalformedAnswer = errors.New("the data plane answered with a malformed gr
 // CatalogReader is the read this seam carries from the Data Plane's catalog:
 // the group-version lookup the commerce roll resolves its entitlement scopes
 // with. It stands beside Management rather than inside it on purpose —
-// Management's one method is still waiting for the credential projection that
-// will call it, and a use case that needs only the read should not have to
-// name the withdrawal it never makes.
+// WithdrawCredential is still waiting for the use case that will call it (the
+// projection that carries the revocation arrived with its own protocol beside
+// this file instead), and a use case that needs only the read should not have
+// to name the withdrawal it never makes.
 type CatalogReader interface {
 	// CurrentGroupVersion is documented on Management, where the seam's
 	// operations are enumerated; the interface exists so the composition
@@ -211,8 +219,8 @@ var ErrCursorExpired = errors.New("usage fact cursor is no longer replayable")
 // most a consumer may ask without taking over that answer.
 var ErrMalformedPage = errors.New("the data plane answered with a malformed usage fact page")
 
-// UsageFacts is the fact half of the cross-plane seam, beside Management's
-// configuration half. One package, both directions.
+// UsageFacts is the fact half of the cross-plane seam, beside Projection's
+// decision half. One package, both directions.
 //
 // The feed is a pull with replay, chosen in ADR 0006 §5 and declared in
 // api/openapi/shared/usage-facts.yaml: the Control Plane remembers a position,

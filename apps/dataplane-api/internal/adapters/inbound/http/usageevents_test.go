@@ -99,7 +99,7 @@ func TestTheUsageEventFeedRefusesAnUntrustedCaller(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			usage := &fakeUsageFacts{}
-			handler := New(application.New("test", usage, &fakeCatalog{}), NewServiceAuthenticator(tt.configured))
+			handler := New(application.New("test", usage, &fakeCatalog{}, &fakeProjection{}), NewServiceAuthenticator(tt.configured))
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath, nil)
@@ -159,7 +159,7 @@ func TestTheCursorAndPageSizeTravelUntouched(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			usage := &fakeUsageFacts{page: dataplane.Page{Events: nil, NextCursor: cursor, HasMore: false}}
-			handler := testHandler(application.New("test", usage, &fakeCatalog{}))
+			handler := testHandler(application.New("test", usage, &fakeCatalog{}, &fakeProjection{}))
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath+tt.query, nil)
@@ -229,7 +229,7 @@ func TestADataPlaneFailureMapsToItsContractedResponse(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			usage := &fakeUsageFacts{err: tt.err}
-			handler := testHandler(application.New("test", usage, &fakeCatalog{}))
+			handler := testHandler(application.New("test", usage, &fakeCatalog{}, &fakeProjection{}))
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath, nil)
@@ -276,7 +276,7 @@ func TestAMalformedPageSizeIsRefusedBeforeTheFeedIsTouched(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			usage := &fakeUsageFacts{}
-			handler := testHandler(application.New("test", usage, &fakeCatalog{}))
+			handler := testHandler(application.New("test", usage, &fakeCatalog{}, &fakeProjection{}))
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath+tt.query, nil)
@@ -306,7 +306,7 @@ func TestAMalformedPageSizeIsRefusedBeforeTheFeedIsTouched(t *testing.T) {
 // a question the caller did not ask and hide the broken consumer that sent it.
 func TestAnEmptyCursorIsRefusedRatherThanReadAsTheBeginning(t *testing.T) {
 	usage := &fakeUsageFacts{}
-	handler := testHandler(application.New("test", usage, &fakeCatalog{}))
+	handler := testHandler(application.New("test", usage, &fakeCatalog{}, &fakeProjection{}))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath+"?after=", nil)
@@ -326,7 +326,7 @@ func TestAnEmptyCursorIsRefusedRatherThanReadAsTheBeginning(t *testing.T) {
 	// The same header without the parameter is a different request and is
 	// served: absence is how a caller asks for the beginning.
 	usage = &fakeUsageFacts{}
-	handler = testHandler(application.New("test", usage, &fakeCatalog{}))
+	handler = testHandler(application.New("test", usage, &fakeCatalog{}, &fakeProjection{}))
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(stdhttp.MethodGet, usageEventsPath, nil)
 	req.Header.Set("Authorization", "Bearer "+testCredential)
@@ -365,7 +365,7 @@ func TestAParameterThisOperationDoesNotDeclareIsRefused(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			usage := &fakeUsageFacts{}
-			handler := testHandler(application.New("test", usage, &fakeCatalog{}))
+			handler := testHandler(application.New("test", usage, &fakeCatalog{}, &fakeProjection{}))
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath+tt.query, nil)
@@ -421,7 +421,7 @@ func TestTheCursorLengthBoundIsTheContracts(t *testing.T) {
 
 	t.Run("a cursor of the declared maximum length in characters but more in bytes crosses untouched", func(t *testing.T) {
 		usage := &fakeUsageFacts{page: dataplane.Page{NextCursor: cursor}}
-		handler := testHandler(application.New("test", usage, &fakeCatalog{}))
+		handler := testHandler(application.New("test", usage, &fakeCatalog{}, &fakeProjection{}))
 
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath+"?after="+url.QueryEscape(multiByteAtLimit), nil)
@@ -446,7 +446,7 @@ func TestTheCursorLengthBoundIsTheContracts(t *testing.T) {
 
 	t.Run("a cursor past the declared maximum length in characters is refused", func(t *testing.T) {
 		usage := &fakeUsageFacts{}
-		handler := testHandler(application.New("test", usage, &fakeCatalog{}))
+		handler := testHandler(application.New("test", usage, &fakeCatalog{}, &fakeProjection{}))
 
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath+"?after="+url.QueryEscape(multiByteOverLimit), nil)
@@ -463,7 +463,7 @@ func TestTheCursorLengthBoundIsTheContracts(t *testing.T) {
 
 	t.Run("a cursor of the declared maximum length crosses untouched", func(t *testing.T) {
 		usage := &fakeUsageFacts{page: dataplane.Page{NextCursor: cursor}}
-		handler := testHandler(application.New("test", usage, &fakeCatalog{}))
+		handler := testHandler(application.New("test", usage, &fakeCatalog{}, &fakeProjection{}))
 
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath+"?after="+url.QueryEscape(atLimit), nil)
@@ -480,7 +480,7 @@ func TestTheCursorLengthBoundIsTheContracts(t *testing.T) {
 
 	t.Run("a cursor past the declared maximum length is refused before the feed is touched", func(t *testing.T) {
 		usage := &fakeUsageFacts{}
-		handler := testHandler(application.New("test", usage, &fakeCatalog{}))
+		handler := testHandler(application.New("test", usage, &fakeCatalog{}, &fakeProjection{}))
 
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath+"?after="+url.QueryEscape(overLimit), nil)
@@ -513,7 +513,7 @@ func TestTheCursorLengthBoundIsTheContracts(t *testing.T) {
 // caller can present to one hop can be presented to the other.
 func TestExtraWhitespaceBetweenSchemeAndCredentialIsAccepted(t *testing.T) {
 	usage := &fakeUsageFacts{}
-	handler := testHandler(application.New("test", usage, &fakeCatalog{}))
+	handler := testHandler(application.New("test", usage, &fakeCatalog{}, &fakeProjection{}))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath, nil)
@@ -559,7 +559,7 @@ func TestTheCredentialIsCheckedBeforeTheMethod(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			usage := &fakeUsageFacts{}
-			handler := testHandler(application.New("test", usage, &fakeCatalog{}))
+			handler := testHandler(application.New("test", usage, &fakeCatalog{}, &fakeProjection{}))
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(stdhttp.MethodPost, usageEventsPath, nil)
@@ -600,7 +600,7 @@ func TestAServedPageIsExactlyWhatTheDataPlaneAnswered(t *testing.T) {
 		NextCursor: cursor,
 		HasMore:    true,
 	}}
-	handler := testHandler(application.New("test", usage, &fakeCatalog{}))
+	handler := testHandler(application.New("test", usage, &fakeCatalog{}, &fakeProjection{}))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(stdhttp.MethodGet, usageEventsPath, nil)

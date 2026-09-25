@@ -22,6 +22,7 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 	}{
 		{
 			name: "uses explicit defaults when no variables are set",
+			env:  requiredDataPlaneEnv(),
 			want: Config{
 				Addr:              DefaultAddr,
 				ShutdownTimeout:   DefaultShutdownTimeout,
@@ -33,15 +34,21 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					ConnMaxLifetime: DefaultPostgresConnMaxLifetime,
 					ConnMaxIdleTime: DefaultPostgresConnMaxIdleTime,
 				},
+				DataPlane: DataPlane{
+					URL:                testDataplaneURL,
+					Credential:         testDataplaneCredential,
+					ProjectionInterval: DefaultProjectionInterval,
+					ProjectionTimeout:  DefaultProjectionTimeout,
+				},
 			},
 		},
 		{
 			name: "uses supplied environment values",
-			env: map[string]string{
+			env: merge(requiredDataPlaneEnv(), map[string]string{
 				"CONSOLE_API_ADDR":                "127.0.0.1:9090",
 				"CONSOLE_API_SHUTDOWN_TIMEOUT":    "15s",
 				"CONSOLE_API_READ_HEADER_TIMEOUT": "3s",
-			},
+			}),
 			want: Config{
 				Addr:              "127.0.0.1:9090",
 				ShutdownTimeout:   15 * time.Second,
@@ -53,17 +60,23 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					ConnMaxLifetime: DefaultPostgresConnMaxLifetime,
 					ConnMaxIdleTime: DefaultPostgresConnMaxIdleTime,
 				},
+				DataPlane: DataPlane{
+					URL:                testDataplaneURL,
+					Credential:         testDataplaneCredential,
+					ProjectionInterval: DefaultProjectionInterval,
+					ProjectionTimeout:  DefaultProjectionTimeout,
+				},
 			},
 		},
 		{
 			name: "uses supplied postgres values",
-			env: map[string]string{
+			env: merge(requiredDataPlaneEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_DSN":                "postgres://gateway:console-secret@db.internal:5433/control?sslmode=require",
 				"CONSOLE_API_POSTGRES_MAX_OPEN_CONNS":     "25",
 				"CONSOLE_API_POSTGRES_MAX_IDLE_CONNS":     "5",
 				"CONSOLE_API_POSTGRES_CONN_MAX_LIFETIME":  "45m",
 				"CONSOLE_API_POSTGRES_CONN_MAX_IDLE_TIME": "90s",
-			},
+			}),
 			want: Config{
 				Addr:              DefaultAddr,
 				ShutdownTimeout:   DefaultShutdownTimeout,
@@ -75,27 +88,116 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					ConnMaxLifetime: 45 * time.Minute,
 					ConnMaxIdleTime: 90 * time.Second,
 				},
+				DataPlane: DataPlane{
+					URL:                testDataplaneURL,
+					Credential:         testDataplaneCredential,
+					ProjectionInterval: DefaultProjectionInterval,
+					ProjectionTimeout:  DefaultProjectionTimeout,
+				},
 			},
 		},
 		{
-			name: "rejects an explicitly empty address",
-			env: map[string]string{
-				"CONSOLE_API_ADDR": "",
+			name: "uses supplied data plane values",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_DATAPLANE_URL":        "https://mgmt.internal.example/gateway",
+				"CONSOLE_API_DATAPLANE_CREDENTIAL": "production-management-credential",
+				"CONSOLE_API_PROJECTION_INTERVAL":  "500ms",
+				"CONSOLE_API_PROJECTION_TIMEOUT":   "1m",
+			}),
+			want: Config{
+				Addr:              DefaultAddr,
+				ShutdownTimeout:   DefaultShutdownTimeout,
+				ReadHeaderTimeout: DefaultReadHeaderTimeout,
+				Postgres: Postgres{
+					DSN:             DefaultPostgresDSN,
+					MaxOpenConns:    DefaultPostgresMaxOpenConns,
+					MaxIdleConns:    DefaultPostgresMaxIdleConns,
+					ConnMaxLifetime: DefaultPostgresConnMaxLifetime,
+					ConnMaxIdleTime: DefaultPostgresConnMaxIdleTime,
+				},
+				DataPlane: DataPlane{
+					URL:                "https://mgmt.internal.example/gateway",
+					Credential:         "production-management-credential",
+					ProjectionInterval: 500 * time.Millisecond,
+					ProjectionTimeout:  time.Minute,
+				},
 			},
+		},
+		{
+			name:    "rejects a missing data plane URL",
+			env:     map[string]string{"CONSOLE_API_DATAPLANE_CREDENTIAL": testDataplaneCredential},
+			wantErr: "CONSOLE_API_DATAPLANE_URL must be set",
+		},
+		{
+			name:    "rejects a missing data plane credential",
+			env:     map[string]string{"CONSOLE_API_DATAPLANE_URL": testDataplaneURL},
+			wantErr: "CONSOLE_API_DATAPLANE_CREDENTIAL must be set",
+		},
+		{
+			name: "rejects an explicitly empty data plane credential",
+			env: map[string]string{
+				"CONSOLE_API_DATAPLANE_URL":        testDataplaneURL,
+				"CONSOLE_API_DATAPLANE_CREDENTIAL": "",
+			},
+			wantErr: "CONSOLE_API_DATAPLANE_CREDENTIAL must not be empty",
+		},
+		{
+			name: "rejects a data plane URL of another scheme",
+			env: map[string]string{
+				"CONSOLE_API_DATAPLANE_URL":        "ftp://" + testDataplaneURL,
+				"CONSOLE_API_DATAPLANE_CREDENTIAL": testDataplaneCredential,
+			},
+			wantErr: "CONSOLE_API_DATAPLANE_URL must use the http or https scheme",
+		},
+		{
+			name: "rejects a data plane URL with no host",
+			env: map[string]string{
+				"CONSOLE_API_DATAPLANE_URL":        "http://",
+				"CONSOLE_API_DATAPLANE_CREDENTIAL": testDataplaneCredential,
+			},
+			wantErr: "CONSOLE_API_DATAPLANE_URL must name a host",
+		},
+		{
+			name: "rejects a data plane URL carrying a query",
+			env: map[string]string{
+				"CONSOLE_API_DATAPLANE_URL":        testDataplaneURL + "?route=management",
+				"CONSOLE_API_DATAPLANE_CREDENTIAL": testDataplaneCredential,
+			},
+			wantErr: "CONSOLE_API_DATAPLANE_URL must carry no query or fragment",
+		},
+		{
+			name: "rejects a zero projection interval",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_PROJECTION_INTERVAL": "0s",
+			}),
+			wantErr: "CONSOLE_API_PROJECTION_INTERVAL must be greater than zero",
+		},
+		{
+			name: "rejects a malformed projection timeout",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_PROJECTION_TIMEOUT": "soon",
+			}),
+			wantErr: "CONSOLE_API_PROJECTION_TIMEOUT must be a Go duration",
+		},
+		{
+			name: "rejects an explicitly empty address",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_ADDR": "",
+			}),
 			wantErr: "CONSOLE_API_ADDR must not be empty",
 		},
 		{
 			name: "rejects an address without a TCP port",
-			env: map[string]string{
+			env: merge(requiredDataPlaneEnv(), map[string]string{
 				"CONSOLE_API_ADDR": "127.0.0.1",
-			},
+			}),
 			wantErr: "CONSOLE_API_ADDR must be a host:port address",
 		},
 		{
 			name: "rejects a named TCP port",
-			env: map[string]string{
+			env: merge(requiredDataPlaneEnv(), map[string]string{
 				"CONSOLE_API_ADDR": ":http",
-			},
+			}),
 			wantErr: "CONSOLE_API_ADDR must contain a numeric port",
 		},
 		{
@@ -251,6 +353,59 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				t.Errorf("Load() = %s, want %s", redactDSN(got), redactDSN(tt.want))
 			}
 		})
+	}
+}
+
+// testDataplaneURL and testDataplaneCredential are the data plane settings
+// every success case above needs: the URL and credential are required, so a
+// test that wants Load to succeed always supplies both. The credential is a
+// test value, not the fixture's — the assertion that no Load error carries a
+// secret is about the DSN's password, and this one never appears in an error
+// at all.
+const (
+	testDataplaneURL        = "http://dataplane-api.internal:8082"
+	testDataplaneCredential = "dev-management-credential"
+)
+
+// requiredDataPlaneEnv is the smallest environment Load accepts: the two
+// required data plane values, everything else defaulted.
+func requiredDataPlaneEnv() map[string]string {
+	return map[string]string{
+		"CONSOLE_API_DATAPLANE_URL":        testDataplaneURL,
+		"CONSOLE_API_DATAPLANE_CREDENTIAL": testDataplaneCredential,
+	}
+}
+
+func merge(base, extra map[string]string) map[string]string {
+	merged := make(map[string]string, len(base)+len(extra))
+	for name, value := range base {
+		merged[name] = value
+	}
+	for name, value := range extra {
+		merged[name] = value
+	}
+	return merged
+}
+
+func TestDataPlaneLogValueRedactsTheCredential(t *testing.T) {
+	dataPlane := DataPlane{
+		URL:                testDataplaneURL,
+		Credential:         testDataplaneCredential,
+		ProjectionInterval: DefaultProjectionInterval,
+		ProjectionTimeout:  DefaultProjectionTimeout,
+	}
+
+	value := dataPlane.LogValue().String()
+	if strings.Contains(value, testDataplaneCredential) {
+		t.Errorf("LogValue() = %q, must not carry the management credential", value)
+	}
+	if !strings.Contains(value, "[redacted]") {
+		t.Errorf("LogValue() = %q, want the redaction marker", value)
+	}
+	for _, want := range []string{testDataplaneURL, "projection_interval", "projection_timeout"} {
+		if !strings.Contains(value, want) {
+			t.Errorf("LogValue() = %q, want it to name %s", value, want)
+		}
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/identity"
+	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/projection"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
@@ -43,6 +44,11 @@ func (s *identityStore) WithinTx(ctx context.Context, fn func(context.Context) e
 	s.units++
 	return fn(ctx)
 }
+
+// InUnitOfWork answers true: this double exists to run units of work inline,
+// so the recorder's precondition holds here and the identity use cases keep
+// exercising their real paths.
+func (s *identityStore) InUnitOfWork(context.Context) bool { return true }
 
 // fakeAccounts keeps whole aggregates and moves them as the compare-and-swap
 // port describes. Its two racer knobs model the two ways a swap loses:
@@ -197,13 +203,73 @@ func (f *fakeCredentials) APIKeyCredential(_ context.Context, id identity.APIKey
 	return c, ok, nil
 }
 
+// fakeProjection is the projection change recorder: it keeps every recorded
+// change in arrival order — the order the revisions would carry — and can be
+// told to fail, which is how the tests prove a failed recording rolls the
+// authority write back with it. A successful record also upserts the mirror
+// row on the log fake beside it, because that is one write in the real
+// adapter, and the revoke tests need a mirror that behaves like one.
+type fakeProjection struct {
+	log         *fakeProjectionLog
+	credentials []projection.Credential
+	accounts    []projection.Account
+	fail        bool
+}
+
+func (f *fakeProjection) RecordCredentialChange(_ context.Context, _ time.Time, c projection.Credential) error {
+	if f.fail {
+		return errProjectionRecord
+	}
+	f.credentials = append(f.credentials, c)
+	f.log.rows[c.KeyID] = c
+	return nil
+}
+
+func (f *fakeProjection) RecordAccountChange(_ context.Context, _ time.Time, a projection.Account) error {
+	if f.fail {
+		return errProjectionRecord
+	}
+	f.accounts = append(f.accounts, a)
+	return nil
+}
+
+// fakeProjectionLog is the mirror read the revoke path makes: rows as the
+// mint wrote them, keyed by key id. A key absent from the map is a key the
+// projection foundation never saw — the pre-B4 shape the revoke must treat
+// as "nothing to project".
+type fakeProjectionLog struct {
+	rows map[string]projection.Credential
+}
+
+func (f *fakeProjectionLog) Head(_ context.Context) (projection.Head, error) {
+	return projection.Head{}, errors.New("fake: Head is not part of the identity path")
+}
+
+func (f *fakeProjectionLog) Snapshot(_ context.Context) (projection.Snapshot, error) {
+	return projection.Snapshot{}, errors.New("fake: Snapshot is not part of the identity path")
+}
+
+func (f *fakeProjectionLog) ChangesAfter(_ context.Context, _ uint64, _ int) ([]projection.Change, error) {
+	return nil, errors.New("fake: ChangesAfter is not part of the identity path")
+}
+
+func (f *fakeProjectionLog) Credential(_ context.Context, keyID string) (projection.Credential, error) {
+	c, ok := f.rows[keyID]
+	if !ok {
+		return projection.Credential{}, fmt.Errorf("fake: projection credential %s: %w", keyID, persistence.ErrNotFound)
+	}
+	return c, nil
+}
+
 // identityHarness wires the real use cases to the fakes.
 type identityHarness struct {
-	store    *identityStore
-	accounts *fakeAccounts
-	users    *fakeUsers
-	keys     *fakeKeys
-	identity *Identity
+	store       *identityStore
+	accounts    *fakeAccounts
+	users       *fakeUsers
+	keys        *fakeKeys
+	projection  *fakeProjection
+	projectsLog *fakeProjectionLog
+	identity    *Identity
 }
 
 func newIdentityHarness() *identityHarness {
@@ -211,14 +277,22 @@ func newIdentityHarness() *identityHarness {
 	accounts := &fakeAccounts{rows: make(map[identity.AccountID]identity.Account)}
 	users := &fakeUsers{rows: make(map[identity.UserID]identity.User)}
 	keys := &fakeKeys{rows: make(map[identity.APIKeyID]identity.APIKey)}
+	projectionLog := &fakeProjectionLog{rows: make(map[string]projection.Credential)}
+	projectionRecorder := &fakeProjection{log: projectionLog}
 	return &identityHarness{
-		store:    store,
-		accounts: accounts,
-		users:    users,
-		keys:     keys,
-		identity: NewIdentity(store, accounts, users, keys),
+		store:       store,
+		accounts:    accounts,
+		users:       users,
+		keys:        keys,
+		projection:  projectionRecorder,
+		projectsLog: projectionLog,
+		identity:    NewIdentity(store, accounts, users, keys, projectionRecorder, projectionLog),
 	}
 }
+
+// errProjectionRecord is the recording failure: any error the recorder can
+// return that the use case must roll back with.
+var errProjectionRecord = errors.New("fake: the projection record failed")
 
 func (h *identityHarness) mustAccount(t *testing.T, name string) identity.Account {
 	t.Helper()
@@ -501,6 +575,152 @@ func TestRevokeConfirmsARevokedRowAfterALostSwap(t *testing.T) {
 	}
 }
 
+// The projection-recording tests: every authority write that moves a row the
+// Data Plane's mirror holds records its entry in the same unit of work, and
+// the writes that do not move a row — losers, no-ops, pre-projection keys —
+// record nothing (ADR 0007). What the unit tier pins is the decision of
+// whether a record happens and what it describes; that the record and the
+// authority write commit atomically is the real transaction's, and the
+// postgres tier proves it.
+
+func TestMintRecordsTheCredentialTheProjectionCarries(t *testing.T) {
+	h := newIdentityHarness()
+	a := h.mustAccount(t, "Acme")
+	minted := h.mustMint(t, a.ID, "", "deploy key")
+
+	if len(h.projection.credentials) != 1 {
+		t.Fatalf("%d credentials recorded for one mint, want 1", len(h.projection.credentials))
+	}
+	recorded := h.projection.credentials[0]
+	if recorded.KeyID != string(minted.Key.ID) || recorded.AccountID != string(a.ID) {
+		t.Fatalf("recorded credential names %s under %s, want the minted key under its account", recorded.KeyID, recorded.AccountID)
+	}
+	if recorded.State != projection.CredentialActive || recorded.RevokedAt != nil {
+		t.Fatalf("recorded credential is %s at %v, want active with no revocation", recorded.State, recorded.RevokedAt)
+	}
+	if recorded.Digest != projection.Digest(minted.Digest.Hex()) {
+		t.Fatalf("recorded digest %q is not the minted secret's digest", recorded.Digest)
+	}
+	// One unit of work for the mint itself: the ownership record and its
+	// projection entry left together, or not at all.
+	if h.store.units != 2 {
+		t.Fatalf("%d units of work ran for account + mint, want 2 — one per write, never one per record", h.store.units)
+	}
+	// The record wrote the mirror row the revoke path reads its digest from.
+	mirror, err := h.projectsLog.Credential(context.Background(), string(minted.Key.ID))
+	if err != nil {
+		t.Fatalf("the mint left no mirror row to read: %v", err)
+	}
+	if mirror.Digest != recorded.Digest || mirror.State != projection.CredentialActive {
+		t.Fatalf("mirror row = %+v, want the recorded credential", mirror)
+	}
+}
+
+func TestRevokeRecordsTheRevokedCredentialWithTheMintedDigest(t *testing.T) {
+	h := newIdentityHarness()
+	a := h.mustAccount(t, "Acme")
+	minted := h.mustMint(t, a.ID, "", "deploy key")
+
+	if err := h.identity.RevokeAPIKey(context.Background(), minted.Key.ID); err != nil {
+		t.Fatalf("RevokeAPIKey: %v", err)
+	}
+	if len(h.projection.credentials) != 2 {
+		t.Fatalf("%d credentials recorded across mint + revoke, want 2", len(h.projection.credentials))
+	}
+	revoked := h.projection.credentials[1]
+	if revoked.State != projection.CredentialRevoked || revoked.RevokedAt == nil {
+		t.Fatalf("revocation recorded %s at %v, want revoked with its instant", revoked.State, revoked.RevokedAt)
+	}
+	if revoked.Digest != projection.Digest(minted.Digest.Hex()) {
+		t.Fatalf("revocation carries digest %q, want the minted digest — the mirror must learn the SAME credential died", revoked.Digest)
+	}
+	mirror, err := h.projectsLog.Credential(context.Background(), string(minted.Key.ID))
+	if err != nil {
+		t.Fatalf("mirror: %v", err)
+	}
+	if mirror.State != projection.CredentialRevoked || mirror.RevokedAt == nil {
+		t.Fatalf("mirror row = %+v, want the revoked state", mirror)
+	}
+}
+
+func TestRevokeSwapsThatDoNotWinRecordNothing(t *testing.T) {
+	h := newIdentityHarness()
+	a := h.mustAccount(t, "Acme")
+	minted := h.mustMint(t, a.ID, "", "deploy key")
+
+	h.keys.failNextRevokes = 1 // the revoke loses its swap to a racing revoker
+	if err := h.identity.RevokeAPIKey(context.Background(), minted.Key.ID); err != nil {
+		t.Fatalf("RevokeAPIKey: %v", err)
+	}
+	if len(h.projection.credentials) != 1 {
+		t.Fatalf("%d credentials recorded, want 1 — the mint's; a lost swap describes nothing", len(h.projection.credentials))
+	}
+
+	// The already-revoked no-op records nothing either.
+	if err := h.identity.RevokeAPIKey(context.Background(), minted.Key.ID); err != nil {
+		t.Fatalf("repeated RevokeAPIKey: %v", err)
+	}
+	if len(h.projection.credentials) != 1 {
+		t.Fatalf("%d credentials recorded after a confirmed no-op revoke, want 1", len(h.projection.credentials))
+	}
+}
+
+func TestRevokingAPreProjectionKeyCommitsWithoutAProjection(t *testing.T) {
+	h := newIdentityHarness()
+	a := h.mustAccount(t, "Acme")
+	minted := h.mustMint(t, a.ID, "", "deploy key")
+
+	// A key the projection foundation never saw: no mirror row, no digest
+	// anywhere in the lane. Its revocation is still real — the authority
+	// record above is what owns the lifecycle — but there is no credential
+	// to describe.
+	delete(h.projectsLog.rows, string(minted.Key.ID))
+	if err := h.identity.RevokeAPIKey(context.Background(), minted.Key.ID); err != nil {
+		t.Fatalf("RevokeAPIKey for a key with no projection row: %v", err)
+	}
+	stored, err := h.identity.APIKey(context.Background(), minted.Key.ID)
+	if err != nil {
+		t.Fatalf("APIKey: %v", err)
+	}
+	if stored.State != identity.APIKeyRevoked {
+		t.Fatalf("stored key = %+v, want revoked", stored)
+	}
+	if len(h.projection.credentials) != 1 {
+		t.Fatalf("%d credentials recorded, want 1 — a key no mirror holds projects no revocation", len(h.projection.credentials))
+	}
+}
+
+func TestAFailedProjectionRecordFailsTheMint(t *testing.T) {
+	h := newIdentityHarness()
+	a := h.mustAccount(t, "Acme")
+	h.projection.fail = true
+
+	if _, err := h.identity.MintAPIKey(context.Background(), a.ID, "", "deploy key"); err == nil {
+		t.Fatal("mint with a failing projection record returned no error — a silent credential the runtime never learns about")
+	}
+}
+
+func TestAccountLifecycleRecordsItsStates(t *testing.T) {
+	h := newIdentityHarness()
+	a := h.mustAccount(t, "Acme")
+	if err := h.identity.SuspendAccount(context.Background(), a.ID); err != nil {
+		t.Fatalf("SuspendAccount: %v", err)
+	}
+	if err := h.identity.CloseAccount(context.Background(), a.ID); err != nil {
+		t.Fatalf("CloseAccount: %v", err)
+	}
+
+	want := []projection.AccountState{projection.AccountActive, projection.AccountSuspended, projection.AccountClosed}
+	if len(h.projection.accounts) != len(want) {
+		t.Fatalf("%d accounts recorded, want %d — one per state the lifecycle moved through", len(h.projection.accounts), len(want))
+	}
+	for idx, state := range want {
+		if got := h.projection.accounts[idx]; got.AccountID != string(a.ID) || got.State != state {
+			t.Fatalf("recorded account[%d] = %s/%s, want %s/%s", idx, got.AccountID, got.State, a.ID, state)
+		}
+	}
+}
+
 func TestVerifyAuthenticatesAMintedToken(t *testing.T) {
 	h := newIdentityHarness()
 	a := h.mustAccount(t, "Acme")
@@ -661,12 +881,16 @@ func TestNewIdentityRefusesAnyNilPort(t *testing.T) {
 	accounts := &fakeAccounts{rows: map[identity.AccountID]identity.Account{}}
 	users := &fakeUsers{rows: map[identity.UserID]identity.User{}}
 	keys := &fakeKeys{rows: map[identity.APIKeyID]identity.APIKey{}}
+	recorder := &fakeProjection{log: &fakeProjectionLog{rows: map[string]projection.Credential{}}}
+	log := &fakeProjectionLog{rows: map[string]projection.Credential{}}
 
 	builds := map[string]func(){
-		"store":    func() { NewIdentity(nil, accounts, users, keys) },
-		"accounts": func() { NewIdentity(store, nil, users, keys) },
-		"users":    func() { NewIdentity(store, accounts, nil, keys) },
-		"api keys": func() { NewIdentity(store, accounts, users, nil) },
+		"store":          func() { NewIdentity(nil, accounts, users, keys, recorder, log) },
+		"accounts":       func() { NewIdentity(store, nil, users, keys, recorder, log) },
+		"users":          func() { NewIdentity(store, accounts, nil, keys, recorder, log) },
+		"api keys":       func() { NewIdentity(store, accounts, users, nil, recorder, log) },
+		"projection":     func() { NewIdentity(store, accounts, users, keys, nil, log) },
+		"projection log": func() { NewIdentity(store, accounts, users, keys, recorder, nil) },
 	}
 	for name, build := range builds {
 		panicked := false

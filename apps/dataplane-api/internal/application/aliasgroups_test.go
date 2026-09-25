@@ -36,7 +36,7 @@ func TestCurrentGroupVersionReturnsThePortAnswerUnchanged(t *testing.T) {
 		Version:        3,
 		GroupVersionID: "0197c1a2-7b31-7cc1-9e4e-6f5d2a1b3c4d",
 	}}
-	app := New("v0.1.0", &fakeUsageFacts{}, catalog)
+	app := New("v0.1.0", &fakeUsageFacts{}, catalog, &fakeProjection{})
 
 	version, err := app.CurrentGroupVersion(context.Background(), "frontier")
 	if err != nil {
@@ -63,7 +63,7 @@ func TestCurrentGroupVersionPassesTheNameThroughUntouched(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			catalog := &fakeCatalog{}
-			app := New("v0.1.0", &fakeUsageFacts{}, catalog)
+			app := New("v0.1.0", &fakeUsageFacts{}, catalog, &fakeProjection{})
 
 			if _, err := app.CurrentGroupVersion(context.Background(), tt.group); err != nil {
 				t.Fatalf("CurrentGroupVersion(%q) error = %v", tt.group, err)
@@ -104,7 +104,7 @@ func TestCurrentGroupVersionMapsThePortsFailures(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			catalog := &fakeCatalog{err: tt.err}
-			app := New("v0.1.0", &fakeUsageFacts{}, catalog)
+			app := New("v0.1.0", &fakeUsageFacts{}, catalog, &fakeProjection{})
 
 			_, err := app.CurrentGroupVersion(context.Background(), "frontier")
 			mapped, ok := As(err)

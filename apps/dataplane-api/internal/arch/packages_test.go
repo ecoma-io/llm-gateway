@@ -142,9 +142,10 @@ func TestEveryPackageLivesUnderASanctionedRoot(t *testing.T) {
 	// is a directory a package will live in.
 	//
 	// `internal/ports/outbound` and `internal/adapters/outbound` are sanctioned
-	// because the usage-fact read is a real outbound dependency: the management
-	// transport calls the Data Plane's internal surface, so the call needs a
-	// port and an adapter like any other. What keeps it from becoming state is
+	// because the cross-plane calls are real outbound dependencies: the
+	// management transport calls the Data Plane's internal surface to read its
+	// usage facts and to front its projection protocol, so the calls need ports
+	// and an adapter like any other. What keeps them from becoming state is
 	// TestTheManagementTransportHoldsNoState below, which names the one seam
 	// that may exist under those trees — not the absence of the trees.
 	internalRoots := []string{
@@ -186,9 +187,9 @@ func TestTheScanSeesTheModule(t *testing.T) {
 		found[dir] = true
 	}
 
-	// The two halves of the usage-fact seam are on the list for the reason the
-	// rest of it exists: they are the packages this module's newest rules name,
-	// and a rules table that governs a package the scan never saw agrees with
+	// The two halves of the data-plane seam are on the list for the reason the
+	// rest of it exists: they are the packages this module's rules name, and a
+	// rules table that governs a package the scan never saw agrees with
 	// everything.
 	for _, must := range []string{
 		"cmd/" + app,
@@ -214,19 +215,22 @@ func TestTheScanSeesTheModule(t *testing.T) {
 	}
 }
 
-// usageFactSeam names the one package pair this application may hold under the
+// dataPlaneSeam names the one package pair this application may hold under the
 // outbound trees, and it is listed by full path rather than by tree on purpose.
-// The port answers how this application reads Data Plane state — the
+// The ports answer how this application reaches Data Plane state — the
 // composition ADR 0006 §9 decided — with a call to the Data Plane, and a call
-// is transport. A second package beside it is a different answer to a question
-// §9 has already answered: a persistence port, a cache, a projection of Data
-// Plane rows kept locally.
+// is transport. The usage-fact read arrived first and the projection deliveries
+// (ADR 0007) joined them in the same pair, which is the pattern the naming
+// states: a new cross-plane interaction extends the port and the adapter, it
+// does not open a second seam beside them. A second package beside the pair is
+// a different answer to a question §9 has already answered: a persistence
+// port, a cache, a projection of Data Plane rows kept locally.
 //
 // The distinction the arch suite can draw is a path; the distinction that
 // matters is whether the package holds state. They line up here because the
-// seam is one port and one adapter, so anything else under these trees is
-// something other than the call.
-var usageFactSeam = []string{
+// seam is one port package and one adapter package, so anything else under
+// these trees is something other than the call.
+var dataPlaneSeam = []string{
 	"internal/ports/outbound/dataplane",
 	"internal/adapters/outbound/dataplane",
 }
@@ -235,7 +239,7 @@ var usageFactSeam = []string{
 // claim, and it is the one ADR 0006 §11 makes: the management transport is a
 // transport. It holds no state of its own, so it has no persistence, no cache
 // and no domain layer — everything it answers comes from the Data Plane over
-// the usage-fact seam, which is the composition §9 decided.
+// the data-plane seam, which is the composition §9 decided.
 //
 // The rule narrowed when the seam arrived. It used to forbid the outbound
 // trees outright, which was the right rule while they were empty and would be
@@ -245,9 +249,11 @@ var usageFactSeam = []string{
 //
 //   - `internal/domain` is where an application months from now would put the
 //     entities it believes it owns. This one owns none: the usage fact's shape
-//     is the Data Plane's to define (api/openapi/shared/usage-facts.yaml) and
-//     this module's copy of it is a wire type in the adapter, deliberately the
-//     thinnest thing that can carry the page across.
+//     is the Data Plane's to define (api/openapi/shared/usage-facts.yaml), the
+//     projection messages' grammar is the mirror's to judge
+//     (api/openapi/shared/projection.yaml), and this module's copies of both
+//     are wire types in the adapter, deliberately the thinnest things that can
+//     carry the answers across.
 //   - anything under the outbound trees that is not the seam is a second owner
 //     of Data Plane data — the thing §9's composition decides against — and
 //     the ordinary way one appears is that someone needs a row locally, finds
@@ -258,10 +264,10 @@ func TestTheManagementTransportHoldsNoState(t *testing.T) {
 			t.Errorf("%s holds Go files: this application owns no data and so has no domain layer of its own — the shapes it carries belong to the Data Plane (ADR 0006 §9, §11)", dir)
 		}
 		for _, root := range []string{"internal/ports/outbound", "internal/adapters/outbound"} {
-			if !under(dir, root) || slices.Contains(usageFactSeam, dir) {
+			if !under(dir, root) || slices.Contains(dataPlaneSeam, dir) {
 				continue
 			}
-			t.Errorf("%s holds Go files: the only thing this application may place under %s is the usage-fact seam %v — anything else is state this application does not own (ADR 0006 §9, §11)", dir, root, usageFactSeam)
+			t.Errorf("%s holds Go files: the only thing this application may place under %s is the data-plane seam %v — anything else is state this application does not own (ADR 0006 §9, §11)", dir, root, dataPlaneSeam)
 		}
 		// The use-case layer is one package, not a tree, and it is the last
 		// place a path rule can still see state arrive. A package below it —

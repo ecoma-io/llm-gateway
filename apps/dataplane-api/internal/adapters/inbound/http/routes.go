@@ -11,11 +11,11 @@ import (
 //
 // The table in routes is that surface's single source of truth: New registers
 // from it, and routes_test.go reads it, so an endpoint cannot exist in the
-// server and be missing from the inventory a reviewer reads. The scaffold has
-// three probes and one management operation; the table is here because the
-// shape of a surface is worth stating in one place before there are twenty rows
-// to state it about, and because that is what makes the surface testable as
-// data rather than as a series of calls.
+// server and be missing from the inventory a reviewer reads. The surface is
+// three probes and the five management operations the Control Plane calls; the
+// table is here because the shape of a surface is worth stating in one place
+// before there are twenty rows to state it about, and because that is what
+// makes the surface testable as data rather than as a series of calls.
 //
 // For this application the table is the whole surface, permanently. The
 // management API is internal — the Control Plane calls it and nobody else on
@@ -79,16 +79,19 @@ func routes(app *application.App) []route {
 				writeJSON(w, stdhttp.StatusOK, versionResponse{Version: app.Version()})
 			},
 		},
-		// The usage-fact feed: the one row on this surface whose caller must
-		// authenticate, and the one whose answer comes from another process.
+		// The usage-fact feed: the Control Plane reading what the runtime
+		// recorded. The check runs before anything else on this path, including
+		// the method. A caller with no credential is not told which methods the
+		// path accepts; it is told to identify itself, which it must do before
+		// any verb would have been useful. The reverse order — answer 405, then
+		// ask for a credential on the retry — would let an unauthenticated
+		// caller enumerate this surface one method at a time, and would make the
+		// guard's placement a property of the verb rather than of the path.
 		//
-		// The check runs before anything else on this path, including the
-		// method. A caller with no credential is not told which methods the path
-		// accepts; it is told to identify itself, which it must do before any
-		// verb would have been useful. The reverse order — answer 405, then ask
-		// for a credential on the retry — would let an unauthenticated caller
-		// enumerate this surface one method at a time, and would make the guard's
-		// placement a property of the verb rather than of the path.
+		// The three projection rows below live under the same rule, and the
+		// rule matters more there, not less: a projection delivery carries the
+		// credential facts the mirror verifies requests against, so the surface
+		// that accepts one accepts nothing without an identified caller.
 		{
 			method:        stdhttp.MethodGet,
 			path:          usageEventsPath,
@@ -107,6 +110,34 @@ func routes(app *application.App) []route {
 			method:        stdhttp.MethodGet,
 			path:          aliasGroupsPath,
 			handler:       currentGroupVersionHandler(app),
+			authenticated: true,
+		},
+		// The projection protocol's caller-facing half (ADR 0007): where the
+		// Data Plane's credential mirror stands, and the two deliveries that
+		// move it. These rows front the private protocol — the message bodies
+		// are the producer's bytes crossing to the listener, judged at the
+		// mirror and nowhere else — and their answers are the closed shapes
+		// projection.go renders. They are three rows rather than one operation
+		// with a discriminator because the contract declares them separately:
+		// the position read answers a GET, and the two deliveries answer a POST
+		// each, which is also what makes the method-agnostic companions below
+		// keep every verb but the declared one off each path.
+		{
+			method:        stdhttp.MethodGet,
+			path:          projectionPositionPath,
+			handler:       projectionPositionHandler(app),
+			authenticated: true,
+		},
+		{
+			method:        stdhttp.MethodPost,
+			path:          projectionSnapshotPath,
+			handler:       projectionSnapshotHandler(app),
+			authenticated: true,
+		},
+		{
+			method:        stdhttp.MethodPost,
+			path:          projectionChangesPath,
+			handler:       projectionChangesHandler(app),
 			authenticated: true,
 		},
 	}

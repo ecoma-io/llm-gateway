@@ -22,7 +22,9 @@
 // constructed over the same pool and answers from the usage_events table the
 // runtime storage schema creates: replaying what this process recorded, in the
 // order the store committed it, to whoever presents a position the stream can
-// still honour.
+// still honour. The projection applier is built straight over that pool
+// beside them — the consumer side of the Control → Data credential projection
+// (ADR 0007) and the first use case in this process that writes.
 //
 // There are two listeners and one application between them. The runtime's is the
 // public surface, opened on DATAPLANE_ADDR always; the management surface is
@@ -140,7 +142,8 @@ func main() {
 	// with the catalog repositories it backs — this is the change that first
 	// runs a query, the one the deferral here was waiting for. The usage-fact
 	// reader rides the same pool, and answers from the usage_events table the
-	// runtime storage schema creates.
+	// runtime storage schema creates; the projection applier (ADR 0007) rides
+	// it too, as the first use case in this process that writes.
 
 	// Every listener is bound before any of them serves. A process that
 	// answered on the runtime port while its management port was already taken
@@ -206,8 +209,12 @@ func postgresLocation(cfg config.Config) string {
 // an administrative port was configured.
 //
 // The pool arrives as an argument rather than being reopened here because the
-// two adapters are built over it: one database, one pool, and the composition
-// root is where adapters that share it meet.
+// adapters are built over it — one database, one pool, and the composition
+// root is where the adapters that share it meet: the fact reader the usage
+// feed is read from, and the projection applier whose mirror the management
+// listener writes on the Control Plane's behalf (ADR 0007). The mirror is
+// this process's one state, shared with everything else the request path
+// will read.
 func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
 	// One store over the pool, and the catalog's four repositories over that
 	// store — every one of them the same postgres adapter, because the catalog
@@ -224,7 +231,7 @@ func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
 		postgres.NewModelAliases(catalogStore),
 		postgres.NewAliasGroupVersions(catalogStore),
 	)
-	app := application.New(version, postgres.NewUsageFacts(pool), catalog)
+	app := application.New(version, postgres.NewUsageFacts(pool), catalog, postgres.NewProjectionApplier(pool))
 
 	runtimeListener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
