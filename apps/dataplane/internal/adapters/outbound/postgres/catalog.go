@@ -190,6 +190,14 @@ SELECT id, name, state, max_output_tokens, reservation_cap, created_at, updated_
 FROM model_aliases
 WHERE id = $1`
 
+// ByName's lookup: the same row ByID reads, named the way requests name it —
+// through the total unique index on name, so retired names resolve too and a
+// miss is final.
+const selectAliasByName = `
+SELECT id, name, state, max_output_tokens, reservation_cap, created_at, updated_at, retired_at
+FROM model_aliases
+WHERE name = $1`
+
 const selectCandidates = `
 SELECT id, backend_id, provider_model, position, parameter_overrides
 FROM model_candidates
@@ -247,23 +255,37 @@ func (r *aliasRepo) Create(ctx context.Context, alias *catalog.ModelAlias) error
 }
 
 func (r *aliasRepo) ByID(ctx context.Context, id catalog.AliasID) (*catalog.ModelAlias, error) {
+	return r.aliasOf(ctx, selectAlias, string(id), string(id))
+}
+
+func (r *aliasRepo) ByName(ctx context.Context, name string) (*catalog.ModelAlias, error) {
+	return r.aliasOf(ctx, selectAliasByName, name, name)
+}
+
+// aliasOf reads one alias aggregate through query: the row scan, the state
+// and retirement columns mapped back onto the domain's optional shapes, then
+// the whole candidate list in position order — the same aggregate ByID and
+// ByName promise, so the two lookups cannot drift into reading different
+// shapes. label is what the errors name the lookup by (the id or the name);
+// arg is the query's single parameter.
+func (r *aliasRepo) aliasOf(ctx context.Context, query, arg, label string) (*catalog.ModelAlias, error) {
 	var a catalog.ModelAlias
 	var state string
 	var retiredAt sql.NullTime
-	err := r.store.Querier(ctx).QueryRowContext(ctx, selectAlias, string(id)).
+	err := r.store.Querier(ctx).QueryRowContext(ctx, query, arg).
 		Scan(&a.ID, &a.Name, &state, &a.MaxOutputTokens, &a.ReservationCap, &a.CreatedAt, &a.UpdatedAt, &retiredAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("postgres: alias %s: %w", id, persistence.ErrNotFound)
+			return nil, fmt.Errorf("postgres: alias %s: %w", label, persistence.ErrNotFound)
 		}
-		return nil, fmt.Errorf("postgres: alias %s: %w", id, err)
+		return nil, fmt.Errorf("postgres: alias %s: %w", label, err)
 	}
 	a.State = catalog.AliasState(state)
 	if retiredAt.Valid {
 		t := retiredAt.Time
 		a.RetiredAt = &t
 	}
-	candidates, err := r.candidatesOf(ctx, id)
+	candidates, err := r.candidatesOf(ctx, a.ID)
 	if err != nil {
 		return nil, err
 	}

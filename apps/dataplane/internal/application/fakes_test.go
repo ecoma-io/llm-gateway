@@ -270,6 +270,15 @@ func (f fakeAliases) ByID(ctx context.Context, id catalog.AliasID) (*catalog.Mod
 	return cloneAlias(alias), nil
 }
 
+func (f fakeAliases) ByName(ctx context.Context, name string) (*catalog.ModelAlias, error) {
+	for _, alias := range f.world.aliases {
+		if alias.Name == name {
+			return cloneAlias(alias), nil
+		}
+	}
+	return nil, fmt.Errorf("fake: alias %s: %w", name, persistence.ErrNotFound)
+}
+
 func (f fakeAliases) Retire(ctx context.Context, id catalog.AliasID, from catalog.AliasState, retiredAt time.Time) (bool, error) {
 	if !inCatalogTx(ctx) {
 		f.world.outsideTx++
