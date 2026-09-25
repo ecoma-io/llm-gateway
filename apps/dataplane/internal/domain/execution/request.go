@@ -82,11 +82,36 @@ const (
 //     happened in the dead process, so this reason claims no attempt — and the
 //     pairing is enforced by the database, which refuses an abandoned request
 //     that names one.
+//
+// The three surfaced refusals are pre-commitment endings — the upstream
+// refused the request before any content-bearing byte was forwarded, so no
+// attempt was ever committed and none is named:
+//
+//   - ProviderRejectedRequest: the upstream refused the forwarded request.
+//     The refusal is surfaced to the client, whose request is the one at
+//     fault; it is never retried against another candidate, which would fail
+//     identically or silently produce a different answer (ADR 0002).
+//   - ContextTooLarge: the request's context exceeds what the upstream
+//     accepts. Surfacing it beats silently truncating.
+//   - UpstreamAuthentication: the upstream refused our credentials. An
+//     operator problem, surfaced loudly; no credential material travels with
+//     the name.
+//
+// Each refusal keeps its own name — not one shared "upstream refused" word —
+// because the replay record carries this reason to re-derive the original
+// answer byte for byte, and the three refusals' answers differ. Migration
+// 000007_routing_failure_vocabulary widened the database's twin lists to the
+// same five values; the pairing constraint needs no counterpart change here
+// or there, since every non-stream reason already demands an unnamed attempt.
 type FailureReason string
 
 const (
 	FailedStreamAfterCommitment FailureReason = "stream_failed_after_commitment"
 	FailedGatewayAbandoned      FailureReason = "gateway_abandoned"
+
+	FailedProviderRejectedRequest FailureReason = "provider_rejected_request"
+	FailedContextTooLarge         FailureReason = "context_too_large"
+	FailedUpstreamAuthentication  FailureReason = "upstream_authentication"
 )
 
 // PriceSnapshot is the price basis a final request carries: the revision it
@@ -280,6 +305,28 @@ func (r *Request) FailAbandoned(finishedAt time.Time) error {
 	return nil
 }
 
+// FailBeforeCommitment finalises an executing request whose upstream refused
+// it before any content-bearing byte was forwarded: the surfaced refusals
+// (ProviderRejectedRequest, ContextTooLarge, UpstreamAuthentication). No
+// attempt is named — commitment never happened, so there is nothing to name —
+// and requests_failure_reason_attempt_pairing refuses a row that named one.
+// The two other failure reasons are refused here rather than spelled: a
+// stream that died after commitment finalises through FailAfterCommitment,
+// and an abandoned row is the reaper's decision, made where the evidence
+// lives or not at all.
+func (r *Request) FailBeforeCommitment(reason FailureReason, finishedAt time.Time) error {
+	if r.Status != StatusExecuting {
+		return ErrFinalised
+	}
+	if !reason.preCommitment() {
+		return fmt.Errorf("execution: %q is not a failure reason a pre-commitment finalisation may carry", string(reason))
+	}
+	r.Status = StatusFailed
+	r.FailureReason = reason
+	r.FinishedAt = finishedAt
+	return nil
+}
+
 // checkFinalisable is the shared guard of the two finalisations that name an
 // attempt: the request must still be executing, and the decision must carry
 // the attempt it commits. That the attempt belongs to this request is the
@@ -306,6 +353,20 @@ func (reason RejectionReason) known() bool {
 	case RejectedAccountSuspended, RejectedAccountClosed, RejectedUnknownAlias,
 		RejectedInvalidRequest, RejectedInsufficientEntitlement, RejectedNoAccess,
 		RejectedNoCandidate, RejectedNoCandidateSucceeded:
+		return true
+	}
+	return false
+}
+
+// preCommitment reports whether a failure reason is one of the surfaced
+// upstream refusals — the only failure reasons a pre-commitment finalisation
+// may carry. The two stream-era reasons have their own transitions
+// (FailAfterCommitment, FailAbandoned), so they are deliberately absent here:
+// a caller reaching for them through the pre-commitment door is making the
+// mistake the guard exists to catch.
+func (reason FailureReason) preCommitment() bool {
+	switch reason {
+	case FailedProviderRejectedRequest, FailedContextTooLarge, FailedUpstreamAuthentication:
 		return true
 	}
 	return false

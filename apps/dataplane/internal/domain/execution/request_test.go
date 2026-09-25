@@ -265,6 +265,24 @@ func TestTransitionsFromExecutingSetExactlyTheirOwnDecision(t *testing.T) {
 		}
 	})
 
+	t.Run("failing before commitment carries the named refusal and claims no attempt", func(t *testing.T) {
+		for _, reason := range []FailureReason{FailedProviderRejectedRequest, FailedContextTooLarge, FailedUpstreamAuthentication} {
+			request := admittedRequest(t)
+			if err := request.FailBeforeCommitment(reason, finalAt); err != nil {
+				t.Fatalf("FailBeforeCommitment(%q) error = %v", reason, err)
+			}
+			if request.Status != StatusFailed || request.FailureReason != reason {
+				t.Errorf("reason %q: status = %q, carried reason = %q, want failed / %q", reason, request.Status, request.FailureReason, reason)
+			}
+			if request.CommittedAttemptID != "" {
+				t.Errorf("reason %q: CommittedAttemptID = %q, want empty — commitment never happened, so there is nothing to name", reason, request.CommittedAttemptID)
+			}
+			if request.RejectionReason != "" || request.FinishedAt != finalAt {
+				t.Errorf("reason %q: RejectionReason = %q, FinishedAt = %v, want unset / %v", reason, request.RejectionReason, request.FinishedAt, finalAt)
+			}
+		}
+	})
+
 	t.Run("reject sets only the rejection reason", func(t *testing.T) {
 		request := admittedRequest(t)
 		if err := request.Reject(RejectedNoCandidate, finalAt); err != nil {
@@ -282,29 +300,31 @@ func TestTransitionsFromExecutingSetExactlyTheirOwnDecision(t *testing.T) {
 	})
 }
 
-// transitioners names the four transitions uniformly so the once-only table
+// transitioners names the five transitions uniformly so the once-only table
 // below can drive each of them against each terminal state.
 func transitioners() map[string]func(*Request, time.Time) error {
 	return map[string]func(*Request, time.Time) error{
-		"succeed":             func(r *Request, at time.Time) error { return r.Succeed("att-0002", at) },
-		"failAfterCommitment": func(r *Request, at time.Time) error { return r.FailAfterCommitment("att-0002", at) },
-		"failAbandoned":       func(r *Request, at time.Time) error { return r.FailAbandoned(at) },
-		"reject":              func(r *Request, at time.Time) error { return r.Reject(RejectedNoCandidate, at) },
+		"succeed":              func(r *Request, at time.Time) error { return r.Succeed("att-0002", at) },
+		"failAfterCommitment":  func(r *Request, at time.Time) error { return r.FailAfterCommitment("att-0002", at) },
+		"failAbandoned":        func(r *Request, at time.Time) error { return r.FailAbandoned(at) },
+		"failBeforeCommitment": func(r *Request, at time.Time) error { return r.FailBeforeCommitment(FailedContextTooLarge, at) },
+		"reject":               func(r *Request, at time.Time) error { return r.Reject(RejectedNoCandidate, at) },
 	}
 }
 
-// finaliseEachWay builds one finalised request per terminal shape — the four
+// finaliseEachWay builds one finalised request per terminal shape — the five
 // decisions the vocabulary allows — so the once-only table can prove that no
 // transition can move any of them. Terminal statuses number three; terminal
-// shapes number four, because failed carries two reasons that a later
+// shapes number five, because failed carries four reasons that a later
 // transition must not overwrite into one another.
 func finaliseEachWay(t *testing.T) map[string]*Request {
 	t.Helper()
 	ways := map[string]func(*Request) error{
-		"succeeded":               func(r *Request) error { return r.Succeed("att-0001", finalAt) },
-		"failed after commitment": func(r *Request) error { return r.FailAfterCommitment("att-0001", finalAt) },
-		"failed abandoned":        func(r *Request) error { return r.FailAbandoned(finalAt) },
-		"rejected":                func(r *Request) error { return r.Reject(RejectedInvalidRequest, finalAt) },
+		"succeeded":                func(r *Request) error { return r.Succeed("att-0001", finalAt) },
+		"failed after commitment":  func(r *Request) error { return r.FailAfterCommitment("att-0001", finalAt) },
+		"failed abandoned":         func(r *Request) error { return r.FailAbandoned(finalAt) },
+		"failed before commitment": func(r *Request) error { return r.FailBeforeCommitment(FailedProviderRejectedRequest, finalAt) },
+		"rejected":                 func(r *Request) error { return r.Reject(RejectedInvalidRequest, finalAt) },
 	}
 	finalised := make(map[string]*Request, len(ways))
 	for name, way := range ways {
@@ -318,8 +338,8 @@ func finaliseEachWay(t *testing.T) map[string]*Request {
 }
 
 // TestEveryTransitionOnAFinalisedRequestIsErrFinalised pins finalise-exactly-
-// once over the full 4x4 matrix: each of the four transitions attempted on
-// each of the four terminal shapes returns exactly ErrFinalised and leaves
+// once over the full 5x5 matrix: each of the five transitions attempted on
+// each of the five terminal shapes returns exactly ErrFinalised and leaves
 // the standing decision byte-for-byte intact. A second finalisation is not a
 // retry but a decision to re-read — someone else's decision already stands —
 // and any silent overwrite here would rewrite history the fact feed has
@@ -403,5 +423,40 @@ func TestRejectWithAnUnknownReasonLeavesTheRequestExecuting(t *testing.T) {
 	}
 	if err := finalised.Reject("account_locked", finalAt.Add(time.Minute)); !errors.Is(err, ErrFinalised) {
 		t.Errorf("Reject(unknown) on a finalised request = %v, want ErrFinalised", err)
+	}
+}
+
+// TestFailBeforeCommitmentRefusesTheStreamEraReasonsLeavingTheRequest
+// Executing pins the refusal half of the pre-commitment transition: the two
+// stream-era reasons have transitions of their own (FailAfterCommitment,
+// FailAbandoned), so reaching for them through the pre-commitment door is a
+// caller bug the vocabulary guard must catch by name — with the value in the
+// message — and without spending the request's only finalisation. The empty
+// reason and a foreign word are refused the same way.
+func TestFailBeforeCommitmentRefusesTheStreamEraReasonsLeavingTheRequestExecuting(t *testing.T) {
+	for _, reason := range []FailureReason{"", FailedStreamAfterCommitment, FailedGatewayAbandoned, "upstream_refused", "context_too_large "} {
+		request := admittedRequest(t)
+		err := request.FailBeforeCommitment(reason, finalAt)
+		if err == nil {
+			t.Errorf("FailBeforeCommitment(%q) succeeded, want the non-pre-commitment reason refused", reason)
+			continue
+		}
+		if !strings.Contains(err.Error(), string(reason)) {
+			t.Errorf("FailBeforeCommitment(%q) error = %q, want it to carry the offending value", reason, err)
+		}
+		if request.Status != StatusExecuting || !request.FinishedAt.IsZero() || request.FailureReason != "" {
+			t.Errorf("reason %q: request = %+v, want it untouched and still executing", reason, request)
+		}
+	}
+
+	// The status guard outranks the vocabulary check, as in every other
+	// transition: on a finalised request even a legitimate refusal reason
+	// answers ErrFinalised, because the decision already stands.
+	finalised := admittedRequest(t)
+	if err := finalised.FailAbandoned(finalAt); err != nil {
+		t.Fatalf("finalising the fixture: %v", err)
+	}
+	if err := finalised.FailBeforeCommitment(FailedContextTooLarge, finalAt.Add(time.Minute)); !errors.Is(err, ErrFinalised) {
+		t.Errorf("FailBeforeCommitment on a finalised request = %v, want ErrFinalised", err)
 	}
 }

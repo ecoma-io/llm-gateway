@@ -21,6 +21,17 @@ var ErrDuplicateIntake = errors.New("persistence: replay record already exists")
 // domain sentinel it exists to produce.
 var ErrAttemptNotOfRequest = errors.New("persistence: attempt belongs to another request")
 
+// ErrAttemptAlreadyAppended says the attempt row Insert names is already on
+// disk — the unique keys on (id) and on (request, candidate position, retry
+// sequence) refused a second copy. Like ErrDuplicateIntake, this is
+// information, not a failure to retry: the append raced a writer that
+// persisted the same row, which without this sentinel is reachable without
+// any bug — an append whose commit acknowledgement was lost leaves its caller
+// unable to tell "never happened" from "happened and unacknowledged", and the
+// retry it then runs is the collision. A caller that receives this sentinel
+// reads the append as done.
+var ErrAttemptAlreadyAppended = errors.New("persistence: attempt is already appended")
+
 // RequestRepository persists and finalises requests.
 //
 // Every method resolves its query surface from ctx through the Store that
@@ -59,6 +70,10 @@ type AttemptRepository interface {
 	// Insert writes one finished call's row — appended as the call finishes,
 	// never while it is in flight (ADR 0001 rule 4), so a crash mid-call
 	// leaves no row and no transaction is ever open across a provider call.
+	// A collision with an already-persisted copy of the same attempt fails
+	// with ErrAttemptAlreadyAppended: the row exists, the append already
+	// happened, and the caller reads that as success rather than retrying an
+	// append only the engine's refusal can end.
 	Insert(ctx context.Context, attempt execution.Attempt) error
 
 	// RecordProviderUsage is the one sanctioned update: the provider-usage
