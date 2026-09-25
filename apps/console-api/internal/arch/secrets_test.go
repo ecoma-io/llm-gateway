@@ -125,7 +125,8 @@ func parseGoSources(t *testing.T, fset *token.FileSet) []parsedGoFile {
 }
 
 // secretNestingViolations returns one failure per struct field whose declared
-// type is Secret. It resolves the import's local name from the file's import
+// type nests Secret, including pointers and composites of it. It resolves the
+// import's local name from the file's import
 // block rather than assuming every file spells it `identity`, so renaming an
 // import cannot silently disable the rule.
 func secretNestingViolations(fset *token.FileSet, source parsedGoFile, importPath, importName string) ([]string, error) {
@@ -199,27 +200,38 @@ func secretImportNames(source parsedGoFile, importPath, importName string) (map[
 	return names, nil
 }
 
-// declaresSecret reports whether a field's declared type is the guarded
+// declaresSecret reports whether a field's declared type nests the guarded
 // package's Secret. Selector matching handles named and aliased imports; a dot
-// import turns the type into an identifier. Other expressions are not Secret
-// types themselves and are therefore outside this rule.
+// import turns the type into an identifier. Pointers, slices, arrays and maps
+// are unwrapped because fmt reaches through unexported indirection and into
+// unexported elements: the storage shape is the problem regardless of how many
+// of those wrappers stand between the aggregate and the bytes. Chan and func
+// fields stay unmatched because they do not put the bytes inside the
+// aggregate's own storage the way the leak requires.
 func declaresSecret(expr ast.Expr, localNames map[string]bool) bool {
-	selector, ok := expr.(*ast.SelectorExpr)
-	if ok {
-		packageName, isIdent := selector.X.(*ast.Ident)
-		return isIdent && localNames[packageName.Name] && selector.Sel.Name == "Secret"
+	switch expr := expr.(type) {
+	case *ast.SelectorExpr:
+		packageName, isIdent := expr.X.(*ast.Ident)
+		return isIdent && localNames[packageName.Name] && expr.Sel.Name == "Secret"
+	case *ast.Ident:
+		return localNames["."] && expr.Name == "Secret"
+	case *ast.StarExpr:
+		return declaresSecret(expr.X, localNames)
+	case *ast.ArrayType:
+		return declaresSecret(expr.Elt, localNames)
+	case *ast.MapType:
+		return declaresSecret(expr.Key, localNames) || declaresSecret(expr.Value, localNames)
+	default:
+		return false
 	}
-
-	identifier, ok := expr.(*ast.Ident)
-	return ok && localNames["."] && identifier.Name == "Secret"
 }
 
 // TestTheSecretNestingRuleRefusesExportedAndUnexportedFields proves the rule
-// can fire before trusting its green result over the current tree. Both field
-// names are in one synthetic struct: the unexported case is the leak fmt
-// creates, and the exported case is the same prohibited storage shape caught
-// by the package's wider contract. The expected messages are exact so the
-// diagnostic cannot lose either the mechanism or the safe replacement.
+// can fire before trusting its green result over the current tree. The synthetic
+// struct holds the direct exported and unexported cases — the unexported one is
+// the leak fmt creates — and the pointer and slice spellings a refused
+// contributor would plausibly reach for next. The expected messages are exact so
+// the diagnostic cannot lose either the mechanism or the safe replacement.
 func TestTheSecretNestingRuleRefusesExportedAndUnexportedFields(t *testing.T) {
 	identityPath := modulePath(t) + "/" + secretPackage
 	fixture := fmt.Sprintf(`package outsidekeymaterial
@@ -227,8 +239,12 @@ func TestTheSecretNestingRuleRefusesExportedAndUnexportedFields(t *testing.T) {
 import identity %q
 
 type wrappedSecret struct {
-	Exported identity.Secret
-	secret   identity.Secret
+	Exported      identity.Secret
+	secret        identity.Secret
+	secretPointer *identity.Secret
+	secretSlice   []identity.Secret
+	secretMap     map[string]identity.Secret
+	secretKeyMap  map[identity.Secret]string
 }
 `, identityPath)
 	fset := token.NewFileSet()
@@ -250,6 +266,10 @@ type wrappedSecret struct {
 	want := []string{
 		fmt.Sprintf("outsidekeymaterial.go:6: struct field wrappedSecret.Exported has type identity.Secret: %s", secretNestingWhy),
 		fmt.Sprintf("outsidekeymaterial.go:7: struct field wrappedSecret.secret has type identity.Secret: %s", secretNestingWhy),
+		fmt.Sprintf("outsidekeymaterial.go:8: struct field wrappedSecret.secretPointer has type identity.Secret: %s", secretNestingWhy),
+		fmt.Sprintf("outsidekeymaterial.go:9: struct field wrappedSecret.secretSlice has type identity.Secret: %s", secretNestingWhy),
+		fmt.Sprintf("outsidekeymaterial.go:10: struct field wrappedSecret.secretMap has type identity.Secret: %s", secretNestingWhy),
+		fmt.Sprintf("outsidekeymaterial.go:11: struct field wrappedSecret.secretKeyMap has type identity.Secret: %s", secretNestingWhy),
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("the Secret-nesting guard reported %v, want %v; it must reject both an exported and an unexported Secret field", got, want)
