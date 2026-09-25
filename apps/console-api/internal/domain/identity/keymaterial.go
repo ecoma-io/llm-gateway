@@ -67,7 +67,10 @@ var errSecretLength = errors.New("identity: secret must decode to 32 bytes")
 // Secret stored AS A STRUCT FIELD dumps its raw bytes under %v regardless of
 // these methods. The contract above holds only while Secret values travel as
 // themselves — arguments, returns, interface values — never nested in another
-// struct. Nothing today nests one; nothing later may.
+// struct. Nothing today nests one; nothing later may. Go cannot zeroize either
+// the secret bytes or the minted token string: the garbage collector may retain
+// copies, so never logging and never nesting are the working mitigations, not
+// erasure.
 type Secret struct {
 	bytes []byte
 }

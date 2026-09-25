@@ -11,7 +11,7 @@
 // dependency rule ADR 0006 §6 states. They are the reason a violation is a
 // red build rather than a review comment.
 //
-// Three files, three questions:
+// The files answer separate questions:
 //
 //   - packages_test.go — does every package live where this architecture says
 //     a package may live, and does this module carry the structure the
@@ -19,6 +19,8 @@
 //   - imports_test.go — may this package import that one?
 //   - modules_test.go — is this application's code the only application's
 //     code inside its own module?
+//   - secrets_test.go — is the credential secret ever stored where fmt can
+//     reach its bytes without the keymaterial package's redaction methods?
 package arch
 
 import (
