@@ -440,6 +440,21 @@ func TestAdjustRefusesToOverdrawAndConvergesWhenKeyed(t *testing.T) {
 		t.Fatalf("the same key with other deltas = %v, want ErrDuplicateCommand", err)
 	}
 
+	// The key's meaning is the correction's whole payload: the same deltas
+	// under a different reason, a different original cited, or a different
+	// operator are each a different correction wearing a taken name — the
+	// duplicate names the defect, the audit payload is never silently
+	// replaced by whichever call came second.
+	if _, err := use.Adjust(t.Context(), bucket.ID, -30, 0, "other reason", original, "ops-1", "fix-1"); !errors.Is(err, accounting.ErrDuplicateCommand) {
+		t.Fatalf("the same key with another reason = %v, want ErrDuplicateCommand", err)
+	}
+	if _, err := use.Adjust(t.Context(), bucket.ID, -30, 0, "misposted grant", world.legs[1].ID, "ops-1", "fix-1"); !errors.Is(err, accounting.ErrDuplicateCommand) {
+		t.Fatalf("the same key citing another original = %v, want ErrDuplicateCommand", err)
+	}
+	if _, err := use.Adjust(t.Context(), bucket.ID, -30, 0, "misposted grant", original, "ops-9", "fix-1"); !errors.Is(err, accounting.ErrDuplicateCommand) {
+		t.Fatalf("the same key under another operator = %v, want ErrDuplicateCommand", err)
+	}
+
 	// Unkeyed corrections run without a convergence lookup — an operator's
 	// one-off is still a legal fact.
 	if _, err := use.Adjust(t.Context(), bucket.ID, -10, 0, "second mispost", original, "ops-1", ""); err != nil {

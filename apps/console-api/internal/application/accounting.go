@@ -305,8 +305,15 @@ func (a *Accounting) Adjust(ctx context.Context, bucketID accounting.FundingBuck
 			return a.ledger.ByBucketAndCommandKey(txCtx, bucketID, commandKey)
 		},
 		func(original accounting.LedgerEntry) bool {
+			// The correction's whole payload is the key's meaning: a redelivery
+			// converges on the adjustment already on file — same deltas, same
+			// reason, the same original cited, the same operator — and the same
+			// key carrying any other correction is the defect the duplicate
+			// names, not a variant to swallow.
 			return original.Kind == accounting.KindAdjustment &&
-				original.SettledDelta == settledDelta && original.HeldDelta == heldDelta
+				original.SettledDelta == settledDelta && original.HeldDelta == heldDelta &&
+				original.AdjustmentReason == reason &&
+				original.OriginalEntryID == originalEntryID && original.OperatorID == operatorID
 		})
 }
 
