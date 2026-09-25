@@ -264,6 +264,21 @@ a balance and not a second ledger — it is the ceiling admission enforces, and
 the ledger, never the projection, is the source of truth for money (ADR
 0006).
 
+**A grant is eligible only for the request it may fund.** The drawdown walks
+the waterfall in the domain's order — entitlement cycles strictly before the
+PAYG balance, then named scope before `*`, earliest period end, oldest
+subscription — but only among grants that are eligible for _this_ request: the
+grant's stored scope must contain the requesting alias (the wildcard `*`
+version contains every alias; a named version exactly the aliases its snapshot
+lists; a version id nothing answers for contains nothing, a treat-as-zero and
+never an error), and the grant's cycle must not have ended at the
+transaction's own clock. Eligibility is re-asserted under the row lock by the
+conditional take itself — the same predicate, deliberately the same text — so
+a grant whose scope or cycle moved between the walk and the take is never
+drawn on a stale read's word. A grant that fails eligibility is passed by, not
+fatal: only a final shortfall surfaces, as the usual refusal with nothing
+drawn.
+
 ### Worked ledger sequences
 
 **Success, no fallback, usage below the hold** — entitlement bucket granted
