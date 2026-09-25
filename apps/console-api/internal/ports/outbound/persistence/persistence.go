@@ -44,6 +44,17 @@ import (
 // with context.
 var ErrNotFound = errors.New("persistence: not found")
 
+// ErrConflict is a unit of work the database itself aborted — a serialization
+// failure (SQLSTATE 40001) or a deadlock victim (40P01). It is retryable by
+// definition: nothing about the caller's intent was refused, the store only
+// pitted two units of work against each other and chose a loser. The
+// adapter translates both states to this one sentinel and nothing above it
+// sees driver strings; the caller that owns the unit of work re-runs it from
+// its first statement, re-reading whatever it read before. It is not the
+// guard-miss vocabulary — a guarded statement that fires zero rows is that
+// statement's domain verdict, not a conflict.
+var ErrConflict = errors.New("persistence: unit of work aborted by a concurrent write, retry")
+
 // Pinger reports whether the backing store is answering right now. Readiness
 // is what it is for: /readyz gates on this, over the port itself rather than
 // through the application — there is no use case for a ping — and nothing else
