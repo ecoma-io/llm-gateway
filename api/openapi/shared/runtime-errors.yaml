@@ -126,8 +126,9 @@ components:
     BadRequest:
       description: >-
         The request is not a valid chat completion request and admission
-        refused it before spending anything: a missing or malformed `model`,
-        a missing, non-positive, or disagreeing output ceiling, a missing or
+        refused it before spending anything: a missing or malformed `model`
+        (including a value outside the model grammar), a missing, non-positive,
+        disagreeing, or past-the-2147483647-bound output ceiling, a missing or
         malformed `Idempotency-Key`, a body that cannot be parsed, or a body
         larger than the 10485760-byte bound the operation declares — an
         oversized body is refused 400 and never 413, because the runtime
@@ -251,10 +252,16 @@ components:
         released unused. The condition is expected to clear as capacity and
         routes change, which is why the type is `overloaded_error` and the
         answer carries a `Retry-After`: the caller retries later rather than
-        differently.
+        differently. A recorded no-candidate answer is replayed on a repeat of
+        the same key and body, with the two replay headers beside it and the
+        `Retry-After` hint still attached.
       headers:
         X-Request-Id:
           $ref: "./probes.yaml#/components/headers/RequestId"
+        Idempotent-Replay:
+          $ref: "#/components/headers/IdempotentReplay"
+        X-Original-Request-Id:
+          $ref: "#/components/headers/OriginalRequestId"
         Retry-After:
           $ref: "#/components/headers/RetryAfterHint"
       content:

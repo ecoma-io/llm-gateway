@@ -184,7 +184,7 @@ paths:
         executing it twice, and the key is how the runtime tells a repeat from
         a new request: the key is stored with a digest of the request body, so
         the same key with the same body is answered from the original's
-        outcome — the response carries `Idempotency-Replay: true` and
+        outcome — the response carries `Idempotent-Replay: true` and
         `X-Original-Request-Id` whenever it is a replay — while the same key
         with a different body is refused with the `idempotency_conflict` code
         and never retried with the same key. A request whose key is still
@@ -298,21 +298,37 @@ paths:
                     properties:
                       role:
                         type: string
-                      content: {}
+                      content:
+                        type:
+                          - string
+                          - "null"
+                        description: >-
+                          The message's content as a string, or null when the
+                          part carries none. Admission prices string content
+                          only: a part whose content is an array of typed
+                          chunks is outside this contract, and a null part
+                          contributes nothing to the hold.
                 max_tokens:
                   type: integer
                   minimum: 1
+                  maximum: 2147483647
                   description: >-
                     The ceiling on generated output. Optional when
                     `max_completion_tokens` is present; when both are present
-                    they must agree, and a disagreement is refused 400.
+                    they must agree, and a disagreement is refused 400. The
+                    value is a positive 32-bit integer — a ceiling outside the
+                    bound is refused 400 with `max_tokens` named in `param`.
                 max_completion_tokens:
                   type: integer
                   minimum: 1
+                  maximum: 2147483647
                   description: >-
                     The OpenAI-compatible spelling of the same ceiling.
                     Optional when `max_tokens` is present; when both are
                     present they must agree, and a disagreement is refused 400.
+                    The value is a positive 32-bit integer — a ceiling outside
+                    the bound is refused 400 with `max_completion_tokens` named
+                    in `param`.
                 stream:
                   type: boolean
                   default: false
