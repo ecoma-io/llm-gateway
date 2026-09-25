@@ -329,9 +329,13 @@ the split creates:
   projection that is stale by seconds is the deliberate price of a hot path
   that cannot be taken down by the Control Plane.
 - Key creation does not require a distributed transaction: the Control Plane
-  records ownership and asks the Data Plane for the credential through the
-  management port; a failure leaves an owned-but-inactive key, which is
-  recoverable and visible, not a half-charged account.
+  mints the secret, records ownership, and delivers the secret's digest to
+  the Data Plane through the management surface; a failure leaves an
+  owned-but-inactive key. The secret is shown once and is never
+  reproducible, so recovery is revoke-and-re-mint — visible, not a
+  half-charged account. (Amended before the projection phase built on the
+  earlier wording, which had the Control Plane asking the Data Plane for a
+  credential the Control Plane in fact mints.)
 
 ### 9. Why `dataplane-api` is a management boundary and not a second domain
 
