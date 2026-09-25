@@ -65,6 +65,31 @@ their rows sit, and the two steps that cross a plane are marked.
 | 10  | Settlement             | **Crosses the plane, and is therefore two writes.** The runtime writes the `UsageEvent` and closes the reservation (`settled`) in one Data-Plane transaction. The Control Plane then creates the unique `Settlement`, appends the consume legs (split order preserved) and the release legs for the unconsumed tail, and updates its bucket projections — from that fact, idempotently by `request_id`. The runtime's half never waits for the Control Plane's, and the Control Plane's half follows the fact. | Process death before settlement → lease dies, reaper expires the reservation (state `expired`). Settlement after expiry is forbidden; a proven orphaned completion is an `unbillable_orphaned` usage event, never a customer charge — under-accounting is possible, over-billing is not.                                                                |
 | 11  | Response               | Success body / stream (started earlier for streaming — see below) with the request's final status recorded.                                                                                                                                                                                                                                                                                                                                                                                                    | —                                                                                                                                                                                                                                                                                                                                                       |
 
+The vocabulary this table uses is landed code, not a glossary to be honoured
+later: the terminal statuses and every rejection and failure reason are values
+of `migrations/dataplane/000003_runtime_storage`'s CHECK constraints and of the
+runtime's `execution` domain (`apps/dataplane/internal/domain/execution`), which
+refuses in Go what the database would refuse again in SQL. Three details in the
+table are worth reading precisely because the landed schema fixes their shape.
+The rows of step 4's replay decision live in `request_intake`, keyed
+`(account_id, idempotency_key)` — the database's unique key on that pair is the
+final idempotency guard, whatever admission checked first. The other two
+describe behaviour **no serving path runs yet**: B7 landed the storage
+machinery, its adapters and the tests that exercise their composition, not the
+executor that drives steps 7 and 10, so read those two as design the landed
+pieces are already shaped for. The attempt rows of step 7 are to be appended
+**as each upstream call finishes, never while it is in flight**, so no
+transaction is ever open across a provider call and a crash mid-call leaves no
+row at all; the one sanctioned later write to an attempt row is the
+provider-usage report, and the report adapter that landed carries a COALESCE
+discipline that never displaces a figure already recorded. The fact of step 10
+is to be a `usage_events` row whose position in the feed is allocated at
+commit ([accounting](accounting.md)) — the last statement of the same unit of
+work that closes the reservation, so "settled" and "in the feed" are one fact,
+not two events to reconcile; that composition is what the store's integration
+suite proves against real PostgreSQL
+(`TestIntegrationSettlementUnitIsAllOrNothing`).
+
 ### Streaming places step 11 earlier — the lifecycle does not change
 
 For a streamed response, content begins flowing to the client between steps 7
@@ -201,8 +226,9 @@ in queries/jobs that:
 - never write to the relational working set (balances are never "fixed up" by
   a job — corrections are compensating ledger entries, invariant 2);
 - never sit in the synchronous path's latency budget;
-- read continuous aggregates over the event tables when volume demands
-  (ADR 0005);
+- read rollups over the event tables when volume demands — continuous
+  aggregates were ADR 0005's vehicle here, and the B7 amendment it carries
+  gives them up until an equivalent is built;
 - read either database from one side of the boundary, never both in one
   statement. Operational analytics ("which candidate was slow?") reads the
   event tables, which are the Data Plane's; financial analytics reads the

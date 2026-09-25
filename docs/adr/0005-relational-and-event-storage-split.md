@@ -69,6 +69,24 @@ never the accounting write path.
 > reason per row is in
 > [../architecture/planes.md](../architecture/planes.md).
 
+> **Amended (B7, runtime storage): the event family ships as plain tables, not
+> hypertables.** The runtime's nine tables landed in
+> `migrations/dataplane/000003_runtime_storage` unpartitioned, because three
+> constraints the money path leans on cannot be expressed on a hypertable: the
+> partitioning-column rule forbids `requests(id)` as primary key, the attempts'
+> business key, and the usage-fact dedup partial uniques on
+> `usage_events(request_id)`; the engine refuses a foreign key that references a
+> hypertable, which would take the intra-family guarantees (attempts and facts
+> referencing their billing subject; the request's committed-attempt pairing)
+> with it; and a later conversion would have to rebuild exactly those
+> constraints. What the deviation gives up: columnstore compression on
+> `request_attempts`, chunk-based retention pruning, and continuous aggregates
+> over `usage_events` until an equivalent is built. The family rule above —
+> what is relational, what is an event table — is unchanged; this amendment is
+> about the physical placement of the second family, which follows the same
+> logic the rule always did: the guards the money path needs outrank the
+> operational conveniences of partitioning.
+
 ### Relational family
 
 ```text

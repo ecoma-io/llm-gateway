@@ -66,6 +66,12 @@ type failure struct {
 	// It is what makes the log line below possible without putting the cause on
 	// the wire.
 	internal bool
+	// cause is what actually went wrong, for the log line only. It rides the
+	// failure instead of being logged at the mapping site because the request
+	// ID — the one handle that ties the log line to the response an operator
+	// is holding — is resolved where the failure is written, and a cause
+	// logged without its request ID is a second mystery.
+	cause error
 }
 
 func notFoundFailure() failure {
@@ -96,12 +102,20 @@ func unauthenticatedFailure() failure {
 	}
 }
 
-func internalFailure() failure {
+// internalFailureWithCause is the internal failure carrying what went wrong
+// for the log line. The wire answer is fixed — 500, the internal code, the
+// one message — because a management caller can act on a status and a request
+// ID and cannot act on a driver error; the cause is what the operator reading
+// the log line needs, and it never reaches the envelope. Every internal
+// failure this surface decides has a cause, so there is no cause-less
+// constructor to forget one with.
+func internalFailureWithCause(cause error) failure {
 	return failure{
 		status:   stdhttp.StatusInternalServerError,
 		code:     codeInternal,
 		message:  internalErrorMessage,
 		internal: true,
+		cause:    cause,
 	}
 }
 
@@ -113,6 +127,10 @@ func internalFailure() failure {
 // guarantee that only holds because another function ran first is not one this
 // function can make, and the contract promises the header on every response
 // including the ones produced before routing.
+//
+// The cause, when there is one, is logged against that request ID — the full
+// error chain, driver prose and all, because the log line is where the
+// operator's investigation starts and the wire is where it must never end up.
 func writeFailure(w stdhttp.ResponseWriter, r *stdhttp.Request, f failure) {
 	requestID, ok := RequestIDFromContext(r.Context())
 	if !ok || requestID == "" {
@@ -120,7 +138,11 @@ func writeFailure(w stdhttp.ResponseWriter, r *stdhttp.Request, f failure) {
 	}
 	w.Header().Set(RequestIDHeader, requestID)
 	if f.internal {
-		log.Printf("%s management request_id=%s internal error", serviceName, requestID)
+		if f.cause != nil {
+			log.Printf("%s management request_id=%s internal error: %v", serviceName, requestID, f.cause)
+		} else {
+			log.Printf("%s management request_id=%s internal error", serviceName, requestID)
+		}
 	}
 	writeJSON(w, f.status, errorEnvelope{Error: errorBody{Code: f.code, Message: f.message}, RequestID: requestID})
 }
@@ -152,7 +174,7 @@ func failureFor(err error) failure {
 		// is this Data Plane's own storage and not a peer it could not reach:
 		// there is no upstream to blame and the 502 the facade returns would be
 		// a lie told here.
-		return internalFailure()
+		return internalFailureWithCause(err)
 	}
 
 	if applicationError, ok := application.As(err); ok {
@@ -164,8 +186,8 @@ func failureFor(err error) failure {
 				message: applicationError.Message,
 			}
 		case application.CodeInternal:
-			return internalFailure()
+			return internalFailureWithCause(err)
 		}
 	}
-	return internalFailure()
+	return internalFailureWithCause(err)
 }

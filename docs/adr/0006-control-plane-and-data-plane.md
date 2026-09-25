@@ -306,7 +306,8 @@ timescaledb (one cluster)
 - `migrations/` splits into the same two lanes; each database carries its own
   `schema_migrations`. The TimescaleDB extension and the hypertables belong to
   the Data Plane database, because the high-volume time-series facts are the
-  runtime's.
+  runtime's. (The extension landed there; the hypertables did not — ADR 0005's
+  amendment records why the runtime storage is plain tables.)
 - The table-by-table ownership matrix, with a reason per row, lives in
   [../architecture/planes.md](../architecture/planes.md).
 

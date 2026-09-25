@@ -92,6 +92,29 @@ tasks:
       - "/api/openapi/**/*"
       - "/go.work"
       - "/go.work.sum"
+  # `test` with the race detector turned on, and a target of its own because it
+  # cannot be `test` itself: the detector's instrumentation makes the build and
+  # the run an order of magnitude slower, and a gate that slow on every change
+  # gets worked around rather than waited on. Everything else is `test`'s
+  # script unchanged — `-count=1` and the same out-of-tree inputs, the same
+  # `=== RUN` vacuity guard — because `-race` changes what the suite costs, not
+  # what the target guarantees: every test, every package, or the green means
+  # nothing.
+  test-race:
+    script: |
+      status=0
+      output="$(go test -count=1 -race -v ./... 2>&1)" || status=$?
+      printf '%s\n' "$output"
+      [ "$status" -eq 0 ] || exit "$status"
+      if ! printf '%s\n' "$output" | grep -q '^=== RUN'; then
+        echo "go test -race ./... executed no tests — a green target here would mean nothing ran"
+        exit 1
+      fi
+    inputs:
+      - "**/*"
+      - "/api/openapi/**/*"
+      - "/go.work"
+      - "/go.work.sum"
   # The Go half of what `vue-tsc --noEmit` is for the console project. `go
   # build` over more than one package compiles and discards, writing no binary
   # — a typecheck target that dropped an executable into the package root would

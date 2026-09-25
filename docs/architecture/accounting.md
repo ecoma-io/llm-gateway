@@ -135,11 +135,23 @@ so no transaction can write them all (ADR 0006).
 **In the Data Plane**, the runtime closes the reservation — one transaction
 here, and it is the half that observes what happened:
 
-1. append the `UsageEvent` (immutable fact: committed attempt, normalized
-   token counts, price revision snapshot, capture method). The fact is the
-   **authority the charge is derived from**, not a side effect of it;
-2. close the reservation (`settled`), state-guarded so exactly one writer
-   closes it.
+1. close the reservation (`settled`), state-guarded so exactly one writer
+   closes it — this CAS decides who appends a fact at all, and the loser
+   reads false and appends nothing;
+2. append the `UsageEvent` (immutable fact: committed attempt, normalized
+   token counts, price revision snapshot, capture method) as the unit of
+   work's **last** statement. The fact is the **authority the charge is
+   derived from**, not a side effect of it.
+
+Both statements are guarded twice over in the landed schema: the close is a
+`WHERE state = 'open'` update, and the fact's append sequence is allocated
+from the stream row whose lock is held to commit
+— which is why the append is written **last** in the unit of work, after the
+close has decided the writer. The ordering guarantee the fact feed sells
+([cross-plane protocols](cross-plane-protocols.md)) is minted by that same
+discipline:
+settlement order is visibility order because the statement that takes a
+position in it is the one the transaction commits behind.
 
 **In the Control Plane**, settlement runs from that fact, idempotently by
 `request_id`, in this order:
@@ -185,7 +197,9 @@ the attempt record; it is never silently substituted as customer usage.
 | `gateway_observed`  | Delivery was partial (disconnect / post-commitment failure); the gateway counts forwarded deltas.    |
 | `reservation_floor` | No reliable count exists for a committed attempt; the already-held amount is charged conservatively. |
 
-The method travels on the usage event, so analytics can price confidence.
+The method travels on the usage event — it is the `usage_events.capture_method`
+column since B7's runtime storage landed, one of exactly these three values by
+schema CHECK, so analytics can price confidence from the row itself.
 
 ## Ledger legs and balance projections
 

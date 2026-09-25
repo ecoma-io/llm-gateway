@@ -174,12 +174,12 @@ var ErrSourceUnavailable = errors.New("usage fact source is unavailable")
 //
 // It is an interface at the application boundary rather than a concrete store:
 // the application calls this, and only the composition root decides what
-// answers behind it. The implementation that reads a real store arrives with
-// the schema that creates one; until then this port's production adapter
-// reports ErrSourceUnavailable, which is the honest answer and not a
-// placeholder to be filled in with an in-memory log — an in-memory feed would
-// pass every test in this repository while losing every fact on restart, which
-// is the one failure this whole design exists to prevent.
+// answers behind it. The production adapter is the PostgreSQL reader over the
+// usage_events table the runtime storage schema creates; ErrSourceUnavailable
+// is its answer for a store that cannot be read, and there is deliberately no
+// in-memory implementation anywhere in this repository — an in-memory feed
+// would pass every test while losing every fact on restart, which is the one
+// failure this whole design exists to prevent.
 type Reader interface {
 	// Read returns the facts strictly after the position named by after, in
 	// ascending append order.

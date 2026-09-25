@@ -32,7 +32,8 @@ name: ${GATEWAY_POSTGRES_PROJECT:-llm-gateway-postgres}
 services:
   # The database itself. TimescaleDB is PostgreSQL with the timescaledb
   # extension preloaded — transactional tables for the OLTP domains, and
-  # hypertables for the time-series workloads, in one authoritative store.
+  # the time-series event tables beside them, in one authoritative store
+  # (plain tables today, not hypertables — ADR 0005's B7 amendment).
   postgres:
     # Pinned to an exact version+digest pair, the way every tool in this
     # repository is pinned: the tag carries the readable version and the

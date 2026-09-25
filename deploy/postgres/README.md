@@ -7,11 +7,12 @@ same suite — there is no second definition of green.
 
 The store is PostgreSQL with the
 [TimescaleDB](https://docs.timescale.com/) extension: transactional tables
-for the OLTP domains, hypertables for the time-series workloads. Which
+for the OLTP domains, event tables for the time-series workloads. Which
 tables belong to which family is not decided here —
 [ADR 0005](../../docs/adr/0005-relational-and-event-storage-split.md) set
-the placement rule, and every future migration applies it. Not every table
-becomes a hypertable. The extension and the hypertables belong to the
+the placement rule, and every future migration applies it. No table is a
+hypertable today: the runtime schema's tables landed as plain tables, by
+that ADR's B7 amendment. The extension belongs to the
 `dataplane` database, because the high-volume time-series facts are the
 runtime's; the Control Plane's database is relational tables only
 ([ADR 0006 §7](../../docs/adr/0006-control-plane-and-data-plane.md)).

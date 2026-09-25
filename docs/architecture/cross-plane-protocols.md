@@ -308,6 +308,26 @@ request (ADR 0006 §5 and its amendments to
 [ADR 0004](../adr/0004-reserve-and-settle-accounting.md); the contract's
 requirement is stated in `api/openapi/shared/usage-facts.yaml`).
 
+What the derivation reads, concretely, is the landed fact's two halves. The
+**typed columns** are the settlement's inputs: `capture_method` (the three
+values [accounting](accounting.md) prices confidence by), the normalized token
+counts, the price snapshot (revision and both unit prices), the settled amount,
+and `schema_version`. The **payload** is an opaque jsonb envelope, versioned by
+that `schema_version` rather than by convention — today `v1`, carrying exactly
+one thing, the allocation legs:
+
+| Payload `v1` field                | Type    | What a Control-Plane settlement derives from it                                                           |
+| --------------------------------- | ------- | --------------------------------------------------------------------------------------------------------- |
+| `allocations[].funding_bucket_id` | string  | which ledger bucket each `consume`/`release` leg lands in                                                 |
+| `allocations[].amount`            | integer | the held amount per bucket — the ceiling the consumed figure is subtracted from                           |
+| `allocations[].ordinal`           | integer | the waterfall position, preserved so split-order legs reach the ledger in the order the runtime drew them |
+
+A settled fact's consume legs are priced from the typed columns against each
+leg's `amount`; the release legs are the unconsumed tails. Anything a future
+envelope adds is an explicit field with a bumped `schema_version` — never a
+convention hidden in untyped bytes, and never a second meaning for a `v1`
+field.
+
 What reconciliation cannot repair is a fact that was never written or never
 read within retention; it repairs a **lag**, not an absence. A reconciliation
 path that needed to ask the Data Plane a question mid-settlement would be a
@@ -331,20 +351,36 @@ why a management call is request/response with a defined failure rather than a
 two-phase commit; the third is why the consumer, not the producer, holds the
 position; the fourth is why nothing in the derivation needs a lock.
 
+### The fact source, decided and landed
+
+The one question this page used to leave open on this seam is closed:
+`usage_events` (B7's `migrations/dataplane/000003_runtime_storage`) is the
+table the facts are read from, and the requirements this page names are
+properties of that schema rather than promises about a future one. Ordering is
+**commit ordering**: each fact's `append_seq` is allocated from the single
+`usage_events_stream` row under its row lock held to the writer's commit, so
+the order a consumer reads is the order the appends became visible — no clock
+participates. The stream row's `epoch` is a server-minted uuid from the first
+append (never a migration), and the position a page carries is minted from
+that pair — epoch and sequence — which is why a position from a lost and
+re-seeded stream is refusable rather than silently reusable. The encoding
+remains this Data Plane's private affair: still opaque to every consumer,
+still changeable, and now with a landed fact order behind it and a landed
+reader over it — the postgres adapter's `UsageFacts`
+([ports and adapters](ports.md)) — rather than a promise
+(ADR 0006 §5; [data implications](data-implications.md)).
+
 ## What this page does not decide
 
-- **The durable fact source.** `usage_events` is the future table the facts are
-  read from; its columns, its ordering sequence and its retention are the schema
-  PR's, and this page names the requirements they have to satisfy rather than
-  the shape (ADR 0006 §5; [data implications](data-implications.md)).
 - **The ingestion-cursor schema.** `control.usage_ingestion_cursor` is the
   future table the Control Plane stores its position in. Today the position is a
   repository-level port in `apps/console-api/internal/ports/outbound/persistence`
   with the future table documented beside it and test fakes behind it; a
-  production implementation arrives with the schema rather than before it. On
-  the other side of the same seam, the Data Plane's production fact reader
-  refuses with a source-unavailable error instead of serving an in-memory feed
-  that would lose every fact on restart.
+  production implementation arrives with the schema rather than before it. The
+  Data Plane's side of the same seam has no such gap — its production fact
+  reader is landed ([above](#the-fact-source-decided-and-landed)) — so what
+  remains undecided here is the Control Plane's table and the loop that drives
+  it.
 - **The settlement consumer loop.** Nothing schedules the replay: there is no
   worker, no ticker and no background process. The loop that calls the ingestion
   use case belongs to the pull the schema PR builds, beside the table the cursor
@@ -359,12 +395,19 @@ position; the fourth is why nothing in the derivation needs a lock.
   come from the contract rather than from an adapter: neither `events` nor
   `payload` carries a `maxItems` or a `maxLength` today, so any cap written now
   would be a guess that refuses pages the contract admits, which is the one
-  failure this page spends its length avoiding. The change is small and belongs
-  with the fact schema, when `payload`'s columns and their sizes are decided:
-  an `io.LimitReader` at each decode, one above the largest page the contract
-  permits, and a test that feeds a body past it and watches the read fail
-  instead of the process grow. Recorded rather than fixed because guessing the
-  number would be worse than not having one.
+  failure this page spends its length avoiding. What has changed with the
+  landed fact schema is that the number is now **derivable** rather than
+  unknowable: the source caps `payload` at 32768 octets by schema CHECK
+  ([data implications](data-implications.md)) and the contract caps a page at
+  1000 events, so the largest honest page is on the order of tens of MiB
+  (~32 MiB — 33 MB decimal) — an `io.LimitReader` set just above it can
+  be written the day the contract carries the number, and not before. The
+  change is small and belongs with the fact schema: a limit at each decode,
+  one above the largest page the contract permits, and a test that feeds a
+  body past it and watches the read fail instead of the process grow.
+  Recorded rather than fixed because writing the limit ahead of the contract
+  would be the guess this bullet exists to prevent — the derivation above is
+  the migration's word, and the contract's `maxLength` is still owed.
 - **`X-Request-Id` forwarding across the hops.** Every surface here issues and
   returns one, and a caller may supply a well-formed one, but no outbound
   adapter sends the header onward — so the identifier in the façade's error

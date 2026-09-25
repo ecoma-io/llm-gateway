@@ -201,14 +201,18 @@ jobs:
       #   (POSTGRES_TEST_ADMIN_DSN below) before it runs — the same
       #   ensure-then-connect shape a developer's machine exercises, with the
       #   creation step made explicit instead of delegated to an entrypoint.
-      # - No migration runner service: migrations are verify-persistence's
-      #   subject (`deploy/postgres/verify.sh`, the same suite a contributor
-      #   runs), and this job runs none. The foundation suites need no
-      #   migrated schema — connection, transaction and lifecycle behaviour
-      #   run on probe tables they create and drop themselves — and the
-      #   identity suite applies its own lane's migrations itself, through
-      #   the golang-migrate library the pinned runner image runs, so the
-      #   admin DSN below stays the only database fact the job supplies.
+      # - No migration runner: the lanes' migrations stay
+      #   verify-persistence's subject (`deploy/postgres/verify.sh`, the same
+      #   suite a contributor runs). The suites that need a migrated schema
+      #   apply their own lane's migrations themselves — console-api's
+      #   identity suite through the golang-migrate library the pinned
+      #   runner image runs, the dataplane runtime-storage suite by
+      #   mirroring golang-migrate's versioning discipline by hand over
+      #   `migrations/dataplane`'s `.up.sql` files — while the driver suites
+      #   exercise connection, transaction and lifecycle behaviour on probe
+      #   tables they create and drop themselves. Each derives the database
+      #   it migrates from the admin DSN below, which stays the only
+      #   database fact the job supplies.
       #
       # The role is the fixture's own `gateway` role with the fixture's
       # documented development password — in a fresh container that role is
@@ -362,14 +366,18 @@ jobs:
           tar -xzf "$dir/golangci-lint.tar.gz" -C "$dir"
           sudo mv "$dir/golangci-lint-2.12.2-linux-amd64/golangci-lint" /usr/local/bin/golangci-lint
 
-      # This module's four targets — gofmt/golangci-lint, go test, the compile
-      # pass, and the binary. Same always-in-full reasoning as the console step
-      # above, and the same four target names in every application, which is
-      # what makes the matrix leg a name rather than a list.
+      # This module's five targets — gofmt/golangci-lint, go test, go test
+      # under the race detector, the compile pass, and the binary. Same
+      # always-in-full reasoning as the console step above, and the same five
+      # target names in every application, which is what makes the matrix leg
+      # a name rather than a list. test-race runs beside test rather than
+      # instead of it because the detector sees a different suite: a data race
+      # the unsynchronised run schedules around is exactly the one the gate
+      # exists to catch.
       - name: Lint, test, typecheck and build ${{ matrix.app }}
         run: >-
           pnpm exec moon run ${{ matrix.app }}:lint ${{ matrix.app }}:test
-          ${{ matrix.app }}:typecheck ${{ matrix.app }}:build
+          ${{ matrix.app }}:test-race ${{ matrix.app }}:typecheck ${{ matrix.app }}:build
 
       # The integration tier against the service containers above, through the
       # same target a developer runs — the module's `test-integration` is the
@@ -395,6 +403,20 @@ jobs:
           VALKEY_ADDRESS: 127.0.0.1:6379
           POSTGRES_TEST_ADMIN_DSN: postgres://gateway:gateway-dev-only@127.0.0.1:5432/postgres?sslmode=disable
         run: pnpm exec moon run ${{ matrix.app }}:test-integration
+
+      # The same suites under the race detector, one step after rather than one
+      # target beside the other's flags: the concurrency the storage tier is
+      # built on — the contended drawdown, the stream's commit-order
+      # allocation, the two-session publication race — is exactly the code a
+      # data race would corrupt silently, and the unsynchronised run above
+      # cannot see one. The suites cost seconds even instrumented; the gate is
+      # cheap because the tier was built to be.
+      - name: Run the integration suites under the race detector
+        if: matrix.integration
+        env:
+          VALKEY_ADDRESS: 127.0.0.1:6379
+          POSTGRES_TEST_ADMIN_DSN: postgres://gateway:gateway-dev-only@127.0.0.1:5432/postgres?sslmode=disable
+        run: pnpm exec moon run ${{ matrix.app }}:test-integration-race
 
   verify-persistence:
     name: Verify (persistence)
