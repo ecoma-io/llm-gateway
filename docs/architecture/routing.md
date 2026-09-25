@@ -128,7 +128,7 @@ transient state**: a request whose alias has no admissible candidate is
 refused, not queued for one to appear.
 
 That refusal is a **release**, not a rollback: the request is an admitted
-request whose hold is returned whole, and the runtime's compensation
+request whose hold is returned whole, and the routing stage's compensation
 transaction — enter through the reservation close's compare-and-set, return
 the legs in stored order, finalise the request and its intake record, and
 append the `released` usage fact **last** — runs before the client is
@@ -137,7 +137,30 @@ together. The answer is `503 overloaded_error` with a fixed `Retry-After`,
 because "nothing can serve this right now" is the true reading whether or not
 a later pass would serve it. The capacity is never held for a request that
 will not be attempted, and the Control Plane's projection is returned to
-through the same `released` fact every other release uses.
+through the same `released` fact every other release uses. The same unit
+answers an **exhausted** walk — every eligible candidate tried and fallen
+through — with the identical cell: how deep the walk went before it knew
+changes nothing a client can act on, and which of the two refusals produced
+an answer is the log line's fact, never the wire's.
+
+The stage exists in code as the application's routing half
+(`apps/dataplane/internal/application`, `ChatRouting`), wrapped around
+admission as the chat route's single use case: admission admits, and every
+admitted request is walked — eligibility first (`domain/routing`), then one
+try per eligible candidate in catalog order, each dispositioned by the two
+tables ([ADR 0002](../adr/0002-routing-and-fallback-ownership.md)) — and
+answered through the request's reply. The reply is the transport's half of
+the same channel the executors write content into, which is what makes the
+commitment point real on the wire: the first content byte freezes the
+status line and the framing, and every ending after it knows which side of
+the gate it stands on. The candidate **execution** layer — the adapters that
+translate a request for a provider's protocol and call it — is deliberately
+absent: the registry the stage reads is empty until B10 lands the first
+executor, so today every admitted request is released as a no-candidate
+answer, byte-identical with the endpoint's behaviour before the stage
+existed. The walk, its dispositions, its endings and their transactions are
+landed and pinned by tests; B10 registers an executor and the walk starts
+trying candidates, and nothing above this paragraph changes when it does.
 
 ## Commitment
 

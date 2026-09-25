@@ -61,6 +61,14 @@ const (
 	codeInsufficientQuota   = "insufficient_quota"
 	codeIdempotencyConflict = "idempotency_conflict"
 	codeRequestInProgress   = "request_in_progress"
+
+	// The surfaced refusals: the upstream faults a candidate's provider named
+	// that the endpoint answers as ordinary HTTP, because nothing was
+	// committed when they arrived. Their codes are the failure reasons the
+	// request row stores — one vocabulary, two renderings.
+	codeProviderRejectedRequest = "provider_rejected_request"
+	codeContextTooLarge         = "context_too_large"
+	codeUpstreamAuthentication  = "upstream_authentication"
 )
 
 // The one message per wire cell. Each is a fixed sentence, never composed
@@ -84,6 +92,14 @@ const (
 	inProgressMessage          = "a request with this Idempotency-Key is still in progress; retry the same request with the same key once it completes"
 	quotaMessage               = "the account's quota is insufficient for this request"
 	noCandidateMessage         = "the runtime cannot serve this request right now"
+
+	// The surfaced refusals' sentences. Each names the shape of the fault and
+	// nothing else: not the provider that refused, not the words it refused
+	// with — a provider's own error text is its content, and content is
+	// exactly what this surface never echoes.
+	providerRejectedMessage = "the upstream provider refused this request before any content was generated"
+	contextTooLargeMessage  = "this request's context exceeds what the upstream model accepts"
+	upstreamAuthMessage     = "the gateway could not authenticate to the upstream provider"
 )
 
 // The two Retry-After hints the endpoint sends, in seconds, as strings — the
@@ -136,6 +152,18 @@ type chatAnswer struct {
 	// runtimeID is the runtime identity to log, when the outcome carried
 	// one.
 	runtimeID identity.RequestID
+
+	// silent marks the outcomes whose bytes already travelled through the
+	// request's reply — or never could, because the caller was gone — so the
+	// handler's only remaining act is the log line. A silent answer writes
+	// no status and no body: the wire was the reply's to shape, and re-
+	// writing it would mean two answers for one request.
+	silent bool
+
+	// routing carries what the routing stage did with an admitted request,
+	// set on its three outcomes. It rides the answer for the log line only —
+	// the trace names no candidate, no provider model, no provider handle.
+	routing *application.RoutingTrace
 }
 
 // chatWireCell is the table: one admission outcome, one answer. It is
@@ -190,7 +218,17 @@ func chatWireCell(outcome application.ChatOutcome) chatAnswer {
 		// original answered, plus the two headers that say it is a replay.
 		// The original's identity rides to the wire, so a client correlating
 		// a replay with its first attempt has the runtime's own handle for
-		// it.
+		// it. A failed original's decision was one of the surfaced refusals,
+		// so its cell comes from the failure half of the table — the same
+		// bytes the original was served.
+		if outcome.Failure != "" {
+			return chatAnswer{
+				failure:  failureCell(outcome.Failure),
+				replay:   true,
+				original: outcome.Original,
+				reason:   string(outcome.Failure),
+			}
+		}
 		cell, retryAfter := rejectionCell(outcome.Reason, outcome.Detail)
 		return chatAnswer{
 			failure:    cell,
@@ -199,9 +237,46 @@ func chatWireCell(outcome application.ChatOutcome) chatAnswer {
 			original:   outcome.Original,
 			reason:     string(outcome.Reason),
 		}
+	case application.OutcomeServed:
+		// The answer already travelled through the request's reply — the
+		// completed body or stream, or the stream that failed after
+		// commitment and carried its failure frame. Nothing is written here;
+		// the outcome exists so the log line answers for what the client
+		// received.
+		return chatAnswer{
+			silent:    true,
+			reason:    string(application.OutcomeServed),
+			runtimeID: outcome.RuntimeRequestID,
+			routing:   outcome.Routing,
+		}
+	case application.OutcomeRefused:
+		// The surfaced refusal was written through the reply as the walk
+		// reached it — status, body and all, nothing having been committed
+		// first. What is left for the table is the log line, naming the
+		// refusal the way the request row does.
+		return chatAnswer{
+			silent:    true,
+			reason:    string(outcome.Failure),
+			runtimeID: outcome.RuntimeRequestID,
+			routing:   outcome.Routing,
+		}
+	case application.OutcomeAbandoned:
+		// The caller's context ended mid-walk; there is no channel left to
+		// answer on and nothing was finalised. The outcome is the log's
+		// correlation fact and the reaper's, never the wire's.
+		return chatAnswer{
+			silent:    true,
+			reason:    string(application.OutcomeAbandoned),
+			runtimeID: outcome.RuntimeRequestID,
+			routing:   outcome.Routing,
+		}
 	case application.OutcomeAdmitted:
-		// Unreachable on the wire until routing hands the endpoint its
-		// success response; the release seam is what should have stood here.
+		// The routing stage stands between admission and this table inside
+		// the use case's own Serve, and an admitted request never leaves it
+		// as an outcome. One arriving here means the stage did not run — a
+		// wiring defect, answered as the internal failure rather than as any
+		// refusal that would strand the hold while telling the caller
+		// something false about their request.
 		answer := chatAnswer{failure: internalFailure()}
 		if outcome.Admitted != nil {
 			answer.runtimeID = outcome.Admitted.RuntimeRequestID
@@ -214,15 +289,15 @@ func chatWireCell(outcome application.ChatOutcome) chatAnswer {
 
 // rejectionCell is the rejection half of the table, shared by the rejected
 // and replay kinds because a replay re-answers a rejection's cell. It is
-// exhaustive over the rejection vocabulary; an unknown reason or one whose
-// cell this endpoint cannot produce yet is a defect and lands on the
-// internal failure.
+// exhaustive over the rejection vocabulary; an unknown reason is a defect and
+// lands on the internal failure — an unknown reason is never a client's
+// answer anywhere.
 //
-// Two reasons have no cell here. no_candidate_succeeded is refused after
-// candidates were tried, which only happens once routing calls upstreams; a
-// decided walk inside this endpoint that somehow reached it is an invariant
-// break, answered as an internal failure rather than as the 503 a caller
-// would retry. An unknown reason is never a client's answer anywhere.
+// The two no-candidate reasons share one cell on purpose. The caller's
+// reading of both is the same sentence — the runtime cannot serve this right
+// now, come back later — and how deep the walk went before it knew changes
+// nothing a client can act on. Which of the two produced an answer is the log
+// line's fact, carried by the reason token, not the wire's.
 func rejectionCell(reason execution.RejectionReason, detail application.RejectionDetail) (wireFailure, string) {
 	switch reason {
 	case execution.RejectedInvalidRequest:
@@ -261,7 +336,7 @@ func rejectionCell(reason execution.RejectionReason, detail application.Rejectio
 				Code:    stringCode(codeInsufficientQuota),
 			},
 		}, ""
-	case execution.RejectedNoCandidate:
+	case execution.RejectedNoCandidate, execution.RejectedNoCandidateSucceeded:
 		return wireFailure{
 			status: stdhttp.StatusServiceUnavailable,
 			body: runtimeErrorBody{
@@ -269,10 +344,52 @@ func rejectionCell(reason execution.RejectionReason, detail application.Rejectio
 				Type:    typeOverloadedError,
 			},
 		}, retryAfterNoCandidate
-	case execution.RejectedNoCandidateSucceeded:
-		return internalFailure(), ""
 	default:
 		return internalFailure(), ""
+	}
+}
+
+// failureCell is the surfaced refusal's half of the table: the three
+// pre-commitment faults a candidate's provider named that this endpoint
+// answers as ordinary HTTP, because the walk reached them with nothing
+// committed. Each carries its own fixed sentence. The upstream
+// authentication cell is the one answered in the internal class on the wire
+// — the fault is the gateway's credential, not the caller's request — but it
+// is a classified failure all the same: the log line names it through the
+// refusal reason, and the internal flag stays reserved for the failures the
+// runtime could not place. A reason outside the three is a defect in the
+// caller, not a refusal to render, and lands on the internal failure.
+func failureCell(failure execution.FailureReason) wireFailure {
+	switch failure {
+	case execution.FailedProviderRejectedRequest:
+		return wireFailure{
+			status: stdhttp.StatusBadRequest,
+			body: runtimeErrorBody{
+				Message: providerRejectedMessage,
+				Type:    typeInvalidRequest,
+				Code:    stringCode(codeProviderRejectedRequest),
+			},
+		}
+	case execution.FailedContextTooLarge:
+		return wireFailure{
+			status: stdhttp.StatusBadRequest,
+			body: runtimeErrorBody{
+				Message: contextTooLargeMessage,
+				Type:    typeInvalidRequest,
+				Code:    stringCode(codeContextTooLarge),
+			},
+		}
+	case execution.FailedUpstreamAuthentication:
+		return wireFailure{
+			status: stdhttp.StatusInternalServerError,
+			body: runtimeErrorBody{
+				Message: upstreamAuthMessage,
+				Type:    typeAPIError,
+				Code:    stringCode(codeUpstreamAuthentication),
+			},
+		}
+	default:
+		return internalFailure()
 	}
 }
 

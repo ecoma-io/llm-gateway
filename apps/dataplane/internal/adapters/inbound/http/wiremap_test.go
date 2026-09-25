@@ -33,6 +33,10 @@ const (
 	inProgressBody         = "{\"error\":{\"message\":\"a request with this Idempotency-Key is still in progress; retry the same request with the same key once it completes\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"request_in_progress\"}}\n"
 	quotaBody              = "{\"error\":{\"message\":\"the account's quota is insufficient for this request\",\"type\":\"insufficient_quota\",\"param\":null,\"code\":\"insufficient_quota\"}}\n"
 	noCandidateBody        = "{\"error\":{\"message\":\"the runtime cannot serve this request right now\",\"type\":\"overloaded_error\",\"param\":null,\"code\":null}}\n"
+
+	providerRejectedBody = "{\"error\":{\"message\":\"the upstream provider refused this request before any content was generated\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"provider_rejected_request\"}}\n"
+	contextTooLargeBody  = "{\"error\":{\"message\":\"this request's context exceeds what the upstream model accepts\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"context_too_large\"}}\n"
+	upstreamAuthBody     = "{\"error\":{\"message\":\"the gateway could not authenticate to the upstream provider\",\"type\":\"api_error\",\"param\":null,\"code\":\"upstream_authentication\"}}\n"
 )
 
 // TestEveryOutcomeKindHasItsWireCell is the table's own closure: one row per
@@ -227,16 +231,49 @@ func TestEveryOutcomeKindHasItsWireCell(t *testing.T) {
 			wantReplay: true,
 		},
 		{
+			// A failed original's decision was a surfaced refusal, and the
+			// replay re-answers it byte-for-byte — the failure reason rides
+			// the replay outcome, and the cell is the failure half's.
+			name: "a replayed surfaced refusal re-answers with the original's refusal",
+			outcome: application.ChatOutcome{
+				Kind:     application.OutcomeReplay,
+				Failure:  execution.FailedContextTooLarge,
+				Original: original,
+			},
+			wantStatus: stdhttp.StatusBadRequest,
+			wantBody:   contextTooLargeBody,
+			wantReplay: true,
+		},
+		{
+			name: "a replayed upstream authentication refusal re-answers as the internal class",
+			outcome: application.ChatOutcome{
+				Kind:     application.OutcomeReplay,
+				Failure:  execution.FailedUpstreamAuthentication,
+				Original: original,
+			},
+			wantStatus: stdhttp.StatusInternalServerError,
+			wantBody:   upstreamAuthBody,
+			wantReplay: true,
+		},
+		{
 			name:       "an admitted outcome has no cell yet and answers the internal failure",
 			outcome:    application.ChatOutcome{Kind: application.OutcomeAdmitted},
 			wantStatus: stdhttp.StatusInternalServerError,
 			wantBody:   internalErrorBody,
 		},
 		{
-			name:       "no candidate succeeded is unreachable on this wire and answers the internal failure",
-			outcome:    application.ChatOutcome{Kind: application.OutcomeRejected, Reason: execution.RejectedNoCandidateSucceeded},
-			wantStatus: stdhttp.StatusInternalServerError,
-			wantBody:   internalErrorBody,
+			// The exhausted walk answers exactly the cell an empty walk does:
+			// the caller's reading — come back later — does not depend on how
+			// deep the walk went before it knew, and which of the two produced
+			// an answer is the log line's fact.
+			name: "no candidate succeeded answers the same cell as no candidate",
+			outcome: application.ChatOutcome{
+				Kind:   application.OutcomeRejected,
+				Reason: execution.RejectedNoCandidateSucceeded,
+			},
+			wantStatus: stdhttp.StatusServiceUnavailable,
+			wantBody:   noCandidateBody,
+			wantRetry:  retryAfterNoCandidate,
 		},
 		{
 			name:       "a reason the vocabulary does not declare answers the internal failure",
@@ -332,7 +369,6 @@ func TestTheConflictCellsDifferOnlyByCode(t *testing.T) {
 func TestTheInternalCellNamesNoCause(t *testing.T) {
 	answers := []chatAnswer{
 		chatWireCell(application.ChatOutcome{Kind: application.OutcomeAdmitted}),
-		chatWireCell(application.ChatOutcome{Kind: application.OutcomeRejected, Reason: execution.RejectedNoCandidateSucceeded}),
 		chatWireCell(application.ChatOutcome{Kind: application.OutcomeKind("queued")}),
 	}
 	for _, answer := range answers {
@@ -342,6 +378,135 @@ func TestTheInternalCellNamesNoCause(t *testing.T) {
 		if !answer.failure.internal {
 			t.Error("an internal cell is not marked internal, so its log line would say nothing")
 		}
+	}
+}
+
+// TestTheSurfacedRefusalCells pins the failure half of the table, byte-exact:
+// the three faults a candidate's provider named that this endpoint answers as
+// ordinary HTTP. The upstream authentication cell is answered in the internal
+// class on the wire — the fault is the gateway's — but it is a classified
+// failure, so it carries its code and must not claim the internal flag: the
+// log names it through the refusal reason, and the flag stays reserved for
+// the failures the runtime could not place.
+func TestTheSurfacedRefusalCells(t *testing.T) {
+	tests := []struct {
+		name       string
+		failure    execution.FailureReason
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name:       "a provider's refusal of the request itself",
+			failure:    execution.FailedProviderRejectedRequest,
+			wantStatus: stdhttp.StatusBadRequest,
+			wantBody:   providerRejectedBody,
+		},
+		{
+			name:       "a context the model cannot accept",
+			failure:    execution.FailedContextTooLarge,
+			wantStatus: stdhttp.StatusBadRequest,
+			wantBody:   contextTooLargeBody,
+		},
+		{
+			name:       "the gateway's own credential refused",
+			failure:    execution.FailedUpstreamAuthentication,
+			wantStatus: stdhttp.StatusInternalServerError,
+			wantBody:   upstreamAuthBody,
+		},
+		{
+			name:       "a reason the vocabulary does not declare answers the internal failure",
+			failure:    execution.FailureReason("who_knows"),
+			wantStatus: stdhttp.StatusInternalServerError,
+			wantBody:   internalErrorBody,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cell := failureCell(tt.failure)
+			if cell.status != tt.wantStatus {
+				t.Errorf("status = %d, want %d", cell.status, tt.wantStatus)
+			}
+			if got := renderChatBody(chatAnswer{failure: cell}); got != tt.wantBody {
+				t.Errorf("body = %q, want %q", got, tt.wantBody)
+			}
+			if tt.failure == execution.FailedUpstreamAuthentication && cell.internal {
+				t.Error("the upstream authentication cell claims the internal flag; it is a classified failure")
+			}
+		})
+	}
+}
+
+// TestTheRoutingOutcomesAreSilentAnswers pins the shape the routing stage's
+// three outcomes take through the table: none of them writes a byte here.
+// The served answer's bytes already travelled through the request's reply,
+// the refused answer's cell was written through it as the walk reached the
+// refusal, and an abandoned request has no channel left to answer on — so
+// each arrives as a log line only, carrying the routing trace and the
+// runtime identity, and carrying no status, no body and no headers.
+func TestTheRoutingOutcomesAreSilentAnswers(t *testing.T) {
+	trace := &application.RoutingTrace{
+		Alias:          "test-model",
+		Attempts:       2,
+		LastPosition:   2,
+		LastErrorClass: execution.ErrorRateLimited,
+		Committed:      true,
+	}
+	tests := []struct {
+		name       string
+		outcome    application.ChatOutcome
+		wantReason string
+	}{
+		{
+			name: "a served answer answers through the log alone",
+			outcome: application.ChatOutcome{
+				Kind:             application.OutcomeServed,
+				RuntimeRequestID: identity.RequestID("01930000-0000-7000-8000-000000000042"),
+				Routing:          trace,
+			},
+			wantReason: "served",
+		},
+		{
+			name: "a surfaced refusal answers through the log alone",
+			outcome: application.ChatOutcome{
+				Kind:             application.OutcomeRefused,
+				Failure:          execution.FailedContextTooLarge,
+				RuntimeRequestID: identity.RequestID("01930000-0000-7000-8000-000000000042"),
+				Routing:          trace,
+			},
+			wantReason: "context_too_large",
+		},
+		{
+			name: "an abandoned request answers through the log alone",
+			outcome: application.ChatOutcome{
+				Kind:             application.OutcomeAbandoned,
+				RuntimeRequestID: identity.RequestID("01930000-0000-7000-8000-000000000042"),
+				Routing:          trace,
+			},
+			wantReason: "abandoned",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			answer := chatWireCell(tt.outcome)
+			if !answer.silent {
+				t.Fatal("a routing outcome arrived as a wire answer; its bytes belong to the reply")
+			}
+			if answer.failure.status != 0 {
+				t.Errorf("a silent answer carries status %d; nothing may be written", answer.failure.status)
+			}
+			if answer.retryAfter != "" || answer.replay {
+				t.Error("a silent answer carries headers; nothing may be written")
+			}
+			if answer.reason != tt.wantReason {
+				t.Errorf("reason = %q, want %q", answer.reason, tt.wantReason)
+			}
+			if answer.runtimeID != tt.outcome.RuntimeRequestID {
+				t.Errorf("runtime_request_id = %q, want %q", answer.runtimeID, tt.outcome.RuntimeRequestID)
+			}
+			if answer.routing != trace {
+				t.Error("the routing trace did not ride the answer; the log line could not answer for the walk")
+			}
+		})
 	}
 }
 

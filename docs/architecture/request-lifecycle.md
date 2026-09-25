@@ -86,7 +86,7 @@ happened, never a second execution of it.
 | 12  | Settlement             | **Crosses the plane, and is therefore two writes.** The runtime writes the `UsageEvent` and closes the reservation (`settled`) in one Data-Plane transaction. The Control Plane then creates the unique `Settlement`, appends the consume legs (split order preserved) and the release legs for the unconsumed tail, and updates its bucket projections — from that fact, idempotently by `request_id`. The runtime's half never waits for the Control Plane's, and the Control Plane's half follows the fact.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Process death before settlement → lease dies, reaper expires the reservation (state `expired`). Settlement after expiry is forbidden; a proven orphaned completion is an `unbillable_orphaned` usage event, never a customer charge — under-accounting is possible, over-billing is not.                                                                                                                                                                                                                                                                                                                             |
 | 13  | Response               | Success body / stream (started earlier for streaming — see below) with the request's final status recorded.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | —                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
-### The wire answers admission gives
+### The wire answers the runtime gives
 
 The status codes above are the runtime's decision; the bodies are a contract in
 their own right, and one client's HTTP error is another's machine-readable
@@ -96,19 +96,30 @@ other answer, and one of the values in
 `api/openapi/runtime.yaml`'s `RuntimeError` — no internal reason vocabulary
 leaks into it.
 
-| Wire answer                                                                             | `type`                  | `code`                                  | `param`                                                                | Headers                                                                                 |
-| --------------------------------------------------------------------------------------- | ----------------------- | --------------------------------------- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| 401 on any authentication cause                                                         | `authentication_error`  | `invalid_api_key`                       | —                                                                      | `X-Request-Id`                                                                          |
-| 403 `account_suspended` / `account_closed`                                              | `permission_error`      | `account_suspended` \| `account_closed` | —                                                                      | `X-Request-Id`                                                                          |
-| 403 `no_access` (no eligible grant, PAYG off)                                           | `permission_error`      | `no_access`                             | —                                                                      | `X-Request-Id`                                                                          |
-| 404 unknown or inactive alias                                                           | `not_found_error`       | `model_not_found`                       | `model`                                                                | `X-Request-Id`                                                                          |
-| 400 malformed key / body / output bound / hold over cap                                 | `invalid_request_error` | `invalid_request`                       | `idempotency_key` \| `max_tokens` \| `max_completion_tokens` \| `null` | `X-Request-Id`                                                                          |
-| 409 different digest on the same `(account, key)`                                       | `invalid_request_error` | `idempotency_conflict`                  | —                                                                      | `X-Request-Id`                                                                          |
-| 409 same digest, original admission still open                                          | `invalid_request_error` | `request_in_progress`                   | —                                                                      | `X-Request-Id`, fixed `Retry-After`                                                     |
-| 429 capacity present but the whole hold not secured                                     | `insufficient_quota`    | `insufficient_quota`                    | —                                                                      | `X-Request-Id`                                                                          |
-| 500 no price, or a persistence failure                                                  | `api_error`             | —                                       | —                                                                      | `X-Request-Id`                                                                          |
-| 503 no admissible candidate at the handoff (the compensation of step 8 has already run) | `overloaded_error`      | — (null)                                | —                                                                      | `X-Request-Id`, fixed `Retry-After`                                                     |
-| 503 the same answer replayed from the record on a repeat of the same key and body       | `overloaded_error`      | — (null)                                | —                                                                      | `X-Request-Id`, `Idempotent-Replay: true`, `X-Original-Request-Id`, fixed `Retry-After` |
+| Wire answer                                                                                                                            | `type`                  | `code`                                  | `param`                                                                | Headers                                                                                 |
+| -------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- | --------------------------------------- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| 401 on any authentication cause                                                                                                        | `authentication_error`  | `invalid_api_key`                       | —                                                                      | `X-Request-Id`                                                                          |
+| 403 `account_suspended` / `account_closed`                                                                                             | `permission_error`      | `account_suspended` \| `account_closed` | —                                                                      | `X-Request-Id`                                                                          |
+| 403 `no_access` (no eligible grant, PAYG off)                                                                                          | `permission_error`      | `no_access`                             | —                                                                      | `X-Request-Id`                                                                          |
+| 404 unknown or inactive alias                                                                                                          | `not_found_error`       | `model_not_found`                       | `model`                                                                | `X-Request-Id`                                                                          |
+| 400 malformed key / body / output bound / hold over cap                                                                                | `invalid_request_error` | `invalid_request`                       | `idempotency_key` \| `max_tokens` \| `max_completion_tokens` \| `null` | `X-Request-Id`                                                                          |
+| 400 `provider_rejected_request` — an upstream refused the request before any content                                                   | `invalid_request_error` | `provider_rejected_request`             | — (null)                                                               | `X-Request-Id`                                                                          |
+| 400 `context_too_large` — the upstream model cannot accept the request's context                                                       | `invalid_request_error` | `context_too_large`                     | — (null)                                                               | `X-Request-Id`                                                                          |
+| 500 `upstream_authentication` — the gateway's own upstream credential was refused                                                      | `api_error`             | `upstream_authentication`               | — (null)                                                               | `X-Request-Id`                                                                          |
+| 409 different digest on the same `(account, key)`                                                                                      | `invalid_request_error` | `idempotency_conflict`                  | —                                                                      | `X-Request-Id`                                                                          |
+| 409 same digest, original admission still open                                                                                         | `invalid_request_error` | `request_in_progress`                   | —                                                                      | `X-Request-Id`, fixed `Retry-After`                                                     |
+| 429 capacity present but the whole hold not secured                                                                                    | `insufficient_quota`    | `insufficient_quota`                    | —                                                                      | `X-Request-Id`                                                                          |
+| 500 no price, or a persistence failure                                                                                                 | `api_error`             | —                                       | —                                                                      | `X-Request-Id`                                                                          |
+| 503 no admissible candidate at the handoff, or every candidate tried and failed to serve (the release of step 8 or 10 has already run) | `overloaded_error`      | — (null)                                | —                                                                      | `X-Request-Id`, fixed `Retry-After`                                                     |
+| 503 the same answer replayed from the record on a repeat of the same key and body                                                      | `overloaded_error`      | — (null)                                | —                                                                      | `X-Request-Id`, `Idempotent-Replay: true`, `X-Original-Request-Id`, fixed `Retry-After` |
+
+The three surfaced refusals are the pre-commitment endings whose answers are
+ordinary HTTP: a candidate's provider named the fault before any content was
+committed, the walk stopped there, and the hold was returned whole. A replay of
+a request that ended in one of them re-answers byte-for-byte with the same
+refusal, under the replay headers. The sentences never echo what the provider
+said — a provider's own error text is its content, and content is exactly what
+this surface does not relay; the class and the code are the whole answer.
 
 The distinction `no_access` and `insufficient_quota` make is a real one and not a
 restatement: `no_access` says the account has no capacity that may serve this
@@ -130,20 +141,23 @@ The rows of step 4's replay decision live in `request_intake`, keyed
 `(account_id, idempotency_key)` — the database's unique key on that pair is the
 final idempotency guard, whatever admission checked first, and step 7's
 insert-last discipline is what makes the constraint the arbiter of a race
-rather than a surprise. The other two
-describe behaviour **no serving path runs yet**: B7 landed the storage
-machinery, its adapters and the tests that exercise their composition, not the
-executor that drives steps 9 and 12, so read those two as design the landed
-pieces are already shaped for. The attempt rows of step 9 are to be appended
+rather than a surprise. Steps 8 and 10–12 are the routing stage's ending units,
+and they run: the release (the compensation of step 8 and of an exhausted
+step 10) and the settle (steps 11–12, delivery counted by the interim byte
+rule until B11's tokenizer) are whole transactions of the serving path, with
+the attempt row appended inside the settle unit and the usage fact appended
+**last** — so "settled" and "in the feed" are one fact, not two events to
+reconcile. What no serving path runs yet is the executor of step 9: the
+routing stage's registry carries no adapters until B10, so today's walk
+resolves no candidate for any alias and every admitted request is released as
+a no-candidate answer — the exact cell the endpoint answered before the stage
+existed. The attempt rows of step 9 are to be appended
 **as each upstream call finishes, never while it is in flight**, so no
 transaction is ever open across a provider call and a crash mid-call leaves no
 row at all; the one sanctioned later write to an attempt row is the
 provider-usage report, and the report adapter that landed carries a COALESCE
-discipline that never displaces a figure already recorded. The fact of step 12
-is to be a `usage_events` row whose position in the feed is allocated at
-commit ([accounting](accounting.md)) — the last statement of the same unit of
-work that closes the reservation, so "settled" and "in the feed" are one fact,
-not two events to reconcile; that composition is what the store's integration
+discipline that never displaces a figure already recorded. That
+ending composition is what the store's integration
 suite proves against real PostgreSQL
 (`TestIntegrationSettlementUnitIsAllOrNothing`).
 
