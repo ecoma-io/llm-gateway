@@ -8,12 +8,6 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/identity"
 )
 
-// ErrNotFound says the row the caller named does not exist. It is a sentinel
-// rather than a per-method error so a caller can branch on it without
-// matching text, and it is distinct from every failure below because "not
-// there" is an answer, not a malfunction.
-var ErrNotFound = errors.New("persistence: row not found")
-
 // ErrDuplicateIntake says the replay record's (account, idempotency key)
 // already exists — the engine half of replay idempotency, and the final guard
 // behind whatever check admission ran first. A caller that treats this as a
