@@ -198,6 +198,26 @@ func TestTopUpRefusesAClosedBucket(t *testing.T) {
 	}
 }
 
+func TestTopUpRefusesACycleBucket(t *testing.T) {
+	world := newAccountingWorld(t)
+	use := newAccounting(world)
+	entitlementID, err := commerce.NewEntitlementID()
+	if err != nil {
+		t.Fatalf("mint entitlement id: %v", err)
+	}
+	bucket := world.seedEntitlementFunding(t, entitlementID, 100)
+
+	// A cycle is granted by its roll, never topped up: the ownership rule
+	// is part of the transition the use case runs, so the funder for the
+	// other owner is refused in the transition's own words.
+	if _, err := use.TopUp(t.Context(), bucket.ID, 5000, "cmd-1"); !errors.Is(err, accounting.ErrInvalidTransition) {
+		t.Fatalf("top up a cycle bucket = %v, want ErrInvalidTransition", err)
+	}
+	if len(world.legs) != 1 {
+		t.Fatalf("%d legs on file after the refused top up, want 1 — the grant only", len(world.legs))
+	}
+}
+
 func TestHoldGuardsTheAvailableBalanceAndTheReservationKey(t *testing.T) {
 	world := newAccountingWorld(t)
 	use := newAccounting(world)

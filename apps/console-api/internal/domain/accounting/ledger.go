@@ -303,6 +303,20 @@ func (e LedgerEntry) ApplyTo(b Bucket) (Bucket, error) {
 	take := Balance(e.Amount)
 	switch e.Kind {
 	case KindGrant, KindTopup:
+		// Ownership is part of the algebra: a grant is how a cycle bucket is
+		// funded and a topup is how an account's is, so a leg naming the
+		// other owner is the transition it is not. No single row could pin
+		// the pair — the leg and its bucket's owner live in two tables —
+		// which is why this guard lives here and in the echo's WHERE clause
+		// rather than in a schema CHECK.
+		if e.Kind == KindGrant && b.OwnedByAccount() {
+			return Bucket{}, fmt.Errorf("accounting: apply grant entry to bucket %s: %w: a grant funds a cycle bucket, and %s is account %s's",
+				b.ID, ErrInvalidTransition, b.ID, b.AccountID)
+		}
+		if e.Kind == KindTopup && b.OwnedByEntitlement() {
+			return Bucket{}, fmt.Errorf("accounting: apply topup entry to bucket %s: %w: a topup funds an account bucket, and %s is entitlement %s's cycle",
+				b.ID, ErrInvalidTransition, b.ID, b.EntitlementID)
+		}
 		settled, err := b.Settled.Move(e.SettledDelta)
 		if err != nil {
 			return Bucket{}, fmt.Errorf("accounting: apply %s entry to bucket %s: %w", e.Kind, b.ID, err)

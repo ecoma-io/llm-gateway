@@ -475,6 +475,54 @@ func TestIntegrationAccountingGuardMissesClassifyAndLeaveTheWorkAlive(t *testing
 	})
 }
 
+// TestIntegrationAccountingAFunderRefusesTheOtherOwner proves the owner
+// half of the funder echoes: a grant funds a cycle bucket and a topup an
+// account's, so each echo's WHERE clause names its owner and the leg for
+// the other owner is a guard miss the classification names as the invalid
+// transition it is — with the unit of work alive underneath, its own
+// funder still landing.
+func TestIntegrationAccountingAFunderRefusesTheOtherOwner(t *testing.T) {
+	a := integrationAccounting(t)
+	ctx := t.Context()
+
+	t.Run("a topup on a cycle bucket is refused", func(t *testing.T) {
+		bucket := a.newEntitlementBucket(t, "it-accounting topup owner")
+		a.appendCommitted(t, a.grantEntry(t, bucket.ID, 10000))
+
+		err := a.store.WithinTx(ctx, func(ctx context.Context) error {
+			_, _, err := a.ledger.Append(ctx, a.topupEntry(t, bucket.ID, 5000, acctCommandKey(t, "topup-owner-")))
+			if !errors.Is(err, accounting.ErrInvalidTransition) {
+				t.Fatalf("topup on cycle bucket %s = %v, want ErrInvalidTransition", bucket.ID, err)
+			}
+			// The unit of work is unharmed: the bucket's own funder lands.
+			_, _, err = a.ledger.Append(ctx, a.grantEntry(t, bucket.ID, 1000))
+			return err
+		})
+		if err != nil {
+			t.Fatalf("the unit of work that suffered an owner miss must commit: %v", err)
+		}
+		a.assertBalances(t, bucket.ID, 11000, 0, 11000, 2, 2)
+	})
+
+	t.Run("a grant on an account bucket is refused", func(t *testing.T) {
+		bucket := a.newAccountBucket(t, "it-accounting grant owner")
+		a.appendCommitted(t, a.topupEntry(t, bucket.ID, 10000, acctCommandKey(t, "topup-feed-")))
+
+		err := a.store.WithinTx(ctx, func(ctx context.Context) error {
+			_, _, err := a.ledger.Append(ctx, a.grantEntry(t, bucket.ID, 5000))
+			if !errors.Is(err, accounting.ErrInvalidTransition) {
+				t.Fatalf("grant on account bucket %s = %v, want ErrInvalidTransition", bucket.ID, err)
+			}
+			_, _, err = a.ledger.Append(ctx, a.topupEntry(t, bucket.ID, 1000, acctCommandKey(t, "topup-more-")))
+			return err
+		})
+		if err != nil {
+			t.Fatalf("the unit of work that suffered an owner miss must commit: %v", err)
+		}
+		a.assertBalances(t, bucket.ID, 11000, 0, 11000, 2, 2)
+	})
+}
+
 // TestIntegrationAccountingCollisionsMapToTheirSentinels loses to both
 // uniqueness constraints on purpose. The adapter's verdict is the sentinel
 // and a living unit of work — the payload comparison that turns a collision

@@ -260,9 +260,12 @@ type ledgerRepo struct {
 // enforce it. All RETURNING the post-move row, which is the verdict and the
 // caller's answer at once.
 //
-//   - grant/topup move settled only; the guard is the active gate itself,
-//     because adding settled money cannot break a projection that held the
-//     row's lock.
+//   - grant/topup move settled only; the balance guard is the active gate
+//     itself, because adding settled money cannot break a projection that
+//     held the row's lock — but each names its owner: a grant lands on a
+//     cycle bucket (entitlement_id IS NOT NULL) and a topup on an account's
+//     (entitlement_id IS NULL), the domain's ownership rule written where
+//     the row lock can enforce it.
 //   - hold needs available ≥ take.
 //   - release needs held ≥ take (held_amount + held_delta ≥ 0).
 //   - consume needs held ≥ take AND settled ≥ take — the guard that makes
@@ -279,7 +282,18 @@ SET settled_amount = settled_amount + $2,
     last_sequence = last_sequence + 1,
     version = version + 1,
     updated_at = $4
-WHERE id = $1 AND status = 'active'
+WHERE id = $1 AND status = 'active' AND entitlement_id IS NOT NULL
+RETURNING ` + fundingBucketColumns
+
+const echoTopup = `
+UPDATE control.funding_buckets
+SET settled_amount = settled_amount + $2,
+    held_amount = held_amount + $3,
+    available_amount = settled_amount + $2 - held_amount - $3,
+    last_sequence = last_sequence + 1,
+    version = version + 1,
+    updated_at = $4
+WHERE id = $1 AND status = 'active' AND entitlement_id IS NULL
 RETURNING ` + fundingBucketColumns
 
 const echoHold = `
@@ -333,8 +347,10 @@ RETURNING ` + fundingBucketColumns
 // new Kind cannot silently run the wrong statement.
 func echoFor(kind accounting.Kind) (string, error) {
 	switch kind {
-	case accounting.KindGrant, accounting.KindTopup:
+	case accounting.KindGrant:
 		return echoGrant, nil
+	case accounting.KindTopup:
+		return echoTopup, nil
 	case accounting.KindHold:
 		return echoHold, nil
 	case accounting.KindRelease:
@@ -505,9 +521,21 @@ func (r *ledgerRepo) classifyGuardMiss(ctx context.Context, entry accounting.Led
 	case accounting.KindAdjustment:
 		return fmt.Errorf("postgres: append adjustment entry to bucket %s: %w: settled %d, held %d, available %d does not admit the stated deltas",
 			bucket.ID, accounting.ErrInvalidAdjustment, bucket.Settled, bucket.Held, bucket.Available)
+	case accounting.KindGrant, accounting.KindTopup:
+		// The only guard these echoes carry beyond the active gate is the
+		// owner rule, and the owner cannot change under a leg: an active
+		// bucket here is the wrong owner for this kind.
+		if entry.Kind == accounting.KindGrant && bucket.OwnedByAccount() {
+			return fmt.Errorf("postgres: append grant entry to bucket %s: %w: a grant funds a cycle bucket, and %s is account %s's",
+				bucket.ID, accounting.ErrInvalidTransition, bucket.ID, bucket.AccountID)
+		}
+		if entry.Kind == accounting.KindTopup && bucket.OwnedByEntitlement() {
+			return fmt.Errorf("postgres: append topup entry to bucket %s: %w: a topup funds an account bucket, and %s is entitlement %s's cycle",
+				bucket.ID, accounting.ErrInvalidTransition, bucket.ID, bucket.EntitlementID)
+		}
+		return fmt.Errorf("postgres: append %s entry to bucket %s: %w: guard refused an unguarded kind",
+			entry.Kind, bucket.ID, accounting.ErrInvalidTransition)
 	default:
-		// grant/topup echoes refuse only on missing or closed; both are
-		// answered above. Reaching here is a statement/route mismatch.
 		return fmt.Errorf("postgres: append %s entry to bucket %s: %w: guard refused an unguarded kind",
 			entry.Kind, bucket.ID, accounting.ErrInvalidTransition)
 	}

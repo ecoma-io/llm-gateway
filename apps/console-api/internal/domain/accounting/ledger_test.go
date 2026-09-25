@@ -36,9 +36,18 @@ func mustAmount(t *testing.T, raw int64) Amount {
 
 func activeBucket(t *testing.T) Bucket {
 	t.Helper()
-	b, err := NewAccountBucket(mustBucketID(t), "account-7", bucketNow)
+	b, err := NewEntitlementBucket(mustBucketID(t), EntitlementID(validV7), bucketNow)
 	if err != nil {
 		t.Fatalf("open bucket: %v", err)
+	}
+	return b
+}
+
+func activeAccountBucket(t *testing.T) Bucket {
+	t.Helper()
+	b, err := NewAccountBucket(mustBucketID(t), "account-7", bucketNow)
+	if err != nil {
+		t.Fatalf("open account bucket: %v", err)
 	}
 	return b
 }
@@ -206,6 +215,46 @@ func TestApplyToRefusesALegForADifferentOrClosedBucket(t *testing.T) {
 	}
 	if _, err := mine.ApplyTo(closed); !errors.Is(err, ErrBucketClosed) {
 		t.Fatalf("apply to a closed bucket = %v, want ErrBucketClosed", err)
+	}
+}
+
+func TestApplyToRefusesAFunderForTheOtherOwner(t *testing.T) {
+	// A grant funds a cycle bucket and a topup funds an account's; the
+	// matching kind against the other owner is the transition it is not,
+	// refused before any balance moves.
+	cycle := activeBucket(t)
+	strayTopup, err := NewTopupEntry(mustEntryID(t), cycle.ID, mustAmount(t, 10), "cmd-stray", legNow)
+	if err != nil {
+		t.Fatalf("topup: %v", err)
+	}
+	if _, err := strayTopup.ApplyTo(cycle); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("topup onto entitlement bucket %s = %v, want ErrInvalidTransition", cycle.ID, err)
+	}
+
+	account := activeAccountBucket(t)
+	strayGrant, err := NewGrantEntry(mustEntryID(t), account.ID, mustAmount(t, 10), legNow)
+	if err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	if _, err := strayGrant.ApplyTo(account); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("grant onto account bucket %s = %v, want ErrInvalidTransition", account.ID, err)
+	}
+
+	// The guard is about the pair, not the kind: each funder lands on the
+	// owner it exists for.
+	ownedTopup, err := NewTopupEntry(mustEntryID(t), account.ID, mustAmount(t, 10), "cmd-account", legNow)
+	if err != nil {
+		t.Fatalf("topup: %v", err)
+	}
+	if _, err := ownedTopup.ApplyTo(account); err != nil {
+		t.Fatalf("topup onto its own account bucket: %v", err)
+	}
+	ownedGrant, err := NewGrantEntry(mustEntryID(t), cycle.ID, mustAmount(t, 10), legNow)
+	if err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	if _, err := ownedGrant.ApplyTo(cycle); err != nil {
+		t.Fatalf("grant onto its own cycle bucket: %v", err)
 	}
 }
 
