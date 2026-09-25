@@ -4,6 +4,7 @@
 - Date: 2026-09-23
 - Issue: [#5](https://github.com/ecoma-io/llm-gateway/issues/5)
 - Amended by: [ADR 0006](0006-control-plane-and-data-plane.md) — the transactions below are plane-scoped, and settlement is split across the plane boundary
+- Amended by: B6, the accounting foundation (2026-09-25) — the guards this record states as discipline are schema CHECKs, indexes and triggers now, and there is no negative-settled path any more (see the amendment under “Formal balance projections”)
 
 ## Context
 
@@ -167,6 +168,22 @@ reason, an original-entry reference, and stated `settled_delta`/`held_delta`
 charge appends `settled_delta = −7` against the original settlement. It must
 preserve the same projection identities and is the only negative-settled
 path; it is not an automatic debt/overdraw escape hatch.
+
+> **Amended by B6 (the accounting foundation, 2026-09-25): there is no
+> negative-settled path any more — the no-credit rule is structural.** The
+> two claims above — that a negative `settled` is reachable through an
+> adjustment, and that the adjustment is therefore "the only negative-settled
+> path" — were written when that freedom was discipline the operator was
+> trusted to keep. The landed schema states it as arithmetic instead:
+> `funding_buckets_balance_projection` CHECKs `available = settled − held`
+> with `held ≥ 0` and `available ≥ 0`, which makes `settled ≥ 0` transitive,
+> and the guarded echo that lands an adjustment re-states the same
+> predicates in its WHERE clause — a stated delta that would drive settled,
+> held or available below zero updates zero rows and is refused in the
+> domain's words before that. The examples stand inside that bound: a
+> goodwill credit (`+5`) still appends; repairing a mistaken `−7` charge
+> still appends while settled covers it, and is refused against a settled
+> balance of 5. Corrections fix records; they never create debt.
 
 ### Admission and hard reservation bound
 
@@ -342,6 +359,19 @@ because compensating legs move them (invariants 1–2).
   top-level concepts; those are required to make split settlement, PAYG
   concurrency, and permanent idempotency enforceable, not implementation
   detail.
+- **The guards are structural, and B6 is what made that literal.** Every rule
+  this ADR states as a discipline is now also a statement the database itself
+  refuses to violate: the balance-projection `CHECK` (whose `available = settled
+− held` with both non-negativity predicates makes non-negative `settled`
+  transitive), the owner exclusivity, the leg-algebra and reference-shape
+  `CHECK`s, the price-provenance `CHECK`, the partial unique indexes that make
+  command keys, reservation movements and settlement movements
+  exactly-once, the total order on `(bucket, sequence)`, and the append-only
+  and write-once triggers. The adapter's guarded statements re-state the same
+  predicates in their WHERE clauses and classify the verdicts into the domain's
+  sentinels, so a guard-miss reads as a refusal rather than a surprise — but
+  the schema is what makes the refusal true for any writer, including one that
+  arrives with a hand-written statement.
 - Amounts are integer minor units in the single platform-wide settlement
   currency (ADR 0003); no per-row currency column exists.
 - Analytics can reconcile bucket caches against append-only legs, while hot
@@ -352,7 +382,10 @@ because compensating legs move them (invariants 1–2).
   request, but it cannot create unbounded customer debt. The bound is now
   enforced by the runtime's own projection rather than by a lock on an
   Accounting row, so the guarantee survives the Control Plane being down — and
-  is bought with the reconciliation step named in ADR 0006.
+  is bought with the reconciliation step named in ADR 0006. On the ledger
+  side the same bound is arithmetic: no balance may go negative, so there is
+  no path by which the system records money it does not hold, and corrections
+  never widen the exposure they repair.
 
 ## Alternatives considered
 

@@ -158,12 +158,17 @@ position in it is the one the transaction commits behind.
 
 1. create the **Settlement** — unique by `request_id`; the exactly-once
    boundary. It carries `request_id`, a `settled_total` equal to the sum of
-   its consume legs, and `created_at`. A competing finalizer hits the unique
-   constraint and stops.
+   its consume legs, and `created_at`. A competing acknowledgement of the
+   same request inserts nothing and reads the recorded settlement instead:
+   the same total converges, and a different one is the conflict defect —
+   one request cannot settle twice at two totals.
 2. append **one consume leg per allocated bucket**, then the **release legs**
    for the unconsumed tail of each allocation — the amounts come from the
-   fact, which carries what was held and what was delivered;
-3. update each affected funding bucket's projections.
+   fact, which carries what was held and what was delivered. Every leg lands
+   with the bucket move it names, in the same unit of work: the guarded echo
+   (balances, sequence, version) and the leg's insert are one statement pair
+   under one savepoint, so a header without its legs cannot commit and a leg
+   that loses its guard leaves no header behind.
 
 The fact's carrying the held and delivered amounts is what lets the Control
 Plane settle without so much as a reference to the runtime's reservation rows:
@@ -228,12 +233,18 @@ H = holds, R = releases, A = adjustment `(settled_delta, held_delta)` pairs):
 ```text
 settled   = ΣG − ΣC + ΣA.settled_delta
 held      = ΣH − ΣR − ΣC + ΣA.held_delta
-available = settled − held        (must stay ≥ 0; admission enforces it)
+available = settled − held        (must stay ≥ 0 — the hold guard refuses the overdraw)
 ```
 
-Without adjustments the non-adjustment kinds cannot make `settled` negative
-(bucket guards keep `ΣG ≥ ΣC`); a negative settled balance is reachable only
-through an operator `adjustment` — that is why the algebra separates it.
+No kind can make any of the three negative. The non-adjustment kinds cannot
+— consume's guard checks the take against held _and_ settled before either
+moves — and an `adjustment` cannot either: its stated deltas are free values,
+but a delta that would drive settled, held or available below zero is
+refused, by the domain constructor before any statement runs and by the
+guarded echo inside it. That is the **no-credit rule** (ADR 0004, as amended
+below), and it is why the algebra separates adjustments: their deltas are
+_stated_, not derivable from the kind — never because they may overdraw. A
+correction fixes records; it never creates debt.
 
 Example — grant 100, hold 12, consume 7, release 5:
 
@@ -252,9 +263,15 @@ Plane: its row is written only by the accounting flows of that plane — the
 Control-Plane halves of the four coordinated transactions (settlement, and the
 cycle roll's grant), the `hold`/`release` legs derived from the reservation's
 facts, and the context-local `topup`/`adjustment` refills — while the Commerce
-entitlement cycle or PAYG flag it projects references it by identifier. `adjustment` is an operator correction that states its
-settled/held deltas explicitly; it is never an automatic overdraw path (the
-reservation ceiling means automatic debt cannot arise).
+entitlement cycle or PAYG flag it projects references it by identifier. One
+entitlement cycle and one account each own exactly one bucket (the owner
+exclusivity is a schema `CHECK`, not a convention), and the bucket is never
+re-pointed: the PAYG row's reference to it is write-once, so an account's
+funded money has one home for its whole life. `adjustment` is an operator
+correction that states its settled/held deltas explicitly, with the reason and
+the original entry it corrects; it is never an automatic overdraw path (the
+reservation ceiling means automatic debt cannot arise) and never a credit
+mechanism (the no-credit rule above).
 
 **The Data Plane holds no copy of this row.** What the runtime conditionally
 draws down is the _quota projection_: the lockable capacity row for one
@@ -328,6 +345,65 @@ an `unbillable_orphaned` usage event is appended for reconciliation — with
 the reaper's release when the proof is already there, otherwise later
 (ADR 0004). Under-accounting is possible
 in exactly this crash case; over-billing is not. The asymmetry is deliberate.
+
+### The engine is the last line of defense
+
+Everything above reads as this plane's discipline, and the foundation made it
+structural: the PostgreSQL schema states the same rules in its own grammar, so
+a leg or a row this page would refuse is one the database refuses too — with
+nothing depending on this process being the writer, which is what makes the
+ledger safe to read from any process and its projections safe to rebuild.
+
+- `funding_buckets_balance_projection` CHECKs the projection identity
+  (`available = settled − held`) with `held ≥ 0` and `available ≥ 0`, which
+  makes `settled ≥ 0` transitive — the no-credit rule as arithmetic, not
+  sentiment. `funding_buckets_owner_xor` keeps a bucket exactly one owner's
+  (an entitlement cycle or an account, never both, never neither).
+- `ledger_entries_leg_algebra` pins every kind's deltas to the table above;
+  `ledger_entries_price_snapshot` keeps the price provenance on `consume`
+  legs and off every other kind; `ledger_entries_reference_shape`,
+  `ledger_entries_adjustment_shape` and `ledger_entries_command_key_scope`
+  hold the reference grammar each kind carries — a hold names its
+  reservation, a consume names its settlement, an adjustment names its
+  reason, original and operator, and only a keyed command carries a command
+  key.
+- The idempotency keys are indexes, not conventions: a partial unique on
+  `(funding_bucket_id, command_key)` where a key exists, on
+  `(settlement_id, funding_bucket_id, kind)` where a settlement does, and on
+  `(reservation_id, funding_bucket_id, kind)` where a reservation does —
+  plus the total order itself, `UNIQUE (funding_bucket_id, sequence)`. A
+  replayed command or movement collides before it can move money twice.
+- Append-only is a trigger, not a promise: `UPDATE` or `DELETE` on
+  `ledger_entries` or `settlements` raises with the correction path named in
+  the message, and the PAYG row's `funding_bucket_id` is write-once the same
+  way — re-pointing and deleting the reference are both refused.
+
+The adapter's WHERE-clause guards and its sentinel classification are
+therefore a translation of verdicts the engine guarantees twice over, not
+the last line of defense wearing a Go interface.
+
+### What the foundation carries, and what waits
+
+B6 lands the money authority itself: the funding bucket aggregate, the six
+leg kinds and their algebra, the guarded single-statement echo that moves a
+bucket and its leg together, the settlement of record with its exactly-once
+edge, the keyed `topup` and stated `adjustment` flows, the reconciliation
+read that keeps the cache honest, and the entitlement-funding and
+account-funding choreographies commerce calls. The flows that will drive it
+arrive later, and none is stubbed here:
+
+- **Admission (B8)** — the runtime's reservation waterfall against its quota
+  projection; this plane's `hold` legs are booked from its decisions as
+  facts.
+- **Usage → pricing → settlement wiring (B12)** — the consumer loop that
+  reads the fact feed and calls Settle; what that feed must carry is the
+  open defect of
+  [issue #63](https://github.com/ecoma-io/llm-gateway/issues/63).
+- **Reconciliation worker (B13)** — the scheduled convergence between the
+  Data Plane's quota projections and the ledger; `ReconcileBucket` is the
+  verdict it will lean on.
+- **Payment processor (B15)** — the provider whose webhooks land as topups;
+  an operator's keyed topup is the same door it will use.
 
 ## Concurrency and time
 
