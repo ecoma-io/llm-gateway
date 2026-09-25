@@ -42,13 +42,15 @@ func routes(app *application.App) []route {
 			path:    "/healthz",
 			handler: func(w stdhttp.ResponseWriter, _ *stdhttp.Request) { writeStatus(w) },
 		},
-		// Readiness: the scaffold has no dependencies, so it is always ready.
-		// The checks that will gate this endpoint later — a database ping, a
-		// cache ping, an egress probe — hang off here, and only here.
+		// Readiness: gated on this process's own dependencies — the database
+		// answering, and the credential projection's first snapshot applied.
+		// What the answer is belongs to the application; the checks hang off
+		// here, and only here, so an orchestrator restarting on /healthz never
+		// kills a runtime for a dependency it is on its way to reach.
 		{
 			method:  stdhttp.MethodGet,
 			path:    "/readyz",
-			handler: func(w stdhttp.ResponseWriter, _ *stdhttp.Request) { writeStatus(w) },
+			handler: readyz(app),
 		},
 		// Version flows through the application rather than reading main's stamp
 		// directly: cmd/dataplane owns the one ldflags version source and hands it

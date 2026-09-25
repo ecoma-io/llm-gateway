@@ -35,7 +35,9 @@ info:
     from shared/runtime-errors.yaml: an unmatched path returns it with HTTP 404
     and the `not_found_error` type, a method unsupported by a known path with
     HTTP 405 and `invalid_request_error`, and a contracted operation that is
-    not built with HTTP 501, `api_error` and the `not_implemented` code.
+    not built with HTTP 501, `api_error` and the `not_implemented` code. A
+    probe taken while the runtime's own dependencies are not yet answering
+    returns HTTP 503 and the `overloaded_error` type.
     A request that fails after the response has started streaming reports the
     failure inside the stream instead, because by then no HTTP status can be
     revised — see the chat-completion operation. The runtime's routing,
@@ -85,6 +87,8 @@ paths:
           $ref: "./shared/runtime-errors.yaml#/components/responses/MethodNotAllowed"
         "500":
           $ref: "./shared/runtime-errors.yaml#/components/responses/InternalError"
+        "503":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/ServiceUnavailable"
   /readyz:
     get:
       operationId: getReadiness
@@ -92,11 +96,13 @@ paths:
         - probes
       summary: Readiness of the runtime service
       description: >-
-        Returns 200 when the service may receive traffic. The scaffold has no
-        dependencies, so it is always ready; the runtime's own checks — its
-        database, its cache, its egress — hang off this endpoint. The Control
-        Plane is never among them: the runtime is ready when it can serve an
-        inference request, and it can do that while the Control Plane is down.
+        Returns 200 when the service may receive traffic, and 503 while one of
+        the runtime's own dependencies is not there yet — its database
+        unreachable, or its credential projection not yet bootstrapped: until
+        the first snapshot has been applied there is no mirror to admit a
+        request against (ADR 0007). The Control Plane is never among the
+        dependencies: the runtime is ready when it can serve an inference
+        request, and it can do that while the Control Plane is down.
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
       responses:
@@ -115,6 +121,8 @@ paths:
           $ref: "./shared/runtime-errors.yaml#/components/responses/MethodNotAllowed"
         "500":
           $ref: "./shared/runtime-errors.yaml#/components/responses/InternalError"
+        "503":
+          $ref: "./shared/runtime-errors.yaml#/components/responses/ServiceUnavailable"
   /version:
     get:
       operationId: getVersion

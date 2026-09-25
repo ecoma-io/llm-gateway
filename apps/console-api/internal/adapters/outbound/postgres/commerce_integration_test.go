@@ -1225,7 +1225,8 @@ func TestIntegrationCommerceActiveCandidatesFeedTheDerivation(t *testing.T) {
 // TestIntegrationCommercePaygIsARowPerAccountWithAWriteOnceBucket pins the
 // PAYG row's whole life through the port: absence is the disabled state, the
 // flag flips in one insert-or-update that never rewrites the row's birth,
-// and the bucket reference lands once and never again.
+// and the bucket reference is one insert-or-update — it creates the row when
+// there is none, lands once, and never again.
 func TestIntegrationCommercePaygIsARowPerAccountWithAWriteOnceBucket(t *testing.T) {
 	c := integrationCommerce(t)
 	ctx := t.Context()
@@ -1293,13 +1294,38 @@ func TestIntegrationCommercePaygIsARowPerAccountWithAWriteOnceBucket(t *testing.
 		t.Fatalf("the re-enabled PAYG row = %+v (%v), want the bucket reference untouched", stored, err)
 	}
 
-	// An account with no PAYG row has nothing to fund: the statement writes
-	// nothing and says so.
-	if applied, err := c.payg.AssignFundingBucket(ctx, neverEnabled, bucketTwo, time.Now().UTC()); err != nil || applied {
-		t.Fatalf("assign a bucket to an unfunded account = (%t, %v), want (false, nil)", applied, err)
+	// An account with no PAYG row yet gets the row created around the
+	// reference — PAYG still off, because a reference alone funds nothing —
+	// and the row's birth is the assignment's instant.
+	assignedAt := time.Now().UTC().Truncate(time.Millisecond)
+	applied, err = c.payg.AssignFundingBucket(ctx, neverEnabled, bucketTwo, assignedAt)
+	if err != nil || !applied {
+		t.Fatalf("assign the first bucket of a rowless account = (%t, %v), want (true, nil)", applied, err)
 	}
-	if _, err := c.payg.ByAccount(ctx, neverEnabled); !errors.Is(err, persistence.ErrNotFound) {
-		t.Fatalf("the refused assignment materialised a row: %v", err)
+	stored, err = c.payg.ByAccount(ctx, neverEnabled)
+	if err != nil {
+		t.Fatalf("read the created PAYG row back: %v", err)
+	}
+	if stored.Enabled || stored.FundingBucketID != bucketTwo ||
+		!micros(stored.CreatedAt).Equal(micros(assignedAt)) || !micros(stored.UpdatedAt).Equal(micros(assignedAt)) {
+		t.Fatalf("the created PAYG row = %+v, want disabled, bucket %s, born at %s", stored, bucketTwo, micros(assignedAt))
+	}
+
+	// The row the creation path made is under the same one-bucket rule:
+	// a second assignment is refused and changes nothing.
+	if applied, err := c.payg.AssignFundingBucket(ctx, neverEnabled, bucketOne, time.Now().UTC()); err != nil || applied {
+		t.Fatalf("reassign the created row's bucket = (%t, %v), want (false, nil)", applied, err)
+	}
+	// Enabling the created row flips only the flag: the bucket survives it
+	// untouched, and the birth is never rewritten by an update-path upsert.
+	if err := c.payg.SetEnabled(ctx, neverEnabled, true, assignedAt.Add(time.Minute)); err != nil {
+		t.Fatalf("enable the created PAYG row: %v", err)
+	}
+	if stored, err = c.payg.ByAccount(ctx, neverEnabled); err != nil {
+		t.Fatalf("read the enabled PAYG row back: %v", err)
+	}
+	if !stored.Enabled || stored.FundingBucketID != bucketTwo || !micros(stored.CreatedAt).Equal(micros(assignedAt)) {
+		t.Fatalf("the enabled PAYG row = %+v, want enabled with bucket %s and birth %s untouched", stored, bucketTwo, micros(assignedAt))
 	}
 }
 

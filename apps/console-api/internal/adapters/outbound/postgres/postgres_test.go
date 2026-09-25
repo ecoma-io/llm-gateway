@@ -159,6 +159,47 @@ func TestNestedWithinTxOnADifferentStoreRunsItsOwnIndependentUnit(t *testing.T) 
 	}
 }
 
+// TestInUnitOfWorkAnswersTheScopeTheContextCarries pins the port's newest
+// member against the same lookup Querier and WithinTx resolve on: false on
+// the bare context, true on the context a scope hands its work, and still
+// false for a foreign pool's scope — the answer a ledger-side repository will
+// refuse an autocommitted append on.
+func TestInUnitOfWorkAnswersTheScopeTheContextCarries(t *testing.T) {
+	fA, dbA := registerFake(t)
+	fB, dbB := registerFake(t)
+	storeA, storeB := New(dbA), New(dbB)
+
+	if storeA.InUnitOfWork(context.Background()) {
+		t.Fatal("InUnitOfWork answered true for a context no scope handed out")
+	}
+
+	err := storeA.WithinTx(context.Background(), func(ctxA context.Context) error {
+		if !storeA.InUnitOfWork(ctxA) {
+			t.Fatal("InUnitOfWork answered false for the context its own scope handed out")
+		}
+		// Store B's pool carries no transaction here: its scope has not run,
+		// and another pool's unit is not this context's to see.
+		if storeB.InUnitOfWork(ctxA) {
+			t.Fatal("InUnitOfWork on another store answered true inside store A's scope")
+		}
+		return storeB.WithinTx(ctxA, func(ctxB context.Context) error {
+			if !storeB.InUnitOfWork(ctxB) {
+				t.Fatal("InUnitOfWork answered false for the context B's own scope handed out")
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("nested scopes: %v", err)
+	}
+	if got, want := of(fA.recorded(), evBegin, evCommit, evRollback), []event{evBegin, evCommit}; !equal(got, want) {
+		t.Fatalf("pool A saw %v, want %v", got, want)
+	}
+	if got, want := of(fB.recorded(), evBegin, evCommit, evRollback), []event{evBegin, evCommit}; !equal(got, want) {
+		t.Fatalf("pool B saw %v, want %v", got, want)
+	}
+}
+
 func TestNestedWithinTxFailureOnADifferentStoreLeavesTheOuterVerdictToItsOwner(t *testing.T) {
 	fA, dbA := registerFake(t)
 	fB, dbB := registerFake(t)

@@ -66,6 +66,12 @@ const (
 	// and for a contracted operation that is not built, because in both cases
 	// the caller's request was not what failed.
 	typeAPIError = "api_error"
+
+	// typeOverloadedError says the runtime cannot take the request right now.
+	// It is the readiness probe's one refusal, named for the caller's correct
+	// reading of it: the condition is expected to clear on its own, so the
+	// advice the class carries is retry later, not retry differently.
+	typeOverloadedError = "overloaded_error"
 )
 
 // codeNotImplemented is the one machine-readable refinement this runtime
@@ -260,6 +266,29 @@ func (methodNotAllowedError) wireFailure() wireFailure {
 		body: runtimeErrorBody{
 			Message: "this path does not accept the request method",
 			Type:    typeInvalidRequest,
+		},
+	}
+}
+
+// notReadyError is the transport fact that the process is up and its own
+// dependencies are not: the readiness probe's one refusal. It maps itself like
+// its siblings, because readiness is a fact about this process's wiring and no
+// use case produced it. The class is overloaded_error rather than api_error
+// because the condition is expected to clear — a caller retries later rather
+// than differently — and there is no code, because which dependency is missing
+// is the operator's fact, carried by the log line, never the client's.
+type notReadyError struct{}
+
+func (notReadyError) Error() string {
+	return "not ready"
+}
+
+func (notReadyError) wireFailure() wireFailure {
+	return wireFailure{
+		status: stdhttp.StatusServiceUnavailable,
+		body: runtimeErrorBody{
+			Message: "the runtime is not ready to serve requests",
+			Type:    typeOverloadedError,
 		},
 	}
 }

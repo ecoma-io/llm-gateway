@@ -395,6 +395,7 @@ func TestPaygEnableDisableAndBucketAssignment(t *testing.T) {
 	accountID := world.seedAccount(t)
 	commerceAccountID := commerce.AccountID(accountID)
 	bucketID := commerce.FundingBucketID("0198f0a4-3f6c-7000-8000-0000000000b1")
+	otherBucket := commerce.FundingBucketID("0198f0a4-3f6c-7000-8000-0000000000b2")
 
 	suspended := world.seedAccount(t)
 	world.suspend(suspended)
@@ -402,49 +403,102 @@ func TestPaygEnableDisableAndBucketAssignment(t *testing.T) {
 		t.Fatalf("enable on suspended account error = %v, want identity.ErrAccountNotActive", err)
 	}
 
-	if err := commerceUse.EnableAccountPayg(t.Context(), commerceAccountID); err != nil {
-		t.Fatalf("EnableAccountPayg returned error: %v", err)
+	// Enabling before the choreography has put a bucket on file is refused: a
+	// spending authorisation that names no bucket authorises draws from
+	// nothing.
+	if err := commerceUse.EnableAccountPayg(t.Context(), commerceAccountID); !errors.Is(err, commerce.ErrInvalidTransition) {
+		t.Fatalf("enable without a bucket on file error = %v, want commerce.ErrInvalidTransition", err)
 	}
-	if !world.paygRows[commerceAccountID].Enabled {
-		t.Fatal("the flag did not land")
+	if _, ok := world.paygRows[commerceAccountID]; ok {
+		t.Fatal("the refused enable materialised a PAYG row")
 	}
 
-	if err := commerceUse.DisableAccountPayg(t.Context(), commerceAccountID); err != nil {
-		t.Fatalf("DisableAccountPayg returned error: %v", err)
-	}
+	// The choreography's assignment brings the row into being with PAYG off —
+	// a reference funds and authorises nothing by itself.
 	if err := commerceUse.AssignAccountFundingBucket(t.Context(), commerceAccountID, bucketID); err != nil {
 		t.Fatalf("AssignAccountFundingBucket returned error: %v", err)
 	}
-	if world.paygRows[commerceAccountID].FundingBucketID != bucketID {
-		t.Fatalf("bucket on file = %s, want %s", world.paygRows[commerceAccountID].FundingBucketID, bucketID)
+	if world.paygRows[commerceAccountID].FundingBucketID != bucketID || world.paygRows[commerceAccountID].Enabled {
+		t.Fatalf("PAYG row after assignment = %+v, want the bucket on file with the flag still off", world.paygRows[commerceAccountID])
 	}
-	if err := commerceUse.AssignAccountFundingBucket(t.Context(), commerceAccountID, bucketID); !errors.Is(err, commerce.ErrInvalidTransition) {
+
+	// Re-assigning the same bucket is convergence, not an error; a different
+	// one is the write-once refusal.
+	if err := commerceUse.AssignAccountFundingBucket(t.Context(), commerceAccountID, bucketID); err != nil {
+		t.Fatalf("re-assigning the bucket on file returned error: %v", err)
+	}
+	if err := commerceUse.AssignAccountFundingBucket(t.Context(), commerceAccountID, otherBucket); !errors.Is(err, commerce.ErrInvalidTransition) {
 		t.Fatalf("reassignment error = %v, want the write-once refusal", err)
+	}
+	if world.paygRows[commerceAccountID].FundingBucketID != bucketID {
+		t.Fatalf("bucket on file = %s, want the refused reassignment to have changed nothing", world.paygRows[commerceAccountID].FundingBucketID)
+	}
+
+	// With a bucket on file the flag flips, and the flip never touches the
+	// bucket; the off-switch below is unconditional.
+	if err := commerceUse.EnableAccountPayg(t.Context(), commerceAccountID); err != nil {
+		t.Fatalf("EnableAccountPayg returned error: %v", err)
+	}
+	if !world.paygRows[commerceAccountID].Enabled || world.paygRows[commerceAccountID].FundingBucketID != bucketID {
+		t.Fatalf("enabled PAYG row = %+v, want the flag on with the bucket untouched", world.paygRows[commerceAccountID])
+	}
+	if err := commerceUse.DisableAccountPayg(t.Context(), commerceAccountID); err != nil {
+		t.Fatalf("DisableAccountPayg returned error: %v", err)
+	}
+	if world.paygRows[commerceAccountID].Enabled || world.paygRows[commerceAccountID].FundingBucketID != bucketID {
+		t.Fatalf("disabled PAYG row = %+v, want the flag off with the bucket untouched", world.paygRows[commerceAccountID])
 	}
 
 	// The stalled race: the write reports a lost swap and lands nothing, and
-	// the use case reads what did land — nothing — and refuses.
+	// the use case reads what did land. A different bucket got there first —
+	// the defect the write-once guard exists to stop — so the read names it
+	// and refuses; the winner's own bucket re-fired is convergence.
 	world2 := newCommerceWorld(t)
 	use2 := newCommerce(world2)
 	account2 := world2.seedAccount(t)
-	if err := use2.EnableAccountPayg(t.Context(), commerce.AccountID(account2)); err != nil {
-		t.Fatalf("EnableAccountPayg returned error: %v", err)
+	if err := use2.AssignAccountFundingBucket(t.Context(), commerce.AccountID(account2), otherBucket); err != nil {
+		t.Fatalf("AssignAccountFundingBucket returned error: %v", err)
 	}
 	world2.stallPaygAssign = true
-	if err := use2.AssignAccountFundingBucket(t.Context(), commerce.AccountID(account2), bucketID); err == nil {
-		t.Fatal("a stalled assignment that landed nothing returned nil")
+	if err := use2.AssignAccountFundingBucket(t.Context(), commerce.AccountID(account2), bucketID); !errors.Is(err, commerce.ErrInvalidTransition) {
+		t.Fatalf("a stalled assignment racing a different bucket = %v, want the write-once refusal", err)
+	}
+	world2.stallPaygAssign = false
+	if err := use2.AssignAccountFundingBucket(t.Context(), commerce.AccountID(account2), otherBucket); err != nil {
+		t.Fatalf("re-firing the winner's own assignment returned error: %v", err)
 	}
 
 	// Disabling an account that never enabled PAYG records the flag
-	// explicitly instead of failing.
+	// explicitly instead of failing — and the row that disable created
+	// carries no bucket, so enabling it is refused: the second branch of
+	// the enable gate, and the realistic path a bucket-less row takes.
 	world3 := newCommerceWorld(t)
 	use3 := newCommerce(world3)
 	account3 := world3.seedAccount(t)
-	if err := use3.DisableAccountPayg(t.Context(), commerce.AccountID(account3)); err != nil {
+	payg3 := commerce.AccountID(account3)
+	if err := use3.DisableAccountPayg(t.Context(), payg3); err != nil {
 		t.Fatalf("DisableAccountPayg on an unknown account returned error: %v", err)
 	}
-	if world3.paygRows[commerce.AccountID(account3)].Enabled {
+	if world3.paygRows[payg3].Enabled {
 		t.Fatal("the explicit disable did not land")
+	}
+	if err := use3.EnableAccountPayg(t.Context(), payg3); !errors.Is(err, commerce.ErrInvalidTransition) {
+		t.Fatalf("enable on a bucket-less row error = %v, want commerce.ErrInvalidTransition", err)
+	}
+	if world3.paygRows[payg3].Enabled {
+		t.Fatal("the refused enable flipped the flag on")
+	}
+
+	// A malformed bucket reference is refused in the domain's own words,
+	// before any statement runs.
+	world4 := newCommerceWorld(t)
+	use4 := newCommerce(world4)
+	account4 := world4.seedAccount(t)
+	if err := use4.AssignAccountFundingBucket(t.Context(), commerce.AccountID(account4), "not-a-uuid"); !errors.Is(err, commerce.ErrInvalidFundingBucketID) {
+		t.Fatalf("assign with a malformed bucket id error = %v, want commerce.ErrInvalidFundingBucketID", err)
+	}
+	if _, ok := world4.paygRows[commerce.AccountID(account4)]; ok {
+		t.Fatal("the refused assignment materialised a PAYG row")
 	}
 }
 

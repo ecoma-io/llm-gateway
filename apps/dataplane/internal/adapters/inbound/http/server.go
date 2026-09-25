@@ -3,8 +3,9 @@
 //
 // It owns transport concerns — routing, middleware, request identifiers and
 // wire errors — then calls the application for use-case work. Routing and
-// provider behaviour do not exist yet: health and readiness remain
-// infrastructure-level, GET /version proves the HTTP → application → response
+// provider behaviour do not exist yet: liveness stays infrastructure-level,
+// readiness gates on the runtime's own dependencies answered through the
+// application, GET /version proves the HTTP → application → response
 // path every domain endpoint will follow, and POST /v1/chat/completions is
 // contracted and answers 501 — the inference surface's address, held open
 // before anything behind it is built. The public contract is

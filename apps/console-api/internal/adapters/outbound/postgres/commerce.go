@@ -1005,14 +1005,22 @@ VALUES ($1, $2, $3, $3)
 ON CONFLICT (account_id) DO UPDATE
 SET enabled = EXCLUDED.enabled, updated_at = EXCLUDED.updated_at`
 
-// Write-once: the reference lands only while the row's reference is still
-// unset. One PAYG source and one bucket per account, ever — a changed
-// reference would silently split the account's prepaid money across two
-// buckets, so the statement refuses what a read-then-write would race into.
+// Write-once, insert-or-update: the reference lands only while the row's
+// reference is still unset, and a row that does not exist yet is created to
+// receive it — PAYG off, because an absent row means PAYG off and creating
+// the row must not flip the flag as a side effect of recording a reference.
+// One PAYG source and one bucket per account, ever — a changed reference
+// would silently split the account's prepaid money across two buckets — so
+// the conflict guard, not a read-then-write, is what refuses the re-point.
+// The conflict case answers no row at all (the WHERE fails on the DO UPDATE
+// path and the insert path cannot run twice for one account), which is the
+// rows-affected count the method reads.
 const assignFundingBucket = `
-UPDATE control.account_payg
-SET funding_bucket_id = $2, updated_at = $3
-WHERE account_id = $1 AND funding_bucket_id IS NULL`
+INSERT INTO control.account_payg (account_id, enabled, funding_bucket_id, created_at, updated_at)
+VALUES ($1, false, $2, $3, $3)
+ON CONFLICT (account_id) DO UPDATE
+SET funding_bucket_id = $2, updated_at = EXCLUDED.updated_at
+WHERE control.account_payg.funding_bucket_id IS NULL`
 
 func (r *paygRepo) ByAccount(ctx context.Context, accountID commerce.AccountID) (commerce.AccountPayg, error) {
 	var p commerce.AccountPayg
@@ -1051,10 +1059,10 @@ func (r *paygRepo) AssignFundingBucket(ctx context.Context, accountID commerce.A
 	if err != nil {
 		return false, fmt.Errorf("postgres: assign funding bucket to account %s: read rows affected: %w", accountID, err)
 	}
-	// False means the world moved and the caller re-reads: a reference is
-	// already on file, or the account has no PAYG row at all — a row comes
-	// into being the first time any PAYG state is recorded, enable or
-	// disable alike, so no row means no state and no reference has ever
-	// existed to assign into. Either way nothing was written.
+	// False means a reference was already on file — the conflict branch of
+	// the upsert wrote nothing — and the caller re-reads to converge or to
+	// name the conflict. Every other world lands exactly one row: the insert
+	// that creates the account's PAYG row around the reference, or the
+	// update that fills a reference the row never had.
 	return n == 1, nil
 }

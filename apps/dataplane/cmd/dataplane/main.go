@@ -82,6 +82,27 @@ var version = "dev"
 // process; it is not a retry budget.
 const postgresOpenTimeout = 5 * time.Second
 
+const (
+	// readTimeout bounds one request's read — headers and body together — on
+	// both listeners. Without it a client that connects and stalls mid-upload
+	// holds its connection and its goroutine for as long as it likes. Thirty
+	// seconds is room for the largest request this surface reads on a slow
+	// client, and a ceiling a stalled peer cannot outwait.
+	readTimeout = 30 * time.Second
+
+	// idleTimeout closes a keep-alive connection that has carried no request
+	// for two minutes. It applies between requests and never inside one, so it
+	// cannot shorten a response that is still being written — the streamed
+	// answers this process exists to serve are bounded by the WriteTimeout
+	// decision in newServer, not by this.
+	idleTimeout = 120 * time.Second
+
+	// maxHeaderBytes is the request-header ceiling, stated explicitly rather
+	// than left sitting at the standard library's default of the same size: a
+	// limit a reader can see is a limit a reviewer can argue with.
+	maxHeaderBytes = 1 << 20
+)
+
 // service is one listener this process serves, together with the name that
 // makes a failure or a startup line say which one it was.
 type service struct {
@@ -240,7 +261,7 @@ func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
 
 	services := []service{{
 		name:     "runtime",
-		server:   &stdhttp.Server{Handler: http.New(app), ReadHeaderTimeout: cfg.ReadHeaderTimeout},
+		server:   newServer(http.New(app), cfg),
 		listener: runtimeListener,
 	}}
 
@@ -256,10 +277,30 @@ func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
 
 	services = append(services, service{
 		name:     "management",
-		server:   &stdhttp.Server{Handler: management.New(app, cfg.ManagementToken), ReadHeaderTimeout: cfg.ReadHeaderTimeout},
+		server:   newServer(management.New(app, cfg.ManagementToken), cfg),
 		listener: managementListener,
 	})
 	return services, nil
+}
+
+// newServer builds one listener's http.Server with the transport posture both
+// of this process's surfaces serve under: the configured header timeout, the
+// read and idle bounds, and the header ceiling.
+//
+// WriteTimeout is deliberately absent, and its absence is the decision here.
+// The runtime's inference contract is a Server-Sent Events stream — an answer
+// that is supposed to keep being written for as long as the model keeps
+// producing — and a write deadline would kill a long stream mid-answer: the
+// one failure this process must not introduce itself. What a slow client can
+// actually hold this process with is reading, and that side is bounded.
+func newServer(handler stdhttp.Handler, cfg config.Config) *stdhttp.Server {
+	return &stdhttp.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
 }
 
 // run serves every listener until the process is asked to stop, then drains.
