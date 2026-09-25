@@ -34,8 +34,9 @@
 #      schema crosses the boundary, and one fixture credential opens both;
 #   8. the Control Plane's identity schema enforces its rules: lifecycle
 #      states, the live-email uniqueness and its re-invite exception, the
-#      revocation/state pairing, the token prefix grammar, and every foreign
-#      key;
+#      revocation/state pairing, the token prefix grammar and its binding to
+#      the key's own id, and every foreign key including the creator edge's
+#      same-account rule;
 #   9. PostgreSQL transaction semantics hold (rolled-back work leaves
 #      nothing behind, committed work survives);
 #  10. a migration that fails mid-file rolls back whole, records its target
@@ -131,9 +132,10 @@ expect_failure() {
 # batch is wrapped in an explicit transaction whose ROLLBACK a successful run
 # would reach (so even a probe that fails to fail leaves nothing behind), and
 # the captured error output must name the constraint under test. A refusal
-# for any other reason — a stale row's duplicate key, a mis-aimed seed —
-# fails the suite with psql's actual output attached, because a step that
-# cannot say which rule refused the row has not proven that rule.
+# for any other reason — a stale row's duplicate key, a mis-aimed seed,
+# another constraint the same row violates — fails the suite with psql's
+# actual output attached, because a step that cannot say which rule refused
+# the row has not proven that rule.
 expect_lane_constraint_failure() {
 	local database="$1" label="$2" constraint="$3" batch="$4" output status=0
 	output="$(compose exec -T postgres psql -U gateway -d "$database" \
@@ -494,14 +496,23 @@ WITH account AS (
 INSERT INTO control.api_keys (id, account_id, created_by, display_name, prefix, state, created_at, updated_at, revoked_at)
 SELECT 'c0000000-0000-4000-8000-0000000000c1', id, NULL, 'verify probe', 'gw_c0000000-0000-4000-8000-0000000000c1_', 'revoked', now(), now(), NULL FROM account"
 
-expect_constraint_failure "a key prefix outside the grammar is refused" api_keys_prefix_shape "
+# The prefix probes isolate their constraint on purpose: 000005 bound the
+# prefix to its own id beside the shape check 000002 shipped, and PostgreSQL
+# walks a row's CHECK constraints in name order — a probe violating two
+# proves whichever sorts first and nothing about the other. The binding probe
+# carries a well-formed v4 prefix of a DIFFERENT key, so only
+# api_keys_prefix_id_consistency can refuse it; the shape probe carries an id
+# whose own bits are not v4 (the uuid type accepts any bits, which is exactly
+# why the grammar check exists) with its matching rendering, so the binding
+# holds and only api_keys_prefix_shape can refuse.
+expect_constraint_failure "a key prefix naming another key's id is refused" api_keys_prefix_id_consistency "
 WITH account AS (
   INSERT INTO control.accounts (id, name, state, created_at, updated_at)
   VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
   RETURNING id
 )
 INSERT INTO control.api_keys (id, account_id, created_by, display_name, prefix, state, created_at, updated_at, revoked_at)
-SELECT 'c0000000-0000-4000-8000-0000000000c1', id, NULL, 'verify probe', 'garbage', 'active', now(), now(), NULL FROM account"
+SELECT 'c0000000-0000-4000-8000-0000000000c1', id, NULL, 'verify probe', 'gw_c0000000-0000-4000-8000-0000000000c2_', 'active', now(), now(), NULL FROM account"
 
 expect_constraint_failure "a key prefix with non-v4 uuid nibbles is refused" api_keys_prefix_shape "
 WITH account AS (
@@ -510,7 +521,7 @@ WITH account AS (
   RETURNING id
 )
 INSERT INTO control.api_keys (id, account_id, created_by, display_name, prefix, state, created_at, updated_at, revoked_at)
-SELECT 'c0000000-0000-4000-8000-0000000000c1', id, NULL, 'verify probe', 'gw_c0000000-0000-1000-8000-0000000000c1_', 'active', now(), now(), NULL FROM account"
+SELECT 'c0000000-0000-1000-8000-0000000000c1', id, NULL, 'verify probe', 'gw_c0000000-0000-1000-8000-0000000000c1_', 'active', now(), now(), NULL FROM account"
 
 expect_constraint_failure "a user under an unknown account is refused" users_account_id_fkey "
 INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
@@ -520,7 +531,14 @@ expect_constraint_failure "a key under an unknown account is refused" api_keys_a
 INSERT INTO control.api_keys (id, account_id, created_by, display_name, prefix, state, created_at, updated_at, revoked_at)
 VALUES ('c0000000-0000-4000-8000-0000000000c1', 'e0000000-0000-4000-8000-0000000000e1', NULL, 'verify probe', 'gw_c0000000-0000-4000-8000-0000000000c1_', 'active', now(), now(), NULL)"
 
-expect_constraint_failure "a key created by an unknown user is refused" api_keys_created_by_fkey "
+# The creator edge 000005 made composite: (created_by, account_id) must
+# exist in users (id, account_id). Two refusals prove its two halves — an
+# unknown user id, and a real user of a different account — and one rule
+# deliberately has no probe here: users_id_account_id_key can never fire on
+# its own, because id is the primary key and any duplicate pair is refused
+# by users_pkey first; it exists as the composite edge's referenced key, and
+# the edge's probes prove it in use.
+expect_constraint_failure "a key created by an unknown user is refused" api_keys_created_by_account_id_fkey "
 WITH account AS (
   INSERT INTO control.accounts (id, name, state, created_at, updated_at)
   VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
@@ -528,6 +546,21 @@ WITH account AS (
 )
 INSERT INTO control.api_keys (id, account_id, created_by, display_name, prefix, state, created_at, updated_at, revoked_at)
 SELECT 'c0000000-0000-4000-8000-0000000000c1', id, 'f0000000-0000-4000-8000-0000000000f1', 'verify probe', 'gw_c0000000-0000-4000-8000-0000000000c1_', 'active', now(), now(), NULL FROM account"
+
+expect_constraint_failure "a key created by a user of another account is refused" api_keys_created_by_account_id_fkey "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), other_account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a2', 'verify probe', 'active', now(), now())
+), foreign_user AS (
+  INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+  VALUES ('b0000000-0000-4000-8000-0000000000b1', 'a0000000-0000-4000-8000-0000000000a2', 'other@example.com', 'active', now(), now())
+)
+INSERT INTO control.api_keys (id, account_id, created_by, display_name, prefix, state, created_at, updated_at, revoked_at)
+SELECT 'c0000000-0000-4000-8000-0000000000c1', id, 'b0000000-0000-4000-8000-0000000000b1', 'verify probe', 'gw_c0000000-0000-4000-8000-0000000000c1_', 'active', now(), now(), NULL FROM account"
 
 assert_equals "a well-formed account, user and key all insert" \
 	"$(psql_scalar "$control_db" "
