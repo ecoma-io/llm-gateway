@@ -256,6 +256,12 @@ func (s fakeCommerceStore) WithinTx(ctx context.Context, fn func(ctx context.Con
 	return nil
 }
 
+// InUnitOfWork answers the marker lookup WithinTx marks with — the same
+// question the real store's member asks of the real context.
+func (s fakeCommerceStore) InUnitOfWork(ctx context.Context) bool {
+	return inTransaction(ctx)
+}
+
 func copyMap[K comparable, V any](m map[K]V) map[K]V {
 	out := make(map[K]V, len(m))
 	for k, v := range m {
@@ -736,12 +742,19 @@ func (f fakePaygAccounts) SetEnabled(_ context.Context, accountID commerce.Accou
 	return nil
 }
 
+// AssignFundingBucket models the port's insert-or-update: an absent row is
+// created around the reference with PAYG off, a row whose reference is unset
+// takes it, and a row that already carries a reference is left untouched and
+// answers false — the caller re-reads to converge or to name the conflict.
 func (f fakePaygAccounts) AssignFundingBucket(_ context.Context, accountID commerce.AccountID, bucketID commerce.FundingBucketID, updatedAt time.Time) (bool, error) {
 	if f.world.stallPaygAssign {
 		return false, nil
 	}
 	payg, ok := f.world.paygRows[accountID]
-	if !ok || payg.FundingBucketID != "" {
+	switch {
+	case !ok:
+		payg = commerce.AccountPayg{AccountID: accountID, CreatedAt: updatedAt}
+	case payg.FundingBucketID != "":
 		return false, nil
 	}
 	payg.FundingBucketID = bucketID

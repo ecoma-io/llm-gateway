@@ -545,10 +545,14 @@ func (c *Commerce) transitionSubscription(ctx context.Context, id commerce.Subsc
 // EnableAccountPayg turns the account's prepaid-spending flag on. Enabling
 // authorises spending and funds nothing: the flag is commerce's whole state
 // here, the bucket it will draw from is Accounting's row, and the first
-// topup is B6's choreography. The account must be active — growth stops with
-// a suspension, and authorising new spending is growth — while the off-switch
-// below deliberately has no such gate: disabling a spending path is never the
-// move a suspension should be able to block.
+// topup is B6's choreography. Enabling does require that bucket to be on
+// file — a spending authorisation that names nothing would authorise draws
+// from a bucket that does not exist, and the choreography assigns the
+// reference at account creation, so by the time a flag flip is legitimate
+// the reference is there. The account must be active — growth stops with a
+// suspension, and authorising new spending is growth — while the off-switch
+// below deliberately has no such gate: disabling a spending path is never
+// the move a suspension should be able to block.
 func (c *Commerce) EnableAccountPayg(ctx context.Context, accountID commerce.AccountID) error {
 	return c.store.WithinTx(ctx, func(txCtx context.Context) error {
 		account, err := c.accounts.ByID(txCtx, identity.AccountID(accountID))
@@ -564,6 +568,26 @@ func (c *Commerce) EnableAccountPayg(ctx context.Context, accountID commerce.Acc
 		// given — a residual the admission side already prices in, because a
 		// disabled account's subscriptions stop being served regardless of
 		// what its spending flag says.
+		//
+		// The bucket reference reads the same way, and unlike the account
+		// state it is write-once once landed — so what this read sees is
+		// what every later draw draws from. The race it cannot close runs
+		// the other way: a first assignment landing just after this read
+		// found nothing is refused by this call and converges on retry —
+		// the safe direction, an authorisation that never under-states
+		// its funding.
+		payg, err := c.payg.ByAccount(txCtx, accountID)
+		if err != nil {
+			if errors.Is(err, persistence.ErrNotFound) {
+				return fmt.Errorf("application: enable payg for account %s: %w: no funding bucket is on file",
+					accountID, commerce.ErrInvalidTransition)
+			}
+			return fmt.Errorf("application: enable payg: read payg state: %w", err)
+		}
+		if payg.FundingBucketID == "" {
+			return fmt.Errorf("application: enable payg for account %s: %w: no funding bucket is on file",
+				accountID, commerce.ErrInvalidTransition)
+		}
 		now, err := dbNow(txCtx, c.clock, "enable payg")
 		if err != nil {
 			return err
@@ -605,23 +629,26 @@ func (c *Commerce) AccountPayg(ctx context.Context, accountID commerce.AccountID
 // AssignAccountFundingBucket records the bucket reference the account-creation
 // choreography assigns. The assignment is write-once — one PAYG source and
 // one bucket per account, ever, because a changed reference would silently
-// split the account's prepaid money across two buckets — so the lost race is
-// resolved by reading what did land: the same bucket is convergence, a
-// different one is the defect the guard exists to stop.
+// split the account's prepaid money across two buckets — and it works on an
+// account whose PAYG row does not exist yet: the write is insert-or-update,
+// so the first assignment brings the row into being with PAYG off and the
+// reference set. A lost race is resolved by reading what did land: the same
+// bucket is convergence, a different one is the defect the write-once guard
+// exists to stop.
 func (c *Commerce) AssignAccountFundingBucket(ctx context.Context, accountID commerce.AccountID, bucketID commerce.FundingBucketID) error {
+	// The blind reference's grammar is the domain's to state: a malformed id
+	// is refused in the domain's own words before any statement runs — the
+	// schema's v7 CHECK would refuse it too, but a driver error is not an
+	// answer a caller can branch on.
+	if err := commerce.ValidateFundingBucketID(bucketID); err != nil {
+		return fmt.Errorf("application: assign funding bucket to account %s: %w", accountID, err)
+	}
 	return c.store.WithinTx(ctx, func(txCtx context.Context) error {
 		now, err := dbNow(txCtx, c.clock, "assign funding bucket")
 		if err != nil {
 			return err
 		}
-		payg, err := c.payg.ByAccount(txCtx, accountID)
-		if err != nil {
-			return fmt.Errorf("application: assign funding bucket: read payg state: %w", err)
-		}
-		if err := payg.AssignFundingBucket(bucketID, now); err != nil {
-			return fmt.Errorf("application: assign funding bucket to account %s: %w", accountID, err)
-		}
-		applied, err := c.payg.AssignFundingBucket(txCtx, accountID, bucketID, payg.UpdatedAt)
+		applied, err := c.payg.AssignFundingBucket(txCtx, accountID, bucketID, now)
 		if err != nil {
 			return fmt.Errorf("application: assign funding bucket to account %s: %w", accountID, err)
 		}
