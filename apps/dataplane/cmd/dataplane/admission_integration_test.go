@@ -30,7 +30,7 @@ package main
 //
 // Run (from apps/dataplane):
 //
-//	POSTGRES_TEST_ADMIN_DSN='postgres://gateway:gateway-dev-only@127.0.0.1:55443/postgres?sslmode=disable' \
+//	POSTGRES_TEST_ADMIN_DSN='postgres://gateway:gateway-dev-only@127.0.0.1:5432/dataplane?sslmode=disable' \
 //	  go test -tags=integration ./cmd/dataplane
 
 import (
@@ -73,7 +73,7 @@ func admissionAdminDSN(t testing.TB) string {
 	t.Helper()
 	dsn := os.Getenv("POSTGRES_TEST_ADMIN_DSN")
 	if dsn == "" {
-		t.Fatal("POSTGRES_TEST_ADMIN_DSN is required for the admission suite; start the fixture (docker compose -f deploy/postgres/compose.yaml up -d --wait) and set it to postgres://gateway:gateway-dev-only@127.0.0.1:55443/postgres?sslmode=disable")
+		t.Fatal("POSTGRES_TEST_ADMIN_DSN is required for the admission suite; start the fixture (docker compose -f deploy/postgres/compose.yaml up -d --wait) and set it to postgres://gateway:gateway-dev-only@127.0.0.1:5432/dataplane?sslmode=disable")
 	}
 	return dsn
 }
@@ -1433,7 +1433,7 @@ func TestIntegrationCredentialVerificationJudgesTheMirrorLifecycles(t *testing.T
 //
 // Run (from apps/dataplane):
 //
-//	POSTGRES_TEST_ADMIN_DSN='postgres://gateway:gateway-dev-only@127.0.0.1:55443/postgres?sslmode=disable' \
+//	POSTGRES_TEST_ADMIN_DSN='postgres://gateway:gateway-dev-only@127.0.0.1:5432/dataplane?sslmode=disable' \
 //	  go test -run '^$' -bench BenchmarkChatAdmissionServe -benchmem -tags=integration ./cmd/dataplane
 func BenchmarkChatAdmissionServe(b *testing.B) {
 	db, store := admissionPool(b, admissionPlaneDSN(b), 8)
