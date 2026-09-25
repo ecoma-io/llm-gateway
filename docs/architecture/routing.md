@@ -30,6 +30,18 @@ Every pass through ③ is one `RequestAttempt` row; retries inside ③ append
 additional attempt rows against the **same** candidate. ⑤ never happens once
 a response is committed.
 
+**The pipeline starts where admission ends.** A request reaches step ① only
+after the runtime's admission transaction has committed — key authenticated,
+account identified, intake checked, alias resolved and priced, hold secured
+against the quota projection, reservation row on disk
+([request lifecycle](request-lifecycle.md)). Admission and routing are two
+separated concerns with an order between them, not one pipeline's stages: a
+request that did not commit admission never reaches a router, and the router
+has no admission decision of its own to make. What admission hands the router
+is a **committed state**, not a verdict in flight: the reservation exists, the
+capacity is drawn, and the router's failure modes are therefore never
+admission's.
+
 Steps ①–⑥ run inside `apps/dataplane`, the Data Plane runtime, and nowhere
 else. Alias resolution and the configuration it reads — aliases, candidates,
 backend and egress policy — come from the runtime's own persistence and
@@ -104,6 +116,29 @@ availability, not for client errors. (The name `invalid_request` is reserved
 for the gateway's own admission rejections — ADR 0002 keeps the two families
 of failure lexically distinct.)
 
+## The handoff: no candidate is a determinate answer
+
+Admission commits, and then the request is handed to routing. The handoff
+between them is narrow: the reservation exists and the capacity is drawn, and
+the router reads the alias and its candidates. There is no third thing the
+router can discover at that moment that would make admission wrong — quota is
+already secured, the alias is already resolved and the output bound already
+fixed — so **the absence of a candidate is a determinate refusal, not a
+transient state**: a request whose alias has no admissible candidate is
+refused, not queued for one to appear.
+
+That refusal is a **release**, not a rollback: the request is an admitted
+request whose hold is returned whole, and the runtime's compensation
+transaction — enter through the reservation close's compare-and-set, return
+the legs in stored order, finalise the request and its intake record, and
+append the `released` usage fact **last** — runs before the client is
+answered, so a compensation and the fact that reports it commit or vanish
+together. The answer is `503 overloaded_error` with a fixed `Retry-After`,
+because "nothing can serve this right now" is the true reading whether or not
+a later pass would serve it. The capacity is never held for a request that
+will not be attempted, and the Control Plane's projection is returned to
+through the same `released` fact every other release uses.
+
 ## Commitment
 
 Commitment is the moment the gateway forwards the first **content-bearing**
@@ -128,6 +163,17 @@ byte of the body. It is a one-way gate:
 The buffer is bounded: when a pre-content buffer reaches its cap the gateway
 commits by flushing it, trading a sliver of fallback window for memory — a
 cap-sized preamble is content for commitment purposes.
+
+The gate is also where the hold stops being a reservation and becomes a
+cost bound. Before commitment, a failed attempt costs provider-side effort
+only — the hold is intact, the fallback restart is free to the account, and
+a release gives back exactly what was drawn. After commitment, usage settles
+on what was delivered against the hold admission secured
+([commerce](commerce.md)): the hold is the ceiling the failure cannot exceed,
+and the lease renewed while the stream runs is what keeps the reaper from
+taking that ceiling back mid-flight. Admission sized the hold before any
+candidate ran precisely so that no routing outcome — fallback, exhaustion, or
+mid-stream death — ever needs to resize it.
 
 Consequence for clients: cross-provider resilience operates at request
 granularity. The gateway never splices two providers' output into one

@@ -249,14 +249,25 @@ For a reservation of `n` on alias `a` at admission:
    legs keep an ordinal.
 4. **Spill to PAYG** — only after all matching entitlements: if PAYG is
    enabled **and** its available balance covers the entire shortfall, reserve
-   the shortfall there; otherwise reject `insufficient_entitlement`. A
-   reservation is fully secured or the request is rejected whole — there is
-   no partial admission and no automatic debt.
+   the shortfall there; otherwise reject the whole request. A reservation is
+   fully secured or the request is rejected whole — there is no partial
+   admission and no automatic debt.
+
+Only grants **eligible for this request** are matched at all: the grant's
+stored scope must contain the requesting alias, and its cycle must not have
+ended at the transaction's own clock. An ineligible grant is passed by, not
+fatal — only a final shortfall surfaces, and then with nothing drawn
+([accounting](accounting.md)).
 
 Steps 3 and 4 are the runtime's own transaction, and the rows they guard are
 its **quota projections** — one ceiling per entitlement cycle, one for the
-PAYG balance. The Control Plane's funding buckets record the same movement
-from the runtime's facts, keyed by `request_id` and written outside the
+PAYG balance. A take that matches no row — a contender won the capacity, or
+the grant's eligibility moved between the walk and the take — passes that
+bucket and the walk continues, up to three passes before the walk is
+abandoned. Every giveback on a walk that cannot be completed is
+**unconditional**: capacity the walk drew and does not need is returned
+whole, so a refusal leaves the projection exactly as it found it. The Control
+Plane's funding buckets record the same movement from the runtime's facts, keyed by `request_id` and written outside the
 admission transaction, so the runtime never holds ledger write authority and
 the waterfall order above is unchanged
 ([ADR 0006](../adr/0006-control-plane-and-data-plane.md);
@@ -312,6 +323,45 @@ the bound. Consequences:
 - an upstream that reports more tokens than the enforced bound is a
   provider-cost anomaly on the attempt record — operational, not customer
   debt and not extra client billing.
+
+### How the hold is sized, and where the price comes from
+
+The hold is one integer, in minor units, computed once inside the admission
+transaction:
+
+```text
+hold = ceil((T_in · p_in + T_out · p_out) / 1_000_000)
+```
+
+`T_in` is the tokenizer's input count, `T_out` the canonical `max_output_tokens`,
+and `p_in`/`p_out` the alias's prices in the effective revision, in integer
+minor units **per 1M tokens**. The division is by one million because the
+prices are; the ceiling is taken **once, over the summed raw product** — not
+per term, and not over a rounded intermediate — so the hold is never larger
+than the prices require, and never smaller by rounding twice. The instant
+everything is evaluated at is
+`transaction_timestamp()`, the database's own clock: the same read that
+resolved the price revision resolves the drawdown, and no gateway node's wall
+clock is trusted anywhere in the computation ([ADR
+0003](../adr/0003-concurrent-subscriptions-and-entitlements.md)).
+
+The prices come from the runtime's own **client price list** —
+`client_price_list_revisions` (+ entries), landed on the Data Plane lane
+(migration `000005_client_price_list`). A revision is a versioned whole:
+draft until activated, never edited after activation, effective from an
+operator-chosen instant, and at most one activated revision per
+effective-from — which is what makes "the single activated revision with the
+greatest `effective_from` not after the instant" a total selection. Entries
+are **alias-exact**: an absent entry is a refusal (`500`, nothing written),
+never a neighbouring alias's price and never a price of zero — zero is a
+legitimate price only when an entry states it. The read resolves the revision
+step and the entry step inside the caller's unit of work, so the hold, the
+waterfall and any drawdown sharing the transaction select at one instant.
+
+The hold vs the **cap** verdict is a ceiled comparison: a hold exactly equal
+to the alias's reservation cap is admissible; a hold above it, or an
+arithmetic overflow while sizing it, is `invalid_request` before any capacity
+is taken.
 
 ## Expiration and in-flight work
 
@@ -403,3 +453,17 @@ did serve.
 | No matching entitlement; alias servable only via PAYG (ADR 0003 access rule) | reject `no_access`                | reject `insufficient_entitlement` | serve at PAYG rates     |
 | Account suspended (key and alias both good)                                  | reject `account_suspended`        | reject `account_suspended`        | reject                  |
 | Request missing/invalid `max_output_tokens`, or above the alias limit        | reject `invalid_request`          | reject `invalid_request`          | reject                  |
+
+`no_access` and `insufficient_entitlement` are the two halves of the last
+walk, and they answer different questions. `no_access` is the **access** rule
+of ADR 0003 speaking: the account has no capacity that may serve this alias at
+all — no eligible grant, and PAYG off, so the alias is not servable by this
+account — and the runtime says so with `403`. `insufficient_entitlement` is the
+**capacity** rule speaking: the account may serve the alias, and the hold did
+not fit in what it has; the runtime gives every partial draw back and says so
+with `429 insufficient_quota`. The distinction is not presentational — it is
+the difference between a pricing or plan decision the caller can act on and a
+quota one it cannot. A hold that overflows arithmetic, or that exceeds the
+alias's reservation cap, is neither: it is a property of the request's size,
+and it is `invalid_request` (see [request
+lifecycle](request-lifecycle.md)'s wire-answer table).
