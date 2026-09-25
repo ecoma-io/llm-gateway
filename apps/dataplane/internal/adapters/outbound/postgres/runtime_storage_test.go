@@ -37,11 +37,14 @@ package postgres
 //     being proved, and the truncate-boundary probe that states where the
 //     000006 append-only guard ends; since that migration the engine refuses
 //     the UPDATE and DELETE that once emptied a feed, and both go around it
-//     the way only a privileged role can), and the surfaced-refusal
+//     the way only a privileged role can), the surfaced-refusal
 //     vocabulary probe, whose widened failed rows are terminal state the
 //     fixture must never permanently hold — 000007's down migration refuses
 //     to re-narrow the constraint over a widened row by design, so the
-//     fixture stays a database a full roll-back can return to clean — mint a
+//     fixture stays a database a full roll-back can return to clean — and
+//     the reaper's batch sweep, whose own verdicts and the release seam's
+//     race against it are predicates over the whole reservations table,
+//     meaningful only where the table holds the test's rows alone — mint a
 //     throwaway database instead and answer to nobody else's rows.
 
 import (
@@ -345,7 +348,11 @@ func integrationThrowawaySerialise(t testing.TB) {
 	if err != nil {
 		t.Fatalf("sql.Open on the admin DSN: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// The budget is the schema apply's own 30s (integrationRuntimeSchema's):
+	// this lock queues behind every other process's whole throwaway lifetime —
+	// create, from-scratch apply, test body — and a budget sized for a
+	// connection grab would time a wait that is legitimately longer.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	conn, err := adminDB.Conn(ctx)
 	if err != nil {
@@ -2179,10 +2186,22 @@ func TestIntegrationWaterfallDrawdownMatchesTheDomainOrder(t *testing.T) {
 // sweep, however lapsed its neighbours are: a lapsed lease with a live window
 // is a holder mid-renewal-hiccup, and a lapsed window with a live lease is a
 // close the settlement path — not the reaper — still has time to make.
+//
+// It runs on a throwaway database because its assertions are predicates over
+// the whole reservations table: "the limit-1 sweep took the oldest lapsed
+// lease", "the sweeping sweep closed none", "the survivors are still open"
+// are table-wide verdicts, and on the shared fixture the table also carries
+// every earlier run's rows — whose own clocks have since lapsed, making them
+// exactly what the sweep is for, so the verdicts there would measure the
+// suite's run history rather than the predicate. On a database of its own the
+// table holds this test's rows alone, and every verdict is about the holds
+// the test created and nothing else.
 func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
-	db, store := integrationPool(t)
-	repos := integrationRepos(t, store)
+	integrationThrowawaySerialise(t)
+	db := integrationThrowawayDatabase(t, "dataplane_b7_reaper_probe")
 	integrationRuntimeSchema(t, db)
+	store := New(db)
+	repos := integrationRepos(t, store)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 

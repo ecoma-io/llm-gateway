@@ -68,6 +68,27 @@ func integrationAdmissionFixture(t *testing.T) admissionFixture {
 	return admissionFixture{db: db, store: store, repos: repos, scope: scope}
 }
 
+// integrationAdmissionFixtureOnThrowaway assembles the same fixture on a
+// database of the calling test's own — minted, migrated and dropped for that
+// one test — for the scenarios whose assertions are predicates over a whole
+// table rather than over their own rows. The seam-reaper race runs there:
+// its sweep is a batch over the whole reservations table, and on the shared
+// fixture the table carries earlier runs' holds, whose leases have since
+// lapsed and whose ages buy the sweep's limit before it ever reaches the
+// hold under test. Everything the fixture needs it seeds itself (catalog
+// scope, projections, price snapshot are per-scenario rows), so a database
+// freshly applied from the migration files serves it whole.
+func integrationAdmissionFixtureOnThrowaway(t *testing.T, name string) admissionFixture {
+	t.Helper()
+	integrationThrowawaySerialise(t)
+	db := integrationThrowawayDatabase(t, name)
+	integrationRuntimeSchema(t, db)
+	store := New(db)
+	repos := integrationRepos(t, store)
+	scope := repos.catalogScope(t)
+	return admissionFixture{db: db, store: store, repos: repos, scope: scope}
+}
+
 // admissionUnitOutcome is what one admission-shaped unit decided, read back
 // by the test after the unit's goroutine has joined.
 type admissionUnitOutcome struct {
@@ -781,9 +802,21 @@ func TestIntegrationConcurrentSeamReleasesArbitrateOnTheCloseCas(t *testing.T) {
 // stands. The reaper's driver is not landed yet (its capacity business is the
 // next milestone's), so the sweep here is the port's own shape: close the
 // lapsed holds, append each victim's expired fact in the same unit.
+//
+// It runs on a throwaway database because the sweep it races is a batch over
+// the whole reservations table. On the shared fixture the table also carries
+// every earlier run's holds — the oversubscription scenarios alone leave
+// dozens open per run — and half an hour after any run those leases are older
+// than the backdated hold here, so the sweep spends its limit on rows this
+// test never created and never reaches the race at all: the test would pass,
+// forever, having exercised nothing. Worse, the sweep would legally close
+// those rows and append expired facts to other runs' requests. On a database
+// of its own the table holds one open lapsed hold — this test's — so the
+// race is real and the sweep's victim list is a verdict: empty, or exactly
+// that hold.
 func TestIntegrationSeamReleaseRacesTheReaperToTheEnding(t *testing.T) {
-	fixture := integrationAdmissionFixture(t)
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	fixture := integrationAdmissionFixtureOnThrowaway(t, "dataplane_b8_reaper_seam")
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 
 	const capacity = int64(100)
@@ -852,10 +885,22 @@ func TestIntegrationSeamReleaseRacesTheReaperToTheEnding(t *testing.T) {
 			t.Fatalf("ending %d: %v", i, one.err)
 		}
 	}
+	holdState := integrationReservationState(t, fixture.db, admitted.reservation)
 	seamEnded := results[0].released
-	reaperEnded := results[1].swept > 0
+	reaperEnded := holdState == "expired"
+	// The hold's row is the ground truth of which ending won it: the seam's
+	// completion and the sweep's victim count are each only their own unit's
+	// claim, and the row is what both claims answer to. On this database the
+	// verdicts pin each other besides — the table holds exactly one open
+	// lapsed hold, this test's, so the sweep's victim list is either empty
+	// (the seam's Close won the CAS) or exactly that hold (the sweep took it).
+	// A sweep reporting no victim while the hold reads expired would be a
+	// reaper closing rows it never returns.
 	if seamEnded == reaperEnded {
-		t.Errorf("endings read (released %t, swept %d) — want exactly one ending to exist: both is a double close, neither is a lost hold", results[0].released, results[1].swept)
+		t.Errorf("the hold reads %q with the seam reporting release %t — want exactly one ending to exist: both is a double close, neither is a lost hold", holdState, results[0].released)
+	}
+	if reaperEnded != (results[1].swept == 1) {
+		t.Errorf("the sweep returned %d victims while the hold reads %q — on a database of this test's own its only possible victim is that hold", results[1].swept, holdState)
 	}
 
 	kinds := integrationFactKinds(t, fixture.db, admitted.requestID)
