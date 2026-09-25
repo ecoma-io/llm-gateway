@@ -48,7 +48,7 @@ export const getHealth = <ThrowOnError extends boolean = false>(
 /**
  * Readiness of the Control Plane API service
  *
- * Returns 200 when the service may receive traffic. The scaffold has no dependencies, so it is always ready; the Control Plane's own dependency checks — its database, its cache — hang off this endpoint. The Data Plane is not among them: this service is ready when it can serve the console, whether or not the runtime is reachable.
+ * Returns 200 when the service may receive traffic, and 503 while one of the Control Plane's own dependencies is not answering — its database today, with the cache joining when a caller first reads through one. The Data Plane is never among them: this service is ready when it can serve the console, whether or not the runtime is reachable.
  */
 export const getReadiness = <ThrowOnError extends boolean = false>(
   options?: Options<GetReadinessData, ThrowOnError>,

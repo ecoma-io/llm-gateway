@@ -4,6 +4,7 @@ import (
 	stdhttp "net/http"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/application"
+	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
 // route is one endpoint of this application's HTTP surface.
@@ -24,8 +25,10 @@ type route struct {
 // routes returns this application's HTTP surface, in the order a reader meets
 // it. Each handler owns the response *shape*; what the answer is belongs to
 // the application, and how it reaches the wire belongs to the kit in
-// server.go.
-func routes(app *application.App) []route {
+// server.go. readiness is the one dependency the table carries beside the
+// application, because the readiness probe's answer is a fact about this
+// process's own wiring rather than about a resource any use case owns.
+func routes(app *application.App, readiness persistence.Pinger) []route {
 	return []route{
 		// Liveness: the process is up and its loop is turning. Anything about
 		// whether the gateway could do useful work — a dependency reachable, a
@@ -37,13 +40,15 @@ func routes(app *application.App) []route {
 			path:    "/healthz",
 			handler: func(w stdhttp.ResponseWriter, _ *stdhttp.Request) { writeStatus(w) },
 		},
-		// Readiness: the scaffold has no dependencies, so it is always ready.
-		// The checks that will gate this endpoint later — a database ping, an
-		// upstream probe — hang off here, and only here.
+		// Readiness: gated on this process's own dependency — the database
+		// answering, over the port's Pinger. What the answer is belongs to
+		// readyz; the check hangs off here, and only here, so an orchestrator
+		// restarting on /healthz never kills this process for a dependency it
+		// is on its way to reach.
 		{
 			method:  stdhttp.MethodGet,
 			path:    "/readyz",
-			handler: func(w stdhttp.ResponseWriter, _ *stdhttp.Request) { writeStatus(w) },
+			handler: readyz(readiness),
 		},
 		// Version flows through the application rather than reading main's stamp
 		// directly: cmd/console-api owns the one ldflags version source and hands it

@@ -11,8 +11,10 @@
 // application depends on the outbound ports. The database pool is the one
 // piece of infrastructure wired today — this process owns Control Plane state
 // (ADR 0006 §7), so the pool is opened and validated at startup — and it is
-// wired as a pool only: the persistence.Store is built by the change that
-// first gives a use case a query to run, not before.
+// wired as a store and a pool: the projection loop resolves its units of work
+// through the store, and the readiness probe asks the store whether the pool
+// can still answer. The repositories and use cases built over it arrive with
+// the first query to run, not before.
 package main
 
 import (
@@ -35,6 +37,7 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/adapters/outbound/postgres"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/config"
+	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
 // version is stamped at build time:
@@ -135,8 +138,9 @@ func main() {
 	// and repositories tested at the application boundary; wiring them ahead
 	// of a caller would be composition guessed at, and a guessed composition
 	// is exactly what this file exists to refuse. The projection loop is the
-	// first caller this process has gained, and the wiring below is its
-	// composition.
+	// first caller this process has gained, and the readiness probe the
+	// second: the wiring below is theirs, and the store reaches the server
+	// because the probe asks the pool a question no use case can.
 
 	// The Control Plane's state access, and the projection producer on top of
 	// it (ADR 0007). The store is the one object every persistence port
@@ -186,7 +190,7 @@ func main() {
 	defer stop()
 
 	server := &stdhttp.Server{
-		Handler: http.New(application.New(version)),
+		Handler: newHandler(version, store),
 		// ReadHeaderTimeout guards against a peer that connects and says
 		// nothing — a slowloris costs a goroutine forever without it. The
 		// read/write body and idle timeouts wait until there is real traffic
@@ -242,6 +246,21 @@ func main() {
 	}
 
 	log.Printf("console-api %s stopped", version)
+}
+
+// newHandler composes the one HTTP surface this process serves: the
+// application over the build stamp, and the store whose answers gate the
+// readiness probe. It is a function rather than an inline field so the
+// composition is a fact a test can drive — the probe's gate is the one piece
+// of wiring whose absence would leave this process answering ready while its
+// database is lost, and a handler rebuilt without the store is exactly the
+// regression nothing else would notice.
+//
+// Readiness never travels through the application: there is no use case for a
+// ping, and the probe wants the port itself, so the constructor receives the
+// store beside the application rather than an application carrying it.
+func newHandler(version string, readiness persistence.Pinger) stdhttp.Handler {
+	return http.New(application.New(version), readiness)
 }
 
 // run serves until the process is asked to stop, then drains.
