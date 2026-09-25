@@ -200,6 +200,119 @@ recorded_version() {
 	psql_scalar "$database" 'SELECT COALESCE(max(version), 0) FROM schema_migrations'
 }
 
+# sql_statements prints one line for each top-level SQL statement in the file
+# named by $1, with the lexicals that cannot begin a statement stripped first:
+# line and nested block comments, string literals, quoted identifiers and
+# dollar-quoted bodies. It is the transaction check's matcher, not a SQL
+# parser: `-- BEGIN` is prose and disappears with the comment, `"commit"` is
+# an identifier and disappears with the quotes, and the BEGIN/END pair inside
+# a dollar-quoted function body is PL/pgSQL block structure, not transaction
+# control, so it is gone before matching. The survivor is split on semicolons
+# that really are statement boundaries, so `x; BEGIN;` is still two statements
+# and the second starts its own line.
+sql_statements() {
+	awk '
+		BEGIN {
+			mode = "code"; block_depth = 0; statement = ""
+			# 39 is the single quote, written as a character code because this
+			# whole awk program is a single-quoted shell word.
+			single_quote = sprintf("%c", 39)
+		}
+
+		# Awk has no local declarations: the parameter is the local copy.
+		function print_statement(text) {
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", text)
+			if (text != "") print text
+		}
+		function is_identifier_character(character) {
+			return character ~ /^[A-Za-z0-9_]$/
+		}
+
+		{
+			line = $0
+			starting = 1
+
+			# Resume after a dollar quote that closed on this line. One that
+			# has not closed consumes the rest of the line, and the next line
+			# looks for the same delimiter from its own first character.
+			if (mode == "dollar") {
+				closing = index(line, dollar_delimiter)
+				if (closing == 0) next
+				statement = statement " "
+				mode = "code"
+				starting = closing + length(dollar_delimiter)
+			}
+
+			for (position = starting; position <= length(line); position++) {
+				character = substr(line, position, 1)
+				pair = substr(line, position, 2)
+
+				if (mode == "code") {
+					if (pair == "--") {
+						position = length(line)
+					} else if (pair == "/*") {
+						mode = "block"
+						block_depth = 1
+						position++
+					} else if (character == ";") {
+						print_statement(statement)
+						statement = ""
+					} else if (character == sprintf("%c", 39) || character == "\"") {
+						statement = statement " "
+						mode = (character == sprintf("%c", 39) ? "single" : "double")
+					} else if (character == "$") {
+						delimiter_end = position + 1
+						while (is_identifier_character(substr(line, delimiter_end, 1))) delimiter_end++
+						if (substr(line, delimiter_end, 1) == "$") {
+							dollar_delimiter = substr(line, position, delimiter_end - position + 1)
+							statement = statement " "
+							body = substr(line, delimiter_end + 1)
+							closing = index(body, dollar_delimiter)
+							if (closing > 0) {
+								position = delimiter_end + closing + length(dollar_delimiter) - 1
+							} else {
+								mode = "dollar"
+								position = length(line)
+							}
+						} else {
+							# Not a dollar quote: leave an operator or identifier
+							# character for the statement text.
+							statement = statement character
+						}
+					} else {
+						statement = statement character
+					}
+				} else if (mode == "block") {
+					if (pair == "/*") {
+						block_depth++
+						position++
+					} else if (pair == "*/") {
+						block_depth--
+						position++
+						if (block_depth == 0) mode = "code"
+					}
+				} else if (mode == "single") {
+					if (character == single_quote) {
+						if (substr(line, position + 1, 1) == single_quote) position++
+						else mode = "code"
+					}
+				} else if (mode == "double") {
+					if (character == "\"") {
+						if (substr(line, position + 1, 1) == "\"") position++
+						else mode = "code"
+					}
+				}
+			}
+
+			# The newline is SQL whitespace. A string, comment or body still
+			# open keeps its mode across the line.
+			if (mode == "code") statement = statement " "
+		}
+
+		END { print_statement(statement) }
+	' "$1"
+}
+
 # lane_drift_check proves one lane's directory holds exactly what the runner
 # will read: files named `NNNNNN_<name>.up.sql` or `NNNNNN_<name>.down.sql`
 # and nothing else, exactly one `.up.sql` and one `.down.sql` per version, and
@@ -278,21 +391,22 @@ lane_drift_check() {
 	done
 
 	# The content check that rides along: a migration file carries no BEGIN,
-	# COMMIT or ROLLBACK of its own (migrations/README.md) — the runner
-	# delivers each file as one simple query, one implicit transaction, and
-	# a file-managed transaction would replace that guarantee, not add to
-	# it: anything after the file's COMMIT would auto-commit statement by
-	# statement, outside the atomic unit the safety model promises. The
-	# control lane's 000002 pair predates the rule — the rule was written
-	# into the README after that file had landed, and applied history is
-	# immutable — so it is named here as the one allowed exception, and the
-	# roster shrinks only when a lane rewrite ever retires that pair.
+	# START TRANSACTION, COMMIT, ROLLBACK or END of its own
+	# (migrations/README.md) — the runner delivers each file as one simple
+	# query, one implicit transaction, and a file-managed transaction would
+	# replace that guarantee, not add to it: anything after the file's COMMIT
+	# would auto-commit statement by statement, outside the atomic unit the
+	# safety model promises. The control lane's 000002 pair predates the rule
+	# — the rule was written into the README after that file had landed, and
+	# applied history is immutable — so it is named here as the one allowed
+	# exception, and the roster shrinks only when a lane rewrite ever retires
+	# that pair.
 	for file in "$lane_dir"/*.sql; do
 		name="$(basename "$file")"
 		case "$lane/$name" in
 		control/000002_identity_foundation.up.sql | control/000002_identity_foundation.down.sql) continue ;;
 		esac
-		if grep -qiE '^[[:space:]]*(BEGIN|COMMIT|ROLLBACK|START[[:space:]]+TRANSACTION)([[:space:]]|;)' "$file"; then
+		if sql_statements "$file" | grep -qiE '^(BEGIN|START[[:space:]]+TRANSACTION|COMMIT|ROLLBACK|END)([[:space:]]|;|$)'; then
 			printf 'FAIL: migrations/%s/%s carries its own transaction control — one file is one implicit transaction (migrations/README.md)\n' "$lane" "$name" >&2
 			exit 1
 		fi
