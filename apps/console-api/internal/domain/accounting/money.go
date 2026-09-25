@@ -73,13 +73,21 @@ type Delta int64
 // Int64 returns the delta as the plain signed integer the database stores.
 func (d Delta) Int64() int64 { return int64(d) }
 
-// Abs returns the delta's magnitude. A valid adjustment states exactly one
-// non-zero delta, so its leg amount is the magnitude of that one.
-func (d Delta) Abs() Amount {
-	if d < 0 {
-		return Amount(-d)
+// Abs returns the delta's magnitude, refusing the one value whose magnitude
+// does not fit an Amount: negating math.MinInt64 wraps back to itself, and a
+// wrapped magnitude would file an adjustment leg under an amount the caller
+// never stated. An adjustment states exactly one non-zero delta, so its leg
+// amount is the magnitude of that one — and the schema's amount > 0 would
+// have caught the wrap downstream; this is the same refusal one layer up,
+// where the error can name the delta that caused it.
+func (d Delta) Abs() (Amount, error) {
+	if d == Delta(math.MinInt64) {
+		return 0, fmt.Errorf("accounting: %w: %d has no representable magnitude", ErrAmountRange, int64(d))
 	}
-	return Amount(d)
+	if d < 0 {
+		return Amount(-d), nil
+	}
+	return Amount(d), nil
 }
 
 // Balance is a signed number of minor units — what a bucket holds in one of

@@ -65,14 +65,23 @@ func TestAmountSubTakesExactDifference(t *testing.T) {
 }
 
 func TestDeltaAbsIsTheMagnitudeOfTheStatedDirection(t *testing.T) {
-	if got := Delta(-30).Abs(); got != Amount(30) {
-		t.Fatalf("Abs(-30) = %d, want 30", got)
+	if got, err := Delta(-30).Abs(); err != nil || got != Amount(30) {
+		t.Fatalf("Abs(-30) = %d, %v; want 30", got, err)
 	}
-	if got := Delta(30).Abs(); got != Amount(30) {
-		t.Fatalf("Abs(30) = %d, want 30", got)
+	if got, err := Delta(30).Abs(); err != nil || got != Amount(30) {
+		t.Fatalf("Abs(30) = %d, %v; want 30", got, err)
 	}
-	if got := Delta(0).Abs(); got != Amount(0) {
-		t.Fatalf("Abs(0) = %d, want 0", got)
+	if got, err := Delta(0).Abs(); err != nil || got != Amount(0) {
+		t.Fatalf("Abs(0) = %d, %v; want 0", got, err)
+	}
+}
+
+func TestDeltaAbsRefusesTheDeltaWithNoRepresentableMagnitude(t *testing.T) {
+	// Negating MinInt64 wraps back to itself; an adjustment leg must never
+	// carry an amount its caller never stated, so the magnitude itself is
+	// refused rather than wrapped.
+	if _, err := Delta(math.MinInt64).Abs(); !errors.Is(err, ErrAmountRange) {
+		t.Fatalf("Abs(min int64) = %v; want ErrAmountRange, never a wrapped magnitude", err)
 	}
 }
 

@@ -221,9 +221,14 @@ func NewAdjustmentEntry(id LedgerEntryID, bucketID FundingBucketID, settledDelta
 			return LedgerEntry{}, fmt.Errorf("accounting: new adjustment entry: %w", err)
 		}
 	}
-	amount := Delta.Abs(settledDelta)
+	amount, err := Delta.Abs(settledDelta)
+	if err != nil {
+		return LedgerEntry{}, fmt.Errorf("accounting: new adjustment entry: settled_delta: %w", err)
+	}
 	if heldDelta != 0 {
-		amount = Delta.Abs(heldDelta)
+		if amount, err = Delta.Abs(heldDelta); err != nil {
+			return LedgerEntry{}, fmt.Errorf("accounting: new adjustment entry: held_delta: %w", err)
+		}
 	}
 	entry, err := newEntry(id, bucketID, KindAdjustment, amount, settledDelta, heldDelta, createdAt)
 	if err != nil {

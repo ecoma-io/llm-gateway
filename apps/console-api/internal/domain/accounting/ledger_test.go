@@ -2,6 +2,7 @@ package accounting
 
 import (
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -125,6 +126,14 @@ func TestAdjustmentStatesExactlyOneNonZeroDelta(t *testing.T) {
 	}
 	if _, err := NewAdjustmentEntry(mustEntryID(t), bucket, 0, Delta(5), "held only", original, "ops-1", "", legNow); err != nil {
 		t.Fatalf("adjustment (0, +5) must pass: %v", err)
+	}
+	// The one delta whose magnitude does not fit an Amount is refused where
+	// the leg's amount is derived, not left to wrap or to the schema.
+	if _, err := NewAdjustmentEntry(mustEntryID(t), bucket, Delta(math.MinInt64), 0, "floor correction", original, "ops-1", "", legNow); !errors.Is(err, ErrAmountRange) {
+		t.Fatalf("adjustment with min int64 settled delta = %v, want ErrAmountRange", err)
+	}
+	if _, err := NewAdjustmentEntry(mustEntryID(t), bucket, 0, Delta(math.MinInt64), "floor correction", original, "ops-1", "", legNow); !errors.Is(err, ErrAmountRange) {
+		t.Fatalf("adjustment with min int64 held delta = %v, want ErrAmountRange", err)
 	}
 }
 
