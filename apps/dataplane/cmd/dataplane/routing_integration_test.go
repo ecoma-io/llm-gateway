@@ -91,6 +91,7 @@ func (f *routingFixture) rewire(t *testing.T) {
 		postgres.NewQuotaProjectionRepository(f.store),
 		postgres.NewFactRepository(f.store),
 		executors.NewRegistry(entries),
+		application.ExecutionConfig{MaxDuration: 30 * time.Second, LeaseTTL: time.Hour},
 		f.admission,
 	)
 }
@@ -442,11 +443,19 @@ func TestIntegrationRoutingFallsThroughToTheSecondCandidateAndSettles(t *testing
 	}
 
 	kind, capture, providerInput, providerOutput, delivery, amount := f.latestFact(t, requestID)
-	if kind.String != "settled" || capture.String != "reported" {
-		t.Errorf("fact = %s/%s, want settled/reported", kind.String, capture.String)
+	// The report's input (101) ran past the count the hold was priced from —
+	// the admission's four, len("b8c3") — so the settlement clamps it to the
+	// basis and labels the fact reservation_floor. The report's output (55)
+	// sat inside the output basis (routeServe's max_tokens of 64), so the
+	// report stands as given.
+	if kind.String != "settled" || capture.String != "reservation_floor" {
+		t.Errorf("fact = %s/%s, want settled/reservation_floor", kind.String, capture.String)
 	}
-	if providerInput.Int64 != 101 || providerOutput.Int64 != 55 {
-		t.Errorf("provider figures = %d/%d, want the report 101/55", providerInput.Int64, providerOutput.Int64)
+	if providerInput.Int64 != int64(len("b8c3")) {
+		t.Errorf("provider input = %d, want the basis the hold was priced from — the clamp, not the report", providerInput.Int64)
+	}
+	if providerOutput.Int64 != 55 {
+		t.Errorf("provider output = %d, want the report's 55, which sat inside the basis", providerOutput.Int64)
 	}
 	if delivery.Int64 != int64(len(`{"answer":true}`)) {
 		t.Errorf("delivery = %d, want the gateway's own count of what was delivered", delivery.Int64)
@@ -556,14 +565,19 @@ func TestIntegrationRoutingSettlesAMidStreamFailure(t *testing.T) {
 	}
 
 	kind, capture, providerInput, providerOutput, delivery, amount := f.latestFact(t, requestID)
-	if kind.String != "settled" || capture.String != "gateway_observed" {
-		t.Errorf("fact = %s/%s, want settled/gateway_observed", kind.String, capture.String)
+	// The dying provider reported nothing, so both settled figures fall back
+	// to the counts the hold was sized with — the admission's input count and
+	// routeServe's output basis of 64 — and the label is reservation_floor:
+	// every settled figure here is the reservation's own. Delivery stays the
+	// gateway's own record of what left the process, priced by nothing.
+	if kind.String != "settled" || capture.String != "reservation_floor" {
+		t.Errorf("fact = %s/%s, want settled/reservation_floor", kind.String, capture.String)
 	}
 	if !providerInput.Valid || providerInput.Int64 != int64(len("b8c3")) { // the admission count
 		t.Errorf("provider input = %v, want the admission count the settlement fell back to", providerInput)
 	}
-	if providerOutput.Int64 != int64(len("data: partial")) {
-		t.Errorf("provider output = %d, want the delivered bytes' count", providerOutput.Int64)
+	if providerOutput.Int64 != 64 {
+		t.Errorf("provider output = %d, want the output basis the hold was sized with, not the delivered bytes' count", providerOutput.Int64)
 	}
 	if delivery.Int64 != int64(len("data: partial")) {
 		t.Errorf("delivery = %d, want what the client received", delivery.Int64)

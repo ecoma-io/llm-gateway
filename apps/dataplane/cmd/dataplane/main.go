@@ -63,7 +63,6 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/adapters/outbound/postgres"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/config"
-	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/executors"
 )
 
 // version is stamped at build time:
@@ -109,6 +108,17 @@ const (
 	// than left sitting at the standard library's default of the same size: a
 	// limit a reader can see is a limit a reviewer can argue with.
 	maxHeaderBytes = 1 << 20
+
+	// drainTailGrace is the tail an overran drain gives the in-flight walks
+	// whose sockets the force-close severed. The endings — the release that
+	// returns a hold nobody answered, the settlement of the usage that
+	// arrived — run detached from the caller's context on their own budget,
+	// and they are the work a shutdown must not take with it: the reaper
+	// that would otherwise reclaim their holds is not wired yet (debt #80),
+	// so an ending that dies with the process strands its hold until the
+	// hold window expires. Ten seconds is several endings' worth under
+	// ordinary latency and a rounding error against an operator's patience.
+	drainTailGrace = 10 * time.Second
 )
 
 // service is one listener this process serves, together with the name that
@@ -174,27 +184,30 @@ func main() {
 	// runtime storage schema creates; the projection applier (ADR 0007) rides
 	// it too, as the first use case in this process that writes.
 
+	// SIGINT and SIGTERM are the two signals that mean "stop": Ctrl-C sends
+	// the former, every container orchestrator sends the latter. NotifyContext
+	// cancels on the first one received. The context exists before bind, not
+	// only before run: the executor registry's refresher rides it from the
+	// moment bind reads its first snapshot, so a stop that arrives
+	// mid-composition ends the same work it ends mid-traffic.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	// Every listener is bound before any of them serves. A process that
 	// answered on the runtime port while its management port was already taken
 	// would be a process an operator believes is fully deployed and which is
 	// half of one.
-	services, err := bind(cfg, pool)
+	services, err := bind(ctx, cfg, pool)
 	if err != nil {
-		log.Printf("dataplane listen: %v", err)
+		log.Printf("dataplane startup: %v", err)
 		os.Exit(1)
 	}
-
-	// SIGINT and SIGTERM are the two signals that mean "stop": Ctrl-C sends
-	// the former, every container orchestrator sends the latter. NotifyContext
-	// cancels on the first one received.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	// Buffered so the serve goroutine can record its result and exit even if
 	// main never reads it — no goroutine outliving the decision it reports.
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- run(ctx, stop, services, cfg.ShutdownTimeout, pool)
+		errCh <- run(ctx, stop, services, cfg.ShutdownTimeout, drainTailGrace, pool)
 	}()
 
 	for _, s := range services {
@@ -226,6 +239,12 @@ func postgresLocation(cfg config.Config) string {
 // bind opens every listener this configuration asks for and wires the handlers
 // onto them.
 //
+// The context arrives because bind starts work that outlives it: the executor
+// registry's first snapshot is read here, and the refresher that keeps it
+// current is left running on this context when bind returns. A stop signal
+// that lands mid-composition therefore cancels the same machinery a stop
+// mid-traffic does.
+//
 // The pool arrives here rather than the adapters being built beside the open in
 // main so that the whole composition — store, repositories, application,
 // listeners — is one function a reader can read top to bottom as "what this
@@ -244,7 +263,7 @@ func postgresLocation(cfg config.Config) string {
 // listener writes on the Control Plane's behalf (ADR 0007). The mirror is
 // this process's one state, shared with everything else the request path
 // will read.
-func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
+func bind(ctx context.Context, cfg config.Config, pool *sql.DB) ([]service, error) {
 	// One store over the pool, and the catalog's four repositories over that
 	// store — every one of them the same postgres adapter, because the catalog
 	// is this plane's own database and there is exactly one of it. The
@@ -288,15 +307,32 @@ func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
 		},
 	)
 
+	// The executor snapshot: one whole read of the backend catalog, resolved
+	// into frozen executors, before any listener serves. A snapshot that
+	// cannot be read fails the boot — a runtime that reported ready with no
+	// idea which backends it could call would be serving readiness for
+	// nothing — and the refresher keeps it current afterwards, the last good
+	// snapshot standing on a failed read.
+	backendRepo := postgres.NewBackends(catalogStore)
+	rows, err := backendRepo.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("executor registry: %w", err)
+	}
+	registry := &executorRegistry{}
+	entries := buildExecutors(rows, cfg)
+	registry.store(entries)
+	log.Printf("dataplane executor registry: %d callable backend(s) of %d row(s)", len(entries), len(rows))
+
 	// The routing stage over the same store, wrapping admission as the chat
 	// route's use case: every admitted request is walked through the alias's
 	// candidate list and answered, and every other outcome passes through
-	// untouched. The executor registry starts empty — B9 owns the routing
-	// decision, not the provider calls, so today's walk resolves no
-	// candidate for any alias and every admitted request is released as a
-	// no-candidate answer, byte-identical to the endpoint's behaviour before
-	// this stage existed. B10 registers the first executor and the walk
-	// starts trying candidates; nothing here changes when it does.
+	// untouched. The executors the walk reaches come from the snapshot
+	// registry above — one frozen executor per callable backend, replaced
+	// whole by the refresher — so a backend an operator adds is callable
+	// within one refresh interval, and a provider call never reads the
+	// catalog on its way out. The execution budget is the validated
+	// configuration's: the ceiling every call's context carries, and the
+	// lease the renewal keeps alive at a third of its own length.
 	//
 	// The repositories are the same postgres adapters over the same store —
 	// one database, one pool, and the ending units' transactions span them
@@ -304,14 +340,18 @@ func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
 	routing := application.NewChatRouting(
 		catalogStore,
 		postgres.NewModelAliases(catalogStore),
-		postgres.NewBackends(catalogStore),
+		backendRepo,
 		postgres.NewRequestRepository(catalogStore),
 		postgres.NewAttemptRepository(catalogStore),
 		postgres.NewIntakeRepository(catalogStore),
 		postgres.NewReservationRepository(catalogStore),
 		postgres.NewQuotaProjectionRepository(catalogStore),
 		postgres.NewFactRepository(catalogStore),
-		executors.NewRegistry(nil),
+		registry,
+		application.ExecutionConfig{
+			MaxDuration: cfg.ExecutionMaxDuration,
+			LeaseTTL:    cfg.ReservationLeaseTTL,
+		},
 		admission,
 	)
 
@@ -325,6 +365,13 @@ func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
 		server:   newServer(http.New(app, http.WithChatAuthenticator(application.NewCredentialAuthenticator(credentials)), http.WithChatCompletion(routing)), cfg),
 		listener: runtimeListener,
 	}}
+
+	// The refresher rides the process's signal context from here on and
+	// stops when the process stops; the registry needs no close, a snapshot
+	// being data rather than a resource. It starts beside the first listener
+	// it serves — a bind that still fails past this point fails the process,
+	// and the goroutine dies with it.
+	go refreshExecutors(ctx, backendRepo, registry, cfg)
 
 	if cfg.ManagementAddr == "" {
 		return services, nil
@@ -401,20 +448,32 @@ func newServer(handler stdhttp.Handler, cfg config.Config) *stdhttp.Server {
 // On the stop signal it calls stop before draining — restoring the kernel's
 // default handling, so an impatient operator's second signal is answered by the
 // process dying rather than by another graceful attempt — and only then waits
-// the configured timeout for in-flight requests. A drain that overruns its
-// timeout is a defect worth reporting, so run returns the error and the process
+// the configured timeout for in-flight requests.
+//
+// A drain that overruns its timeout is policy, not failure. The standard
+// library's Shutdown does not force active connections closed when its context
+// expires — it reports the expiry and leaves them running — so shutdown names
+// the overrun, closes the sockets, and this side of the policy gives the walks
+// a bounded tail before the pool closes: a streaming answer whose client is
+// still reading ends inside its own ending machinery, and the ending that
+// returns its hold to the projection is the work that must outlive the
+// socket. The process still exits green: the overrun is deployment's clock
+// being shorter than a model's answer, which is a shape this process is built
+// to be killed in, not a defect in the drain. A drain that fails any other
+// way is a defect worth reporting, so run returns the error and the process
 // exits non-zero instead of green.
 //
 // The database pool is closed when run returns, which orders it correctly on
-// every path: after the servers have drained on the stop path, so no request
-// still in flight loses its database mid-query, and immediately on the
+// every path: after the servers have drained on the stop path — and after the
+// overrun tail, which is exactly what the tail is for — so no request still
+// in flight loses its database mid-query, and immediately on the
 // listener-failed path, where nothing is being served at all. It arrives as
 // io.Closer because closing is the whole of what run does with it. A close
 // that fails is reported rather than buried: it is joined onto whatever run
 // is already returning, so the process exits non-zero even when the drain
 // itself was clean — the sibling composition root's contract, kept the same
 // here so the two copies read as one rule.
-func run(ctx context.Context, stop context.CancelFunc, services []service, shutdownTimeout time.Duration, pool io.Closer) error {
+func run(ctx context.Context, stop context.CancelFunc, services []service, shutdownTimeout, drainTail time.Duration, pool io.Closer) error {
 	// Buffered for the same reason as main's channel: each goroutine records
 	// its result and exits even if the select below never reads it.
 	errCh := make(chan error, len(services))
@@ -437,7 +496,17 @@ func run(ctx context.Context, stop context.CancelFunc, services []service, shutd
 
 	case <-ctx.Done():
 		stop()
-		serveErr = shutdown(services, shutdownTimeout)
+		var overran bool
+		serveErr, overran = shutdown(services, shutdownTimeout)
+		if overran {
+			// The tail is bounded and one-shot: long enough for the endings
+			// of the walks the force-close interrupted to write their
+			// releases and settlements, short enough that an operator
+			// waiting on the process sees it leave. It is not interruptible
+			// — granted once, on the way out.
+			log.Printf("dataplane drain overran %s with requests in flight; closing their sockets and giving the in-flight endings a %s tail before exit", shutdownTimeout, drainTail)
+			time.Sleep(drainTail)
+		}
 	}
 
 	if closeErr := pool.Close(); closeErr != nil {
@@ -446,36 +515,56 @@ func run(ctx context.Context, stop context.CancelFunc, services []service, shutd
 	return serveErr
 }
 
-// shutdown drains every listener and reports what went wrong, if anything did.
+// shutdown drains every listener and reports what went wrong, if anything
+// did, and whether the drain overran its deadline.
 //
 // The listeners are drained together rather than one after another, against a
 // single deadline. Draining them in sequence would give a process with two
 // busy listeners twice the grace period its deployment granted it, and the
 // second listener's drain would start with the first one's already spent.
-func shutdown(services []service, timeout time.Duration) error {
+//
+// An overrun is separated from a failure because the two call for opposite
+// exits. Shutdown's context expiry is reported per listener as
+// DeadlineExceeded while its active connections keep running — the standard
+// library closes none of them for you — so this side closes them explicitly,
+// and reports the overrun for the tail run() grants the endings. Any other
+// error stays a failure.
+func shutdown(services []service, timeout time.Duration) (err error, overran bool) {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	// Each outcome carries the name of the listener it came from: results
-	// arrive in completion order, so reading them positionally would blame
-	// whichever listener happened to be mentioned first in the configuration
-	// for a timeout the other one caused.
+	// Each outcome carries the listener it came from: results arrive in
+	// completion order, so reading them positionally would blame whichever
+	// listener happened to be mentioned first in the configuration for a
+	// timeout the other one caused — and the overrun branch needs the
+	// server itself, to close what Shutdown left running.
 	type outcome struct {
-		name string
-		err  error
+		name   string
+		server *stdhttp.Server
+		err    error
 	}
 	outcomes := make(chan outcome, len(services))
 	for _, s := range services {
 		go func(s service) {
-			outcomes <- outcome{name: s.name, err: s.server.Shutdown(shutdownCtx)}
+			outcomes <- outcome{name: s.name, server: s.server, err: s.server.Shutdown(shutdownCtx)}
 		}(s)
 	}
 
 	var failures []error
 	for range services {
-		if result := <-outcomes; result.err != nil {
-			failures = append(failures, fmt.Errorf("graceful shutdown of the %s listener: %w", result.name, result.err))
+		result := <-outcomes
+		if result.err == nil {
+			continue
 		}
+		if errors.Is(result.err, context.DeadlineExceeded) {
+			overran = true
+			log.Printf("dataplane %s listener still had requests in flight at the drain deadline; its connections were force-closed", result.name)
+			if closeErr := result.server.Close(); closeErr != nil {
+				failures = append(failures, fmt.Errorf("force close of the %s listener: %w", result.name, closeErr))
+			}
+			continue
+		}
+		failures = append(failures, fmt.Errorf("graceful shutdown of the %s listener: %w", result.name, result.err))
 	}
-	return errors.Join(failures...)
+	return errors.Join(failures...), overran
 }

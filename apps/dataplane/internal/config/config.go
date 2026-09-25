@@ -72,6 +72,25 @@ const (
 	// reclaim test and the lease's fence both compare timestamps written by
 	// more than one process, and a window measured in milliseconds expires
 	// between the write of a stamp and the read of it. Below this, a
+	// DefaultExecutionMaxDuration is the ceiling on one provider call — the
+	// deadline the routing stage puts on the context every executor's call
+	// runs under. Four minutes sits strictly inside the default hold window:
+	// a call that used its whole budget plus its settlement endings still
+	// finishes inside the hold it was admitted under, which is the invariant
+	// that keeps settled usage priced by the reservation that defended it.
+	// Lease renewal keeps the process's CLAIM on the hold alive for the
+	// call's duration; it never extends the hold itself, and this ceiling is
+	// what stops one slow provider from turning the hold window into a
+	// formality.
+	DefaultExecutionMaxDuration = 4 * time.Minute
+
+	// DefaultExecutionRegistryRefresh is how often the composition root
+	// rebuilds the executor registry from the backend catalog. Ten seconds
+	// makes a catalog edit — a new backend, a re-pointed endpoint — live
+	// within one interval, and a refresh that fails changes nothing: the last
+	// good snapshot keeps serving until a refresh succeeds.
+	DefaultExecutionRegistryRefresh = 10 * time.Second
+
 	// deployment is not tuned, it is broken — so the loader refuses rather
 	// than runs.
 	minReservationHorizon = time.Second
@@ -165,6 +184,21 @@ type Config struct {
 	// to start with, in validateReservationHorizons.
 	ReservationLeaseTTL time.Duration
 
+	// ExecutionMaxDuration is the deadline one provider call may run under —
+	// the context budget the routing stage hands every executor's attempt.
+	// It is an operational horizon like the two reservation ones above, and
+	// it is validated strictly below the hold window: renewal keeps the
+	// lease alive, never the hold, so a call allowed to run as long as its
+	// hold could outrun the reservation that prices it.
+	ExecutionMaxDuration time.Duration
+
+	// ExecutionRegistryRefresh is how often the composition root rebuilds the
+	// executor registry from the backend catalog. It must be positive; there
+	// is no "never refresh" spelling, because a registry that cannot learn a
+	// new backend is a process that must be restarted to be reconfigured,
+	// which is what the interval exists to avoid.
+	ExecutionRegistryRefresh time.Duration
+
 	// ManagementAddr is the private listener the Data Plane's management
 	// surface is served from. An empty value means this process serves no
 	// management surface at all, which is the default: a runtime that has not
@@ -248,6 +282,9 @@ func Defaults() Config {
 		ReadHeaderTimeout:     DefaultReadHeaderTimeout,
 		ReservationHoldWindow: DefaultReservationHoldWindow,
 		ReservationLeaseTTL:   DefaultReservationLeaseTTL,
+
+		ExecutionMaxDuration:     DefaultExecutionMaxDuration,
+		ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
 		Postgres: Postgres{
 			DSN:             DefaultPostgresDSN,
 			MaxOpenConns:    DefaultPostgresMaxOpenConns,
@@ -302,6 +339,20 @@ func Load(lookup LookupEnv) (Config, error) {
 			return Config{}, err
 		}
 		cfg.ReservationLeaseTTL = duration
+	}
+	if value, ok := lookup("DATAPLANE_EXECUTION_MAX_DURATION"); ok {
+		duration, err := parsePositiveDuration("DATAPLANE_EXECUTION_MAX_DURATION", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ExecutionMaxDuration = duration
+	}
+	if value, ok := lookup("DATAPLANE_EXECUTION_REGISTRY_REFRESH"); ok {
+		duration, err := parsePositiveDuration("DATAPLANE_EXECUTION_REGISTRY_REFRESH", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ExecutionRegistryRefresh = duration
 	}
 
 	if value, ok := lookup("DATAPLANE_EGRESS_POLICIES"); ok {
@@ -387,6 +438,9 @@ func Load(lookup LookupEnv) (Config, error) {
 		return Config{}, err
 	}
 	if err := validateReservationHorizons(cfg.ReservationHoldWindow, cfg.ReservationLeaseTTL); err != nil {
+		return Config{}, err
+	}
+	if err := validateExecutionBudgets(cfg.ReservationHoldWindow, cfg.ExecutionMaxDuration); err != nil {
 		return Config{}, err
 	}
 	if err := validateEgress(cfg.Egress); err != nil {
@@ -669,6 +723,24 @@ func validateReservationHorizons(hold, lease time.Duration) error {
 		return fmt.Errorf(
 			"DATAPLANE_RESERVATION_LEASE_TTL (%s) must be strictly shorter than DATAPLANE_RESERVATION_HOLD_WINDOW (%s); a lease must never outlive the hold it fences",
 			lease, hold)
+	}
+	return nil
+}
+
+// validateExecutionBudgets decides the one cross-field fact the execution
+// ceiling carries: it must sit strictly below the hold window. Lease renewal
+// keeps the process's claim on a hold alive while a provider call runs; the
+// hold itself is never extended — its expiry is stamped once, at admission —
+// so an execution budget at or past the hold window would let a call outlive
+// the reservation that has to price it, and the settlement would be reading
+// a hold that the window's arithmetic has already let go of. Strictly below,
+// because the call's settlement endings run after the call and inside the
+// same window.
+func validateExecutionBudgets(hold, execution time.Duration) error {
+	if execution >= hold {
+		return fmt.Errorf(
+			"DATAPLANE_EXECUTION_MAX_DURATION (%s) must be strictly shorter than DATAPLANE_RESERVATION_HOLD_WINDOW (%s); a provider call must end inside the hold it was admitted under",
+			execution, hold)
 	}
 	return nil
 }

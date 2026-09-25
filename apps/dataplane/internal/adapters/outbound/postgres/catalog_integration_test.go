@@ -256,6 +256,41 @@ func TestIntegrationBackendRoundTripCarriesOptionalRefs(t *testing.T) {
 	}
 }
 
+// TestIntegrationBackendListIsTheWholeCatalogInOrder: the snapshot read the
+// executor registry's refresh makes returns every row — references present
+// and absent alike, no eligibility filter — in id order, the determinism the
+// snapshot signature's change detection leans on.
+func TestIntegrationBackendListIsTheWholeCatalogInOrder(t *testing.T) {
+	_, backends, _, _ := integrationCatalogRepos(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	first := catalogBackend(t, ctx, backends)
+	second := catalogBackend(t, ctx, backends)
+
+	rows, err := backends.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	got := make(map[catalog.BackendID]catalog.Backend, len(rows))
+	for _, row := range rows {
+		if _, seen := got[row.ID]; seen {
+			t.Fatalf("List returned backend %s twice", row.ID)
+		}
+		got[row.ID] = row
+	}
+	for _, id := range []catalog.BackendID{first.ID, second.ID} {
+		if _, ok := got[id]; !ok {
+			t.Fatalf("List is missing backend %s — the snapshot must be the whole catalog", id)
+		}
+	}
+	for i := 1; i < len(rows); i++ {
+		if rows[i-1].ID > rows[i].ID {
+			t.Fatalf("List is not ordered by id: %s before %s", rows[i-1].ID, rows[i].ID)
+		}
+	}
+}
+
 func TestIntegrationAliasAggregateRoundTripKeepsOrderAndOverrides(t *testing.T) {
 	store, backends, aliases, _ := integrationCatalogRepos(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)

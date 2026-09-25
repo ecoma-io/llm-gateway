@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/accounting"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/catalog"
@@ -50,6 +51,10 @@ func routingFixture(t *testing.T) (*ChatRouting, *admissionWorld, *fakeReply, Ch
 
 // newRouting wires the routing stage over one world. The clock is the same
 // seam the admission tests use; the registry's entries are the scenario's.
+// The execution budget is chosen for hermeticity: the immediate renewal —
+// the one the walk always starts — is answered by the fake reservations, and
+// the renewal ticker, a third of the lease, never fires inside a test's
+// lifetime. The renewal tests build their own clock over the same seams.
 func newRouting(world *admissionWorld, entries map[catalog.BackendID]executors.Executor) *ChatRouting {
 	routing := NewChatRouting(
 		fakeAdmissionStore{world: world},
@@ -62,6 +67,7 @@ func newRouting(world *admissionWorld, entries map[catalog.BackendID]executors.E
 		fakeAdmissionLedger{world: world},
 		fakeAdmissionFacts{world: world},
 		executors.NewRegistry(entries),
+		ExecutionConfig{MaxDuration: 30 * time.Second, LeaseTTL: time.Hour},
 		newAdmission(world),
 	)
 	routing.clock = admissionClock{world}
@@ -452,11 +458,15 @@ func TestRoutingSettlesAMidStreamFailure(t *testing.T) {
 	}
 }
 
-// TestRoutingAbandonsWhenTheCallerLeaves: a caller gone between attempts
-// stops the walk — nothing is finalised, the hold stays open, the request
-// stays executing, and the one observation the walk already made stands on
-// its own. The reaper's shape, reached while the process still lives.
-func TestRoutingAbandonsWhenTheCallerLeaves(t *testing.T) {
+// TestRoutingReleasesTheHoldWhenTheCallerLeaves: a caller gone between
+// attempts stops the walk. Nothing was committed, so there is no settlement;
+// but the hold the request opened is real reserved capacity, and the ending
+// that returns it has a channel of its own — the walk releases it detached
+// from the dead caller's context, naming gateway_abandoned on the request
+// row and the replay record, the same word the reaper uses for the process
+// it cannot ask. The outcome kind stays abandoned: the transport writes
+// nothing either way.
+func TestRoutingReleasesTheHoldWhenTheCallerLeaves(t *testing.T) {
 	routing, world, reply, in := routingFixture(t)
 	world.seedCandidates("test-model",
 		catalog.Candidate{ID: "cand-a", BackendID: "backend-a", ProviderModel: "model-a", Position: 1},
@@ -477,26 +487,32 @@ func TestRoutingAbandonsWhenTheCallerLeaves(t *testing.T) {
 		t.Fatalf("outcome = %s, want abandoned", outcome.Kind)
 	}
 
-	// The observation of the call that happened, and nothing after it: no
-	// ending unit ever opened.
+	// The abandoned ending is a whole release unit: the hold returned, the
+	// request finalised through the abandoned door, the replay record
+	// failed with it, and the released fact the feed's last word. The one
+	// observation of the call that happened stands before it.
 	wantEvents(t, world, []string{
 		"begin", "ledger.drawdown", "request.insert", "reservation.insert", "intake.insert", "commit",
 		"attempt.insert",
+		"begin", "reservation.close", "ledger.return", "request.finalise", "intake.finalise", "fact.append", "commit",
 	})
-	if reservation := admissionReservationRow(t, world); reservation.State != accounting.StateOpen {
-		t.Fatalf("the hold is %s, want open — the reaper's to reclaim", reservation.State)
+	if reservation := admissionReservationRow(t, world); reservation.State != accounting.StateReleased {
+		t.Fatalf("the hold is %s, want released — the walk that saw the caller leave returns it", reservation.State)
 	}
-	if row := admissionRequestRow(t, world); row.Status != execution.StatusExecuting {
-		t.Fatalf("the request is %s, want executing", row.Status)
+	row := admissionRequestRow(t, world)
+	if row.Status != execution.StatusFailed || row.FailureReason != execution.FailedGatewayAbandoned {
+		t.Fatalf("the request is %s/%s, want failed/gateway_abandoned", row.Status, row.FailureReason)
 	}
-	if intake := admissionIntakeRow(t, world, admissionAccount, "replay-key-1"); intake.FinalStatus != nil {
-		t.Fatalf("the replay record is terminal, want it waiting on an ending nobody stated")
+	if intake := admissionIntakeRow(t, world, admissionAccount, "replay-key-1"); intake.FinalStatus == nil ||
+		*intake.FinalStatus != execution.FinalFailed ||
+		intake.FinalFailureReason != execution.FailedGatewayAbandoned {
+		t.Fatalf("the replay record does not carry the abandonment")
 	}
-	if len(world.facts) != 0 {
-		t.Fatalf("the abandoned walk appended %d facts, want none", len(world.facts))
+	if len(world.facts) != 1 {
+		t.Fatalf("the abandoned walk appended %d facts, want the one release", len(world.facts))
 	}
-	if got := world.available("bucket-1"); got != 10_000-37 {
-		t.Fatalf("the grant holds %d, want 9963 — the hold is still out", got)
+	if got := world.available("bucket-1"); got != 10_000 {
+		t.Fatalf("the grant holds %d, want 10000 — the release returned the hold whole", got)
 	}
 	if len(reply.served) != 0 {
 		t.Fatalf("the reply served %v, want nothing — there is no channel left", reply.served)

@@ -119,9 +119,22 @@ func (r *ChatRouting) releaseOnce(ctx context.Context, in ChatInput, admitted *A
 			return fmt.Errorf("application: release request %s: return the hold: %w", admitted.RuntimeRequestID, err)
 		}
 		request := execution.Request{ID: admitted.RuntimeRequestID, Status: execution.StatusExecuting}
-		if failure != "" {
+		switch {
+		case failure == execution.FailedGatewayAbandoned:
+			// The abandoned word names the request through its own door.
+			// FailBeforeCommitment refuses it — that refusal is the domain's
+			// law that a surfaced refusal and an abandonment are different
+			// shapes of ending — and FailAbandoned is the finalisation the
+			// vocabulary gives the word: no attempt named, because nothing
+			// was committed. The reaper reaches it for the process it cannot
+			// ask; the walk reaches it here, where the evidence is its own:
+			// the caller left before any candidate answered, so this process
+			// is the evidence, and the hold it opened comes back now instead
+			// of stranding until the sweep.
+			err = request.FailAbandoned(now)
+		case failure != "":
 			err = request.FailBeforeCommitment(failure, now)
-		} else {
+		default:
 			err = request.Reject(rejection, now)
 		}
 		if err != nil {

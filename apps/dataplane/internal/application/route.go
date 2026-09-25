@@ -58,6 +58,7 @@ type ChatRouting struct {
 	registry     executors.Registry
 	routed       ChatCompletion
 	clock        txClock
+	execution    ExecutionConfig
 }
 
 // NewChatRouting builds the routing stage over the ports it needs and the
@@ -77,6 +78,7 @@ func NewChatRouting(
 	ledger persistence.QuotaProjectionRepository,
 	facts persistence.FactRepository,
 	registry executors.Registry,
+	execution ExecutionConfig,
 	routed ChatCompletion,
 ) *ChatRouting {
 	switch {
@@ -100,6 +102,10 @@ func NewChatRouting(
 		panic("application: NewChatRouting requires a fact repository")
 	case registry == nil:
 		panic("application: NewChatRouting requires an executor registry")
+	case execution.MaxDuration <= 0:
+		panic("application: NewChatRouting requires a positive execution max duration; the call's context needs its one budget")
+	case execution.LeaseTTL <= 0:
+		panic("application: NewChatRouting requires a positive lease ttl; the renewal ticks on its third")
 	case routed == nil:
 		panic("application: NewChatRouting requires the use case it routes for")
 	}
@@ -116,6 +122,7 @@ func NewChatRouting(
 		registry:     registry,
 		routed:       routed,
 		clock:        storeClock{store: store},
+		execution:    execution,
 	}
 }
 
@@ -207,10 +214,19 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 
 	for step := 1; ; step++ {
 		if ctx.Err() != nil {
-			// The caller is gone before any candidate answered. Nothing is
-			// finalised and nothing can be written — there is no channel —
-			// so the request stays executing with its hold open, exactly the
-			// shape a dead process leaves, for the reaper to close.
+			// The caller is gone before any candidate answered. The walk's
+			// own ending is the abandoned one — nothing was delivered, the
+			// transport writes nothing — but the hold the request opened is
+			// real reserved capacity, and the ending that returns it has a
+			// channel of its own: the release runs on the detached ending
+			// context, naming gateway_abandoned as the failure, so the hold
+			// comes back to the projection instead of stranding open until
+			// the hold window expires. The outcome kind stays abandoned
+			// either way; the release is bookkeeping the caller will never
+			// see, not an answer.
+			if err := r.release(ctx, in, admitted, "", execution.FailedGatewayAbandoned); err != nil {
+				return ChatOutcome{}, err
+			}
 			return ChatOutcome{
 				Kind:             OutcomeAbandoned,
 				RuntimeRequestID: admitted.RuntimeRequestID,
@@ -238,7 +254,13 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 		executor, _ := r.registry.For(candidate.BackendID)
 		attemptID := identity.NewAttemptID()
 		started := time.Now().UTC()
-		result := executor.Execute(ctx, executors.AttemptSpec{
+		// The call runs under the renewal: its context carries the execution
+		// budget, and the lease-renewal goroutine lives exactly as long as
+		// the call does. The stop waits for the renewer — no renewal races
+		// the ending this attempt's finish writes — and reports whether the
+		// renewal was what ended the call.
+		callCtx, stopRenewing := r.executionContext(ctx, admitted)
+		result := executor.Execute(callCtx, executors.AttemptSpec{
 			RequestID:          admitted.RuntimeRequestID,
 			AttemptID:          attemptID,
 			BackendID:          string(candidate.BackendID),
@@ -247,6 +269,7 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 			Stream:             admitted.Stream,
 			Body:               admitted.RawBody,
 		}, reply)
+		renewalLost := stopRenewing()
 		finished := time.Now().UTC()
 		trace.Attempts++
 		trace.LastPosition = candidate.Position
@@ -336,6 +359,28 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 		}
 		if err := r.appendAttempt(ctx, attempt); err != nil {
 			return ChatOutcome{}, err
+		}
+
+		if renewalLost {
+			// The renewal stopped this call: the hold is gone from the open
+			// set — closed by a concurrent settlement, or swept — and no
+			// disposition applies, because every candidate after this one
+			// would be called on a hold nobody owns. The abandoned release
+			// returns what the ending still can: where the hold's close is
+			// already another writer's, the release's own CAS loses and
+			// writes nothing; the outcome is abandoned either way, and the
+			// transport writes nothing for a request whose hold died
+			// mid-walk. A renewal lost after commitment never reaches this
+			// branch — that ending is the settle's, whose CAS loses the
+			// same race and records the orphan tail.
+			if err := r.release(ctx, in, admitted, "", execution.FailedGatewayAbandoned); err != nil {
+				return ChatOutcome{}, err
+			}
+			return ChatOutcome{
+				Kind:             OutcomeAbandoned,
+				RuntimeRequestID: admitted.RuntimeRequestID,
+				Routing:          trace,
+			}, nil
 		}
 
 		if reason, surfaced := routing.SurfacedRefusal(class); surfaced {

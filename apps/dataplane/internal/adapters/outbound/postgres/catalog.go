@@ -109,6 +109,11 @@ SELECT id, adapter_type, endpoint, credentials_ref, egress_policy_ref, state, cr
 FROM backends
 WHERE id = $1`
 
+const listBackends = `
+SELECT id, adapter_type, endpoint, credentials_ref, egress_policy_ref, state, created_at, updated_at
+FROM backends
+ORDER BY id`
+
 // The compare-and-swap is the whole concurrency story: the move happens only
 // while the row still shows the state the caller read, so two racing
 // transitions converge instead of one silently overwriting the other.
@@ -149,6 +154,31 @@ func (r *backendRepo) ByID(ctx context.Context, id catalog.BackendID) (*catalog.
 	b.EgressPolicyRef = egressPolicyRef.String
 	b.State = catalog.BackendState(state)
 	return &b, nil
+}
+
+func (r *backendRepo) List(ctx context.Context) ([]catalog.Backend, error) {
+	rows, err := r.store.Querier(ctx).QueryContext(ctx, listBackends)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list backends: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	backends := []catalog.Backend{}
+	for rows.Next() {
+		var b catalog.Backend
+		var state string
+		var credentialsRef, egressPolicyRef sql.NullString
+		if err := rows.Scan(&b.ID, &b.AdapterType, &b.Endpoint, &credentialsRef, &egressPolicyRef, &state, &b.CreatedAt, &b.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("postgres: list backends: %w", err)
+		}
+		b.CredentialsRef = credentialsRef.String
+		b.EgressPolicyRef = egressPolicyRef.String
+		b.State = catalog.BackendState(state)
+		backends = append(backends, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list backends: %w", err)
+	}
+	return backends, nil
 }
 
 func (r *backendRepo) TransitionState(ctx context.Context, id catalog.BackendID, from, to catalog.BackendState, updatedAt time.Time) (bool, error) {

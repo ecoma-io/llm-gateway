@@ -50,6 +50,16 @@ type Backends interface {
 	// ByID returns the backend with id, or ErrNotFound.
 	ByID(ctx context.Context, id catalog.BackendID) (*catalog.Backend, error)
 
+	// List returns every backend row, ordered by id. It is the composition
+	// root's snapshot read — the one call the executor registry's refresh
+	// makes — and it returns rows, not eligibility: a disabled backend is a
+	// row with a state, and the routing stage's eligibility leg stays the
+	// only reader that decides what a state means. The parts each read as of
+	// their own committed statement, like every read in this port; a snapshot
+	// that straddles two catalog instants is corrected by the next refresh,
+	// which is one interval away by construction.
+	List(ctx context.Context) ([]catalog.Backend, error)
+
 	// TransitionState applies the active ↔ disabled machine's one move: it
 	// sets the state to `to` only while the row still shows `from`, stamps
 	// updated_at with the caller's instant, and reports whether the move
