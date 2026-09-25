@@ -126,10 +126,15 @@ Notes for the schema designer:
   — an unknown alias, an invalid bound, a hold the waterfall cannot secure —
   which are born terminal with `final_status = 'rejected'` and their reason,
   so a replay of the same bytes re-answers the same refusal instead of
-  re-running admission. Refusals before that transaction (the account's
-  state, the key's grammar, a body that is not JSON) write a `rejected`
-  request row and no intake row: the cheap refusals stay cheap, and replaying
-  them re-runs the check rather than minting a replay of an error.
+  re-running admission. Refusals before that transaction — the account's
+  state, the key's grammar, a body the transport could not deliver — write a
+  `rejected` request row and no intake row: no digest exists to key a record
+  with, so the cheap refusals stay cheap, and the caller simply sends a fresh
+  request. A body that is _not JSON_ is not one of them: it is judged inside
+  the admission transaction, recorded as the pair, and its key is spent — a
+  corrected body under the same key is a different digest and answers 409
+  `idempotency_conflict`, so a caller that fixes its request mints a fresh
+  key.
   The crash window between admission's COMMIT and the client's answer leaves
   exactly the state the NULL pointer describes — intake row in flight, request
   row `executing`, hold drawn, no candidate ever chosen. That window is not

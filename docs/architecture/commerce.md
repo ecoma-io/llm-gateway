@@ -261,11 +261,18 @@ fatal — only a final shortfall surfaces, and then with nothing drawn
 
 Steps 3 and 4 are the runtime's own transaction, and the rows they guard are
 its **quota projections** — one ceiling per entitlement cycle, one for the
-PAYG balance. A take that matches no row — a contender won the capacity, or
-the grant's eligibility moved between the walk and the take — passes that
-bucket and the walk continues, up to three passes before the walk is
-abandoned. Every giveback on a walk that cannot be completed is
-**unconditional**: capacity the walk drew and does not need is returned
+PAYG balance. The walk reads the eligible rows **once**, in the order above,
+and takes from each once: a take that matches no row — a contender won the
+capacity, or the grant's eligibility moved between the walk and the take — is
+a stale number, not a verdict, and that bucket is passed while the single
+forward pass continues. There is no re-read and no second pass; if the hold is
+not secured when the pass ends, every take is given back and the request is
+refused whole. What does run twice is the **unit**, never one pass of one
+walk: an engine abort (a serialization failure, a deadlock, a connection
+class) or a lost `(account, key)` unique race rolls the transaction back and
+the admission unit re-runs from its first statement — a re-decide, never a
+stale verdict carried over. Every giveback on a walk that cannot be completed
+is **unconditional**: capacity the walk drew and does not need is returned
 whole, so a refusal leaves the projection exactly as it found it. The Control
 Plane's funding buckets record the same movement from the runtime's facts, keyed by `request_id` and written outside the
 admission transaction, so the runtime never holds ledger write authority and
