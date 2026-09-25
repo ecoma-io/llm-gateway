@@ -3,12 +3,14 @@ package application
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/accounting"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/catalog"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/execution"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/identity"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/executors"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/persistence"
 )
 
@@ -418,6 +420,13 @@ func (f fakeVersions) HighestVersion(ctx context.Context, groupName string) (int
 // unique-key race fire, make the release's compare-and-swap lose, and make a
 // drawdown fall short; the store restores the snapshot a rollback owes.
 type admissionWorld struct {
+	// mu makes the world safe for the concurrent-routing tests: a hundred
+	// requests admitted and routed over one world is the shape the race
+	// detector is asked about, and the fakes answer it by guarding the
+	// shared state they move. Single-threaded tests lock it too; the cost
+	// is nothing and the rules stay uniform.
+	mu sync.Mutex
+
 	// events is the observation log: "begin", "commit", "rollback", and one
 	// entry per repository call that decides, in the order it happened. The
 	// write-order assertions read this list, never the maps.
@@ -432,7 +441,9 @@ type admissionWorld struct {
 	credentials   map[string]persistence.CredentialView
 	aliasesByName map[string]*catalog.ModelAlias
 	prices        map[catalog.AliasID]catalog.PriceSnapshot
+	backends      map[catalog.BackendID]catalog.Backend
 	requests      map[identity.RequestID]execution.Request
+	attempts      []execution.Attempt
 	intakes       map[string]execution.Intake
 	reservations  map[identity.ReservationID]accounting.Reservation
 	buckets       []*admissionBucket
@@ -456,6 +467,7 @@ type admissionWorld struct {
 	clockFailure         error
 	seamCloseLost        bool
 	requestFinaliseLost  bool   // the compensation's CAS won, but the request row did not finalise
+	attemptDuplicate     bool   // the attempt insert races a writer that already persisted the row
 	intakeRace           int    // the first N intake inserts lose the unique race
 	intakeRaceWinner     string // "", "in_flight", or "rejected"
 
@@ -482,6 +494,7 @@ func newAdmissionWorld() *admissionWorld {
 		credentials:   map[string]persistence.CredentialView{},
 		aliasesByName: map[string]*catalog.ModelAlias{},
 		prices:        map[catalog.AliasID]catalog.PriceSnapshot{},
+		backends:      map[catalog.BackendID]catalog.Backend{},
 		requests:      map[identity.RequestID]execution.Request{},
 		intakes:       map[string]execution.Intake{},
 		reservations:  map[identity.ReservationID]accounting.Reservation{},
@@ -514,7 +527,17 @@ func newCredentialAuthenticator(world *admissionWorld) *CredentialAuthenticator 
 	return NewCredentialAuthenticator(fakeAdmissionCredentials{world: world})
 }
 
+// note appends one entry to the observation log. Every fake goes through it,
+// so the log is ordered under the same lock the state it describes is.
+func (w *admissionWorld) note(event string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.events = append(w.events, event)
+}
+
 func (w *admissionWorld) commitCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	n := 0
 	for _, entry := range w.events {
 		if entry == "commit" {
@@ -525,6 +548,8 @@ func (w *admissionWorld) commitCount() int {
 }
 
 func (w *admissionWorld) rollbackCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	n := 0
 	for _, entry := range w.events {
 		if entry == "rollback" {
@@ -535,12 +560,29 @@ func (w *admissionWorld) rollbackCount() int {
 }
 
 func (w *admissionWorld) happened(event string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	for _, entry := range w.events {
 		if entry == event {
 			return true
 		}
 	}
 	return false
+}
+
+// count is happened's tally: how many times one entry appears in the log —
+// the shape a budget assertion reads (a whole retry budget is three closes,
+// not one).
+func (w *admissionWorld) count(event string) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := 0
+	for _, entry := range w.events {
+		if entry == event {
+			n++
+		}
+	}
+	return n
 }
 
 func (w *admissionWorld) intakeKey(accountID, idempotencyKey string) string {
@@ -552,6 +594,8 @@ func (w *admissionWorld) intakeKey(accountID, idempotencyKey string) string {
 // ---------------------------------------------------------------------------
 
 func (w *admissionWorld) seedCredential(keyID, accountID, digest, keyState string, accountState *string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	view := persistence.CredentialView{
 		Digest:    digest,
 		AccountID: accountID,
@@ -565,6 +609,8 @@ func (w *admissionWorld) seedCredential(keyID, accountID, digest, keyState strin
 }
 
 func (w *admissionWorld) seedAlias(name string, maxOutputTokens, reservationCap int64) *catalog.ModelAlias {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	alias := &catalog.ModelAlias{
 		ID:              catalog.AliasID("alias-" + name),
 		Name:            name,
@@ -576,15 +622,36 @@ func (w *admissionWorld) seedAlias(name string, maxOutputTokens, reservationCap 
 	return alias
 }
 
+// seedCandidates gives a seeded alias the candidate list the routing walk
+// reads. The alias is the world's own row — the fakes hand out clones, so
+// this edits the one truth the clones come from.
+func (w *admissionWorld) seedCandidates(name string, candidates ...catalog.Candidate) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.aliasesByName[name].Candidates = candidates
+}
+
+func (w *admissionWorld) seedBackend(id catalog.BackendID, state catalog.BackendState) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.backends[id] = catalog.Backend{ID: id, State: state}
+}
+
 func (w *admissionWorld) seedPrice(aliasID catalog.AliasID, snapshot catalog.PriceSnapshot) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.prices[aliasID] = snapshot
 }
 
 func (w *admissionWorld) seedBucket(account, id string, available int64, eligible bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.buckets = append(w.buckets, &admissionBucket{account: account, id: id, available: available, eligible: eligible})
 }
 
 func (w *admissionWorld) available(bucketID string) int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	for _, bucket := range w.buckets {
 		if bucket.id == bucketID {
 			return bucket.available
@@ -608,14 +675,14 @@ type fakeAdmissionStore struct {
 }
 
 func (s fakeAdmissionStore) WithinTx(ctx context.Context, fn func(ctx context.Context) error) error {
-	s.world.events = append(s.world.events, "begin")
+	s.world.note("begin")
 	snapshot := s.world.snapshot()
 	if err := fn(context.WithValue(ctx, admissionTxKey{}, true)); err != nil {
 		s.world.restore(snapshot)
-		s.world.events = append(s.world.events, "rollback")
+		s.world.note("rollback")
 		return err
 	}
-	s.world.events = append(s.world.events, "commit")
+	s.world.note("commit")
 	return nil
 }
 
@@ -638,6 +705,7 @@ type admissionSnapshot struct {
 	aliasesByName map[string]*catalog.ModelAlias
 	prices        map[catalog.AliasID]catalog.PriceSnapshot
 	requests      map[identity.RequestID]execution.Request
+	attempts      []execution.Attempt
 	intakes       map[string]execution.Intake
 	reservations  map[identity.ReservationID]accounting.Reservation
 	buckets       []admissionBucket
@@ -647,6 +715,8 @@ type admissionSnapshot struct {
 }
 
 func (w *admissionWorld) snapshot() admissionSnapshot {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	snap := admissionSnapshot{
 		credentials:   make(map[string]persistence.CredentialView, len(w.credentials)),
 		aliasesByName: make(map[string]*catalog.ModelAlias, len(w.aliasesByName)),
@@ -667,6 +737,7 @@ func (w *admissionWorld) snapshot() admissionSnapshot {
 	for id, request := range w.requests {
 		snap.requests[id] = request
 	}
+	snap.attempts = append([]execution.Attempt(nil), w.attempts...)
 	for key, intake := range w.intakes {
 		snap.intakes[key] = cloneAdmissionIntake(intake)
 	}
@@ -684,10 +755,13 @@ func (w *admissionWorld) snapshot() admissionSnapshot {
 }
 
 func (w *admissionWorld) restore(snap admissionSnapshot) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.credentials = snap.credentials
 	w.aliasesByName = snap.aliasesByName
 	w.prices = snap.prices
 	w.requests = snap.requests
+	w.attempts = snap.attempts
 	w.intakes = snap.intakes
 	w.reservations = snap.reservations
 	w.buckets = make([]*admissionBucket, len(snap.buckets))
@@ -741,6 +815,8 @@ func cloneAdmissionReservation(reservation accounting.Reservation) accounting.Re
 type fakeAdmissionCredentials struct{ world *admissionWorld }
 
 func (f fakeAdmissionCredentials) Lookup(ctx context.Context, keyID string) (persistence.CredentialView, error) {
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
 	f.world.credentialLookups++
 	if f.world.credentialFailure != nil {
 		return persistence.CredentialView{}, f.world.credentialFailure
@@ -762,6 +838,8 @@ type fakeAdmissionAliases struct {
 }
 
 func (f fakeAdmissionAliases) ByName(ctx context.Context, name string) (*catalog.ModelAlias, error) {
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
 	if f.world.aliasFailure != nil {
 		return nil, f.world.aliasFailure
 	}
@@ -775,6 +853,8 @@ func (f fakeAdmissionAliases) ByName(ctx context.Context, name string) (*catalog
 type fakeAdmissionPrices struct{ world *admissionWorld }
 
 func (f fakeAdmissionPrices) EffectiveAt(ctx context.Context, aliasID catalog.AliasID) (catalog.PriceSnapshot, error) {
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
 	if f.world.priceFailure != nil {
 		return catalog.PriceSnapshot{}, f.world.priceFailure
 	}
@@ -812,7 +892,9 @@ func (f fakeAdmissionRequests) Insert(ctx context.Context, request execution.Req
 	if !inAdmissionTx(ctx) {
 		f.world.outsideTx++
 	}
-	f.world.events = append(f.world.events, "request.insert")
+	f.world.note("request.insert")
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
 	f.world.requests[request.ID] = request
 	return nil
 }
@@ -821,7 +903,9 @@ func (f fakeAdmissionRequests) Finalise(ctx context.Context, request execution.R
 	if !inAdmissionTx(ctx) {
 		f.world.outsideTx++
 	}
-	f.world.events = append(f.world.events, "request.finalise")
+	f.world.note("request.finalise")
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
 	if f.world.requestFinaliseLost {
 		// The store answered, and the row did not move: nobody won it, it
 		// simply refused the ending. The caller must not read this as done.
@@ -834,6 +918,7 @@ func (f fakeAdmissionRequests) Finalise(ctx context.Context, request execution.R
 	stored.Status = request.Status
 	stored.RejectionReason = request.RejectionReason
 	stored.FailureReason = request.FailureReason
+	stored.CommittedAttemptID = request.CommittedAttemptID
 	stored.FinishedAt = request.FinishedAt
 	f.world.requests[request.ID] = stored
 	return true, nil
@@ -845,7 +930,9 @@ func (f fakeAdmissionIntakes) Insert(ctx context.Context, intake execution.Intak
 	if !inAdmissionTx(ctx) {
 		f.world.outsideTx++
 	}
-	f.world.events = append(f.world.events, "intake.insert")
+	f.world.note("intake.insert")
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
 	key := f.world.intakeKey(intake.AccountID, intake.IdempotencyKey)
 	if _, ok := f.world.intakes[key]; ok {
 		return fmt.Errorf("fake: intake for %s: %w", key, persistence.ErrDuplicateIntake)
@@ -883,6 +970,8 @@ func (f fakeAdmissionIntakes) Insert(ctx context.Context, intake execution.Intak
 }
 
 func (f fakeAdmissionIntakes) Find(ctx context.Context, accountID, idempotencyKey string) (execution.Intake, error) {
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
 	intake, ok := f.world.intakes[f.world.intakeKey(accountID, idempotencyKey)]
 	if !ok {
 		return execution.Intake{}, fmt.Errorf("fake: intake for %s: %w", accountID, persistence.ErrNotFound)
@@ -894,7 +983,9 @@ func (f fakeAdmissionIntakes) Finalise(ctx context.Context, accountID, idempoten
 	if !inAdmissionTx(ctx) {
 		f.world.outsideTx++
 	}
-	f.world.events = append(f.world.events, "intake.finalise")
+	f.world.note("intake.finalise")
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
 	key := f.world.intakeKey(accountID, idempotencyKey)
 	intake, ok := f.world.intakes[key]
 	if !ok {
@@ -919,7 +1010,9 @@ func (f fakeAdmissionReservations) Insert(ctx context.Context, reservation accou
 	if !inAdmissionTx(ctx) {
 		f.world.outsideTx++
 	}
-	f.world.events = append(f.world.events, "reservation.insert")
+	f.world.note("reservation.insert")
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
 	if f.world.reservationDuplicate {
 		return fmt.Errorf("fake: reservation %s: %w", reservation.ID, persistence.ErrDuplicateReservation)
 	}
@@ -931,7 +1024,9 @@ func (f fakeAdmissionReservations) Close(ctx context.Context, id identity.Reserv
 	if !inAdmissionTx(ctx) {
 		f.world.outsideTx++
 	}
-	f.world.events = append(f.world.events, "reservation.close")
+	f.world.note("reservation.close")
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
 	if f.world.seamCloseLost {
 		return false, nil // another writer closed the hold first
 	}
@@ -954,7 +1049,9 @@ func (f fakeAdmissionLedger) Drawdown(ctx context.Context, accountID string, ali
 	if !inAdmissionTx(ctx) {
 		f.world.outsideTx++
 	}
-	f.world.events = append(f.world.events, "ledger.drawdown")
+	f.world.note("ledger.drawdown")
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
 	if f.world.drawdownFailures > 0 {
 		f.world.drawdownFailures--
 		return nil, f.world.drawdownFailure
@@ -1002,7 +1099,9 @@ func (f fakeAdmissionLedger) Return(ctx context.Context, legs []accounting.Alloc
 	if !inAdmissionTx(ctx) {
 		f.world.outsideTx++
 	}
-	f.world.events = append(f.world.events, "ledger.return")
+	f.world.note("ledger.return")
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
 	if f.world.returnFailures > 0 {
 		f.world.returnFailures--
 		return 0, f.world.returnFailure
@@ -1024,9 +1123,138 @@ func (f fakeAdmissionFacts) Append(ctx context.Context, fact accounting.Fact) (i
 	if !inAdmissionTx(ctx) {
 		f.world.outsideTx++
 	}
-	f.world.events = append(f.world.events, "fact.append")
+	f.world.note("fact.append")
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
 	f.world.appendSeq++
 	fact.AppendSeq = f.world.appendSeq
 	f.world.facts = append(f.world.facts, fact)
 	return fact.AppendSeq, nil
+}
+
+// ---------------------------------------------------------------------------
+// the routing stage's fakes
+// ---------------------------------------------------------------------------
+
+// fakeAdmissionAttempts is the attempt repository the routing tests share.
+// The insert is deliberately legal in BOTH contexts the routing stage writes
+// it in — standalone, for a pre-commitment failure (the observation of a call
+// that happened, committed on its own), and inside the settle unit, for a
+// committed one — which is why this fake runs no outside-unit check: the
+// outside unit IS one of the shapes under test.
+type fakeAdmissionAttempts struct {
+	persistence.AttemptRepository
+	world *admissionWorld
+}
+
+func (f fakeAdmissionAttempts) Insert(ctx context.Context, attempt execution.Attempt) error {
+	f.world.note("attempt.insert")
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
+	if f.world.attemptDuplicate {
+		// The row is already on disk — the lost-commit-ack shape whose
+		// sentinel reads as done.
+		return fmt.Errorf("fake: attempt %s: %w", attempt.ID, persistence.ErrAttemptAlreadyAppended)
+	}
+	f.world.attempts = append(f.world.attempts, attempt)
+	return nil
+}
+
+// fakeRoutingBackends is the backend half of the servable closure. Only ByID
+// is reachable from the routing stage's pre-unit reads; every other method of
+// the port panics on the nil embedded value, the honest answer for a call the
+// walk must never make.
+type fakeRoutingBackends struct {
+	persistence.Backends
+	world *admissionWorld
+}
+
+func (f fakeRoutingBackends) ByID(ctx context.Context, id catalog.BackendID) (*catalog.Backend, error) {
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
+	backend, ok := f.world.backends[id]
+	if !ok {
+		return nil, fmt.Errorf("fake: backend %s: %w", id, persistence.ErrNotFound)
+	}
+	clone := backend
+	return &clone, nil
+}
+
+// fakeReply is the Reply the routing tests serve through: the sink half an
+// executor writes into and the ending half the walk calls, recording both.
+// Its commitment is armed by the first Content call, exactly as the
+// transport's reply arms its status line — the router trusts this fact over
+// anything an executor claims.
+type fakeReply struct {
+	stream    bool
+	opened    bool
+	committed bool
+	delivered []byte
+	served    []string
+	surfaced  execution.FailureReason
+}
+
+func (r *fakeReply) Content(chunk []byte) error {
+	r.committed = true
+	r.delivered = append(r.delivered, chunk...)
+	return nil
+}
+
+func (r *fakeReply) Committed() bool        { return r.committed }
+func (r *fakeReply) Delivered() []byte      { return r.delivered }
+func (r *fakeReply) Open(stream bool)       { r.opened = true; r.stream = stream }
+func (r *fakeReply) ServeSucceeded()        { r.served = append(r.served, "succeeded") }
+func (r *fakeReply) ServeMidStreamFailure() { r.served = append(r.served, "mid_stream_failure") }
+
+func (r *fakeReply) ServeSurfaced(failure execution.FailureReason) {
+	r.surfaced = failure
+	r.served = append(r.served, "surfaced")
+}
+
+func (r *fakeReply) ServeNoCandidate() { r.served = append(r.served, "no_candidate") }
+
+// fakeExecutor is one registered candidate's stand-in: it answers from a
+// script, consuming one result per call and repeating the last once the
+// script runs out. Its act, when set, runs before the answer — writing a
+// chunk through the sink is how the mid-stream shapes are reached. The mutex
+// is what lets one executor stand behind a registry a hundred concurrent
+// requests walk.
+type fakeExecutor struct {
+	mu      sync.Mutex
+	results []executors.Result
+	act     func(sink executors.Sink)
+	calls   int
+	specs   []executors.AttemptSpec
+}
+
+func (e *fakeExecutor) Execute(ctx context.Context, spec executors.AttemptSpec, sink executors.Sink) executors.Result {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls++
+	e.specs = append(e.specs, spec)
+	if e.act != nil {
+		e.act(sink)
+	}
+	if len(e.results) == 0 {
+		// An empty script answers nil — the broken-contract shape, used
+		// deliberately by the test that pins the router's verdict on it.
+		return nil
+	}
+	result := e.results[0]
+	if len(e.results) > 1 {
+		e.results = e.results[1:]
+	}
+	return result
+}
+
+// okExec reports a completed call with the provider's own usage report.
+func okExec(input, output int64) executors.Result {
+	return executors.Success{
+		Usage: executors.Usage{InputTokens: &input, OutputTokens: &output},
+	}
+}
+
+// failExec reports a finished call that failed with a classified fault.
+func failExec(class execution.ErrorClass) executors.Result {
+	return executors.Failure{Class: class}
 }

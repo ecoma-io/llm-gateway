@@ -210,16 +210,24 @@ func TestTheScanSeesTheModule(t *testing.T) {
 //
 // `usagefacts` is the third port and the honest question is whether it breaks
 // the rule. It does not: it is this process reading back what it recorded, and
-// its adapter is this Data Plane's own storage. What would break the rule is a
-// port whose adapter dials one of the other applications, and every such port
-// would have to be added to this list first — which is why the list is written
-// out rather than derived, and why a port named for a peer application would be
-// an edit here that a reviewer cannot miss.
+// its adapter is this Data Plane's own storage.
+//
+// `executors` is the fourth and the same question gets the same answer. It is
+// the port the routing stage calls a provider through, and its adapters are
+// the provider drivers B10 wires — outbound calls, yes, but to the upstream
+// providers the runtime exists to reach, never to another application of this
+// repository. A request's path already leaves the plane by design; what it
+// must never do is stop at one of this repository's other planes on the way.
+// What would break the rule is a port whose adapter dials one of the other
+// applications, and every such port would have to be added to this list
+// first — which is why the list is written out rather than derived, and why a
+// port named for a peer application would be an edit here that a reviewer
+// cannot miss.
 func TestTheRuntimeHasNoCrossPlanePort(t *testing.T) {
 	ports := outboundPorts(t)
-	want := []string{"cache", "persistence", "usagefacts"}
+	want := []string{"cache", "executors", "persistence", "usagefacts"}
 	if !slices.Equal(ports, want) {
-		t.Errorf("outbound ports are %v, want %v — the three are this process's own infrastructure: its cache, its database, and its own recorded history. A port named for the Control Plane or the management API would be a hop on the request path, and the runtime does not have one", ports, want)
+		t.Errorf("outbound ports are %v, want %v — the four are this process's own infrastructure: its cache, its database, its own recorded history, and the provider drivers its routing stage calls. A port named for the Control Plane or the management API would be a hop on the request path, and the runtime does not have one", ports, want)
 	}
 }
 
