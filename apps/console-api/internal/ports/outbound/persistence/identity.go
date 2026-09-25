@@ -40,9 +40,11 @@ import (
 // Accounts persists the account aggregate — the ownership root.
 type Accounts interface {
 	// Create inserts a new account in one unit of work with its caller's.
-	// The row must be in its birth state (active); creating a suspended or
-	// closed account is a domain rule violation and the adapter refuses it
-	// through the schema's own state check.
+	// The row must be in its birth state (active); the domain constructs
+	// every new account that way. accounts_state_valid is a membership
+	// guard, not a birth guard: suspended and closed must remain storable
+	// for their later states. Whether a stored account may authenticate is
+	// a separate runtime verdict, made by VerifyCredential's state switch.
 	Create(ctx context.Context, account identity.Account) error
 
 	// ByID returns the account with id, or ErrNotFound.
@@ -52,8 +54,10 @@ type Accounts interface {
 	// move: it sets the state to `to` only while the row still shows `from`,
 	// stamps updated_at with the caller's instant, and reports whether the
 	// move happened. A false return means someone else moved the row first;
-	// the caller re-reads. The schema's state check is the last line of
-	// defence if a caller names a move the domain forbids.
+	// the caller re-reads. The schema's state check admits every lifecycle
+	// state so transitions can be persisted; it neither polices the move
+	// nor decides whether a stored state may authenticate. The domain owns
+	// the former, VerifyCredential's switch the latter.
 	TransitionState(ctx context.Context, id identity.AccountID, from, to identity.AccountState, updatedAt time.Time) (bool, error)
 }
 
@@ -80,7 +84,9 @@ type Users interface {
 type APIKeys interface {
 	// Create inserts a new key's ownership record in its birth state
 	// (active, revoked_at null). The row's state/revoked_at pairing is
-	// enforced by the schema, so an inconsistent record cannot exist.
+	// enforced by the schema, so an inconsistent record cannot exist. That
+	// is consistency, not liveness: the state check admits revoked rows, and
+	// VerifyCredential's state switch refuses them at authentication.
 	Create(ctx context.Context, key identity.APIKey) error
 
 	// ByID returns the key's ownership record, or ErrNotFound.
