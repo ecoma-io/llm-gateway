@@ -85,6 +85,15 @@ func (reader *UsageFacts) Read(ctx context.Context, after string, limit int) (us
 	if err != nil {
 		return usagefacts.Page{}, err
 	}
+	if limit < 1 {
+		// The management surface bounds the limit before this port is reached;
+		// a non-positive one here reached the reader past that surface, and it
+		// is a defect rather than a request to reinterpret.
+		return usagefacts.Page{}, fmt.Errorf("usagefacts: limit must be at least one, got %d", limit)
+	}
+	if limit > usagefacts.MaxLimit {
+		limit = usagefacts.MaxLimit
+	}
 
 	readCtx, cancel := context.WithTimeout(ctx, readTimeout)
 	defer cancel()
@@ -111,6 +120,18 @@ func (reader *UsageFacts) Read(ctx context.Context, after string, limit int) (us
 	// believes it already delivered.
 	if pos.epoch != "" && pos.epoch != epoch {
 		return usagefacts.Page{}, expiredf("cursor names epoch %q, but this stream is %q", pos.epoch, epoch)
+	}
+
+	// And a position beyond this stream's own tail is expired by the same
+	// reasoning, not served as an empty page: the sequence it names has never
+	// been allocated on this epoch, so the cursor is from a sibling database
+	// (a restored copy against a live original) and the facts between its
+	// position and this stream's real tail would be silently skipped. A
+	// non-empty page also cannot be served from here — the page query would
+	// return nothing forever — so the honest answer is the one that stops the
+	// consumer and asks a human about the gap.
+	if pos.seq > lastSeq {
+		return usagefacts.Page{}, expiredf("cursor names sequence %d, but this stream has minted %d", pos.seq, lastSeq)
 	}
 
 	rows, err := reader.db.QueryContext(readCtx, pageQuery, pos.seq, limit+1)

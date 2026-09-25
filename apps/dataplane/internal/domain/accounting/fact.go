@@ -16,7 +16,8 @@ import (
 //     settlement-relevant ending that carries an amount.
 //   - Released: the request finalised without settleable usage and the whole
 //     hold went back.
-//   - Expired: the reaper closed a hold whose window lapsed; no usage is
+//   - Expired: the reaper closed a hold whose hold window and whose lease
+//     had both lapsed; no usage is
 //     claimed and the hold is gone.
 //   - UnbillableOrphaned: a proven completion whose usage cannot bill — usage
 //     observed, no charge derived, never a customer amount. It is not
@@ -175,9 +176,6 @@ func NewSettled(requestID identity.RequestID, attempt identity.AttemptID, captur
 		OutputUnitPrice:      &pricedOut,
 		SettledAmount:        &amount,
 		OccurredAt:           occurredAt,
-	}
-	if err := checkUsage(input, output, delivery); err != nil {
-		return Fact{}, err
 	}
 	if err := fact.setPayload(legs); err != nil {
 		return Fact{}, err

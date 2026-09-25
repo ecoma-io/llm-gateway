@@ -145,12 +145,38 @@ const (
 // Refill is a capacity increase beyond the original grant, delivered as its
 // own operation rather than smuggled through a republication: the guard
 // revision is the projection's revision at the time the increase was granted,
-// and the operation applies only to a projection still sitting at it.
+// and the operation applies only to a projection still sitting at it. The
+// refill id is the Control Plane's identity for the increase, and it is what
+// makes the operation safe to deliver at-least-once: the store records every
+// id once (the quota_refills unique), so a redelivery answers with the first
+// delivery's outcome instead of minting the amount a second time.
 type Refill struct {
+	RefillID        string
 	FundingBucketID string
 	Amount          int64
 	AtRevision      int64
 }
+
+// RefillOutcome is what applying one refill did, and the three values are the
+// whole of the refill algebra:
+//
+//   - Applied: the identity's first sighting at a live guard revision; the
+//     projection's available rose by the amount.
+//   - AlreadyApplied: the identity was recorded before — a redelivery, or a
+//     replay — and the answer repeats the first sighting's outcome instead of
+//     minting again. The amount on the wire is not re-checked against the
+//     recorded one: the identity is the contract, and a Control Plane that
+//     reuses an identity for a different amount has already broken it.
+//   - Stale: the projection moved past the guard revision before the refill
+//     arrived; the identity is recorded unapplied, and the increase must be
+//     re-derived under a new one.
+type RefillOutcome string
+
+const (
+	RefillApplied        RefillOutcome = "applied"
+	RefillAlreadyApplied RefillOutcome = "already_applied"
+	RefillStale          RefillOutcome = "stale"
+)
 
 // Validate refuses a publication whose scope kind and scope fields disagree —
 // the same shape rules a projection answers to, since a publication is how a
@@ -172,6 +198,12 @@ func (p Publication) Validate() error {
 	if p.AccountID == "" || p.FundingBucketID == "" || p.AliasGroupVersionID == "" {
 		return ErrUnknownScope
 	}
+	// SubscriptionCreatedAt is NOT NULL on the row and the waterfall's third
+	// sort input; a publication that left it out would seed a row the
+	// waterfall could not place against its siblings.
+	if p.SubscriptionCreatedAt.IsZero() {
+		return ErrUnknownScope
+	}
 	if p.LimitAmount < 0 {
 		return ErrUnknownScope
 	}
@@ -185,9 +217,15 @@ func (p Publication) Validate() error {
 // refuses to build the operation without it.
 var ErrRefillNotGuarded = errors.New("accounting: a refill must carry the revision it is guarded by")
 
-// NewRefill builds a guarded refill and refuses an unguarded one at the site
-// that forms it.
-func NewRefill(fundingBucketID string, amount, atRevision int64) (Refill, error) {
+// NewRefill builds a guarded, identified refill and refuses an unguarded or
+// unidentified one at the site that forms it. Both refusals protect the same
+// invariant — one identity mints at most once — from its two failure modes:
+// without the guard, a replay mints twice; without the identity, there is
+// nothing to tell the replay from the first delivery.
+func NewRefill(refillID, fundingBucketID string, amount, atRevision int64) (Refill, error) {
+	if refillID == "" {
+		return Refill{}, errors.New("accounting: a refill carries the Control Plane's refill identity")
+	}
 	if fundingBucketID == "" {
 		return Refill{}, errors.New("accounting: a refill names its bucket")
 	}
@@ -197,15 +235,15 @@ func NewRefill(fundingBucketID string, amount, atRevision int64) (Refill, error)
 	if atRevision < 0 {
 		return Refill{}, ErrRefillNotGuarded
 	}
-	return Refill{FundingBucketID: fundingBucketID, Amount: amount, AtRevision: atRevision}, nil
+	return Refill{RefillID: refillID, FundingBucketID: fundingBucketID, Amount: amount, AtRevision: atRevision}, nil
 }
 
 // ByWaterfall orders an account's projections the way ADR 0003's one and only
 // waterfall reads them: grants made under a named alias group before grants
 // made under the singleton `*`, then the earliest period end, then the
-// oldest subscription, then the entitlement id as the last tiebreak. A PAYG
-// balance names no period end, and no period end is the end of the order —
-// the cycles drain before the balance does.
+// oldest subscription, then the entitlement id, then the funding bucket id as
+// the last tiebreak. A PAYG balance names no period end, and no period end is
+// the end of the order — the cycles drain before the balance does.
 //
 // The order is computed here, from the raw inputs the row stores, every time
 // it is needed — never precomputed into a seed-time rank. A rank frozen at
@@ -215,9 +253,12 @@ func NewRefill(fundingBucketID string, amount, atRevision int64) (Refill, error)
 // that touches more than one of an account's rows touches them in this order,
 // so two writers can never deadlock across the set. Admission and return call
 // this one function; there is no second ordering anywhere in the runtime. The
-// adapter's SQL walks this same order (`named_scope DESC, period_end ASC
-// NULLS LAST, subscription_created_at ASC, entitlement_id ASC`); the two
-// spellings are one order, and the integration suite proves it.
+// final funding-bucket tiebreak is what makes the order total — two
+// projections can share every other input (one entitlement, two buckets) and
+// the lock order still needs to pick one first — and the adapter's SQL walks
+// this same order (`named_scope DESC, period_end ASC NULLS LAST,
+// subscription_created_at ASC, entitlement_id ASC, funding_bucket_id ASC`);
+// the two spellings are one order, and the integration suite proves it.
 func ByWaterfall(projections []Projection) []Projection {
 	ordered := make([]Projection, len(projections))
 	copy(ordered, projections)
@@ -238,7 +279,10 @@ func ByWaterfall(projections []Projection) []Projection {
 		if !a.SubscriptionCreatedAt.Equal(b.SubscriptionCreatedAt) {
 			return a.SubscriptionCreatedAt.Before(b.SubscriptionCreatedAt)
 		}
-		return a.EntitlementID < b.EntitlementID
+		if a.EntitlementID != b.EntitlementID {
+			return a.EntitlementID < b.EntitlementID
+		}
+		return a.FundingBucketID < b.FundingBucketID
 	})
 	return ordered
 }

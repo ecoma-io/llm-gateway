@@ -24,9 +24,19 @@ var ErrDuplicateReservation = errors.New("persistence: the request already holds
 // writes nothing.
 var ErrDuplicateFact = errors.New("persistence: the request already has its settlement fact")
 
+// ErrAppendOutsideUnitOfWork says Append arrived with no unit of work in its
+// context. The append sequence must be allocated inside the unit that writes
+// the fact — a sequence allocated outside one could commit apart from the
+// fact it numbers, which is the tearing the commit-order guarantee exists to
+// make impossible — so the store refuses the call instead of appending a lone
+// fact whose position the caller believes is atomic with something.
+var ErrAppendOutsideUnitOfWork = errors.New("persistence: a fact append needs a unit of work")
+
 // ExpiredLease is one hold the reaper closed, with everything the expired
-// fact derives from: the request it held for and the pricing basis it held
-// under. It is a read shape of the port, not a domain aggregate — the reaper
+// fact derives from: the request it held for, the pricing basis it held
+// under, and the legs its hold was split into — the fact's allocation tail,
+// read in the same sweep that closed the hold, so the append needs no second
+// read. It is a read shape of the port, not a domain aggregate — the reaper
 // reads what it closed and appends from what it read, in one unit of work.
 type ExpiredLease struct {
 	ID              identity.ReservationID
@@ -37,6 +47,7 @@ type ExpiredLease struct {
 	InputTokens     int
 	MaxOutputTokens int
 	LeaseOwner      string
+	Allocations     []accounting.Allocation
 }
 
 // ReservationRepository persists holds and closes them exactly once.
@@ -61,16 +72,32 @@ type ReservationRepository interface {
 	Close(ctx context.Context, id identity.ReservationID, state accounting.State, closedAt time.Time) (bool, error)
 
 	// ExpireLapsedLeases is the reaper's batch CAS: every hold still open
-	// whose lease has lapsed against the store's own clock moves to expired,
-	// up to limit, and the holds that moved come back whole so their facts can
-	// be appended in the same unit of work — no completed close without its
-	// fact. The precondition is carried whole — `state = 'open' AND
-	// lease_expires_at < clock_timestamp()` — so a hold whose lease the
-	// settlement path is extending this instant is never touched: the two
-	// writers' predicates overlap on one row exactly once, and the row lock
-	// decides. Contended rows are skipped, not waited on, so a reaper sweep
-	// never stands behind a settlement.
+	// whose hold window AND whose lease have both lapsed against the store's
+	// own clock moves to expired, up to limit, and the holds that moved come
+	// back whole — legs included — so their facts can be appended in the same
+	// unit of work: no completed close without its fact. Both clocks must
+	// have passed because they guard different disasters: a lapsed window is
+	// the caller walking away, a lapsed lease is the owner dying, and taking
+	// a hold on only one of them would close out a request that is still
+	// executing (live window, hiccuping renewal) or hold capacity for a
+	// caller that already left (live lease, lapsed window) until the lease
+	// too runs out. A hold whose lease the settlement path is extending this
+	// instant is never touched: the row lock decides between the two writers'
+	// predicates. Contended rows are skipped, not waited on, so a reaper
+	// sweep never stands behind a settlement. A limit below one is refused —
+	// an unbounded sweep is how a backlog becomes a long transaction.
 	ExpireLapsedLeases(ctx context.Context, limit int) ([]ExpiredLease, error)
+
+	// RenewLease extends one open hold's lease to the caller's new expiry,
+	// naming the owner that holds it. True means the lease moved; false means
+	// the hold is gone from the open set — closed by a concurrent settlement,
+	// or swept — and the renewing process must stop settling on its behalf.
+	// The lease is what tells the reaper "this process is alive and this hold
+	// is not abandoned"; a renewal for a hold whose window has already lapsed
+	// still succeeds if the hold is open, because the window and the lease
+	// are different clocks with different owners, and the settlement path —
+	// not the reaper — decides when the window matters.
+	RenewLease(ctx context.Context, id identity.ReservationID, owner string, leaseExpiresAt time.Time) (bool, error)
 }
 
 // QuotaProjectionRepository is the runtime's lock over its copy of grants:
@@ -84,11 +111,17 @@ type QuotaProjectionRepository interface {
 	// publication, because spent capacity must never be resurrected.
 	ApplyPublication(ctx context.Context, publication accounting.Publication) (accounting.PublicationOutcome, error)
 
-	// ApplyRefill adds capacity beyond the original grant, only to a
-	// projection still sitting at the refill's guard revision; false means the
-	// projection moved on and the refill must be re-derived, never re-applied
-	// blindly — an unguarded refill replayed is capacity minted twice.
-	ApplyRefill(ctx context.Context, refill accounting.Refill) (bool, error)
+	// ApplyRefill adds capacity beyond the original grant. The refill's id is
+	// the idempotency key and the store records every id once: the first
+	// sighting at a live guard revision answers RefillApplied with the
+	// projection's available raised by the amount; a redelivery of the same
+	// id answers RefillAlreadyApplied and moves nothing; a refill whose
+	// projection has moved past its guard revision answers RefillStale — the
+	// identity is recorded unapplied, and the increase must be re-derived
+	// under a new one. The stale asymmetry is the guard doing its job: the
+	// alternative is raising capacity against a grant state the Control Plane
+	// has already superseded.
+	ApplyRefill(ctx context.Context, refill accounting.Refill) (accounting.RefillOutcome, error)
 
 	// Drawdown takes `amount` of minor units from one account's projections,
 	// walking them in ADR 0003's waterfall order and drawing each bucket
@@ -121,13 +154,18 @@ type QuotaProjectionRepository interface {
 // FactRepository appends facts to the runtime's durable feed.
 type FactRepository interface {
 	// Append writes one fact and returns the append sequence the store
-	// allocated for it. The sequence is allocated from the stream's single row
+	// allocated for it. The call must arrive inside a unit of work — an
+	// append with none in its context fails with ErrAppendOutsideUnitOfWork,
+	// because a sequence allocated outside one could commit apart from the
+	// fact it numbers, and the feed's whole ordering discipline exists to
+	// make that impossible.
+	//
+	// Within its unit, the sequence is allocated from the stream's single row
 	// by an upsert whose lock is held to the transaction's commit, so
-	// allocation order equals visibility order — and Append must therefore be
-	// the LAST statement of the unit of work that calls it: it serialises the
-	// tail of every settlement, and moving it earlier serialises more of the
-	// unit for no gain. A fact written outside a unit of work still appends,
-	// alone; the sequence is no less real for that.
+	// allocation order equals visibility order — and Append should therefore
+	// be the LAST statement of the unit that calls it: it serialises the tail
+	// of every settlement, and moving it earlier serialises more of the unit
+	// for no gain. Aborted units roll the counter back with everything else.
 	//
 	// A second settlement-relevant fact for one request fails with
 	// ErrDuplicateFact — the dedup partial unique is the final idempotency

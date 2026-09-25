@@ -160,6 +160,7 @@ func TestPublicationValidateEnforcesTheSameShape(t *testing.T) {
 		{name: "refuses an empty account", mutate: func(p *Publication) { p.AccountID = "" }, refused: true},
 		{name: "refuses a publication with no funding bucket", mutate: func(p *Publication) { p.FundingBucketID = "" }, refused: true},
 		{name: "refuses a publication with no alias group version", mutate: func(p *Publication) { p.AliasGroupVersionID = "" }, refused: true},
+		{name: "refuses a publication with no subscription created-at", mutate: func(p *Publication) { p.SubscriptionCreatedAt = time.Time{} }, refused: true},
 		{name: "refuses a negative limit", mutate: func(p *Publication) { p.LimitAmount = -1 }, refused: true},
 	}
 
@@ -180,44 +181,47 @@ func TestPublicationValidateEnforcesTheSameShape(t *testing.T) {
 	}
 }
 
-// TestNewRefillBuildsAGuardedOperation pins the refill's rules: it names its
-// bucket, adds a positive amount, and always carries the revision it is
-// guarded by — a negative revision is refused with ErrRefillNotGuarded,
-// because an unguarded refill replayed is capacity minted twice, the one way
-// this table could invent money. Zero is a legitimate guard: a projection at
-// revision zero is a state a grant can sit at.
+// TestNewRefillBuildsAGuardedOperation pins the refill's rules: it carries
+// the Control Plane's identity, it names its bucket, it adds a positive
+// amount, and it always carries the revision it is guarded by — a negative
+// revision is refused with ErrRefillNotGuarded, because an unguarded refill
+// replayed is capacity minted twice, the one way this table could invent
+// money. Zero is a legitimate guard: a projection at revision zero is a state
+// a grant can sit at.
 func TestNewRefillBuildsAGuardedOperation(t *testing.T) {
 	t.Run("builds a guarded refill and rounds it through", func(t *testing.T) {
-		refill, err := NewRefill("bucket-0001", 1500, 7)
+		refill, err := NewRefill("refill-0001", "bucket-0001", 1500, 7)
 		if err != nil {
 			t.Fatalf("NewRefill() error = %v", err)
 		}
-		if refill != (Refill{FundingBucketID: "bucket-0001", Amount: 1500, AtRevision: 7}) {
-			t.Errorf("NewRefill() = %+v, want the three fields back as given", refill)
+		if refill != (Refill{RefillID: "refill-0001", FundingBucketID: "bucket-0001", Amount: 1500, AtRevision: 7}) {
+			t.Errorf("NewRefill() = %+v, want the four fields back as given", refill)
 		}
 	})
 
 	t.Run("accepts a zero guard revision", func(t *testing.T) {
-		if _, err := NewRefill("bucket-0001", 1500, 0); err != nil {
+		if _, err := NewRefill("refill-0001", "bucket-0001", 1500, 0); err != nil {
 			t.Errorf("NewRefill() with a zero guard error = %v, want it accepted — zero is a state a projection can sit at", err)
 		}
 	})
 
 	tests := []struct {
 		name            string
+		refillID        string
 		fundingBucketID string
 		amount          int64
 		atRevision      int64
 		wantErr         error
 	}{
-		{name: "refuses an unnamed bucket", fundingBucketID: "", amount: 1500, atRevision: 7},
-		{name: "refuses a zero amount", fundingBucketID: "bucket-0001", amount: 0, atRevision: 7},
-		{name: "refuses a negative amount", fundingBucketID: "bucket-0001", amount: -1, atRevision: 7},
-		{name: "refuses a negative guard revision", fundingBucketID: "bucket-0001", amount: 1500, atRevision: -1, wantErr: ErrRefillNotGuarded},
+		{name: "refuses an unidentified refill", refillID: "", fundingBucketID: "bucket-0001", amount: 1500, atRevision: 7},
+		{name: "refuses an unnamed bucket", refillID: "refill-0001", fundingBucketID: "", amount: 1500, atRevision: 7},
+		{name: "refuses a zero amount", refillID: "refill-0001", fundingBucketID: "bucket-0001", amount: 0, atRevision: 7},
+		{name: "refuses a negative amount", refillID: "refill-0001", fundingBucketID: "bucket-0001", amount: -1, atRevision: 7},
+		{name: "refuses a negative guard revision", refillID: "refill-0001", fundingBucketID: "bucket-0001", amount: 1500, atRevision: -1, wantErr: ErrRefillNotGuarded},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewRefill(tt.fundingBucketID, tt.amount, tt.atRevision)
+			_, err := NewRefill(tt.refillID, tt.fundingBucketID, tt.amount, tt.atRevision)
 			if err == nil {
 				t.Fatal("NewRefill() succeeded, want a refusal")
 			}
@@ -225,6 +229,23 @@ func TestNewRefillBuildsAGuardedOperation(t *testing.T) {
 				t.Errorf("NewRefill() error = %v, want it to wrap %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestRefillOutcomeVocabulary pins the three outcomes' wire spellings. They
+// cross the port boundary as strings the adapter's SQL CASE emits, so a
+// renamed constant would silently stop matching the statement — the pin is
+// what makes that a compile-time-adjacent failure instead of a runtime one.
+func TestRefillOutcomeVocabulary(t *testing.T) {
+	want := map[RefillOutcome]string{
+		RefillApplied:        "applied",
+		RefillAlreadyApplied: "already_applied",
+		RefillStale:          "stale",
+	}
+	for outcome, spelling := range want {
+		if string(outcome) != spelling {
+			t.Errorf("RefillOutcome %q does not spell %q — the adapter's CASE emits the spelling, not the constant", string(outcome), spelling)
+		}
 	}
 }
 
@@ -251,11 +272,13 @@ func orderedBuckets(projections []Projection) []string {
 }
 
 // TestByWaterfallOrdersTheAccountTheWayADR0003ReadsIt pins the one and only
-// waterfall order over a six-projection fixture, asserted in exact final
+// waterfall order over an eight-projection fixture, asserted in exact final
 // position: named scopes before the wildcard, then the earliest period end,
-// then the oldest subscription, then the entitlement id as the last
-// tiebreak, and the PAYG balance — no period end — last of all. The input is
-// handed over shuffled so the sort, not the input order, is what the output
+// then the oldest subscription, then the entitlement id, then the funding
+// bucket id as the last tiebreak — the order must be total, because it is
+// also the lock order and two rows tied on every input would make "first"
+// a coin flip — and the PAYG balance — no period end — last of all. The input
+// is handed over shuffled so the sort, not the input order, is what the output
 // proves, and the input is checked to come back un-reordered: ByWaterfall is
 // computed fresh from raw fields every call and must not write through to
 // the caller's slice.
@@ -267,11 +290,15 @@ func TestByWaterfallOrdersTheAccountTheWayADR0003ReadsIt(t *testing.T) {
 		waterfallProjection(false, cycleTwoEnd, subscribedOld, "ent-e", "wildcard-cycle-two"),      // wildcard, real period end
 		waterfallProjection(true, cycleOneEnd, subscribedOld, "ent-c", "named-cycle-one-ent-c"),    // full tie except entitlement id
 		waterfallProjection(true, cycleOneEnd, subscribedOld, "ent-a", "named-cycle-one-ent-a"),    // full tie except entitlement id
+		waterfallProjection(true, cycleOneEnd, subscribedOld, "ent-b", "named-cycle-one-ent-b-2"),  // full tie incl. entitlement id: bucket tiebreak
+		waterfallProjection(true, cycleOneEnd, subscribedOld, "ent-b", "named-cycle-one-ent-b-1"),  // full tie incl. entitlement id: bucket tiebreak
 	}
 	want := []string{
-		"named-cycle-one-ent-a",    // tie on everything but the entitlement id: ent-a < ent-c
+		"named-cycle-one-ent-a",    // tie on everything but the entitlement id: ent-a < ent-b < ent-c
+		"named-cycle-one-ent-b-1",  // tie with its ent-b sibling on every other input: bucket-1 < bucket-2
+		"named-cycle-one-ent-b-2",  // the sibling, after
 		"named-cycle-one-ent-c",    // same end, older subscription than the late-sub row
-		"named-cycle-one-late-sub", // same end as the first two, newer subscription
+		"named-cycle-one-late-sub", // same end as the tie group, newer subscription
 		"named-cycle-two",          // named, later period end
 		"wildcard-cycle-two",       // wildcard sorts after every named scope, own period end ordering
 		"payg-balance",             // no period end: last, whatever a zero time would do

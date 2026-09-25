@@ -157,7 +157,12 @@ type Request struct {
 // snapshot its eventual fact will be priced from. The rejection path may know
 // less — a row written "with the fields known so far" is formed directly by
 // RejectNew — but an admitted request knows its alias, its bounds and its
-// price, because the fact of it cannot be settled without them.
+// price, because the fact of it cannot be settled without them. The alias and
+// a positive input count are part of that knowledge: the alias is what every
+// final row must carry (the final-snapshot shape refuses one without it, so
+// an alias-less admission would be a request that can never finalise), and a
+// zero input count would open a zero hold whose reservation could take no
+// legs — a settlement that could never be built.
 func NewRequest(id identity.RequestID, accountID, apiKeyID, alias string, inputTokens, maxOutputTokens int, price PriceSnapshot, admittedAt time.Time) (Request, error) {
 	if id == "" {
 		return Request{}, errors.New("execution: a request needs an id")
@@ -165,8 +170,11 @@ func NewRequest(id identity.RequestID, accountID, apiKeyID, alias string, inputT
 	if accountID == "" || apiKeyID == "" {
 		return Request{}, errors.New("execution: a request needs its account and api key")
 	}
-	if inputTokens < 0 {
-		return Request{}, errors.New("execution: input tokens must not be negative")
+	if alias == "" {
+		return Request{}, errors.New("execution: an admitted request knows its alias")
+	}
+	if inputTokens <= 0 {
+		return Request{}, errors.New("execution: input tokens must be positive")
 	}
 	if maxOutputTokens <= 0 {
 		return Request{}, errors.New("execution: max output tokens must be positive")

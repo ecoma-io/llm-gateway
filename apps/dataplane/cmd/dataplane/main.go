@@ -120,6 +120,20 @@ func main() {
 		os.Exit(1)
 	}
 	log.Printf("dataplane %s postgres pool on %s", version, postgresLocation(cfg))
+
+	// The schema check is the other half of "opened and pinged": the pool can
+	// answer a ping while the migration that creates its tables has not run,
+	// and a process that learns that on its first real query has been serving
+	// readiness the whole time. The check runs at boot, where the DSN and the
+	// migration are deployment's business together, and it fails the boot
+	// rather than every later request.
+	schemaCtx, cancelSchema := context.WithTimeout(context.Background(), postgresOpenTimeout)
+	err = postgres.ValidateSchema(schemaCtx, pool)
+	cancelSchema()
+	if err != nil {
+		log.Printf("dataplane postgres: %v", err)
+		os.Exit(1)
+	}
 	// The persistence.Store over this pool is still not constructed: no use
 	// case runs a query yet, and postgres.New(pool) is wired by the change
 	// that first does. The fact reader is over the same pool already — bind

@@ -46,8 +46,19 @@ func NewRequestRepository(store persistence.Store) *RequestRepository {
 	return &RequestRepository{store: store}
 }
 
-// Insert implements persistence.RequestRepository.
+// Insert implements persistence.RequestRepository. The two shapes the store
+// accepts are the two admission decisions: executing and fresh, or rejected
+// and terminal from birth. A row in any other status did not come from an
+// admission path — succeeded and failed are transitions Finalise writes, and
+// inserting one directly would be a finalisation that skipped the once-only
+// close — so it is refused here rather than left for a shape constraint to
+// catch after the fact.
 func (repository *RequestRepository) Insert(ctx context.Context, request execution.Request) error {
+	switch request.Status {
+	case execution.StatusExecuting, execution.StatusRejected:
+	default:
+		return fmt.Errorf("postgres: insert request: %q is not a status a row is born with", string(request.Status))
+	}
 	// The price columns ride the snapshot's presence, not its arithmetic: the
 	// schema's requests_price_snapshot_pairing prices each unit column NULL
 	// exactly when the revision is NULL, so a row written "with the fields
@@ -83,11 +94,17 @@ func (repository *RequestRepository) Insert(ctx context.Context, request executi
 	return nil
 }
 
-// Finalise implements persistence.RequestRepository. False comes back with no
-// error when the row is no longer executing: the writer that lost the race
-// has nothing to do but read the winner's decision, and an error would tell
-// it to retry a decision that can only lose again.
+// Finalise implements persistence.RequestRepository. A call whose request is
+// still in executing status is refused before the statement runs — finalising
+// to executing is not a transition, and letting the statement through would
+// rewrite the row to exactly what it already was and report that as a win.
+// False comes back with no error when the row is no longer executing: the
+// writer that lost the race has nothing to do but read the winner's decision,
+// and an error would tell it to retry a decision that can only lose again.
 func (repository *RequestRepository) Finalise(ctx context.Context, request execution.Request) (bool, error) {
+	if request.Status == execution.StatusExecuting {
+		return false, errors.New("postgres: finalise request: executing is not a status to finalise to")
+	}
 	result, err := repository.store.Querier(ctx).ExecContext(ctx, requestFinalise,
 		string(request.ID),
 		string(request.Status),

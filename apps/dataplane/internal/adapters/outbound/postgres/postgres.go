@@ -223,6 +223,48 @@ var (
 	_ persistence.Querier = (*sql.Tx)(nil)
 )
 
+// InUnitOfWork reports whether ctx carries a unit of work this store opened
+// or joined — the same lookup Querier and WithinTx make, so the three can
+// never disagree about which unit of work a context belongs to. It exists for
+// the caller whose contract is unit-of-work-shaped and who must refuse rather
+// than silently degrade: the fact append, whose sequence would otherwise be
+// allocated on the pool and could commit apart from the fact it numbers.
+func (s *store) InUnitOfWork(ctx context.Context) bool {
+	_, ok := ctx.Value(txKey{db: s.db}).(*sql.Tx)
+	return ok
+}
+
+// ValidateSchema reports whether the runtime storage schema this package's
+// repositories are written against is present. It is a boot-time guard, not a
+// port member: a pool answers a ping all day while the migration that creates
+// its tables has not run, and a process that discovers that on its first real
+// query turns a one-line deployment mistake into per-request failures. The
+// probe asks for the three objects whose absence breaks the very first
+// statement of each repository — the feed's ordering authority, the request
+// family, the quota family — and the error names the missing object and
+// nothing else: no SQL, no driver prose, the same discipline the
+// repositories' own failures follow.
+func ValidateSchema(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		panic("postgres: ValidateSchema requires a non-nil *sql.DB — open the pool before validating")
+	}
+	const probe = `SELECT to_regclass($1)`
+	for _, required := range []struct{ object, why string }{
+		{"public.usage_events_stream", "the usage fact feed has no ordering authority"},
+		{"public.requests", "the request family is missing"},
+		{"public.quota_projections", "the quota projections are missing"},
+	} {
+		var found *string
+		if err := db.QueryRowContext(ctx, probe, required.object).Scan(&found); err != nil {
+			return fmt.Errorf("postgres: validate schema: %w", err)
+		}
+		if found == nil {
+			return fmt.Errorf("postgres: validate schema: %s is missing from the runtime database (%s) — apply migrations/dataplane before serving", required.object, required.why)
+		}
+	}
+	return nil
+}
+
 // txKey is the context key carrying the transaction a WithinTx scope opened,
 // keyed by the pool that opened it. Unexported on purpose: only this package
 // can put a transaction in a context, so no caller can smuggle one in from

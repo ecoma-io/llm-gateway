@@ -125,4 +125,14 @@ type Store interface {
 	// transaction on one pool can no more carry another pool's writes than
 	// a query can reach across pools.
 	WithinTx(ctx context.Context, fn func(ctx context.Context) error) error
+
+	// InUnitOfWork reports whether ctx carries a unit of work this store
+	// opened or joined — the same lookup Querier and WithinTx make, exposed
+	// for the callers whose correctness depends on the answer rather than on
+	// the handle. A repository uses it to refuse a call whose contract is
+	// unit-of-work-shaped (the fact append is the settled case: a sequence
+	// allocated outside a unit of work could commit apart from its fact,
+	// which is the tearing the append ordering exists to make impossible);
+	// it is a question about the context, not an invitation to open one.
+	InUnitOfWork(ctx context.Context) bool
 }

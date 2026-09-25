@@ -75,9 +75,9 @@ func TestNewRequestOpensExecutingWithItsAdmissionSnapshot(t *testing.T) {
 }
 
 // TestNewRequestRefusesAnUnusableAdmission pins each constructor refusal:
-// an admitted request knows its id, its owner, its bounds and its price,
-// because the fact of it cannot be settled without them. Every refusal here
-// has a twin CHECK on the row; the value of this table is that the caller
+// an admitted request knows its id, its owner, its alias, its bounds and its
+// price, because the fact of it cannot be settled without them. Every refusal
+// here has a twin CHECK on the row; the value of this table is that the caller
 // reads the reason at the moment it forms the request, not at the write.
 func TestNewRequestRefusesAnUnusableAdmission(t *testing.T) {
 	tests := []struct {
@@ -85,6 +85,7 @@ func TestNewRequestRefusesAnUnusableAdmission(t *testing.T) {
 		id      identity.RequestID
 		account string
 		key     string
+		alias   string
 		input   int
 		maxOut  int
 		price   PriceSnapshot
@@ -92,44 +93,54 @@ func TestNewRequestRefusesAnUnusableAdmission(t *testing.T) {
 	}{
 		{
 			name:    "rejects an empty id",
-			account: "acc-0001", key: "key-0001", input: 512, maxOut: 1024, price: admissionSnapshot(),
+			account: "acc-0001", key: "key-0001", alias: "claude-sonnet-4-5", input: 512, maxOut: 1024, price: admissionSnapshot(),
 			wantErr: "a request needs an id",
 		},
 		{
 			name: "rejects an empty account",
-			id:   "req-0001", key: "key-0001", input: 512, maxOut: 1024, price: admissionSnapshot(),
+			id:   "req-0001", key: "key-0001", alias: "claude-sonnet-4-5", input: 512, maxOut: 1024, price: admissionSnapshot(),
 			wantErr: "needs its account and api key",
 		},
 		{
 			name: "rejects an empty api key",
-			id:   "req-0001", account: "acc-0001", input: 512, maxOut: 1024, price: admissionSnapshot(),
+			id:   "req-0001", account: "acc-0001", alias: "claude-sonnet-4-5", input: 512, maxOut: 1024, price: admissionSnapshot(),
 			wantErr: "needs its account and api key",
 		},
 		{
+			name: "rejects an empty alias",
+			id:   "req-0001", account: "acc-0001", key: "key-0001", input: 512, maxOut: 1024, price: admissionSnapshot(),
+			wantErr: "an admitted request knows its alias",
+		},
+		{
+			name: "rejects zero input tokens",
+			id:   "req-0001", account: "acc-0001", key: "key-0001", alias: "claude-sonnet-4-5", input: 0, maxOut: 1024, price: admissionSnapshot(),
+			wantErr: "input tokens must be positive",
+		},
+		{
 			name: "rejects negative input tokens",
-			id:   "req-0001", account: "acc-0001", key: "key-0001", input: -1, maxOut: 1024, price: admissionSnapshot(),
-			wantErr: "input tokens must not be negative",
+			id:   "req-0001", account: "acc-0001", key: "key-0001", alias: "claude-sonnet-4-5", input: -1, maxOut: 1024, price: admissionSnapshot(),
+			wantErr: "input tokens must be positive",
 		},
 		{
 			name: "rejects a zero output ceiling",
-			id:   "req-0001", account: "acc-0001", key: "key-0001", input: 512, maxOut: 0, price: admissionSnapshot(),
+			id:   "req-0001", account: "acc-0001", key: "key-0001", alias: "claude-sonnet-4-5", input: 512, maxOut: 0, price: admissionSnapshot(),
 			wantErr: "max output tokens must be positive",
 		},
 		{
 			name: "rejects a negative output ceiling",
-			id:   "req-0001", account: "acc-0001", key: "key-0001", input: 512, maxOut: -100, price: admissionSnapshot(),
+			id:   "req-0001", account: "acc-0001", key: "key-0001", alias: "claude-sonnet-4-5", input: 512, maxOut: -100, price: admissionSnapshot(),
 			wantErr: "max output tokens must be positive",
 		},
 		{
 			name: "rejects a missing price revision",
-			id:   "req-0001", account: "acc-0001", key: "key-0001", input: 512, maxOut: 1024,
+			id:   "req-0001", account: "acc-0001", key: "key-0001", alias: "claude-sonnet-4-5", input: 512, maxOut: 1024,
 			wantErr: "carries a price snapshot",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			request, err := NewRequest(tt.id, tt.account, tt.key, "claude-sonnet-4-5", tt.input, tt.maxOut, tt.price, admittedAt)
+			request, err := NewRequest(tt.id, tt.account, tt.key, tt.alias, tt.input, tt.maxOut, tt.price, admittedAt)
 			if err == nil {
 				t.Fatalf("NewRequest() = %+v, want an error", request)
 			}

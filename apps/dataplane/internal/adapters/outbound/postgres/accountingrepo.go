@@ -2,6 +2,9 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -30,20 +33,28 @@ SET state = $2, closed_at = $3
 WHERE id = $1 AND state = 'open'`
 
 // reservationExpireLapsed is the reaper's batch CAS. The select pins the
-// victims — open, lease lapsed against the store's own clock — and locks them
-// SKIP LOCKED, so a settlement extending a lease on one of these rows this
-// instant simply keeps it: the subquery skips the locked row, the outer update
-// never sees it, and the two writers serialise on the row instead of
-// deadlocking across it. The rows that moved come back whole — the request,
-// the pricing basis, the lease — so the caller can append their facts inside
-// the same unit of work and no closed hold is ever left without its fact
-// (crash consistency: no completed close without a fact).
+// victims — open, with the hold window AND the lease both lapsed against the
+// store's own clock — and locks them SKIP LOCKED, so a settlement extending a
+// lease on one of these rows this instant simply keeps it: the subquery skips
+// the locked row, the outer update never sees it, and the two writers
+// serialise on the row instead of deadlocking across it. Both clocks must
+// have passed because they guard different disasters — taking on a lapsed
+// lease alone would close out a request that is still executing, and taking
+// on a lapsed window alone would hold capacity for a caller that already
+// walked away. The rows that moved come back whole — the request, the pricing
+// basis, the lease, and the legs their hold was split into (the fact's
+// allocation tail, read here so the append needs no second read) — so the
+// caller can append their facts inside the same unit of work and no closed
+// hold is ever left without its fact (crash consistency: no completed close
+// without a fact).
 const reservationExpireLapsed = `WITH victims AS (
     SELECT id, lease_expires_at, request_id::text AS request_id,
            price_revision_id, input_unit_price, output_unit_price,
            input_tokens, max_output_tokens, lease_owner
     FROM public.reservations
-    WHERE state = 'open' AND lease_expires_at < clock_timestamp()
+    WHERE state = 'open'
+      AND expires_at < clock_timestamp()
+      AND lease_expires_at < clock_timestamp()
     ORDER BY lease_expires_at
     LIMIT $1
     FOR UPDATE SKIP LOCKED
@@ -56,10 +67,20 @@ const reservationExpireLapsed = `WITH victims AS (
               v.input_unit_price, v.output_unit_price, v.input_tokens,
               v.max_output_tokens, v.lease_owner, v.lease_expires_at
 )
-SELECT id, request_id, price_revision_id, input_unit_price, output_unit_price,
-       input_tokens, max_output_tokens, lease_owner
+SELECT closed.id, closed.request_id, closed.price_revision_id,
+       closed.input_unit_price, closed.output_unit_price,
+       closed.input_tokens, closed.max_output_tokens, closed.lease_owner,
+       COALESCE((
+           SELECT jsonb_agg(jsonb_build_object(
+                      'funding_bucket_id', legs.funding_bucket_id,
+                      'amount', legs.amount,
+                      'ordinal', legs.ordinal)
+                      ORDER BY legs.ordinal)
+           FROM public.reservation_allocations legs
+           WHERE legs.reservation_id = closed.id::uuid
+       ), '[]'::jsonb) AS allocations
 FROM closed
-ORDER BY lease_expires_at, id`
+ORDER BY closed.lease_expires_at, closed.id`
 
 // ReservationRepository is the PostgreSQL implementation of the reservation
 // half of the persistence port.
@@ -125,8 +146,14 @@ func (repository *ReservationRepository) insertAllocations(ctx context.Context, 
 	return nil
 }
 
-// Close implements persistence.ReservationRepository.
+// Close implements persistence.ReservationRepository. A close to the open
+// state is refused before the statement runs: "closing" a hold to open is not
+// a transition, and a statement that would rewrite closed_at and no-op the
+// state would only be hiding the caller's bug behind a true RowsAffected.
 func (repository *ReservationRepository) Close(ctx context.Context, id identity.ReservationID, state accounting.State, closedAt time.Time) (bool, error) {
+	if state == accounting.StateOpen {
+		return false, errors.New("postgres: close reservation: the state to close to must be terminal")
+	}
 	result, err := repository.store.Querier(ctx).ExecContext(ctx, reservationClose,
 		string(id), string(state), closedAt,
 	)
@@ -142,7 +169,13 @@ func (repository *ReservationRepository) Close(ctx context.Context, id identity.
 
 // ExpireLapsedLeases implements persistence.ReservationRepository, returning
 // the holds it closed so their facts can be appended in the same unit of work.
+// A limit below one is refused: an unbounded sweep is how a backlog becomes a
+// long transaction, and "no limit today" is a decision a caller makes by
+// passing the table's size, not by omitting the argument.
 func (repository *ReservationRepository) ExpireLapsedLeases(ctx context.Context, limit int) ([]persistence.ExpiredLease, error) {
+	if limit < 1 {
+		return nil, fmt.Errorf("postgres: expire lapsed leases: limit must be at least one, got %d", limit)
+	}
 	rows, err := repository.store.Querier(ctx).QueryContext(ctx, reservationExpireLapsed, limit)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: expire lapsed leases: %w", err)
@@ -154,6 +187,7 @@ func (repository *ReservationRepository) ExpireLapsedLeases(ctx context.Context,
 		var (
 			expiredRow persistence.ExpiredLease
 			requestID  string
+			legsJSON   []byte
 		)
 		if err := rows.Scan(
 			&expiredRow.ID,
@@ -164,6 +198,7 @@ func (repository *ReservationRepository) ExpireLapsedLeases(ctx context.Context,
 			&expiredRow.InputTokens,
 			&expiredRow.MaxOutputTokens,
 			&expiredRow.LeaseOwner,
+			&legsJSON,
 		); err != nil {
 			return nil, fmt.Errorf("postgres: expire lapsed leases: %w", err)
 		}
@@ -171,6 +206,22 @@ func (repository *ReservationRepository) ExpireLapsedLeases(ctx context.Context,
 			// Fail closed: a hold whose request is not an identity is not a
 			// hold this build can close loudly and correctly.
 			return nil, fmt.Errorf("postgres: expire lapsed leases: %w", err)
+		}
+		// The legs came back in ordinal order; decode them through the domain's
+		// own leg shape (the one the fact payload uses) so a schema drift here
+		// is a decode error, not silently-empty allocations.
+		var legs []accounting.AllocationLeg
+		if len(legsJSON) > 0 {
+			if err := json.Unmarshal(legsJSON, &legs); err != nil {
+				return nil, fmt.Errorf("postgres: expire lapsed leases: decode the allocation legs of %s: %w", expiredRow.ID, err)
+			}
+		}
+		expiredRow.Allocations = make([]accounting.Allocation, 0, len(legs))
+		for _, leg := range legs {
+			// Allocation and AllocationLeg are field-for-field the same shape
+			// on purpose — the hold's memory and the fact's publication of it
+			// — so the conversion is a spelling, not a mapping.
+			expiredRow.Allocations = append(expiredRow.Allocations, accounting.Allocation(leg))
 		}
 		expired = append(expired, expiredRow)
 	}
@@ -180,44 +231,76 @@ func (repository *ReservationRepository) ExpireLapsedLeases(ctx context.Context,
 	return expired, nil
 }
 
-// publicationApply is the publication algebra in one statement, atomic
-// regardless of the unit of work around it. The data-modifying CTEs each run
-// exactly once, in order: the update wins when a row exists at an older
-// revision and touches only the Control-Plane-owned columns — never
-// `available`; the insert seeds when the update matched nothing and a row does
-// not already exist; the outer select reads off which of the three outcomes
-// happened. A stale redelivery leaves both CTEs empty and is answered
-// PublicationStale with nothing written.
-const publicationApply = `WITH updated AS (
-    UPDATE public.quota_projections
-    SET account_id = $1, scope_kind = $2, entitlement_id = $3,
-        cycle_number = $4, alias_group_version_id = $5, named_scope = $6,
-        period_end = $7, subscription_created_at = $8, state = $9,
-        limit_amount = $10, revision = $11, updated_at = clock_timestamp()
-    WHERE funding_bucket_id = $12 AND revision < $11
-    RETURNING 1
-), seeded AS (
-    INSERT INTO public.quota_projections
-        (account_id, scope_kind, entitlement_id, cycle_number,
-         funding_bucket_id, alias_group_version_id, named_scope, dimension,
-         period_end, subscription_created_at, state, limit_amount, available,
-         revision)
-    SELECT $1, $2, $3, $4, $12, $5, $6, 'cost', $7, $8, $9, $10, $10, $11
-    WHERE NOT EXISTS (SELECT 1 FROM updated)
-    ON CONFLICT (funding_bucket_id) DO NOTHING
-    RETURNING 1
-)
-SELECT CASE
-    WHEN EXISTS (SELECT 1 FROM updated) THEN 'updated'
-    WHEN EXISTS (SELECT 1 FROM seeded)   THEN 'seeded'
-    ELSE 'stale'
-END`
+// reservationRenewLease extends one open hold's lease, naming its owner. The
+// predicate carries the owner and the open state: a renewal cannot extend a
+// lease someone else holds, cannot resurrect a closed hold, and cannot be the
+// statement that mutates a terminal row — the terminal trigger behind it is
+// the bug detector, this predicate is the guard. False means the hold is gone
+// from the open set, and the renewing process must stop settling on its
+// behalf.
+const reservationRenewLease = `UPDATE public.reservations
+SET lease_expires_at = $3
+WHERE id = $1 AND lease_owner = $2 AND state = 'open'`
 
-// The seeded CTE's ON CONFLICT DO NOTHING is there for the race, not the
-// common path: two publications for a brand-new bucket arriving together both
-// find no row to update, and the loser of the insert race lands in the
-// conflict branch — answering 'stale', which is correct, because the row it
-// now conflicts with carries its revision or a newer one.
+// RenewLease implements persistence.ReservationRepository.
+func (repository *ReservationRepository) RenewLease(ctx context.Context, id identity.ReservationID, owner string, leaseExpiresAt time.Time) (bool, error) {
+	if owner == "" {
+		return false, errors.New("postgres: renew lease: a renewal names its owner")
+	}
+	result, err := repository.store.Querier(ctx).ExecContext(ctx, reservationRenewLease,
+		string(id), owner, leaseExpiresAt,
+	)
+	if err != nil {
+		return false, fmt.Errorf("postgres: renew lease: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("postgres: renew lease: %w", err)
+	}
+	return affected > 0, nil
+}
+
+// publicationApply is the publication algebra in one statement, atomic
+// regardless of the unit of work around it. One INSERT with an upsert carries
+// the whole algebra: no row exists and it inserts — seeded; a row exists and
+// the conflict branch's guard (`revision < EXCLUDED.revision`, re-evaluated
+// under the row lock against the committed row, so a concurrent publication
+// cannot slip between the check and the write) moves only the
+// Control-Plane-owned columns — never `available` — and the outcome is
+// updated; the guard fails and nothing is written — stale. RETURNING
+// (xmax = 0) tells the seed and the update apart on the row that comes back:
+// xmax is 0 exactly for a tuple this statement inserted, never for one it
+// updated in place.
+const publicationApply = `INSERT INTO public.quota_projections
+    (account_id, scope_kind, entitlement_id, cycle_number,
+     funding_bucket_id, alias_group_version_id, named_scope, dimension,
+     period_end, subscription_created_at, state, limit_amount, available,
+     revision)
+VALUES ($1, $2, $3, $4, $12, $5, $6, 'cost', $7, $8, $9, $10, $10, $11)
+ON CONFLICT (funding_bucket_id) DO UPDATE
+SET account_id = EXCLUDED.account_id,
+    scope_kind = EXCLUDED.scope_kind,
+    entitlement_id = EXCLUDED.entitlement_id,
+    cycle_number = EXCLUDED.cycle_number,
+    alias_group_version_id = EXCLUDED.alias_group_version_id,
+    named_scope = EXCLUDED.named_scope,
+    period_end = EXCLUDED.period_end,
+    subscription_created_at = EXCLUDED.subscription_created_at,
+    state = EXCLUDED.state,
+    limit_amount = EXCLUDED.limit_amount,
+    revision = EXCLUDED.revision,
+    updated_at = clock_timestamp()
+WHERE public.quota_projections.revision < EXCLUDED.revision
+RETURNING (xmax = 0) AS seeded`
+
+// The guard lives in the conflict branch, not the VALUES, so it is
+// re-evaluated against the committed row at the moment the row lock is won:
+// two publications arriving together serialise on the row, the loser's
+// re-check reads the winner's revision, and the answer is stale by the same
+// rule that decides a redelivery. `seeded_at`, `dimension` and `available`
+// appear on no SET line on purpose — seed time is immutable, the dimension is
+// the schema's, and spent capacity must never be resurrected by a
+// republication.
 
 // QuotaProjectionRepository is the PostgreSQL implementation of the quota
 // half of the persistence port.
@@ -235,7 +318,7 @@ func (repository *QuotaProjectionRepository) ApplyPublication(ctx context.Contex
 	if err := publication.Validate(); err != nil {
 		return "", err
 	}
-	var outcome string
+	var seeded bool
 	err := repository.store.Querier(ctx).QueryRowContext(ctx, publicationApply,
 		publication.AccountID,
 		string(publication.ScopeKind),
@@ -249,57 +332,93 @@ func (repository *QuotaProjectionRepository) ApplyPublication(ctx context.Contex
 		publication.LimitAmount,
 		publication.Revision,
 		publication.FundingBucketID,
-	).Scan(&outcome)
+	).Scan(&seeded)
+	if errors.Is(err, sql.ErrNoRows) {
+		// No row came back: the conflict branch's guard refused the write, and
+		// the publication is a redelivery or arrives out of order.
+		return accounting.PublicationStale, nil
+	}
 	if err != nil {
 		return "", fmt.Errorf("postgres: apply publication: %w", err)
 	}
-	return accounting.PublicationOutcome(outcome), nil
+	if seeded {
+		return accounting.PublicationSeeded, nil
+	}
+	return accounting.PublicationUpdated, nil
 }
 
-// refillApply adds capacity only to a projection still sitting at the guard
-// revision. RowsAffected is the whole verdict: zero means the projection moved
-// on — a newer publication, a refill already applied — and the operation must
-// be re-derived, never retried blind.
-const refillApply = `UPDATE public.quota_projections
-SET available = available + $2, updated_at = clock_timestamp()
-WHERE funding_bucket_id = $1 AND revision = $3`
+// refillApply is the refill algebra in one statement. The claim CTE records
+// the identity first — INSERT ON CONFLICT DO NOTHING, whose unique is the
+// engine's at-most-once mint guard — and only a claimed identity reaches the
+// raise, which still demands the projection to be sitting at the guard
+// revision. Three outcomes, one CASE: claimed and raised is applied; claimed
+// and not raised is stale (the identity is spent unapplied, by design — the
+// alternative is raising against a grant state the Control Plane has already
+// superseded); not claimed is a redelivery, answered already_applied with the
+// first sighting's receipt standing. Two sessions racing the same identity
+// serialise on the claim insert (the second waits on the first's unique-index
+// entry), so the mint really is at-most-once and not merely declared so.
+const refillApply = `WITH claim AS (
+    INSERT INTO public.quota_refills (funding_bucket_id, refill_id, amount, at_revision)
+    VALUES ($2, $1, $3, $4)
+    ON CONFLICT (refill_id) DO NOTHING
+    RETURNING funding_bucket_id, amount, at_revision
+), raised AS (
+    UPDATE public.quota_projections p
+    SET available = p.available + claim.amount, updated_at = clock_timestamp()
+    FROM claim
+    WHERE p.funding_bucket_id = claim.funding_bucket_id
+      AND p.revision = claim.at_revision
+    RETURNING 1
+)
+SELECT CASE
+    WHEN EXISTS (SELECT 1 FROM claim) AND EXISTS (SELECT 1 FROM raised) THEN 'applied'
+    WHEN EXISTS (SELECT 1 FROM claim) THEN 'stale'
+    ELSE 'already_applied'
+END`
 
 // ApplyRefill implements persistence.QuotaProjectionRepository.
-func (repository *QuotaProjectionRepository) ApplyRefill(ctx context.Context, refill accounting.Refill) (bool, error) {
-	result, err := repository.store.Querier(ctx).ExecContext(ctx, refillApply,
-		refill.FundingBucketID, refill.Amount, refill.AtRevision,
-	)
-	if err != nil {
-		return false, fmt.Errorf("postgres: apply refill: %w", err)
+func (repository *QuotaProjectionRepository) ApplyRefill(ctx context.Context, refill accounting.Refill) (accounting.RefillOutcome, error) {
+	// The domain constructor is the shape guard — identity, bucket, positive
+	// amount, a guard revision — so a malformed refill is refused in the
+	// domain's vocabulary before the statement exists.
+	if _, err := accounting.NewRefill(refill.RefillID, refill.FundingBucketID, refill.Amount, refill.AtRevision); err != nil {
+		return "", err
 	}
-	affected, err := result.RowsAffected()
+	var outcome string
+	err := repository.store.Querier(ctx).QueryRowContext(ctx, refillApply,
+		refill.RefillID, refill.FundingBucketID, refill.Amount, refill.AtRevision,
+	).Scan(&outcome)
 	if err != nil {
-		return false, fmt.Errorf("postgres: apply refill: %w", err)
+		return "", fmt.Errorf("postgres: apply refill: %w", err)
 	}
-	return affected > 0, nil
+	return accounting.RefillOutcome(outcome), nil
 }
 
 // projectionWalk reads one account's live projections in ADR 0003's waterfall
 // order — named scope before `*`, earliest period end, oldest subscription,
-// entitlement id last. The order here is the canonical lock order: every
-// multi-row writer walks the same sequence, so two of them can interleave
-// without ever waiting on each other in opposite orders.
+// entitlement id, funding bucket id last. The order here is the canonical
+// lock order: every multi-row writer walks the same sequence, so two of them
+// can interleave without ever waiting on each other in opposite orders.
 const projectionWalk = `SELECT funding_bucket_id, available
 FROM public.quota_projections
 WHERE account_id = $1 AND state = 'active'
 ORDER BY named_scope DESC, period_end ASC NULLS LAST,
-         subscription_created_at ASC, entitlement_id ASC`
+         subscription_created_at ASC, entitlement_id ASC, funding_bucket_id ASC`
 
 // projectionTake is the conditional drawdown of one bucket, and its predicate
 // is where exactly-one-wins lives: two contenders run this against the same
-// row, the row lock serialises them, and the second re-evaluates
-// `available >= $2` against the first's committed write — the losing predicate
-// matches zero rows, and no available ever goes negative. No SELECT FOR
-// UPDATE, no read-then-write window: the decision and the write are one
-// statement.
+// row, the row lock serialises them, and the second re-evaluates the whole
+// predicate against the first's committed write — the losing predicate
+// matches zero rows, and no available ever goes negative. The predicate also
+// re-checks `state = 'active'`: the walk read it, but a publication can
+// deactivate the grant between the walk and the take, and capacity the
+// Control Plane withdrew must not leave the row on a stale read's word. No
+// SELECT FOR UPDATE, no read-then-write window: the decision and the write
+// are one statement.
 const projectionTake = `UPDATE public.quota_projections
 SET available = available - $2, updated_at = clock_timestamp()
-WHERE funding_bucket_id = $1 AND available >= $2`
+WHERE funding_bucket_id = $1 AND state = 'active' AND available >= $2`
 
 // projectionGiveback returns capacity drawn before a walk failed. It is the
 // unconditional return shape — a giveback must never fail for the same reason
@@ -353,10 +472,14 @@ func (repository *QuotaProjectionRepository) Drawdown(ctx context.Context, accou
 
 	// The walk: take from each bucket in order until the hold is covered. The
 	// legs record reality — what the store granted, which may be less than a
-	// bucket's whole available.
+	// bucket's whole available. The ordinal is the leg's own counter, not the
+	// bucket index: the schema's shape demands ordinals that count the legs
+	// contiguously from 1, and a bucket with nothing to give (take <= 0) is
+	// skipped without spending one.
 	legs := make([]accounting.Allocation, 0, len(buckets))
 	remaining := amount
-	for i, one := range buckets {
+	ordinal := 0
+	for _, one := range buckets {
 		if remaining == 0 {
 			break
 		}
@@ -377,12 +500,14 @@ func (repository *QuotaProjectionRepository) Drawdown(ctx context.Context, accou
 		}
 		if affected == 0 {
 			// Another writer took this bucket's capacity between the walk and
-			// the take. The walk's numbers are stale: fail the whole hold and
-			// let the caller retry against fresh numbers — a partial hold is
-			// money reserved against a request it will not cover.
+			// the take — or deactivated the grant. The walk's numbers are
+			// stale: fail the whole hold and let the caller retry against
+			// fresh numbers — a partial hold is money reserved against a
+			// request it will not cover.
 			return nil, repository.giveback(ctx, querier, legs, accounting.ErrInsufficientCapacity)
 		}
-		legs = append(legs, accounting.Allocation{FundingBucketID: one.id, Amount: take, Ordinal: i + 1})
+		ordinal++
+		legs = append(legs, accounting.Allocation{FundingBucketID: one.id, Amount: take, Ordinal: ordinal})
 		remaining -= take
 	}
 	if remaining > 0 {
@@ -467,10 +592,17 @@ func NewFactRepository(store persistence.Store) *FactRepository {
 	return &FactRepository{store: store}
 }
 
-// Append implements persistence.FactRepository: allocate the sequence, write
-// the fact, return the sequence. Two statements, one unit of work, the
-// allocation last.
+// Append implements persistence.FactRepository: refuse a contextless append,
+// allocate the sequence, write the fact, return the sequence. The refusal is
+// first because it decides whether the two statements after it may run
+// together at all: a sequence allocated outside a unit of work could commit
+// apart from the fact it numbers — a consumer's cursor would then hold a
+// position for a fact that does not exist yet, and no error anywhere would
+// say so.
 func (repository *FactRepository) Append(ctx context.Context, fact accounting.Fact) (int64, error) {
+	if !repository.store.InUnitOfWork(ctx) {
+		return 0, fmt.Errorf("postgres: append fact: %w", persistence.ErrAppendOutsideUnitOfWork)
+	}
 	querier := repository.store.Querier(ctx)
 
 	var epoch string

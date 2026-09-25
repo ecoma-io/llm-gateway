@@ -41,14 +41,19 @@ var ErrAttemptNotOfRequest = errors.New("persistence: attempt belongs to another
 // error to retry.
 type RequestRepository interface {
 	// Insert writes the request's row: executing and fresh, or terminal from
-	// birth for the rejection path. The domain has already refused a malformed
-	// aggregate; a failure here is the store's, and it is returned wrapped,
-	// never with SQL internals of its own.
+	// birth for the rejection path. The two are the only shapes the store
+	// accepts — a row in any other status did not come from an admission
+	// decision, and an error names it. The domain has already refused a
+	// malformed aggregate; a failure here is the store's, and it is returned
+	// wrapped, never with SQL internals of its own.
 	Insert(ctx context.Context, request execution.Request) error
 
 	// Finalise writes the request's terminal shape from its current status:
 	// status, the one reason column the status owns, the committed attempt the
-	// status names, and the finish time. It returns false — with no error —
+	// status names, and the finish time. A call whose request is still in
+	// executing status is refused — finalising to executing is not a
+	// transition, and an adapter that wrote the row back unchanged would
+	// only be hiding the caller's bug. It returns false — with no error —
 	// when the row is no longer executing, because the losing writer has
 	// nothing left to do but read the winner's decision.
 	Finalise(ctx context.Context, request execution.Request) (bool, error)
