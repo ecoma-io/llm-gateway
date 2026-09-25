@@ -39,6 +39,15 @@ type CredentialView struct {
 	// the presented token and compares against this value in constant time.
 	Digest string
 
+	// AccountID is the identity of the account the credential belongs to, read
+	// from the credential row itself — never from the joined half, which is
+	// why it is set even when the account row is absent (AccountState nil
+	// beside an AccountID is exactly the integrity-violation shape). The
+	// account every admission write keys on is this value: the request row,
+	// the replay record and the drawdown all name the owner the mirror
+	// verified, not one re-derived elsewhere.
+	AccountID string
+
 	// KeyState is the credential's lifecycle state as the mirror spells it
 	// ("active", "revoked").
 	KeyState string

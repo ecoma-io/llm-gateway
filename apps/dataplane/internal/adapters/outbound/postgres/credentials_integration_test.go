@@ -64,6 +64,9 @@ func TestIntegrationCredentialLookupReturnsTheJoinedPair(t *testing.T) {
 	if view.Digest != projectionDigestB {
 		t.Errorf("digest = %q, want the mirrored 64-hex verbatim", view.Digest)
 	}
+	if view.AccountID != string(account) {
+		t.Errorf("account id = %q, want the credential row's own owner %q — the identity every admission write keys on", view.AccountID, account)
+	}
 	if view.KeyState != string(projection.CredentialActive) {
 		t.Errorf("key state = %q, want active", view.KeyState)
 	}
@@ -101,6 +104,9 @@ func TestIntegrationCredentialLookupKeepsAMissingAccountRowNil(t *testing.T) {
 	view := mustLookup(t, creds, key)
 	if view.AccountState != nil {
 		t.Errorf("account state = %q, want nil — an absent account row is a fact to fail closed on, not a default", *view.AccountState)
+	}
+	if view.AccountID != string(account) {
+		t.Errorf("account id = %q, want %q — the owner is read from the credential row, so the absence of the account row cannot take it away", view.AccountID, account)
 	}
 	if view.Digest != projectionDigestB || view.KeyState != string(projection.CredentialActive) {
 		t.Errorf("credential = %s/%s, want the row's own halves intact beside the absent account", view.Digest, view.KeyState)

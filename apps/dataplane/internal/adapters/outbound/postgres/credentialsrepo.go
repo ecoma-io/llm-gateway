@@ -26,7 +26,7 @@ import (
 // no-account-row case observable: the absence arrives as a NULL the caller
 // fails closed on, rather than vanishing into a missed row.
 const selectCredentialView = `
-SELECT c.digest, c.state, c.revoked_at, a.state
+SELECT c.digest, c.state, c.revoked_at, c.account_id, a.state
 FROM api_key_credentials c
 LEFT JOIN account_states a ON a.account_id = c.account_id
 WHERE c.key_id = $1`
@@ -59,7 +59,7 @@ func (r *credentialsRepo) Lookup(ctx context.Context, keyID string) (persistence
 	var revokedAt sql.NullTime
 	var accountState sql.NullString
 	err := r.store.Querier(ctx).QueryRowContext(ctx, selectCredentialView, keyID).
-		Scan(&view.Digest, &view.KeyState, &revokedAt, &accountState)
+		Scan(&view.Digest, &view.KeyState, &revokedAt, &view.AccountID, &accountState)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return persistence.CredentialView{}, fmt.Errorf("postgres: credential %s: %w", keyID, persistence.ErrCredentialNotFound)

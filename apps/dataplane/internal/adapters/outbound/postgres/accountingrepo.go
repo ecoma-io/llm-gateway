@@ -580,7 +580,12 @@ func (repository *QuotaProjectionRepository) Drawdown(ctx context.Context, accou
 		remaining -= take
 	}
 	if remaining > 0 {
-		return nil, repository.giveback(ctx, querier, legs, accounting.ErrInsufficientCapacity)
+		// The shortfall carries its classification with it, read off the walk
+		// this Drawdown already ran: the walk's statement returns exactly the
+		// buckets eligible to fund this request, so "the walk saw at least
+		// one" answers the caller's shortage-or-no-access question here, for
+		// free, and never by asking the database a second time.
+		return nil, repository.giveback(ctx, querier, legs, &persistence.InsufficientCapacityError{EligibleRowSeen: len(buckets) > 0})
 	}
 	return legs, nil
 }

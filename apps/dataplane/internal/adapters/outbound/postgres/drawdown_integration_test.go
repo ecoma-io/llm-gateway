@@ -27,6 +27,7 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/accounting"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/catalog"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/identity"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/persistence"
 )
 
 // integrationPublishScoped delivers one grant whose stored scope the caller
@@ -133,6 +134,12 @@ func TestIntegrationDrawdownSkipsAGrantWhoseScopeExcludesTheAlias(t *testing.T) 
 		if !errors.Is(err, accounting.ErrInsufficientCapacity) {
 			t.Errorf("%s: Drawdown(100) error = %v, want ErrInsufficientCapacity", tt.name, err)
 		}
+		var shortfall *persistence.InsufficientCapacityError
+		if !errors.As(err, &shortfall) {
+			t.Errorf("%s: Drawdown(100) error = %v, want it typed as InsufficientCapacityError", tt.name, err)
+		} else if shortfall.EligibleRowSeen {
+			t.Errorf("%s: EligibleRowSeen = true, want false — the exclusion is the scope's, so the walk saw no eligible grant", tt.name)
+		}
 		if len(legs) != 0 {
 			t.Errorf("%s: Drawdown(100) = %v, want no legs — the excluded grant must not be drawn", tt.name, legs)
 		}
@@ -149,6 +156,44 @@ func TestIntegrationDrawdownSkipsAGrantWhoseScopeExcludesTheAlias(t *testing.T) 
 	}
 	if len(legs) != 1 || legs[0].Amount != 100 || legs[0].FundingBucketID != excludedBucket {
 		t.Fatalf("Drawdown(100) for the grant's own alias = %v, want one leg of 100 from %s", legs, excludedBucket)
+	}
+}
+
+// TestIntegrationDrawdownShortfallNamesWhetherAnyGrantWasEligible: the other
+// shortfall shape, beside the scope exclusions above. A grant whose scope
+// contains the alias and whose cycle is live but whose available cannot cover
+// the hold is a real shortage: the shortfall still answers the sentinel, and
+// the typed error names the difference — EligibleRowSeen true, because the
+// walk saw a grant it was allowed to draw from, just not enough of one.
+func TestIntegrationDrawdownShortfallNamesWhetherAnyGrantWasEligible(t *testing.T) {
+	db, store := integrationPool(t)
+	repos := integrationRepos(t, store)
+	integrationRuntimeSchema(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	scope := repos.catalogScope(t)
+	account := integrationRuntimeAccount(t, "eligible-short")
+	bucket := account + "-bucket"
+	integrationPublishScoped(t, ctx, repos, account, bucket, scope.wildcard, false,
+		time.Now().UTC().Add(24*time.Hour), 100)
+
+	legs, err := repos.quota.Drawdown(ctx, account, scope.alias, 250)
+	if !errors.Is(err, accounting.ErrInsufficientCapacity) {
+		t.Fatalf("Drawdown(250) error = %v, want ErrInsufficientCapacity", err)
+	}
+	var shortfall *persistence.InsufficientCapacityError
+	if !errors.As(err, &shortfall) {
+		t.Fatalf("Drawdown(250) error = %T, want *persistence.InsufficientCapacityError", err)
+	}
+	if !shortfall.EligibleRowSeen {
+		t.Errorf("EligibleRowSeen = false, want true — the grant's scope contains the alias, so the walk saw it; it was just too small")
+	}
+	if len(legs) != 0 {
+		t.Errorf("Drawdown(250) = %v, want no legs — a shortfall draws nothing", legs)
+	}
+	if available, _, _, _ := integrationProjectionRow(t, db, bucket); available != 100 {
+		t.Errorf("available after the refused draw = %d, want 100 — the giveback restored what the walk took", available)
 	}
 }
 
