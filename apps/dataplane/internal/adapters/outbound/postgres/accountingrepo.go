@@ -495,6 +495,13 @@ WHERE funding_bucket_id = $1`
 // what makes the giveback atomic with the takes — and the legs it returns are
 // what the caller builds the reservation's allocations from.
 //
+// A zero amount is not a short-circuit past the walk. Admission asks the
+// waterfall even when the hold prices out at nothing, because the question
+// the walk answers is "may this account fund this alias at all" — the
+// scope question — and a zero-priced alias has to answer it like any other:
+// no eligible bucket is the no-access refusal, and an eligible one takes
+// nothing and funds the request for free.
+//
 // The read and the takes are separate statements by design: the takes are
 // conditional, so a stale read costs a passed-by bucket, never a negative
 // balance. A take that matches zero rows — a contender won the capacity, or
@@ -506,9 +513,6 @@ WHERE funding_bucket_id = $1`
 func (repository *QuotaProjectionRepository) Drawdown(ctx context.Context, accountID string, aliasID catalog.AliasID, amount int64) ([]accounting.Allocation, error) {
 	if amount < 0 {
 		return nil, accounting.ErrNegativeAmount
-	}
-	if amount == 0 {
-		return []accounting.Allocation{}, nil
 	}
 	if aliasID == "" {
 		return nil, errors.New("postgres: drawdown: a drawdown names the alias it serves")
@@ -536,6 +540,18 @@ func (repository *QuotaProjectionRepository) Drawdown(ctx context.Context, accou
 		return nil, fmt.Errorf("postgres: drawdown walk: %w", err)
 	}
 	_ = rows.Close()
+
+	// The zero hold, classified by the walk that just ran: the eligibility
+	// question is answered off the same read every amount answers it from,
+	// and nothing is taken. An eligible waterfall funds the request for
+	// nothing — empty legs, no error — and the reservation built on them is
+	// a hold of zero with no split, which the domain's own shape allows.
+	if amount == 0 {
+		if len(buckets) == 0 {
+			return nil, &persistence.InsufficientCapacityError{EligibleRowSeen: false}
+		}
+		return []accounting.Allocation{}, nil
+	}
 
 	// The walk: take from each bucket in order until the hold is covered. The
 	// legs record reality — what the store granted, which may be less than a

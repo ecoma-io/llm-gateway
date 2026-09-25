@@ -342,3 +342,80 @@ func TestIntegrationDrawdownPaysEntitlementCyclesBeforePayg(t *testing.T) {
 		t.Errorf("the scoped PAYG balance insert error = %v, want 23514 on quota_projections_payg_scope_wildcard", err)
 	}
 }
+
+// TestIntegrationDrawdownOfZeroStillAnswersTheScopeQuestion: a zero amount is
+// not a short-circuit past the walk. The use case turns the walk's answer
+// into `no_access` or `insufficient_entitlement`, and that classification is
+// exactly what a free alias still needs — an account with no entitlement to
+// it is refused the same at zero cost as at any cost. A zero draw over an
+// eligible grant answers no error and no legs; over a scope that excludes the
+// alias, and over an account with no rows at all, it answers the shortfall
+// with EligibleRowSeen false. Nothing moves in any case, and the foreign
+// grant funds its own alias for free — the walk ran and found it.
+func TestIntegrationDrawdownOfZeroStillAnswersTheScopeQuestion(t *testing.T) {
+	db, store := integrationPool(t)
+	repos := integrationRepos(t, store)
+	integrationRuntimeSchema(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	scope := repos.catalogScope(t)
+	foreignAlias, foreignVersion := integrationForeignScope(t, ctx, repos)
+	live := time.Now().UTC().Add(24 * time.Hour)
+
+	eligible := integrationRuntimeAccount(t, "zero-eligible")
+	eligibleBucket := eligible + "-bucket"
+	integrationPublishScoped(t, ctx, repos, eligible, eligibleBucket, scope.wildcard, false, live, 500)
+
+	excluded := integrationRuntimeAccount(t, "zero-excluded")
+	excludedBucket := excluded + "-bucket"
+	integrationPublishScoped(t, ctx, repos, excluded, excludedBucket, foreignVersion, true, live, 500)
+
+	absent := integrationRuntimeAccount(t, "zero-absent")
+
+	// Eligible: zero buys nothing, and the walk says so without error.
+	legs, err := repos.quota.Drawdown(ctx, eligible, scope.alias, 0)
+	if err != nil {
+		t.Fatalf("Drawdown(0) over an eligible grant: %v", err)
+	}
+	if len(legs) != 0 {
+		t.Fatalf("Drawdown(0) over an eligible grant = %v, want no legs — zero buys nothing", legs)
+	}
+	if available, _, _, _ := integrationProjectionRow(t, db, eligibleBucket); available != 500 {
+		t.Fatalf("available after the zero draw = %d, want 500 — nothing moved", available)
+	}
+
+	for _, tt := range []struct {
+		name    string
+		account string
+	}{
+		{name: "a scope that excludes the alias", account: excluded},
+		{name: "an account with no grants at all", account: absent},
+	} {
+		legs, err := repos.quota.Drawdown(ctx, tt.account, scope.alias, 0)
+		if !errors.Is(err, accounting.ErrInsufficientCapacity) {
+			t.Errorf("%s: Drawdown(0) error = %v, want ErrInsufficientCapacity", tt.name, err)
+		}
+		var shortfall *persistence.InsufficientCapacityError
+		if !errors.As(err, &shortfall) {
+			t.Errorf("%s: Drawdown(0) error = %v, want it typed as InsufficientCapacityError", tt.name, err)
+		} else if shortfall.EligibleRowSeen {
+			t.Errorf("%s: EligibleRowSeen = true, want false — no grant was eligible to draw", tt.name)
+		}
+		if len(legs) != 0 {
+			t.Errorf("%s: Drawdown(0) = %v, want no legs", tt.name, legs)
+		}
+	}
+	if available, _, _, _ := integrationProjectionRow(t, db, excludedBucket); available != 500 {
+		t.Errorf("available after the excluded zero draw = %d, want 500", available)
+	}
+
+	// The exclusion is the scope's, not the amount's: the same zero draw for
+	// the foreign grant's own alias finds the eligible row and answers
+	// nothing owed.
+	if legs, err := repos.quota.Drawdown(ctx, excluded, foreignAlias, 0); err != nil {
+		t.Errorf("Drawdown(0) for the grant's own alias: %v", err)
+	} else if len(legs) != 0 {
+		t.Errorf("Drawdown(0) for the grant's own alias = %v, want no legs", legs)
+	}
+}
