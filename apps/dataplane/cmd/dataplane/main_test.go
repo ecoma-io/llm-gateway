@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/config"
 )
 
 // The lifecycle tests below drive run() against a real listener, because the
@@ -17,6 +19,35 @@ import (
 // a dead listener is not swallowed — only exists once a socket is involved.
 // Handler behaviour belongs to internal/adapters/inbound/http and is tested there through
 // httptest, without a process.
+
+// TestNewServerCarriesTheTransportPosture pins the fields both listeners are
+// built with. The WriteTimeout assertion is the one that matters: the runtime's
+// inference contract is a Server-Sent Events stream, and a write deadline would
+// kill a long answer mid-flight — so its zero value is the decision itself, and
+// an editor who adds one meets this red test instead of a silent regression.
+func TestNewServerCarriesTheTransportPosture(t *testing.T) {
+	cfg := config.Config{ReadHeaderTimeout: 7 * time.Second}
+	server := newServer(stdhttp.HandlerFunc(func(_ stdhttp.ResponseWriter, _ *stdhttp.Request) {}), cfg)
+
+	if server.Handler == nil {
+		t.Error("newServer built a server without a handler")
+	}
+	if server.ReadHeaderTimeout != cfg.ReadHeaderTimeout {
+		t.Errorf("ReadHeaderTimeout = %s, want the configured %s", server.ReadHeaderTimeout, cfg.ReadHeaderTimeout)
+	}
+	if server.ReadTimeout != readTimeout {
+		t.Errorf("ReadTimeout = %s, want %s", server.ReadTimeout, readTimeout)
+	}
+	if server.IdleTimeout != idleTimeout {
+		t.Errorf("IdleTimeout = %s, want %s", server.IdleTimeout, idleTimeout)
+	}
+	if server.MaxHeaderBytes != maxHeaderBytes {
+		t.Errorf("MaxHeaderBytes = %d, want %d", server.MaxHeaderBytes, maxHeaderBytes)
+	}
+	if server.WriteTimeout != 0 {
+		t.Errorf("WriteTimeout = %s, want unset — a write deadline would kill a streamed answer mid-flight", server.WriteTimeout)
+	}
+}
 
 // recordingPool stands in for the database pool run closes on its way out, and
 // records that the close happened — a process that drained its listeners and
