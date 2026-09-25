@@ -48,6 +48,22 @@ import (
 //     of ended cycles flip to expired and stay, and the rows are history
 //     immutable accounting references point at.
 
+// Clock is the due-work lanes' time source: the database's own clock, read
+// through whatever connection the context resolves to. Inside a unit of work
+// the answer is that transaction's transaction_timestamp() — one instant,
+// stable for the whole unit, which is what makes every gate in the unit
+// evaluate against the same now; outside one it is the reading statement's
+// own. It is a port member rather than a SQL string in the application
+// because "what time does the database think it is" is an adapter question,
+// and the application's only honest alternatives would be its own drifting
+// process clock or a raw query.
+type Clock interface {
+	// Now returns the database's transaction_timestamp() for the connection
+	// ctx resolves to. It never returns the application's clock, and an
+	// implementation wraps transport failures as itself.
+	Now(ctx context.Context) (time.Time, error)
+}
+
 // Plans persists the plan aggregate — the commercial product's identity root.
 type Plans interface {
 	// Create inserts a new plan root. A name another plan already carries
