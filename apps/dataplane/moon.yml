@@ -126,6 +126,74 @@ tasks:
       fi
     inputs:
       - "**/*"
+      # The postgres suite applies the files under migrations/dataplane at run
+      # time — integrationRuntimeSchema is golang-migrate's versioning
+      # discipline mirrored by hand over the lane's .up.sql files — and neither
+      # cache can see a file a test reads: Go hashes the package's source, Moon
+      # hashes the inputs this file lists. So an edit to a migration alone — a
+      # column added, say — would replay a cached `ok` produced against the
+      # previous schema, and the gate would report a proven migration it never
+      # proved. This line is what makes Moon run the target at all; it is the
+      # same shape of gap `/api/openapi/**/*` closes for `test`.
+      - "/migrations/dataplane/**/*"
+      - "/go.work"
+      - "/go.work.sum"
+  # `test` with the race detector turned on, and a target of its own because it
+  # cannot be `test` itself: the detector's instrumentation makes the build and
+  # the run an order of magnitude slower, and a gate that slow on every change
+  # gets worked around rather than waited on. Everything else is `test`'s
+  # script unchanged — `-count=1` and the same two out-of-tree inputs, the same
+  # `=== RUN` vacuity guard — because `-race` changes what the suite costs, not
+  # what the target guarantees: every test, every package, or the green means
+  # nothing.
+  test-race:
+    script: |
+      status=0
+      output="$(go test -count=1 -race -v ./... 2>&1)" || status=$?
+      printf '%s\n' "$output"
+      [ "$status" -eq 0 ] || exit "$status"
+      if ! printf '%s\n' "$output" | grep -q '^=== RUN'; then
+        echo "go test -race ./... executed no tests — a green target here would mean nothing ran"
+        exit 1
+      fi
+    inputs:
+      - "**/*"
+      - "/api/openapi/**/*"
+      - "/go.work"
+      - "/go.work.sum"
+  # The benchmarks: what the runtime storage's write paths and the fact feed
+  # cost against a real PostgreSQL. A developer instrument, not a CI gate — a
+  # benchmark's numbers belong to the machine that produced them, and a gate
+  # over them would fail on load rather than on regressions — so nothing here
+  # compares a number against anything. What it does carry is the same
+  # discipline as the tier it sits beside, minus the half that does not apply:
+  # the postgres env guard, because nothing here runs against a server nobody
+  # named (the benchmarks live in the postgres package alone, so there is no
+  # valkey to name); the `-run '^$'`, which asks for the empty test run so the
+  # target is benchmarks only; and a vacuity guard of its own, over
+  # `^Benchmark` — `go test -bench` over a package whose tagged files lost
+  # their build constraint is also a silent green over nothing. The scope is
+  # the postgres package alone: it is where every benchmark in this module
+  # lives.
+  bench:
+    script: |
+      if [ -z "${POSTGRES_TEST_ADMIN_DSN:-}" ]; then
+        echo "POSTGRES_TEST_ADMIN_DSN is required — start the fixture (from the repository root: docker compose -f deploy/postgres/compose.yaml up -d --wait) and set it to postgres://gateway:gateway-dev-only@127.0.0.1:5432/postgres?sslmode=disable (see deploy/postgres/README.md)"
+        exit 1
+      fi
+      status=0
+      output="$(go test -run '^$' -bench . -benchmem -tags=integration ./internal/adapters/outbound/postgres 2>&1)" || status=$?
+      printf '%s\n' "$output"
+      [ "$status" -eq 0 ] || exit "$status"
+      if ! printf '%s\n' "$output" | grep -q '^Benchmark'; then
+        echo "go test -bench executed no benchmarks — a green target here would mean nothing ran"
+        exit 1
+      fi
+    inputs:
+      - "**/*"
+      # The benchmarks share the suite's schema helper, so a migration edit
+      # must reach this target's hash too — the same gap as `test-integration`.
+      - "/migrations/dataplane/**/*"
       - "/go.work"
       - "/go.work.sum"
   # The Go half of what `vue-tsc --noEmit` is for the console project. `go
