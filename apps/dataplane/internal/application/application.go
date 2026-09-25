@@ -19,6 +19,7 @@
 package application
 
 import (
+	"context"
 	"errors"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/persistence"
@@ -139,6 +140,17 @@ func New(version string, facts usagefacts.Reader, catalog *Catalog, projections 
 // which owns every JSON envelope this service emits.
 func (app *App) Version() string {
 	return app.version
+}
+
+// PingDatabase reports whether the runtime's own database is answering within
+// ctx. It is the first half of the readiness answer this process's probe
+// gives: intake, reservations and usage are durable only through this
+// database, so a runtime whose database is unreachable has nothing to serve
+// from and must say so rather than take traffic. The second half — whether
+// the credential projection has applied its first snapshot — is
+// ProjectionPosition's to report.
+func (app *App) PingDatabase(ctx context.Context) error {
+	return app.catalog.Ping(ctx)
 }
 
 // As reports whether err is an application Error.

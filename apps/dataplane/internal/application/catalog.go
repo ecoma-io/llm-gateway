@@ -86,6 +86,15 @@ func NewCatalog(store persistence.Store, backends persistence.Backends, aliases 
 	return &Catalog{store: store, backends: backends, aliases: aliases, versions: versions}
 }
 
+// Ping reports whether the store the catalog's use cases run against is
+// answering within ctx. That store is this process's one database — the pool
+// every repository over it shares — so the runtime's readiness question is
+// asked through the one use case that already holds the store, rather than by
+// opening a second handle on the same pool.
+func (c *Catalog) Ping(ctx context.Context) error {
+	return c.store.Ping(ctx)
+}
+
 // ---------------------------------------------------------------------------
 // backends
 // ---------------------------------------------------------------------------

@@ -38,15 +38,26 @@ func (f noFacts) Read(context.Context, string, int) (usagefacts.Page, error) {
 // is the real one over these ports, because the use case is concrete rather
 // than an interface and New refuses an App without one; what is stubbed is the
 // store it would have to ask, which is where a leak would show.
+//
+// The store's one served method is the ping: the readiness probe's question,
+// and the reason the runtime surface reaches the catalog's store at all.
+// pingErr is the answer a test wants — nil while the database is up, a failure
+// when the test drives the not-ready path.
 type silentStore struct {
 	persistence.Store
-	t *testing.T
+	t       *testing.T
+	pingErr error
 }
 
 // WithinTx implements persistence.Store.
 func (s silentStore) WithinTx(context.Context, func(context.Context) error) error {
 	s.t.Error("the runtime surface opened a unit of work against the catalog; that is the management listener's surface, not this one")
 	return errors.New("the runtime surface has no catalog")
+}
+
+// Ping implements persistence.Pinger.
+func (s silentStore) Ping(context.Context) error {
+	return s.pingErr
 }
 
 type silentBackends struct{ persistence.Backends }
@@ -65,38 +76,60 @@ func (v silentVersions) HighestVersion(context.Context, string) (int, error) {
 	return 0, errors.New("the runtime surface has no catalog")
 }
 
-// noProjections is the projection applier this package's tests construct the
-// application with, and it fails the test if it is ever touched — the same
-// assertion as noFacts, for the same reason on the other port: applying the
-// credential mirror is the management listener's surface, and a request path
-// that wrote it would be a Control Plane decision taken at inference time.
-type noProjections struct{ t *testing.T }
+// readyPosition is the position of a runtime that has applied its first
+// snapshot: the projection's answer while /readyz may answer 200.
+var readyPosition = projection.Position{Bootstrapped: true, AppliedRevision: 1, Epoch: "test-epoch"}
+
+// stubProjections is the projection applier behind the application this
+// package's tests build. Reading the position is the runtime surface's own
+// readiness question — the credential mirror is what a request is admitted
+// against, so /readyz asks whether it has been bootstrapped — and position
+// and positionErr are the answer a test wants. Applying the mirror is still
+// the management listener's surface alone, and those two methods still fail
+// the test they are reached from: a request path that wrote the credential
+// mirror would be a Control Plane decision taken at inference time.
+type stubProjections struct {
+	t           *testing.T
+	position    projection.Position
+	positionErr error
+}
 
 // Position implements persistence.ProjectionApplier.
-func (p noProjections) Position(context.Context) (projection.Position, error) {
-	p.t.Error("the runtime surface read the projection position; that is the management listener's surface, not this one")
-	return projection.Position{}, errors.New("the runtime surface has no projection applier")
+func (p stubProjections) Position(context.Context) (projection.Position, error) {
+	return p.position, p.positionErr
 }
 
 // ApplySnapshot implements persistence.ProjectionApplier.
-func (p noProjections) ApplySnapshot(context.Context, projection.Snapshot, time.Time) (uint64, error) {
+func (p stubProjections) ApplySnapshot(context.Context, projection.Snapshot, time.Time) (uint64, error) {
 	p.t.Error("the runtime surface applied a projection snapshot; that is the management listener's surface, not this one")
 	return 0, errors.New("the runtime surface has no projection applier")
 }
 
 // ApplyChanges implements persistence.ProjectionApplier.
-func (p noProjections) ApplyChanges(context.Context, projection.Batch) (uint64, error) {
+func (p stubProjections) ApplyChanges(context.Context, projection.Batch) (uint64, error) {
 	p.t.Error("the runtime surface applied projection changes; that is the management listener's surface, not this one")
 	return 0, errors.New("the runtime surface has no projection applier")
 }
 
-// newTestApp returns the application under test for this package's handlers.
+// newTestApp returns the application under test for this package's handlers,
+// ready by default: the store answers a ping and the projection reports its
+// first snapshot applied. The tests that drive /readyz through a dependency
+// being down build their own with newTestAppWith.
 //
-// It exists so that the ports this process needs — and this surface does not
-// use — are stated once, in a file whose name says why it is there, instead
-// of at every call site as an argument a reader has to interpret.
+// It exists so that the ports this process needs — and the answers this
+// surface's probe gives — are stated once, in a file whose name says why it
+// is there, instead of at every call site as an argument a reader has to
+// interpret.
 func newTestApp(t *testing.T, version string) *application.App {
 	t.Helper()
-	catalog := application.NewCatalog(silentStore{t: t}, silentBackends{}, silentAliases{}, silentVersions{t: t})
-	return application.New(version, noFacts{t: t}, catalog, noProjections{})
+	return newTestAppWith(t, version, silentStore{t: t}, stubProjections{t: t, position: readyPosition})
+}
+
+// newTestAppWith returns the application over the one store and the one
+// projection applier of the test's choosing — the two dependencies the
+// readiness probe gates on.
+func newTestAppWith(t *testing.T, version string, store silentStore, projections stubProjections) *application.App {
+	t.Helper()
+	catalog := application.NewCatalog(store, silentBackends{}, silentAliases{}, silentVersions{t: t})
+	return application.New(version, noFacts{t: t}, catalog, projections)
 }
