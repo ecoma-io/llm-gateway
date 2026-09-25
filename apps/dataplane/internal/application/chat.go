@@ -269,6 +269,15 @@ type ChatOutcome struct {
 	// replay re-answers.
 	Original identity.RequestID
 
+	// RuntimeRequestID is the runtime identity of the arrival this outcome
+	// answers — the attempt identity the decision was actually reached under:
+	// the transport-minted id for every decision made before a unit of work
+	// opens (the probe, the early refusals), the unit's own attempt id for
+	// everything decided inside one. It is set on every decision, and the
+	// transport logs it beside the answer so a caller's report resolves to
+	// exactly the arrival that produced it.
+	RuntimeRequestID identity.RequestID
+
 	// Admitted carries what an admitted request hands forward. It is set
 	// exactly on OutcomeAdmitted.
 	Admitted *Admission

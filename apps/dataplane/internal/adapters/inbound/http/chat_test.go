@@ -432,6 +432,18 @@ func TestTheDecisionLogCarriesTheSchemaTheContractNames(t *testing.T) {
 			wantParts: []string{"request_id=chat-request", "reason=no_candidate", "replayed=true", "runtime_request_id="},
 		},
 		{
+			// A decision reached inside a unit of work names the attempt id that
+			// decided it, not this arrival's own mint: the caller's report has
+			// to resolve to exactly the arrival that produced the answer.
+			name: "a decision made under a unit's attempt id logs that id",
+			outcome: application.ChatOutcome{
+				Kind:             application.OutcomeRejected,
+				Reason:           execution.RejectedNoCandidate,
+				RuntimeRequestID: identity.RequestID("01930000-0000-7000-8000-000000000099"),
+			},
+			wantParts: []string{"request_id=chat-request", "reason=no_candidate", "runtime_request_id=01930000-0000-7000-8000-000000000099"},
+		},
+		{
 			name:      "an in-flight collision",
 			outcome:   application.ChatOutcome{Kind: application.OutcomeInFlight},
 			wantParts: []string{"reason=request_in_progress"},

@@ -200,6 +200,33 @@ func TestEveryOutcomeKindHasItsWireCell(t *testing.T) {
 			wantReplay: true,
 		},
 		{
+			// The replayed 400 is byte-identical to the original's: the field
+			// detail rides the replay outcome, so the caller fixing the request
+			// is told the same field the first arrival was told.
+			name: "a replayed field refusal re-answers with the original's field named",
+			outcome: application.ChatOutcome{
+				Kind:     application.OutcomeReplay,
+				Reason:   execution.RejectedInvalidRequest,
+				Detail:   application.DetailMaxTokens,
+				Original: original,
+			},
+			wantStatus: stdhttp.StatusBadRequest,
+			wantBody:   maxTokensParamBody,
+			wantReplay: true,
+		},
+		{
+			name: "a replayed model refusal re-answers with the model named",
+			outcome: application.ChatOutcome{
+				Kind:     application.OutcomeReplay,
+				Reason:   execution.RejectedInvalidRequest,
+				Detail:   application.DetailModel,
+				Original: original,
+			},
+			wantStatus: stdhttp.StatusBadRequest,
+			wantBody:   modelParamBody,
+			wantReplay: true,
+		},
+		{
 			name:       "an admitted outcome has no cell yet and answers the internal failure",
 			outcome:    application.ChatOutcome{Kind: application.OutcomeAdmitted},
 			wantStatus: stdhttp.StatusInternalServerError,
@@ -256,11 +283,19 @@ func TestEveryOutcomeKindHasItsWireCell(t *testing.T) {
 			if tt.wantRetry == "" && answer.retryAfter != "" {
 				t.Errorf("Retry-After = %q on a cell that must not carry it", answer.retryAfter)
 			}
-			if answer.failure.internal && answer.reason != "" && strings.Contains(tt.wantBody, tt.wantBody) {
-				// A defensive cell may still name the decision it could not
-				// place; what it must never do is describe the cause in prose.
-				// The fixed message above is the whole assertion.
-				_ = answer.reason
+			if answer.failure.internal {
+				// A defensive cell names the decision it could not place —
+				// that is what the reason field is for, and the log reads it —
+				// but its wire body is the fixed sentence and nothing else:
+				// the cause is a server fact, and prose describing it would
+				// carry server state across the boundary. The message must be
+				// exactly the fixed one, and the reason must not appear in it.
+				if answer.failure.body.Message != internalErrorMessage {
+					t.Errorf("the internal failure body says %q, want the fixed %q", answer.failure.body.Message, internalErrorMessage)
+				}
+				if answer.reason != "" && strings.Contains(answer.failure.body.Message, string(answer.reason)) {
+					t.Errorf("the internal failure body leaks its cause %q", answer.reason)
+				}
 			}
 		})
 	}

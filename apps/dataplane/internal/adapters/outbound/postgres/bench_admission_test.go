@@ -270,11 +270,13 @@ func BenchmarkPriceBookEffectiveAt(b *testing.B) {
 	}
 }
 
-// benchmarkAdmissionWalk costs the waterfall walk at a fixed grant count:
-// every iteration draws 40 minor units through one unit of work, exactly as
-// the admission unit runs it, against grants seeded deep enough that capacity
-// is never the variable. The grant count is the walk's row count, so the two
-// benchmarks bracket the waterfall's per-row cost.
+// benchmarkAdmissionWalk costs the waterfall walk together with the unit of
+// work that commits it, at a fixed grant count: every iteration draws 40
+// minor units through one WithinTx — the walk, its conditional takes and the
+// commit, exactly as the admission unit runs them — against grants seeded
+// deep enough that capacity is never the variable. The grant count is the
+// walk's row count, so the two benchmarks bracket the walk's per-row cost;
+// the commit's share is part of what is measured, not part of the bracket.
 func benchmarkAdmissionWalk(b *testing.B, grants int) {
 	db, store := integrationPoolTB(b)
 	repos := integrationRepos(b, store)

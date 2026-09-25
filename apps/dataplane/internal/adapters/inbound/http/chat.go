@@ -125,7 +125,15 @@ func newChatCompletionHandler(wiring wiring) stdhttp.HandlerFunc {
 			return
 		}
 		answer := chatWireCell(outcome)
+		// The log names the identity the decision was reached under when the
+		// use case names one — the unit's attempt id for anything decided
+		// inside a unit of work — and falls back to this arrival's own mint
+		// for the answers decided before one opened. The wire body is never
+		// touched: the runtime request id is a log fact, not a contract one.
 		answer.runtimeID = runtimeID
+		if outcome.RuntimeRequestID != "" {
+			answer.runtimeID = outcome.RuntimeRequestID
+		}
 		writeChatAnswer(w, r, answer)
 	}
 }

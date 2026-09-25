@@ -328,6 +328,11 @@ func TestAdmissionAccountGateRefusesWithARowAndNothingElse(t *testing.T) {
 	}{
 		{name: "a suspended account", state: string(projection.LifecycleSuspended), wantReason: execution.RejectedAccountSuspended},
 		{name: "a closed account", state: string(projection.LifecycleClosed), wantReason: execution.RejectedAccountClosed},
+		{
+			name:       "a lifecycle the projection does not declare",
+			state:      "archived",
+			wantReason: execution.RejectedAccountSuspended,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			useCase, world := admissionFixture(t)
@@ -497,8 +502,9 @@ func TestAdmissionAnswersFromTheRecordBeforeAnyUnitOpens(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			useCase, world := admissionFixture(t)
 			tt.seed(world)
+			in := admissionInput(body)
 
-			outcome, err := useCase.Serve(context.Background(), admissionInput(body))
+			outcome, err := useCase.Serve(context.Background(), in)
 			if tt.wantFail {
 				if err == nil {
 					t.Fatalf("Serve answered a record this build cannot answer, want the failure")
@@ -519,6 +525,12 @@ func TestAdmissionAnswersFromTheRecordBeforeAnyUnitOpens(t *testing.T) {
 			}
 			if outcome.Original != tt.wantOrig {
 				t.Fatalf("outcome original = %q, want %q", outcome.Original, tt.wantOrig)
+			}
+			// Every decision names the arrival that reached it: the probe's
+			// answers carry the transport-minted id, since no unit opened to
+			// mint another.
+			if outcome.RuntimeRequestID != in.RequestID {
+				t.Fatalf("outcome runtime request id = %q, want the arrival's %q", outcome.RuntimeRequestID, in.RequestID)
 			}
 			if len(world.events) != 0 {
 				t.Fatalf("the probe wrote %v, want nothing — the record already owned the answer", world.events)
@@ -1219,6 +1231,270 @@ func TestAdmissionParsesTheCeilingsSpellingsDirectly(t *testing.T) {
 		t.Fatalf("an unknown alias reached the waterfall")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// the replayed refusal's field detail
+// ---------------------------------------------------------------------------
+
+// TestAdmissionReplayReDerivesTheFieldDetail: a replayed invalid_request
+// re-derives the field it names from the bytes the digest matched — the
+// record carries the reason, never the field — and the derivation degrades to
+// no detail rather than inventing one it cannot support. Nothing is written:
+// the decision is already on the record, only its field name is re-judged.
+func TestAdmissionReplayReDerivesTheFieldDetail(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		body       []byte
+		wantDetail RejectionDetail
+	}{
+		{
+			name:       "a ceiling past the alias's own bound names that ceiling",
+			body:       []byte(`{"model":"test-model","max_tokens":5000,"messages":[{"content":"hello"}]}`),
+			wantDetail: DetailMaxTokens,
+		},
+		{
+			name:       "a ceiling past the other spelling's bound names the other spelling",
+			body:       []byte(`{"model":"test-model","max_completion_tokens":5000,"messages":[{"content":"hello"}]}`),
+			wantDetail: DetailMaxCompletionTokens,
+		},
+		{
+			name:       "a body with no model names the model",
+			body:       []byte(`{"max_tokens":16,"messages":[{"content":"hello"}]}`),
+			wantDetail: DetailModel,
+		},
+		{
+			name:       "a body that will not parse degrades to no detail",
+			body:       []byte("{not json"),
+			wantDetail: DetailNone,
+		},
+		{
+			name:       "a model the catalog has lost degrades to no detail",
+			body:       admissionBody("gone-model"),
+			wantDetail: DetailNone,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			useCase, world := admissionFixture(t)
+			digest := execution.SecretDigest(tt.body)
+			seedReplayRecord(world, digest, finalStatusPtr(execution.FinalRejected), execution.RejectedInvalidRequest, "original-1")
+
+			outcome, err := useCase.Serve(context.Background(), admissionInput(tt.body))
+			if err != nil {
+				t.Fatalf("Serve: %v", err)
+			}
+			if outcome.Kind != OutcomeReplay || outcome.Reason != execution.RejectedInvalidRequest {
+				t.Fatalf("outcome = %s/%s, want replay/invalid_request", outcome.Kind, outcome.Reason)
+			}
+			if outcome.Detail != tt.wantDetail {
+				t.Fatalf("replayed detail = %q, want %q", outcome.Detail, tt.wantDetail)
+			}
+			if outcome.Original != "original-1" {
+				t.Fatalf("replayed original = %q, want the original's own id", outcome.Original)
+			}
+			if len(world.events) != 0 {
+				t.Fatalf("the re-derivation wrote %v, want nothing", world.events)
+			}
+		})
+	}
+}
+
+// TestAdmissionReplayOfANonFieldRefusalCarriesNoDetail: only an
+// invalid_request replay may carry a field name. A refusal about the account
+// or the alias is replayed with its reason alone, even when the replayed body
+// would fault a ceiling if it were judged — the original's decision, not a
+// re-run of it, is what a replay answers.
+func TestAdmissionReplayOfANonFieldRefusalCarriesNoDetail(t *testing.T) {
+	useCase, world := admissionFixture(t)
+	body := []byte(`{"model":"test-model","max_tokens":5000,"messages":[{"content":"hello"}]}`)
+	seedReplayRecord(world, execution.SecretDigest(body), finalStatusPtr(execution.FinalRejected), execution.RejectedAccountSuspended, "original-1")
+
+	outcome, err := useCase.Serve(context.Background(), admissionInput(body))
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if outcome.Kind != OutcomeReplay || outcome.Reason != execution.RejectedAccountSuspended {
+		t.Fatalf("outcome = %s/%s, want replay/account_suspended", outcome.Kind, outcome.Reason)
+	}
+	if outcome.Detail != DetailNone {
+		t.Fatalf("replayed detail = %q, want none — the account refusal names no request field", outcome.Detail)
+	}
+	if len(world.events) != 0 {
+		t.Fatalf("the replay wrote %v, want nothing", world.events)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// retired aliases
+// ---------------------------------------------------------------------------
+
+// TestAdmissionRefusesARetiredAliasAsUnknown: retirement takes a name out of
+// resolution one-way, so the runtime answers unknown_alias for it exactly as
+// it would for a name no row ever carried — and the refusal is a decision,
+// so it is recorded as the pair and replayed from the record after it.
+func TestAdmissionRefusesARetiredAliasAsUnknown(t *testing.T) {
+	useCase, world := admissionFixture(t)
+	world.aliasesByName["test-model"].State = catalog.AliasRetired
+
+	outcome, err := useCase.Serve(context.Background(), admissionInput(admissionBody("test-model")))
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if outcome.Kind != OutcomeRejected || outcome.Reason != execution.RejectedUnknownAlias {
+		t.Fatalf("outcome = %s/%s, want rejected/unknown_alias", outcome.Kind, outcome.Reason)
+	}
+	wantEvents(t, world, []string{"begin", "request.insert", "intake.insert", "commit"})
+	row := admissionRequestRow(t, world)
+	if row.Status != execution.StatusRejected || row.RejectionReason != execution.RejectedUnknownAlias || row.Alias != "test-model" {
+		t.Fatalf("the row is %s/%s for alias %q, want rejected/unknown_alias naming the retired name", row.Status, row.RejectionReason, row.Alias)
+	}
+	intake := admissionIntakeRow(t, world, admissionAccount, "replay-key-1")
+	if intake.FinalStatus == nil || *intake.FinalStatus != execution.FinalRejected || intake.FinalRejectionReason != execution.RejectedUnknownAlias {
+		t.Fatalf("the replay record is not born terminal with unknown_alias")
+	}
+	if world.happened("ledger.drawdown") {
+		t.Fatalf("a retired alias reached the waterfall")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the refusal path's own race
+// ---------------------------------------------------------------------------
+
+// TestAdmissionRefusalThatLosesTheIntakeRaceAnswersTheWinner: a refusal
+// decided inside the unit can lose the record's unique key to a concurrent
+// unit, exactly as the admission path can. The losing unit aborts whole and
+// the winner's committed decision is what the caller is answered with — the
+// loser's own refusal is not half-committed and never surfaces.
+func TestAdmissionRefusalThatLosesTheIntakeRaceAnswersTheWinner(t *testing.T) {
+	useCase, world := admissionFixture(t)
+	world.intakeRace = 1
+	world.intakeRaceWinner = "rejected"
+	// The body refuses on its ceiling, so the unit decides a refusal and
+	// reaches the record's insert with it.
+	body := []byte(`{"model":"test-model","max_tokens":5000,"messages":[{"content":"hello"}]}`)
+
+	outcome, err := useCase.Serve(context.Background(), admissionInput(body))
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if outcome.Kind != OutcomeReplay || outcome.Reason != execution.RejectedAccountSuspended {
+		t.Fatalf("outcome = %s/%s, want the winner's replay/rejected", outcome.Kind, outcome.Reason)
+	}
+	if outcome.Original != "winner-rejected" {
+		t.Fatalf("replayed original = %q, want the winner's request id", outcome.Original)
+	}
+	if outcome.Detail != DetailNone {
+		t.Fatalf("replayed detail = %q, want none — the winner's refusal names no request field", outcome.Detail)
+	}
+	// The losing unit ran to the record's insert and was aborted whole; the
+	// re-probe that answered the winner wrote nothing.
+	wantEvents(t, world, []string{"begin", "request.insert", "intake.insert", "rollback"})
+	if world.commitCount() != 0 {
+		t.Fatalf("the loser committed %d units, want none", world.commitCount())
+	}
+	if len(world.facts) != 0 {
+		t.Fatalf("the loser appended a fact, want none")
+	}
+	if world.outsideTx != 0 {
+		t.Fatalf("%d calls ran outside a unit of work", world.outsideTx)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the seam's own doctrine
+// ---------------------------------------------------------------------------
+
+// TestAdmissionSeamDoesNotCommitACloseWithoutItsFact: the release fact is the
+// close's receipt, and a close whose receipt never lands is the orphan the
+// doctrine forbids. When the request row will not take the ending, the whole
+// seam unit rolls back — the CAS's close included — leaving the hold open for
+// a whole retry or, at exhaustion, for the reaper.
+func TestAdmissionSeamDoesNotCommitACloseWithoutItsFact(t *testing.T) {
+	useCase, world := admissionFixture(t)
+	world.requestFinaliseLost = true
+
+	outcome, err := useCase.Serve(context.Background(), admissionInput(admissionBody("test-model")))
+	if err == nil {
+		t.Fatalf("Serve answered %s from a close whose fact never landed, want the error", outcome.Kind)
+	}
+	wantEvents(t, world, []string{
+		"begin", "ledger.drawdown", "request.insert", "reservation.insert", "intake.insert", "commit",
+		"begin", "reservation.close", "ledger.return", "request.finalise", "rollback",
+	})
+	if world.commitCount() != 1 || world.rollbackCount() != 1 {
+		t.Fatalf("the world committed %d and rolled back %d units, want the admission's one commit and the seam's one rollback", world.commitCount(), world.rollbackCount())
+	}
+	// Nothing stayed half-closed: the hold is back open, the row still
+	// executing, the record still in flight, and no fact exists.
+	if reservation := admissionReservationRow(t, world); reservation.State != accounting.StateOpen {
+		t.Fatalf("the hold is %s after the rollback, want open — the close went back with the unit", reservation.State)
+	}
+	if row := admissionRequestRow(t, world); row.Status != execution.StatusExecuting {
+		t.Fatalf("the request row is %s after the rollback, want executing", row.Status)
+	}
+	if intake := admissionIntakeRow(t, world, admissionAccount, "replay-key-1"); intake.FinalStatus != nil {
+		t.Fatalf("the replay record is terminal after the rollback, want still in flight")
+	}
+	if len(world.facts) != 0 {
+		t.Fatalf("the factless close appended %d facts, want none", len(world.facts))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the constructor's own bounds
+// ---------------------------------------------------------------------------
+
+// TestNewChatAdmissionRequiresALeaseInsideTheHoldWindow: a lease that
+// outlives the hold it fences lets a process close a hold the reaper already
+// owns — the constructor refuses the wiring rather than running it.
+func TestNewChatAdmissionRequiresALeaseInsideTheHoldWindow(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		hold      time.Duration
+		lease     time.Duration
+		wantPanic bool
+	}{
+		{name: "a lease inside its hold window", hold: time.Minute, lease: 30 * time.Second},
+		{name: "a lease at the hold window's edge is still inside it", hold: time.Minute, lease: time.Minute},
+		{name: "a lease past its hold window", hold: 30 * time.Second, lease: time.Minute, wantPanic: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				recovered := recover()
+				if tt.wantPanic && recovered == nil {
+					t.Fatalf("NewChatAdmission accepted a lease TTL past its hold window")
+				}
+				if !tt.wantPanic && recovered != nil {
+					t.Fatalf("NewChatAdmission panicked on %s: %v", tt.name, recovered)
+				}
+			}()
+			newAdmissionWithHorizons(t, tt.hold, tt.lease)
+		})
+	}
+}
+
+// newAdmissionWithHorizons builds the use case over one world with the
+// horizons given — the same wiring every admission test uses, with only the
+// clock's fences moved.
+func newAdmissionWithHorizons(t *testing.T, hold, lease time.Duration) *ChatAdmission {
+	t.Helper()
+	world := newAdmissionWorld()
+	useCase := NewChatAdmission(
+		fakeAdmissionStore{world: world},
+		fakeAdmissionCredentials{world: world},
+		fakeAdmissionAliases{world: world},
+		fakeAdmissionPrices{world: world},
+		fakeAdmissionRequests{world: world},
+		fakeAdmissionIntakes{world: world},
+		fakeAdmissionReservations{world: world},
+		fakeAdmissionLedger{world: world},
+		fakeAdmissionFacts{world: world},
+		AdmissionConfig{HoldWindow: hold, LeaseTTL: lease, LeaseOwner: "test-host:1"},
+	)
+	useCase.clock = admissionClock{world}
+	return useCase
+}
+
 // ---------------------------------------------------------------------------
 // the interim tokenizer seam
 // ---------------------------------------------------------------------------

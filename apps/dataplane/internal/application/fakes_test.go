@@ -455,6 +455,7 @@ type admissionWorld struct {
 	reservationDuplicate bool
 	clockFailure         error
 	seamCloseLost        bool
+	requestFinaliseLost  bool   // the compensation's CAS won, but the request row did not finalise
 	intakeRace           int    // the first N intake inserts lose the unique race
 	intakeRaceWinner     string // "", "in_flight", or "rejected"
 
@@ -821,6 +822,11 @@ func (f fakeAdmissionRequests) Finalise(ctx context.Context, request execution.R
 		f.world.outsideTx++
 	}
 	f.world.events = append(f.world.events, "request.finalise")
+	if f.world.requestFinaliseLost {
+		// The store answered, and the row did not move: nobody won it, it
+		// simply refused the ending. The caller must not read this as done.
+		return false, nil
+	}
 	stored, ok := f.world.requests[request.ID]
 	if !ok || stored.Status != execution.StatusExecuting {
 		return false, nil // the row moved on: the loser reads the winner's decision

@@ -151,6 +151,8 @@ func NewChatAdmission(
 		panic("application: NewChatAdmission requires a fact repository")
 	case cfg.HoldWindow <= 0 || cfg.LeaseTTL <= 0:
 		panic("application: NewChatAdmission requires a positive hold window and lease TTL")
+	case cfg.LeaseTTL > cfg.HoldWindow:
+		panic("application: NewChatAdmission requires a lease TTL that does not outlive the hold window it fences")
 	case cfg.LeaseOwner == "":
 		panic("application: NewChatAdmission requires a lease owner")
 	}
@@ -189,10 +191,21 @@ func (a *ChatAdmission) Serve(ctx context.Context, in ChatInput) (ChatOutcome, e
 		return ChatOutcome{}, fmt.Errorf("application: admit request %s: no account fact arrived with the verified key", in.RequestID)
 	}
 	switch *in.AccountState {
+	case string(projection.LifecycleActive):
+		// The one lifecycle that admits. The gate is an allowlist, not a
+		// denylist: the wire names exactly two account refusals, so a value
+		// the projection has not declared is refused as suspended rather than
+		// served through.
 	case string(projection.LifecycleSuspended):
 		return a.refuseEarly(ctx, in, execution.RejectedAccountSuspended, DetailNone)
 	case string(projection.LifecycleClosed):
 		return a.refuseEarly(ctx, in, execution.RejectedAccountClosed, DetailNone)
+	default:
+		// A lifecycle this build does not know. The refusal vocabulary for an
+		// account has two cells — suspended and closed — and inventing a third
+		// would be a wire change, so the unknown state answers as suspended:
+		// fail closed, never through.
+		return a.refuseEarly(ctx, in, execution.RejectedAccountSuspended, DetailNone)
 	}
 
 	// The key's grammar, before the body: the refusal is the same rejected
@@ -222,7 +235,7 @@ func (a *ChatAdmission) Serve(ctx context.Context, in ChatInput) (ChatOutcome, e
 	// digest is the sameness test, so it is asked first — the same key over
 	// different bytes is a conflict whatever the record's state, and the
 	// original's decision must never be re-answered for bytes it never saw.
-	outcome, decided, err := a.probe(ctx, in, digest)
+	outcome, decided, err := a.probe(ctx, in, digest, raw)
 	if err != nil || decided {
 		return outcome, err
 	}
@@ -249,7 +262,7 @@ func (a *ChatAdmission) Serve(ctx context.Context, in ChatInput) (ChatOutcome, e
 			// re-read OUTSIDE the aborted unit, from whatever actually
 			// committed. Nothing found there means the winner aborted too,
 			// and the unit runs again under a fresh identity.
-			probed, decided, perr := a.probe(ctx, in, digest)
+			probed, decided, perr := a.probe(ctx, in, digest, raw)
 			if perr != nil {
 				return ChatOutcome{}, perr
 			}
@@ -287,17 +300,19 @@ func (a *ChatAdmission) refuseEarly(ctx context.Context, in ChatInput, reason ex
 	if err != nil {
 		return ChatOutcome{}, fmt.Errorf("application: admit request %s: record the %s refusal: %w", in.RequestID, reason, err)
 	}
-	return ChatOutcome{Kind: OutcomeRejected, Reason: reason, Detail: detail}, nil
+	return ChatOutcome{Kind: OutcomeRejected, Reason: reason, Detail: detail, RuntimeRequestID: in.RequestID}, nil
 }
 
 // probe reads the replay record for one (account, key) and decides what the
 // record already answers. The boolean is "the record answered": a false with
 // a nil error means this request is the first arrival, and admission goes on.
-// A record terminal in a way this build cannot answer is an error, not an
-// answer: succeeded and failed originals are the execution pipeline's
+// The raw bytes ride along for the one answer that needs them: a replayed
+// rejection re-derives its field detail from the same bytes the digest
+// matched. A record terminal in a way this build cannot answer is an error,
+// not an answer: succeeded and failed originals are the execution pipeline's
 // outcomes, and inventing an answer for them here would be vocabulary this
 // milestone has no transport for.
-func (a *ChatAdmission) probe(ctx context.Context, in ChatInput, digest string) (ChatOutcome, bool, error) {
+func (a *ChatAdmission) probe(ctx context.Context, in ChatInput, digest string, raw []byte) (ChatOutcome, bool, error) {
 	record, err := a.intakes.Find(ctx, in.AccountID, in.IdempotencyKey)
 	if errors.Is(err, persistence.ErrNotFound) {
 		return ChatOutcome{}, false, nil
@@ -305,20 +320,74 @@ func (a *ChatAdmission) probe(ctx context.Context, in ChatInput, digest string) 
 	if err != nil {
 		return ChatOutcome{}, false, fmt.Errorf("application: admit request %s: read the replay record: %w", in.RequestID, err)
 	}
-	if record.RequestDigest != digest {
-		return ChatOutcome{Kind: OutcomeConflict}, true, nil
+	if !execution.EqualDigests(record.RequestDigest, digest) {
+		return ChatOutcome{Kind: OutcomeConflict, RuntimeRequestID: in.RequestID}, true, nil
 	}
 	if record.FinalStatus == nil {
-		return ChatOutcome{Kind: OutcomeInFlight}, true, nil
+		return ChatOutcome{Kind: OutcomeInFlight, RuntimeRequestID: in.RequestID}, true, nil
 	}
 	if *record.FinalStatus == execution.FinalRejected {
+		// The original's decision stands; this arrival only repeats it. The
+		// field detail is re-derived, not remembered — the replay record
+		// carries the reason, and the reason's field name is a judgment about
+		// bytes the record never stored. Only an invalid_request replay can
+		// carry one.
+		detail := DetailNone
+		if record.FinalRejectionReason == execution.RejectedInvalidRequest {
+			detail = a.replayDetail(ctx, raw)
+		}
 		return ChatOutcome{
-			Kind:     OutcomeReplay,
-			Reason:   record.FinalRejectionReason,
-			Original: record.RequestID,
+			Kind:             OutcomeReplay,
+			Reason:           record.FinalRejectionReason,
+			Detail:           detail,
+			Original:         record.RequestID,
+			RuntimeRequestID: in.RequestID,
 		}, true, nil
 	}
 	return ChatOutcome{}, false, fmt.Errorf("application: admit request %s: the replay record is terminal in a way this build cannot answer", in.RequestID)
+}
+
+// replayDetail re-derives the field detail a replayed invalid_request answers
+// with, from the raw bytes the digest just matched. The replay record stores
+// the reason but not the field it names, and the wire refuses to guess one —
+// so the judgment is re-run, deterministically, on bytes that are provably
+// the original's: same key, same digest, therefore the same parse, the same
+// ceiling spelling and the same alias bound produce the same detail. It never
+// fails and never changes the replay's kind or reason — a derivation that
+// cannot name a field degrades to no detail, and the decision itself is
+// already on the record.
+//
+// The order is the parse's own: a body that will not parse now is answered
+// with the parse's detail; a body that parses is judged on the ceiling's
+// spelling, which needs no alias; and the one detail-bearing refusal left —
+// a ceiling past the alias's own bound — re-reads the alias. A name that has
+// since left the catalog (retired or removed) answers no detail: the original
+// refusal's decision stands, and this arrival simply cannot re-derive the
+// field name the retired row would have named.
+func (a *ChatAdmission) replayDetail(ctx context.Context, raw []byte) RejectionDetail {
+	parsed, refusal := parseChatRequest(raw)
+	if refusal != nil {
+		return refusal.detail
+	}
+	// The spelling half of the bounds judgment is alias-free. Standing in an
+	// alias whose bound nothing in the contract can cross leaves that half as
+	// the only possible refusal, so the run below is the spelling's verdict
+	// alone.
+	unbounded := &catalog.ModelAlias{MaxOutputTokens: math.MaxInt64}
+	if _, _, spelling := parsed.bounds(unbounded); spelling != nil {
+		return spelling.detail
+	}
+	alias, err := a.aliases.ByName(ctx, parsed.model)
+	if err != nil {
+		// A plain pre-unit read, like the probe itself: no unit is open here,
+		// and a miss is an answer, not an error — the replay stands either way.
+		return DetailNone
+	}
+	_, _, refusal = parsed.bounds(alias)
+	if refusal != nil {
+		return refusal.detail
+	}
+	return DetailNone
 }
 
 // admitOnce runs the admission unit once: one WithinTx, one clock read, and
@@ -353,9 +422,12 @@ func (a *ChatAdmission) admitOnce(ctx context.Context, in ChatInput, requestID i
 		}
 		model := parsed.model
 
-		// The alias: a name no catalog row carries is refused, and a retired
-		// name is not — retirement froze a row that still resolves, and B8
-		// refuses only a name with nothing behind it.
+		// The alias: only a row the catalog still resolves in its active state
+		// admits. A name no row carries is refused, and a retired one is
+		// refused with it — retirement is one-way and takes the name out of
+		// resolution (the doctrine the catalog domain states), so the runtime
+		// answers unknown_alias for both rather than admitting against a row
+		// its operators have withdrawn.
 		alias, err := a.aliases.ByName(txCtx, model)
 		if err != nil {
 			if errors.Is(err, persistence.ErrNotFound) {
@@ -363,6 +435,10 @@ func (a *ChatAdmission) admitOnce(ctx context.Context, in ChatInput, requestID i
 					&chatRefusal{reason: execution.RejectedUnknownAlias}, &outcome)
 			}
 			return fmt.Errorf("application: admit request %s: read the alias: %w", requestID, err)
+		}
+		if alias.State != catalog.AliasActive {
+			return a.refuseInTx(txCtx, in, requestID, model, digest, now,
+				&chatRefusal{reason: execution.RejectedUnknownAlias}, &outcome)
 		}
 
 		// The bounds, now that the alias they are bounded against is known.
@@ -430,9 +506,12 @@ func (a *ChatAdmission) admitOnce(ctx context.Context, in ChatInput, requestID i
 		}
 
 		// The hold, formed with the legs the store actually granted — never
-		// the amounts the caller hoped for — and asserted to re-derive its
-		// own amount immediately before the insert: a hold whose split cannot
-		// reproduce it is a leak, not a memory.
+		// the amounts the caller hoped for. That the split matches the amount
+		// is NewReservation's own validation, and the row's trigger enforces
+		// it again at write; the assertion below is the other half, the
+		// formula's: these prices and these counts must re-derive the very
+		// hold that was drawn, so a hold the arithmetic does not support
+		// fails here, at the decision, and never reaches a row.
 		reservationID := identity.NewReservationID()
 		reservation, err := accounting.NewReservation(reservationID, requestID, snapshot.RevisionID,
 			snapshot.InputUnitPrice, snapshot.OutputUnitPrice, int(inputTokens), ceiling, hold, legs,
@@ -494,7 +573,7 @@ func (a *ChatAdmission) admitOnce(ctx context.Context, in ChatInput, requestID i
 	if err := a.complete(ctx, in, admitted, legs); err != nil {
 		return ChatOutcome{}, err
 	}
-	return ChatOutcome{Kind: OutcomeRejected, Reason: execution.RejectedNoCandidate, Detail: DetailNone}, nil
+	return ChatOutcome{Kind: OutcomeRejected, Reason: execution.RejectedNoCandidate, Detail: DetailNone, RuntimeRequestID: requestID}, nil
 }
 
 // refuseInTx records the rejection pair inside the admission unit that
@@ -528,9 +607,19 @@ func (a *ChatAdmission) refuseInTx(
 		return err
 	}
 	if err := a.intakes.Insert(txCtx, record); err != nil {
+		if errors.Is(err, persistence.ErrDuplicateIntake) {
+			// The probe missed it, but the record's unique key did not: another
+			// unit wrote this (account, key) while this one was deciding its
+			// refusal. The unit is aborted whole — a refusal that lost the
+			// claim is not half-committed — and the race signal goes up, the
+			// same signal the admission path raises: the winner's decision is
+			// the answer, and Serve re-probes outside this unit to answer
+			// from what actually committed.
+			return errIntakeRaced
+		}
 		return fmt.Errorf("application: admit request %s: record the replay refusal: %w", requestID, err)
 	}
-	*outcome = ChatOutcome{Kind: OutcomeRejected, Reason: refusal.reason, Detail: refusal.detail}
+	*outcome = ChatOutcome{Kind: OutcomeRejected, Reason: refusal.reason, Detail: refusal.detail, RuntimeRequestID: requestID}
 	return nil
 }
 
@@ -611,7 +700,13 @@ func (a *ChatAdmission) completeOnce(ctx context.Context, in ChatInput, admitted
 			return fmt.Errorf("application: complete request %s: finalise the request: %w", admitted.RuntimeRequestID, err)
 		}
 		if !finalised {
-			return nil
+			// The CAS gave this unit the ending, and the request row would not
+			// take it. That is not a quiet no-op: a closed hold with no
+			// deciding fact behind it is exactly the orphan the doctrine
+			// forbids (no closed hold without its fact). The unit errors and
+			// rolls back — the CAS's close included — leaving the hold open
+			// for a whole retry or, at exhaustion, for the reaper.
+			return fmt.Errorf("application: complete request %s: the request row did not finalise", admitted.RuntimeRequestID)
 		}
 		decided, err := a.intakes.Finalise(txCtx, in.AccountID, in.IdempotencyKey,
 			execution.FinalRejected, execution.RejectedNoCandidate, "")
@@ -619,7 +714,10 @@ func (a *ChatAdmission) completeOnce(ctx context.Context, in ChatInput, admitted
 			return fmt.Errorf("application: complete request %s: finalise the replay record: %w", admitted.RuntimeRequestID, err)
 		}
 		if !decided {
-			return nil
+			// Same verdict one step later: the record would not take its
+			// terminal pointer, so the release fact must not be appended.
+			// The unit rolls back whole and stays whole for its retry.
+			return fmt.Errorf("application: complete request %s: the replay record did not finalise", admitted.RuntimeRequestID)
 		}
 		fact, err := accounting.NewReleased(admitted.RuntimeRequestID, factLegs(legs), now)
 		if err != nil {
@@ -663,8 +761,11 @@ type chatRefusal struct {
 }
 
 // parseChatRequest reads the fields admission decides on. A body that will
-// not parse and a body with no model are refused here — nothing downstream
-// can decide without them; everything else is judged with the alias in hand.
+// not parse, a body with no model, and a body whose model is outside the
+// alias-name grammar are refused here — nothing downstream can decide without
+// them, and a name the grammar cannot carry is a malformed request, not an
+// unknown one: the catalog is never consulted with a string that could not be
+// a row's name. Everything else is judged with the alias in hand.
 func parseChatRequest(raw []byte) (*chatRequest, *chatRefusal) {
 	var body struct {
 		Model         json.RawMessage `json:"model"`
