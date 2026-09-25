@@ -162,7 +162,14 @@ func NewAttemptRepository(store persistence.Store) *AttemptRepository {
 	return &AttemptRepository{store: store}
 }
 
-// Insert implements persistence.AttemptRepository.
+// Insert implements persistence.AttemptRepository. A 23505 on either unique
+// key of request_attempts — the row's own id, or its (request, candidate
+// position, retry sequence) business key — is not a store failure but the
+// answer that the attempt is already appended: an append whose commit
+// acknowledgement was lost looks exactly like a lost append to the caller
+// that retries it, and the engine's refusal is the only writer that knows the
+// difference. The constraint name is matched the way every classification in
+// this adapter is — never the message text.
 func (repository *AttemptRepository) Insert(ctx context.Context, attempt execution.Attempt) error {
 	var providerError any
 	if len(attempt.ProviderError) > 0 {
@@ -186,6 +193,9 @@ func (repository *AttemptRepository) Insert(ctx context.Context, attempt executi
 		attempt.FinishedAt,
 	)
 	if err != nil {
+		if code(err) == "23505" && (constraint(err) == "request_attempts_pkey" || constraint(err) == "request_attempts_business_key") {
+			return fmt.Errorf("postgres: insert attempt: %w", persistence.ErrAttemptAlreadyAppended)
+		}
 		return fmt.Errorf("postgres: insert attempt: %w", err)
 	}
 	return nil

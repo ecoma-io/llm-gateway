@@ -3486,3 +3486,57 @@ func TestIntegrationSurfacedRefusalVocabularyWritesAndRefuses(t *testing.T) {
 		t.Fatalf("finalising a refusal that names an attempt = %v, want a requests_failure_reason_attempt_pairing refusal", err)
 	}
 }
+
+// TestIntegrationAttemptAppendCollisionReadsAsAlreadyAppended pins the
+// engine half of append idempotency: a second insert of an attempt the row
+// already carries — by id, or by the (request, candidate position, retry
+// sequence) business key — is the persistence sentinel, not a raw driver
+// error, because an append whose commit acknowledgement was lost must read
+// "already done" from the one writer that knows. A genuinely new attempt on
+// the same request (the next retry sequence) still inserts cleanly, proving
+// the sentinel is the collision's answer and not a swallowed failure.
+func TestIntegrationAttemptAppendCollisionReadsAsAlreadyAppended(t *testing.T) {
+	db, store := integrationPool(t)
+	repos := integrationRepos(t, store)
+	integrationRuntimeSchema(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	account := integrationRuntimeAccount(t, "appendtwice")
+	request, attempt, _ := integrationFormSettled(t, account, nil, time.Now().UTC())
+	err := store.WithinTx(ctx, func(ctx context.Context) error {
+		if err := repos.requests.Insert(ctx, request); err != nil {
+			return err
+		}
+		return repos.attempts.Insert(ctx, attempt)
+	})
+	if err != nil {
+		t.Fatalf("inserting the request and its attempt: %v", err)
+	}
+
+	// The same attempt, appended again: the id key refuses it, and the
+	// refusal surfaces as the sentinel the caller reads as done.
+	if err := repos.attempts.Insert(ctx, attempt); !errors.Is(err, persistence.ErrAttemptAlreadyAppended) {
+		t.Fatalf("re-inserting the same attempt = %v, want ErrAttemptAlreadyAppended", err)
+	}
+
+	// The same business identity under a fresh id: the (request, candidate
+	// position, retry sequence) key refuses it with the same answer.
+	twin, err := execution.NewAttempt(identity.NewAttemptID(), request.ID, attempt.CandidatePosition, attempt.RetrySequence, attempt.BackendID, attempt.ProviderModel, attempt.Outcome, "", attempt.StartedAt, attempt.FinishedAt)
+	if err != nil {
+		t.Fatalf("building the twin attempt: %v", err)
+	}
+	if err := repos.attempts.Insert(ctx, twin); !errors.Is(err, persistence.ErrAttemptAlreadyAppended) {
+		t.Fatalf("inserting a twin under the business key = %v, want ErrAttemptAlreadyAppended", err)
+	}
+
+	// A different retry sequence is a different call of the same request on
+	// the same candidate: no key refuses it, and it lands.
+	next, err := execution.NewAttempt(identity.NewAttemptID(), request.ID, attempt.CandidatePosition, attempt.RetrySequence+1, attempt.BackendID, attempt.ProviderModel, attempt.Outcome, "", attempt.StartedAt, attempt.FinishedAt)
+	if err != nil {
+		t.Fatalf("building the next-sequence attempt: %v", err)
+	}
+	if err := repos.attempts.Insert(ctx, next); err != nil {
+		t.Fatalf("inserting the next-sequence attempt: %v", err)
+	}
+}
