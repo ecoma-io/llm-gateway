@@ -126,17 +126,17 @@ expect_failure() {
 	printf 'ok: %s (failed as required)\n' "$label"
 }
 
-# expect_constraint_failure runs one SQL batch against the Control Plane's
-# database that must fail, and by one particular constraint: the batch is
-# wrapped in an explicit transaction whose ROLLBACK a successful run would
-# reach (so even a probe that fails to fail leaves nothing behind), and the
-# captured error output must name the constraint under test. A refusal for
-# any other reason — a stale row's duplicate key, a mis-aimed seed — fails
-# the suite with psql's actual output attached, because a step that cannot
-# say which rule refused the row has not proven that rule.
-expect_constraint_failure() {
-	local label="$1" constraint="$2" batch="$3" output status=0
-	output="$(compose exec -T postgres psql -U gateway -d "$control_db" \
+# expect_lane_constraint_failure is the probe's core: one SQL batch against
+# one lane's database that must fail, and by one particular constraint: the
+# batch is wrapped in an explicit transaction whose ROLLBACK a successful run
+# would reach (so even a probe that fails to fail leaves nothing behind), and
+# the captured error output must name the constraint under test. A refusal
+# for any other reason — a stale row's duplicate key, a mis-aimed seed —
+# fails the suite with psql's actual output attached, because a step that
+# cannot say which rule refused the row has not proven that rule.
+expect_lane_constraint_failure() {
+	local database="$1" label="$2" constraint="$3" batch="$4" output status=0
+	output="$(compose exec -T postgres psql -U gateway -d "$database" \
 		-v ON_ERROR_STOP=1 -q -c "BEGIN;
 $batch;
 ROLLBACK;" 2>&1)" || status=$?
@@ -150,6 +150,19 @@ ROLLBACK;" 2>&1)" || status=$?
 		exit 1
 	fi
 	printf 'ok: %s (refused by %s)\n' "$label" "$constraint"
+}
+
+# expect_constraint_failure probes the Control Plane's database — the lane
+# every identity and commerce rule lives in.
+expect_constraint_failure() {
+	expect_lane_constraint_failure "$control_db" "$@"
+}
+
+# expect_dataplane_constraint_failure probes the Data Plane's database — the
+# lane the runtime mirror half lives in. Same transactional wrapper, same
+# verdict rule; only the database differs.
+expect_dataplane_constraint_failure() {
+	expect_lane_constraint_failure "$dataplane_db" "$@"
 }
 
 # newest_migration_version returns the newest migration version present in
@@ -360,10 +373,17 @@ assert_equals "the ownership namespace exists in the Control Plane's database" \
 assert_equals "the namespace carries the ownership comment, byte for byte" \
 	"$(psql_scalar "$control_db" "SELECT obj_description('$control_db'::regnamespace, 'pg_namespace')")" \
 	"Control Plane ownership namespace (ADR 0006 §7); owned by apps/console-api."
-assert_equals "the namespace holds exactly the identity and commerce schemas' nine tables" \
-	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "9"
-assert_equals "the control tables are the identity and commerce foundations' set" \
-	"$(psql_scalar "$control_db" "SELECT string_agg(tablename, ',' ORDER BY tablename COLLATE \"C\") FROM pg_tables WHERE schemaname = 'control'")" "account_payg,accounts,api_keys,entitlements,plan_grant_definitions,plan_versions,plans,subscriptions,users"
+assert_equals "the namespace holds exactly the identity, commerce and projection schemas' thirteen tables" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "13"
+assert_equals "the control tables are the identity, commerce and projection foundations' set" \
+	"$(psql_scalar "$control_db" "SELECT string_agg(tablename, ',' ORDER BY tablename COLLATE \"C\") FROM pg_tables WHERE schemaname = 'control'")" \
+	"account_payg,accounts,api_keys,entitlements,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,subscriptions,users"
+assert_equals "the projection counter is a seeded singleton with a timeline epoch" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM control.projection_revision WHERE id = 1 AND last_revision = (SELECT count(*) FROM control.accounts) AND epoch IS NOT NULL")" \
+	"1"
+assert_equals "the projection's backfilled log and mirror carry one entry per account" \
+	"$(psql_scalar "$control_db" "SELECT (SELECT count(*) FROM control.projection_changes) || '|' || (SELECT count(*) FROM control.projection_accounts)")" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM control.accounts")|$(psql_scalar "$control_db" "SELECT count(*) FROM control.accounts")"
 
 migrate_lane "$control_db" up
 assert_equals "re-applying the Control Plane's lane is a no-op too" \
@@ -401,15 +421,16 @@ assert_equals "one fixture credential opens both plane databases" \
 	"$(psql_scalar "$control_db" 'SELECT current_user')|$(psql_scalar "$dataplane_db" 'SELECT current_user')" \
 	"gateway|gateway"
 
-step "8/12 the Control Plane's schemas enforce their rules"
+step "8/12 both lanes' schemas enforce their rules"
 # Every refusal below names the constraint it proves, and every probe —
 # refusal or positive — seeds what it needs inside its own explicit
 # transaction and rolls it back, so the probes are self-contained,
 # order-independent and re-runnable: no probe depends on a state a previous
 # one left, and none leaves one for the next. The probe rows use fixed
-# UUIDv4-form ids, matching the grammar the schema itself demands, and every
-# table is named in the `control` namespace the lane's foundation migration
-# built.
+# UUIDv4-form ids, matching the grammar the schema itself demands. The
+# Control Plane's tables are named in the `control` namespace its lane's
+# foundation migration built; the Data Plane's projection mirror lives in
+# that plane's `public` schema and is probed against its own database.
 
 expect_constraint_failure "an account state outside the lifecycle is refused" accounts_state_valid "
 INSERT INTO control.accounts (id, name, state, created_at, updated_at)
@@ -945,6 +966,73 @@ WITH account AS (
 INSERT INTO control.account_payg (account_id, enabled, funding_bucket_id, created_at, updated_at)
 SELECT id, true, 'b8000000-0000-4000-8000-0000000000b1', now(), now() FROM account"
 
+# The projection foundation's half of the step, in the same voice: the change
+# log, the materialized mirrors and the counter singleton, each rule a
+# refusal that names its constraint. Revisions here sit far past the
+# backfill's 1..N so no probe can collide with the seeded history.
+expect_constraint_failure "an api_key log entry without a digest is refused" projection_changes_payload_digest_shape "
+INSERT INTO control.projection_changes (revision, resource_kind, resource_id, recorded_at, payload)
+VALUES (99001, 'api_key', 'a1000000-0000-4000-8000-0000000000a2', now(), '{\"state\": \"active\"}')"
+
+expect_constraint_failure "an api_key log entry with a malformed digest is refused" projection_changes_payload_digest_shape "
+INSERT INTO control.projection_changes (revision, resource_kind, resource_id, recorded_at, payload)
+VALUES (99002, 'api_key', 'a1000000-0000-4000-8000-0000000000a2', now(), '{\"digest\": \"XYZ\", \"state\": \"active\"}')"
+
+expect_constraint_failure "a log entry of an unknown resource kind is refused" projection_changes_resource_kind_valid "
+INSERT INTO control.projection_changes (revision, resource_kind, resource_id, recorded_at, payload)
+VALUES (99003, 'plan', 'b2000000-0000-4000-8000-0000000000b1', now(), '{}')"
+
+expect_constraint_failure "a log entry at revision zero is refused" projection_changes_revision_positive "
+INSERT INTO control.projection_changes (revision, resource_kind, resource_id, recorded_at, payload)
+VALUES (0, 'account', 'a0000000-0000-4000-8000-0000000000a1', now(), '{}')"
+
+expect_constraint_failure "a mirror credential with a malformed digest is refused" projection_api_keys_digest_shape "
+INSERT INTO control.projection_api_keys (key_id, account_id, digest, state, revoked_at, source_revision, updated_at)
+VALUES ('a1000000-0000-4000-8000-0000000000a2', 'a0000000-0000-4000-8000-0000000000a1', 'NOPE', 'active', NULL, 99001, now())"
+
+expect_constraint_failure "an active mirror credential carrying a revocation stamp is refused" projection_api_keys_revocation_consistency "
+INSERT INTO control.projection_api_keys (key_id, account_id, digest, state, revoked_at, source_revision, updated_at)
+VALUES ('a1000000-0000-4000-8000-0000000000a2', 'a0000000-0000-4000-8000-0000000000a1', '$(printf 'a%.0s' $(seq 1 64))', 'active', now(), 99001, now())"
+
+expect_constraint_failure "a mirror credential outside its lifecycle is refused" projection_api_keys_state_valid "
+INSERT INTO control.projection_api_keys (key_id, account_id, digest, state, revoked_at, source_revision, updated_at)
+VALUES ('a1000000-0000-4000-8000-0000000000a2', 'a0000000-0000-4000-8000-0000000000a1', '$(printf 'a%.0s' $(seq 1 64))', 'suspended', NULL, 99001, now())"
+
+expect_constraint_failure "a second revision-counter row is refused" projection_revision_id_singleton "
+INSERT INTO control.projection_revision (id, epoch, last_revision)
+VALUES (2, gen_random_uuid(), 0)"
+
+# The backfill's positive proof: the counter's singleton exists, carries an
+# epoch, and stands at exactly the number of backfilled accounts.
+assert_equals "the projection counter is seeded to the backfilled account count" \
+	"$(psql_scalar "$control_db" "
+SELECT (SELECT last_revision FROM control.projection_revision WHERE id = 1) =
+       (SELECT count(*) FROM control.accounts)
+  AND (SELECT epoch IS NOT NULL FROM control.projection_revision WHERE id = 1)")" "t"
+
+# The Data Plane's mirror half, in the same voice: the runtime-side tables
+# the projection writes through the listener enforce the same grammar in
+# their own database.
+expect_dataplane_constraint_failure "a mirror credential digest outside the hex grammar is refused" api_key_credentials_digest_grammar "
+INSERT INTO public.api_key_credentials (key_id, account_id, digest, state, revoked_at, source_revision, updated_at)
+VALUES ('a1000000-0000-4000-8000-0000000000a2', 'a0000000-0000-4000-8000-0000000000a1', 'NOPE', 'active', NULL, 5, now())"
+
+expect_dataplane_constraint_failure "an active runtime credential with a revocation stamp is refused" api_key_credentials_revocation_consistency "
+INSERT INTO public.api_key_credentials (key_id, account_id, digest, state, revoked_at, source_revision, updated_at)
+VALUES ('a1000000-0000-4000-8000-0000000000a2', 'a0000000-0000-4000-8000-0000000000a1', '$(printf 'a%.0s' $(seq 1 64))', 'active', now(), 5, now())"
+
+expect_dataplane_constraint_failure "a runtime credential outside its lifecycle is refused" api_key_credentials_state_valid "
+INSERT INTO public.api_key_credentials (key_id, account_id, digest, state, revoked_at, source_revision, updated_at)
+VALUES ('a1000000-0000-4000-8000-0000000000a2', 'a0000000-0000-4000-8000-0000000000a1', '$(printf 'a%.0s' $(seq 1 64))', 'closed', NULL, 5, now())"
+
+expect_dataplane_constraint_failure "a runtime account outside its lifecycle is refused" account_states_state_valid "
+INSERT INTO public.account_states (account_id, state, source_revision, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000a1', 'revoked', 5, now())"
+
+expect_dataplane_constraint_failure "a second runtime position row is refused" projection_state_id_singleton "
+INSERT INTO public.projection_state (id, bootstrapped, applied_revision, producer_epoch)
+VALUES (2, false, 0, NULL)"
+
 # The positive proof of the whole chain, in one rolled-back transaction:
 # account -> plan -> published version -> grant definition -> active
 # subscription with its first cycle -> its entitlement -> its PAYG flag.
@@ -1069,6 +1157,8 @@ assert_equals "the Data Plane's recorded version is zero after a full roll-back"
 	"$(recorded_version "$dataplane_db")" "0"
 assert_equals "the timescaledb extension is gone after a full roll-back" \
 	"$(psql_scalar "$dataplane_db" "SELECT count(*) FROM pg_extension WHERE extname = 'timescaledb'")" "0"
+assert_equals "the projection mirror is gone after a full roll-back" \
+	"$(psql_scalar "$dataplane_db" "SELECT to_regclass('public.api_key_credentials') IS NULL AND to_regclass('public.account_states') IS NULL AND to_regclass('public.projection_state') IS NULL")" "t"
 migrate_lane "$control_db" down -all </dev/null
 assert_equals "the Control Plane's recorded version is zero after a full roll-back" \
 	"$(recorded_version "$control_db")" "0"
@@ -1076,6 +1166,8 @@ assert_equals "the identity tables are gone after a full roll-back" \
 	"$(psql_scalar "$control_db" "SELECT to_regclass('control.accounts') IS NULL AND to_regclass('control.users') IS NULL AND to_regclass('control.api_keys') IS NULL")" "t"
 assert_equals "the commerce tables are gone after a full roll-back" \
 	"$(psql_scalar "$control_db" "SELECT to_regclass('control.plans') IS NULL AND to_regclass('control.subscriptions') IS NULL AND to_regclass('control.entitlements') IS NULL AND to_regclass('control.account_payg') IS NULL")" "t"
+assert_equals "the projection tables are gone after a full roll-back" \
+	"$(psql_scalar "$control_db" "SELECT to_regclass('control.projection_revision') IS NULL AND to_regclass('control.projection_changes') IS NULL AND to_regclass('control.projection_api_keys') IS NULL AND to_regclass('control.projection_accounts') IS NULL")" "t"
 assert_equals "the ownership namespace and its comment are gone after a full roll-back" \
 	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_namespace WHERE nspname = '$control_db'")" "0"
 assert_equals "the Control Plane's public schema is back to its migration history alone" \

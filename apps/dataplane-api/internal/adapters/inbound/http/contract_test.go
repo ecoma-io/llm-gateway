@@ -232,6 +232,127 @@ func TestTheFactContractsNumbersAreTheConstants(t *testing.T) {
 	}
 }
 
+// projectionPath is the fragment both hops of the projection protocol speak,
+// relative to this package's directory. The two delivery bodies cross as the
+// producer's bytes and this surface renders the two closed answers from the
+// schemas declared there, so this is the document the pins below are read
+// from. It is shared by the façade and the private listener, and neither
+// module can hold the other to it — each carries its own copy of the pin
+// (ADR 0006 §1).
+const projectionPath = "../../../../../../api/openapi/shared/projection.yaml"
+
+// TestTheProjectionShapesThisSurfaceWritesAreTheSchemasTheFragmentDeclares is
+// the field-name pin for the projection answers, the same pin the usage-fact
+// page carries. The names matter more here, not less: the producer's cycle
+// decodes the position to decide whether to bootstrap, and a name that exists
+// only on one side of this surface does not arrive as a wrong value but as an
+// absent one — which the producer would read as a mirror that never
+// bootstrapped, and answer with a snapshot nobody needed.
+func TestTheProjectionShapesThisSurfaceWritesAreTheSchemasTheFragmentDeclares(t *testing.T) {
+	document := scanContract(t, projectionPath)
+
+	tests := []struct {
+		name   string
+		path   string
+		sample any
+	}{
+		{
+			name:   "the position",
+			path:   "components.schemas.ProjectionPosition.properties",
+			sample: projectionPositionResponse{},
+		},
+		{
+			name:   "the acknowledgement",
+			path:   "components.schemas.ProjectionAppliedAck.properties",
+			sample: projectionAckResponse{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			declared := document.children[tt.path]
+			if len(declared) == 0 {
+				t.Fatalf("%s declares no %s; this pin proves nothing until the scan finds it", projectionPath, tt.path)
+			}
+			sort.Strings(declared)
+
+			if got := jsonFieldNames(t, tt.sample); !slices.Equal(got, declared) {
+				t.Errorf("this surface serializes %v and %s declares %v; the producer reads the contract's names, and one that is only on one side arrives as an absent field rather than a wrong one", got, projectionPath, declared)
+			}
+		})
+	}
+}
+
+// TestTheProjectionContractsNumbersAreTheConstants pins the one number this
+// surface enforces on the projection path — the body bound both delivery
+// operations declare — to the document that declares it, and the document's
+// two declarations to each other.
+//
+// The bound is the transport's whole contribution to the delivery path, and it
+// is the number a well-meaning edit would most easily let drift: sized into
+// the code so a full snapshot fits, declared in the contract so a caller can
+// rely on it, and enforced by the listener a hop behind — all three must move
+// together, and each pin here is what notices one of them moving alone.
+func TestTheProjectionContractsNumbersAreTheConstants(t *testing.T) {
+	numbers := scanContract(t, contractPath).numbers
+
+	tests := []struct {
+		name     string
+		key      string
+		constant int
+	}{
+		{
+			name:     "the snapshot delivery's body bound",
+			key:      "paths./internal/projection/snapshot.post.x-max-body-bytes",
+			constant: maxProjectionBodyBytes,
+		},
+		{
+			name:     "the changes delivery's body bound",
+			key:      "paths./internal/projection/changes.post.x-max-body-bytes",
+			constant: maxProjectionBodyBytes,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			declared, ok := numbers[tt.key]
+			if !ok {
+				t.Fatalf("%s declares no %s; this pin proves nothing until the scan finds it", contractPath, tt.key)
+			}
+			if declared != tt.constant {
+				t.Errorf("%s says %s is %d and this surface enforces %d; the code and the contract have drifted apart", contractPath, tt.key, declared, tt.constant)
+			}
+		})
+	}
+
+	t.Run("the fragment's array bounds are the ones the bound was sized for", func(t *testing.T) {
+		fragment := scanContract(t, projectionPath).numbers
+
+		tests := []struct {
+			name string
+			key  string
+		}{
+			{name: "the snapshot's api_keys array", key: "components.schemas.ProjectionSnapshot.properties.api_keys.maxItems"},
+			{name: "the snapshot's accounts array", key: "components.schemas.ProjectionSnapshot.properties.accounts.maxItems"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				declared, ok := fragment[tt.key]
+				if !ok {
+					t.Fatalf("%s declares no %s; this pin proves nothing until the scan finds it", projectionPath, tt.key)
+				}
+				// The two arrays at their bound must fit inside the body bound the
+				// deliveries declare. The assertion is against the constant rather
+				// than recomputed, because the arithmetic is the design: 5000
+				// records of a bounded credential row, twice, inside ten mebibytes.
+				if declared != 5000 {
+					t.Errorf("%s says %s is %d, want 5000; the body bound was sized against this number and the two moving apart is a reviewed decision, not a rounding one", projectionPath, tt.key, declared)
+				}
+			})
+		}
+	})
+}
+
 // contractDocument is what scanning a YAML file yields: the integer scalars it
 // declares, and the child keys of every mapping. Both are keyed by dotted path,
 // so a `minimum` under one schema and a `minimum` under another are two

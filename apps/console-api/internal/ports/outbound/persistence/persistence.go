@@ -121,4 +121,15 @@ type Store interface {
 	// transaction on one pool can no more carry another pool's writes than
 	// a query can reach across pools.
 	WithinTx(ctx context.Context, fn func(ctx context.Context) error) error
+
+	// InUnitOfWork reports whether ctx carries a unit of work this store
+	// opened or joined — the same lookup Querier and WithinTx make, so the
+	// three can never disagree about which unit of work a context belongs
+	// to. It exists for the port member whose contract is unit-of-work-
+	// shaped and who must refuse rather than silently degrade: the
+	// projection change recorder, whose revision allocation, log append and
+	// mirror write would each autocommit on the pool if the caller's
+	// context lost its transaction, breaking the gapless counter and the
+	// log/mirror atomicity the projection's correctness rests on.
+	InUnitOfWork(ctx context.Context) bool
 }

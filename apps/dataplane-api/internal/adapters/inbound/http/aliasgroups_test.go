@@ -40,7 +40,7 @@ func catalogReadTarget(group string) string {
 
 func TestTheCatalogReadIsTheThreeFields(t *testing.T) {
 	catalog := &fakeCatalog{version: aGroupVersion}
-	handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog))
+	handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog, &fakeProjection{}))
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, authedCatalogRead("frontier"))
@@ -74,7 +74,7 @@ func TestANameWhoseDecodingLooksNonCanonicalStillReachesTheCatalog(t *testing.T)
 	catalog := &fakeCatalog{version: dataplane.GroupVersion{
 		GroupName: "a//b", Version: 2, GroupVersionID: "0197c1a2-7b31-7cc1-9e4e-6f5d2a1b3c4d",
 	}}
-	handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog))
+	handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog, &fakeProjection{}))
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, authedCatalogRead("a//b"))
@@ -114,7 +114,7 @@ func TestTheWildcardNameReachesTheCatalogAsItself(t *testing.T) {
 				Version:        1,
 				GroupVersionID: "0197c1a2-7b31-7cc1-9e4e-6f5d2a1b3c4d",
 			}}
-			handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog))
+			handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog, &fakeProjection{}))
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(stdhttp.MethodGet, tt.target, nil)
@@ -143,7 +143,7 @@ func TestTheWildcardNameReachesTheCatalogAsItself(t *testing.T) {
 func TestASegmentedNameTravelsAsOneSegment(t *testing.T) {
 	t.Run("an encoded slash arrives decoded", func(t *testing.T) {
 		catalog := &fakeCatalog{version: aGroupVersion}
-		handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog))
+		handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog, &fakeProjection{}))
 
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, authedCatalogRead("team/model"))
@@ -158,7 +158,7 @@ func TestASegmentedNameTravelsAsOneSegment(t *testing.T) {
 
 	t.Run("an unencoded slash is a path this surface does not serve", func(t *testing.T) {
 		catalog := &fakeCatalog{}
-		handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog))
+		handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog, &fakeProjection{}))
 
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(stdhttp.MethodGet, "/internal/alias-groups/team/model/versions/current", nil)
@@ -212,7 +212,7 @@ func TestACatalogFailureMapsToItsContractedResponse(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			catalog := &fakeCatalog{err: tt.err}
-			handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog))
+			handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog, &fakeProjection{}))
 
 			rec := httptest.NewRecorder()
 			handler.ServeHTTP(rec, authedCatalogRead("frontier"))
@@ -246,7 +246,7 @@ func TestACatalogFailureMapsToItsContractedResponse(t *testing.T) {
 // learns whether a group exists.
 func TestTheCatalogReadRefusesAnUntrustedCaller(t *testing.T) {
 	catalog := &fakeCatalog{version: aGroupVersion}
-	handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog))
+	handler := testHandler(application.New("test", &fakeUsageFacts{}, catalog, &fakeProjection{}))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(stdhttp.MethodGet, catalogReadTarget("frontier"), nil)

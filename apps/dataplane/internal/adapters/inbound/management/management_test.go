@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/application"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/projection"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/usagefacts"
 )
 
@@ -35,6 +36,39 @@ func (stub *stubFacts) Read(_ context.Context, after string, limit int) (usagefa
 	return stub.page, stub.err
 }
 
+// stubProjection is the applier these tests drive the surface with. It
+// records every snapshot and batch the handler handed over, because what the
+// tests assert about the projection operations is mostly the handover — that
+// a refused body never reaches the port, that a batch's entries arrive parsed
+// rather than as bytes — and the answer it gives is one knob, `err`, plus the
+// acknowledgement and position each test wants the surface to report.
+type stubProjection struct {
+	position    projection.Position
+	positionErr error
+	ack         uint64
+	err         error
+
+	snapshots []projection.Snapshot
+	batches   []projection.Batch
+}
+
+// Position implements persistence.ProjectionApplier.
+func (stub *stubProjection) Position(_ context.Context) (projection.Position, error) {
+	return stub.position, stub.positionErr
+}
+
+// ApplySnapshot implements persistence.ProjectionApplier.
+func (stub *stubProjection) ApplySnapshot(_ context.Context, snapshot projection.Snapshot, _ time.Time) (uint64, error) {
+	stub.snapshots = append(stub.snapshots, snapshot)
+	return stub.ack, stub.err
+}
+
+// ApplyChanges implements persistence.ProjectionApplier.
+func (stub *stubProjection) ApplyChanges(_ context.Context, batch projection.Batch) (uint64, error) {
+	stub.batches = append(stub.batches, batch)
+	return stub.ack, stub.err
+}
+
 // The credential these tests configure and present. It is one value so that a
 // test which presents the wrong one has to say so in its own case.
 const (
@@ -46,13 +80,31 @@ const (
 // routing, authentication, handler — because that chain is what the surface is.
 // Testing the handler directly would leave the guard, the envelope and the
 // request ID unexercised, and those are the parts a change is most likely to
-// break.
+// break. The catalog sits over the empty stub world in groupversions_test.go
+// and the projection applier is an empty stub: the fact-feed and catalog tests
+// deliver nothing, and the projection tests build their own surface through
+// serveProjection below.
 func serve(t *testing.T, facts *stubFacts, request *stdhttp.Request) *httptest.ResponseRecorder {
 	t.Helper()
-	handler := New(application.New("v0.1.0", facts, newStubCatalog(&stubVersions{})), serviceCredential)
+	return serveApp(t, application.New("v0.1.0", facts, newStubCatalog(&stubVersions{}), &stubProjection{}), request)
+}
+
+// serveApp is serve with the application made explicit, for the tests that
+// need to name the stub one of the ports answers through.
+func serveApp(t *testing.T, app *application.App, request *stdhttp.Request) *httptest.ResponseRecorder {
+	t.Helper()
+	handler := New(app, serviceCredential)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, request)
 	return rec
+}
+
+// serveProjection drives one request through a surface whose projection
+// applier is the given stub, so a projection test controls both what the
+// operations read and what their applies answer.
+func serveProjection(t *testing.T, applier *stubProjection, request *stdhttp.Request) *httptest.ResponseRecorder {
+	t.Helper()
+	return serveApp(t, application.New("v0.1.0", &stubFacts{}, newStubCatalog(&stubVersions{}), applier), request)
 }
 
 // authed builds a GET for the fact feed carrying the configured credential.

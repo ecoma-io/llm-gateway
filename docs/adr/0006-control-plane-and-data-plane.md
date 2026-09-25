@@ -138,8 +138,11 @@ Catalog configuration — aliases, candidates, backends, price revisions — is
 **stored where the runtime reads it**, in the Data Plane's own database, and
 crosses as an instruction written through the management surface (section 3).
 Entitlements and key projections cross as records, because the Control Plane is
-their authority. The row states a direction, not where a record lives; the
-record-by-record answer is the matrix in
+their authority. The key projection's protocol — its durable log, its
+revision ordering, its snapshot bootstrap and its replay — is
+[ADR 0007](0007-control-to-data-projection.md); the rules of this section are
+its skeleton, that record is its body. The row states a direction, not where a
+record lives; the record-by-record answer is the matrix in
 [../architecture/planes.md](../architecture/planes.md).
 
 Rules that follow:
@@ -328,15 +331,24 @@ the split creates:
   cross-plane call. Revocation therefore has a **bounded staleness**, and that
   bound is a named deployment property rather than an accidental one. A
   projection that is stale by seconds is the deliberate price of a hot path
-  that cannot be taken down by the Control Plane.
+  that cannot be taken down by the Control Plane. The delivery mechanism is
+  [ADR 0007](0007-control-to-data-projection.md) — a durable change log in
+  this plane's own database, drained by a stateless reconciliation loop over
+  the management chain — and the bound is now the producer's interval (5 s by
+  default) plus one failed cycle, by construction rather than by intention.
 - Key creation does not require a distributed transaction: the Control Plane
-  mints the secret, records ownership, and delivers the secret's digest to
-  the Data Plane through the management surface; a failure leaves an
-  owned-but-inactive key. The secret is shown once and is never
+  mints the secret, records ownership, and records the secret's digest into
+  its own projection log in the same transaction (ADR 0007 §2); a delivery
+  failure leaves the key owned, recorded and projected late, when the loop
+  catches up — not owned-but-inactive, which was this bullet's answer when
+  delivery rode the mint itself. The secret is shown once and is never
   reproducible, so recovery is revoke-and-re-mint — visible, not a
-  half-charged account. (Amended before the projection phase built on the
-  earlier wording, which had the Control Plane asking the Data Plane for a
-  credential the Control Plane in fact mints.)
+  half-charged account. (Amended twice: before the projection phase built on
+  the earlier wording, which had the Control Plane asking the Data Plane for
+  a credential the Control Plane in fact mints; and by
+  [ADR 0007](0007-control-to-data-projection.md), which replaced the
+  synchronous digest delivery this bullet described with the durable
+  projection log.)
 
 ### 9. Why `dataplane-api` is a management boundary and not a second domain
 

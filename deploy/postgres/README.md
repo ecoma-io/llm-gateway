@@ -274,11 +274,15 @@ definition of green, for a contributor and for the pipeline alike.
 
 ## What is deliberately not here
 
-- No business schema beyond identity itself. Tables arrive with the domains
-  that own them, as migrations in the lane that owns them; the Data Plane's
-  bootstrap migration enables the `timescaledb` extension and nothing else,
-  and the Control Plane's lane holds its ownership namespace plus the
-  identity foundation (accounts, users, api_keys) and nothing more.
+- No schema beyond what the landed domains own. Tables arrive with the
+  domains that own them, as migrations in the lane that owns them; the Data
+  Plane's bootstrap migration enables the `timescaledb` extension and nothing
+  else, and the Control Plane's lane holds its ownership namespace, the
+  identity foundation (accounts, users, api_keys) and the credential
+  projection's foundation — the change log, the materialized mirrors and the
+  revision counter ([ADR 0007](../../docs/adr/0007-control-to-data-projection.md)).
+  The Data Plane's lane carries that pipeline's consumer half beside its
+  catalog foundation: the mirror tables and the position singleton.
 - No per-plane roles, and no claim that this fixture demonstrates credential
   isolation — it does not. One convenient role (`gateway`) owns and opens both
   databases, which is a local-development fixture and not a security property:

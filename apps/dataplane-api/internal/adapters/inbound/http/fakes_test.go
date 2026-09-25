@@ -68,12 +68,54 @@ func (f *fakeCatalog) CurrentGroupVersion(_ context.Context, groupName string) (
 // called reports whether anything reached the port.
 func (f *fakeCatalog) called() bool { return len(f.names) > 0 }
 
+// projectionCall records one delivery the handler made of the write port —
+// which path it went to and which bytes crossed — so that "the message reached
+// the listener verbatim" and "nothing reached the listener at all" are both
+// assertions rather than assumptions.
+type projectionCall struct {
+	operation string // "snapshot" or "changes"
+	message   string
+}
+
+// fakeProjection is the write half of the outbound port as the handler tests
+// see it: an acknowledgement or failure to answer with, plus the record of
+// every delivery and position read. Hand-written for the same reason
+// fakeUsageFacts is.
+type fakeProjection struct {
+	position dataplane.ProjectionPosition
+	positionErr,
+	snapshotErr,
+	changesErr error
+	ack   dataplane.ProjectionAck
+	calls []projectionCall
+}
+
+func (f *fakeProjection) ProjectionPosition(_ context.Context) (dataplane.ProjectionPosition, error) {
+	return f.position, f.positionErr
+}
+
+func (f *fakeProjection) ApplyProjectionSnapshot(_ context.Context, message []byte) (dataplane.ProjectionAck, error) {
+	f.calls = append(f.calls, projectionCall{operation: "snapshot", message: string(message)})
+	if f.snapshotErr != nil {
+		return dataplane.ProjectionAck{}, f.snapshotErr
+	}
+	return f.ack, nil
+}
+
+func (f *fakeProjection) ApplyProjectionChanges(_ context.Context, message []byte) (dataplane.ProjectionAck, error) {
+	f.calls = append(f.calls, projectionCall{operation: "changes", message: string(message)})
+	if f.changesErr != nil {
+		return dataplane.ProjectionAck{}, f.changesErr
+	}
+	return f.ack, nil
+}
+
 // testApp is the application the route-table tests read a surface from. The
 // ports are fakes because those tests serve no request — they assert the table
 // as data, and the handler behaviour is driven through the tests in
-// usageevents_test.go and aliasgroups_test.go.
+// usageevents_test.go, aliasgroups_test.go and projection_test.go.
 func testApp() *application.App {
-	return application.New("test", &fakeUsageFacts{}, &fakeCatalog{})
+	return application.New("test", &fakeUsageFacts{}, &fakeCatalog{}, &fakeProjection{})
 }
 
 // testHandler returns the real handler over app and the real authenticator

@@ -51,8 +51,11 @@ func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 		"GET /healthz",
 		"GET /internal/alias-groups/{group_name}/versions/current",
 		"GET /internal/usage-events",
+		"GET /internal/projection/position",
 		"GET /readyz",
 		"GET /version",
+		"POST /internal/projection/changes",
+		"POST /internal/projection/snapshot",
 	}
 	sort.Strings(want)
 

@@ -123,6 +123,17 @@ var capabilities = []capability{
 		permitted: "internal/adapters/inbound/http",
 		refused:   "internal/adapters/outbound/valkey",
 	},
+	{
+		prefix:  "<module>/internal/domain",
+		imports: "/identity",
+		// The session surface reaching for the domain's own types — the move
+		// that would put ownership aggregates, and the credential grammar
+		// whose one secret-bearing form is the digest, directly behind an
+		// HTTP route. The inbound adapter renders its own wire shapes; it
+		// does not speak the domain.
+		permitted: "internal/application",
+		refused:   "internal/adapters/inbound/http",
+	},
 }
 
 // TestEveryRuleRefusesWhatItDescribes is the rule-capability test: for each

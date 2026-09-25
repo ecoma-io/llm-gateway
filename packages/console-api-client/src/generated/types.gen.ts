@@ -6,7 +6,7 @@ export type ClientOptions = {
 
 export type Error = {
   /**
-   * A stable machine-readable category for the failure, shared by both surfaces that return this envelope. `cursor_expired` and `upstream_unavailable` are produced by the Data Plane management API today; they are named here rather than in that document alone so a Control Plane caller has one vocabulary for both.
+   * A stable machine-readable category for the failure, shared by both surfaces that return this envelope. `cursor_expired` and `upstream_unavailable` are produced by the Data Plane management API today, as are the three projection codes (`unsupported_version`, `revision_gap`, `snapshot_required`); they are named here rather than in that document alone so a Control Plane caller has one vocabulary for both.
    */
   code:
     | "not_found"
@@ -14,6 +14,9 @@ export type Error = {
     | "invalid_request"
     | "unauthenticated"
     | "cursor_expired"
+    | "unsupported_version"
+    | "revision_gap"
+    | "snapshot_required"
     | "upstream_unavailable"
     | "internal";
   /**

@@ -6,6 +6,7 @@ import (
 	stdhttp "net/http"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/application"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/projection"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/usagefacts"
 )
 
@@ -28,12 +29,15 @@ import (
 // and a constant shared across two processes would be a second definition
 // wearing a name.
 const (
-	codeNotFound         = "not_found"
-	codeMethodNotAllowed = "method_not_allowed"
-	codeInvalidRequest   = "invalid_request"
-	codeUnauthenticated  = "unauthenticated"
-	codeCursorExpired    = "cursor_expired"
-	codeInternal         = "internal"
+	codeNotFound           = "not_found"
+	codeMethodNotAllowed   = "method_not_allowed"
+	codeInvalidRequest     = "invalid_request"
+	codeUnauthenticated    = "unauthenticated"
+	codeCursorExpired      = "cursor_expired"
+	codeUnsupportedVersion = "unsupported_version"
+	codeRevisionGap        = "revision_gap"
+	codeSnapshotRequired   = "snapshot_required"
+	codeInternal           = "internal"
 )
 
 // errorEnvelope is the whole failure shape of this surface.
@@ -119,6 +123,64 @@ func internalFailureWithCause(cause error) failure {
 	}
 }
 
+// The three projection refusals below are the private protocol's own words
+// for "the delivery cannot be applied", and each names the answer the
+// producer's loop must take. They exist as their own codes rather than as
+// flavours of invalid_request because the producer's reaction differs
+// materially: an unsupported version means halt and upgrade, a revision gap
+// means the loop may not skip and a human decides, and a required snapshot is
+// the one refusal the loop resolves by itself on its next cycle.
+
+func unsupportedVersionFailure() failure {
+	return failure{
+		status:  stdhttp.StatusBadRequest,
+		code:    codeUnsupportedVersion,
+		message: "the message speaks a protocol version this surface does not support",
+	}
+}
+
+// shapeFailure answers a message that violates the protocol's grammar. The
+// sentence is fixed on purpose: the detail — which field, what the producer
+// sent — is the producer's own log to keep, and this surface's wire never
+// restates caller input.
+func shapeFailure() failure {
+	return failure{
+		status:  stdhttp.StatusBadRequest,
+		code:    codeInvalidRequest,
+		message: "the message does not satisfy the projection protocol's grammar",
+	}
+}
+
+func revisionGapFailure() failure {
+	return failure{
+		status:  stdhttp.StatusConflict,
+		code:    codeRevisionGap,
+		message: "the delivered batch does not join the applied position",
+	}
+}
+
+// terminalRegressionFailure answers a batch that would move a terminal state
+// backwards. It shares the shape refusal's status and code — the contract's
+// error envelope has no fifth projection code, and a caller's reflex here is
+// the invalid-request one: stop sending this message — while the sentence is
+// its own, because the remediation is not "fix your grammar" but "investigate
+// what produced this entry".
+func terminalRegressionFailure() failure {
+	return failure{
+		status:  stdhttp.StatusBadRequest,
+		code:    codeInvalidRequest,
+		message: "the delivered change would move a terminal state backwards",
+	}
+}
+
+func snapshotRequiredFailure() failure {
+	return failure{
+		status:  stdhttp.StatusConflict,
+		code:    codeSnapshotRequired,
+		message: "the stored position cannot join this producer timeline; deliver a snapshot",
+	}
+}
+
 // writeFailure serializes a decided failure and logs it when its cause is not
 // for the wire.
 //
@@ -177,6 +239,30 @@ func failureFor(err error) failure {
 			code:    codeCursorExpired,
 			message: "the requested position is no longer replayable",
 		}
+	case errors.Is(err, projection.ErrUnsupportedVersion):
+		// The protocol fails closed: a message in a version this plane does
+		// not speak is refused with the position and the rows untouched, and
+		// delivery halts until both ends speak one version. It never skips.
+		return unsupportedVersionFailure()
+	case errors.Is(err, projection.ErrBatchShape):
+		return shapeFailure()
+	case errors.Is(err, projection.ErrRevisionGap):
+		// The batch is refused whole, never partially applied: a position that
+		// jumped its gap would strand the undelivered revisions behind it
+		// forever, reported as duplicates.
+		return revisionGapFailure()
+	case errors.Is(err, projection.ErrSnapshotRequired):
+		// The one refusal the producer's loop resolves by itself: the next
+		// cycle reads the position, sees it cannot join, and snapshots.
+		return snapshotRequiredFailure()
+	case errors.Is(err, projection.ErrTerminalRegression):
+		// A batch that would move a revoked credential or a closed account
+		// back into a live state. Like the shape refusal it is a 400: the
+		// message is at fault and no retry of it can succeed — but unlike the
+		// gap it must not trigger a snapshot either, because a snapshot would
+		// overwrite the very state the refusal protects. The loop wedges and
+		// a human reads the producer's log.
+		return terminalRegressionFailure()
 	case errors.Is(err, usagefacts.ErrSourceUnavailable):
 		// This listener answers from its own process, so an unavailable source
 		// is this Data Plane's own storage and not a peer it could not reach:

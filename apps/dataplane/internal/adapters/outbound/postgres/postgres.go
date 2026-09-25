@@ -239,10 +239,12 @@ func (s *store) InUnitOfWork(ctx context.Context) bool {
 // port member: a pool answers a ping all day while the migration that creates
 // its tables has not run, and a process that discovers that on its first real
 // query turns a one-line deployment mistake into per-request failures. The
-// probe asks for the three objects whose absence breaks the very first
+// probe asks for the six objects whose absence breaks the very first
 // statement of each repository — the feed's ordering authority, the request
-// family, the quota family — and the error names the missing object and
-// nothing else: no SQL, no driver prose, the same discipline the
+// family, the quota family, and the projection foundation's mirror and
+// position, whose absence would otherwise surface as per-delivery failures
+// after a boot that reported ready — and the error names the missing object
+// and nothing else: no SQL, no driver prose, the same discipline the
 // repositories' own failures follow.
 func ValidateSchema(ctx context.Context, db *sql.DB) error {
 	if db == nil {
@@ -253,6 +255,9 @@ func ValidateSchema(ctx context.Context, db *sql.DB) error {
 		{"public.usage_events_stream", "the usage fact feed has no ordering authority"},
 		{"public.requests", "the request family is missing"},
 		{"public.quota_projections", "the quota projections are missing"},
+		{"public.api_key_credentials", "the credential mirror is missing"},
+		{"public.account_states", "the account mirror is missing"},
+		{"public.projection_state", "the projection position is missing"},
 	} {
 		var found *string
 		if err := db.QueryRowContext(ctx, probe, required.object).Scan(&found); err != nil {

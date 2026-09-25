@@ -13,9 +13,14 @@ import (
 // everything belongs to, the users who act for them, and the API keys minted
 // under them. All three tables live in the `control` database and nowhere
 // else — that is the whole point of the two-record API-key model (ADR 0006
-// §8): this port persists the ownership record, and the credential record
-// with the secret's digest belongs to the Data Plane's own port, reachable
-// from here by nothing.
+// §8): this port persists the ownership record, and the Data Plane's
+// credential record is written only by the Data Plane. The digest is the one
+// deliberate qualification since the projection (ADR 0007): it now transits
+// and rests in this database's projection tables — the change log and the
+// materialized mirror this package's ProjectionLog reads — and nowhere in the
+// ownership records these interfaces persist. The ownership row keeps no
+// digest column, and nothing behind these ports can reach the digest except
+// through the projection port that exists to carry it.
 //
 // Three rules the signatures below carry on purpose:
 //

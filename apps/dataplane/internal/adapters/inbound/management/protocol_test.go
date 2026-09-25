@@ -15,8 +15,18 @@ import (
 	stdhttp "net/http"
 	"net/http/httptest"
 
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/projection"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/usagefacts"
 )
+
+// grammarValidBatchBody is a delivered batch that passes the grammar and
+// reaches the application, for the rows that assert on how an application
+// answer is translated. Its numbers mean nothing; its shape means everything.
+const grammarValidBatchBody = `{"protocol_version":1,` +
+	`"epoch":"0b6fd7a1-3f6e-4a55-9a21-5c8f2e7d1b90","from_revision":10,` +
+	`"changes":[{"revision":11,"resource_kind":"account",` +
+	`"resource_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",` +
+	`"recorded_at":"2026-09-24T10:00:00Z","payload":{"state":"active"}}]}`
 
 // contractPath is the façade's contract, read from here because the two hops
 // have to agree about one thing and this is where that agreement is checked.
@@ -208,9 +218,11 @@ func TestTheFailureVocabularyIsThisSurfacesOwn(t *testing.T) {
 	tests := []struct {
 		name       string
 		facts      *stubFacts
+		applier    *stubProjection
 		authorized bool
 		method     string
 		target     string
+		body       string
 		wantStatus int
 		wantCode   string
 	}{
@@ -269,16 +281,65 @@ func TestTheFailureVocabularyIsThisSurfacesOwn(t *testing.T) {
 			wantStatus: stdhttp.StatusInternalServerError,
 			wantCode:   codeInternal,
 		},
+		{
+			// The protocol fails closed: a version this plane does not speak is
+			// refused before anything is read or applied.
+			name:       "a message in a protocol version this plane does not speak",
+			authorized: true,
+			method:     stdhttp.MethodPost,
+			target:     "/internal/projection/changes",
+			body:       `{"protocol_version":99}`,
+			wantStatus: stdhttp.StatusBadRequest,
+			wantCode:   codeUnsupportedVersion,
+		},
+		{
+			name:       "a batch that cannot join the applied position",
+			applier:    &stubProjection{err: projection.ErrRevisionGap},
+			authorized: true,
+			method:     stdhttp.MethodPost,
+			target:     "/internal/projection/changes",
+			body:       grammarValidBatchBody,
+			wantStatus: stdhttp.StatusConflict,
+			wantCode:   codeRevisionGap,
+		},
+		{
+			name:       "a stored position that cannot join the producer timeline",
+			applier:    &stubProjection{err: projection.ErrSnapshotRequired},
+			authorized: true,
+			method:     stdhttp.MethodPost,
+			target:     "/internal/projection/changes",
+			body:       grammarValidBatchBody,
+			wantStatus: stdhttp.StatusConflict,
+			wantCode:   codeSnapshotRequired,
+		},
+		{
+			// A batch that would move a terminal state backwards shares the
+			// shape refusal's status and code: the message is at fault, and
+			// no retry of it can succeed.
+			name:       "a batch that would move a terminal state backwards",
+			applier:    &stubProjection{err: projection.ErrTerminalRegression},
+			authorized: true,
+			method:     stdhttp.MethodPost,
+			target:     "/internal/projection/changes",
+			body:       grammarValidBatchBody,
+			wantStatus: stdhttp.StatusBadRequest,
+			wantCode:   codeInvalidRequest,
+		},
 	}
 
 	produced := map[string]bool{}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			request := httptest.NewRequest(tt.method, tt.target, nil)
+			request := httptest.NewRequest(tt.method, tt.target, strings.NewReader(tt.body))
 			if tt.authorized {
 				request.Header.Set(authorizationHeader, credentialScheme+" "+serviceCredential)
 			}
-			rec := serve(t, tt.facts, request)
+			var rec *httptest.ResponseRecorder
+			if tt.applier != nil {
+				rec = serveProjection(t, tt.applier, request)
+			} else {
+				rec = serve(t, tt.facts, request)
+			}
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tt.wantStatus, rec.Body.String())
@@ -469,6 +530,57 @@ func TestTheFactContractsNumbersAreTheConstants(t *testing.T) {
 			}
 			if declared != tt.constant {
 				t.Errorf("%s says %s is %d and this listener enforces %d; the code and the contract have drifted apart", usageFactsPath, tt.key, declared, tt.constant)
+			}
+		})
+	}
+}
+
+// projectionFactsPath is the projection fragment both ends of this hop
+// implement, relative to this package's directory, alongside the façade
+// document that carries the two delivered operations.
+//
+// Its numbers — the protocol version, the per-array snapshot bound, the batch
+// bound and the delivered-body ceiling — are declared there and nowhere else,
+// and this listener enforces all of them.
+const projectionFactsPath = "../../../../../../api/openapi/shared/projection.yaml"
+
+// TestTheProjectionContractsNumbersAreTheConstants pins this listener's
+// projection numbers to the documents that declare them, for the same reason
+// its sibling pins the fact feed's: a constant widened here while the document
+// stood still is a façade that refuses bodies this listener accepts, and the
+// disagreement would be invisible from inside either module alone.
+//
+// The body ceiling is read out of dataplane.yaml rather than the fragment,
+// because the ceiling is declared on the operations and the operations are the
+// façade's — the fragment deliberately describes shapes only. Both delivered
+// operations carry it, and both are pinned: a ceiling raised on one operation
+// and not the other is exactly the kind of edit this test exists to make red.
+func TestTheProjectionContractsNumbersAreTheConstants(t *testing.T) {
+	facade := scanContract(t, contractPath).numbers
+	fragment := scanContract(t, projectionFactsPath).numbers
+
+	tests := []struct {
+		name     string
+		document map[string]int
+		key      string
+		constant int
+	}{
+		{name: "the protocol version this plane speaks", document: fragment, key: "components.schemas.ProjectionProtocolVersion.const", constant: projection.ProtocolVersion},
+		{name: "the api keys a snapshot may carry", document: fragment, key: "components.schemas.ProjectionSnapshot.properties.api_keys.maxItems", constant: projection.MaxSnapshotRecords},
+		{name: "the accounts a snapshot may carry", document: fragment, key: "components.schemas.ProjectionSnapshot.properties.accounts.maxItems", constant: projection.MaxSnapshotRecords},
+		{name: "the changes one delivery may carry", document: fragment, key: "components.schemas.ProjectionChangesBatch.properties.changes.maxItems", constant: projection.MaxChangesPerBatch},
+		{name: "the snapshot body's ceiling in bytes", document: facade, key: "paths./internal/projection/snapshot.post.x-max-body-bytes", constant: maxProjectionBodyBytes},
+		{name: "the batch body's ceiling in bytes", document: facade, key: "paths./internal/projection/changes.post.x-max-body-bytes", constant: maxProjectionBodyBytes},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			declared, ok := tt.document[tt.key]
+			if !ok {
+				t.Fatalf("the document declares no %s; this pin proves nothing until the scan finds it", tt.key)
+			}
+			if declared != tt.constant {
+				t.Errorf("the contract says %s is %d and this listener enforces %d; the code and the contract have drifted apart", tt.key, declared, tt.constant)
 			}
 		})
 	}

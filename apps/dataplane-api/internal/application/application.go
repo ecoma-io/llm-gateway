@@ -23,6 +23,15 @@
 // the same shape and adds one decision of its own: the version it returns is
 // carried as the catalog reported it, with its membership withheld — that
 // question belongs to the plane that evaluates containment.
+//
+// The third is the projection deliveries (projection.go), which follow that
+// shape with the one difference the direction forces: the message they carry
+// is the caller's bytes, judged nowhere in this process, because the grammar
+// is the Data Plane's to apply and a second grammar here would drift from the
+// first. They add the mirror and the change log to that list of owned facts —
+// the Data Plane owns the mirror, the Control Plane the change log — and the
+// refusal above holds for them too: a copy here would be a third party's guess
+// at all four.
 package application
 
 import (
@@ -56,6 +65,36 @@ const (
 	// Internal, because nothing in this process is broken; the transport maps
 	// it to a 502 so the failure is not reported as this application's own.
 	CodeUpstreamUnavailable Code = "upstream_unavailable"
+
+	// CodeUnsupportedVersion says a delivered projection message speaks a
+	// protocol version this process's Data Plane does not support. The delivery
+	// halts until both ends speak one version; it never skips. It is its own
+	// category because the caller — the Control Plane's producer — can act on
+	// it only by stopping, and a generic internal would tell it to retry what
+	// no retry can fix.
+	CodeUnsupportedVersion Code = "unsupported_version"
+
+	// CodeInvalidRequest says a delivered projection message does not satisfy
+	// the projection protocol's grammar, as the Data Plane judged it. The
+	// judgement belongs to the mirror that applies the message; this process
+	// carries it and never re-judges it, which is why the message is fixed and
+	// carries no detail from the Data Plane's refusal.
+	CodeInvalidRequest Code = "invalid_request"
+
+	// CodeRevisionGap says a delivered batch neither continues the Data
+	// Plane's applied position nor duplicates history already behind it. It is
+	// refused whole — never partially applied, never silently skipped — and
+	// resolving it is a human decision, because stepping the position forward
+	// would strand the gap's revisions forever.
+	CodeRevisionGap Code = "revision_gap"
+
+	// CodeSnapshotRequired says the Data Plane's stored position cannot join
+	// the producer's timeline — a different epoch, or no bootstrap at all. It
+	// is the one projection refusal the producer resolves by itself: its next
+	// cycle reads the position and delivers a snapshot. It is distinct from
+	// CodeRevisionGap because the two demand opposite reflexes — one halts for
+	// a human, the other is the loop's own recovery path.
+	CodeSnapshotRequired Code = "snapshot_required"
 
 	// CodeInternal says the application cannot complete a request safely.
 	// Its public representation is deliberately generic at the transport edge.
@@ -102,12 +141,17 @@ func Internal(cause error) *Error {
 }
 
 // App holds the use-cases this process currently exposes, and the ports they
-// reach. It holds no position, no cache and no page: the only state in it is
-// the version string it was handed at startup.
+// reach. It holds no position, no cache, no page and no projection state: the
+// only state in it is the version string it was handed at startup. The
+// projection deliveries (projection.go) are stateless in the same way the
+// usage-fact read is — the mirror's position lives in the Data Plane, the
+// change log lives in the Control Plane, and a copy here would be a third
+// party's guess at both.
 type App struct {
-	version string
-	usage   dataplane.UsageFacts
-	catalog dataplane.Catalog
+	version     string
+	usage       dataplane.UsageFacts
+	catalog     dataplane.Catalog
+	projections dataplane.ProjectionDelivery
 }
 
 // New constructs the dataplane-api application around the build version supplied
@@ -119,14 +163,16 @@ type App struct {
 // dereference inside the first management request this process serves, which is
 // a 500 from a handler whose wiring could not have been tested; and a use case
 // with nothing behind it is not a state the composition root can mean.
-func New(version string, usage dataplane.UsageFacts, catalog dataplane.Catalog) *App {
+func New(version string, usage dataplane.UsageFacts, catalog dataplane.Catalog, projections dataplane.ProjectionDelivery) *App {
 	switch {
 	case usage == nil:
 		panic("application: New requires a UsageFacts port — the management surface has nothing to answer with without one")
 	case catalog == nil:
 		panic("application: New requires a Catalog port — the group-version route has nothing to answer with without one")
+	case projections == nil:
+		panic("application: New requires a ProjectionDelivery port — the projection surface has nothing to deliver with without one")
 	}
-	return &App{version: version, usage: usage, catalog: catalog}
+	return &App{version: version, usage: usage, catalog: catalog, projections: projections}
 }
 
 // Version returns the build version injected into the process. It is a plain

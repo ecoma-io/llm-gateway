@@ -47,15 +47,16 @@ info:
   version: 0.1.0
   description: >-
     Health and readiness probes, the usage-fact feed, the alias-group catalog
-    read, and the common HTTP boundary of the Ecoma LLM Gateway's Data Plane
-    management façade. This surface is internal: it is called by the Control
-    Plane and is not published to callers of the gateway. Every response returns
-    X-Request-Id, and every failure — including the ones no operation declares, a
-    404 for an unmatched path and a 500 for an unclassifiable implementation
-    failure — returns the ErrorEnvelope. A management call identifies itself as a
-    service; a browser session or a customer API key is not a service identity
-    and is refused. The Data Plane's administrative operations beyond the fact
-    feed and the catalog read are not designed yet; this document carries the
+    read, the Control Plane's credential projection, and the common HTTP
+    boundary of the Ecoma LLM Gateway's Data Plane management façade. This
+    surface is internal: it is called by the Control Plane and is not published
+    to callers of the gateway. Every response returns X-Request-Id, and every
+    failure — including the ones no operation declares, a 404 for an unmatched
+    path and a 500 for an unclassifiable implementation failure — returns the
+    ErrorEnvelope. A management call identifies itself as a service; a browser
+    session or a customer API key is not a service identity and is refused. The
+    Data Plane's administrative operations beyond the fact feed, the catalog
+    read, and the projection are not designed yet; this document carries the
     surface that exists and the process every later operation follows.
 
     This is a façade contract and not the Data Plane's own surface. The process
@@ -83,6 +84,14 @@ tags:
       and its immutability — is Data Plane data (ADR 0006 §5); what crosses here
       is the one fact a Control Plane commerce roll needs to pin an entitlement's
       scope, and it arrives as a version's id and nothing else.
+  - name: projection
+    description: >-
+      The Control → Data credential projection: the operations by which the
+      Control Plane delivers the identity decisions it owns — API-key
+      credentials and account states — to the credential mirror the runtime's
+      request path verifies against. The delivery model, the revision and
+      epoch semantics, and every schema are stated in
+      shared/projection.yaml (ADR 0006 §5, ADR 0007).
 paths:
   /healthz:
     get:
@@ -318,6 +327,165 @@ paths:
           $ref: "./shared/errors.yaml#/components/responses/NotFound"
         "405":
           $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+        "502":
+          $ref: "./shared/errors.yaml#/components/responses/UpstreamUnavailable"
+  /internal/projection/position:
+    get:
+      operationId: getProjectionPosition
+      tags:
+        - projection
+      summary: Read the Data Plane's projection position
+      description: >-
+        Returns where the runtime's credential mirror stands: whether it has
+        been bootstrapped from a snapshot, the producer timeline its position
+        was earned on, and the highest applied revision. The delivery model and
+        the position semantics are stated once in `shared/projection.yaml` and
+        are not repeated here.
+
+
+        The position is the producer's steering signal, and it answers from the
+        Data Plane and never from here: this façade holds no projection state,
+        no epoch and no cache of either, and when the runtime cannot be reached
+        the answer is a 502 rather than a guess. Nothing is consumed by asking
+        — the position is read as often as the producer likes and changes only
+        when the runtime applies something.
+      security:
+        - serviceCredential: []
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The consumer's current projection position.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/projection.yaml#/components/schemas/ProjectionPosition"
+        "400":
+          $ref: "./shared/errors.yaml#/components/responses/InvalidRequest"
+        "401":
+          $ref: "./shared/errors.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+        "502":
+          $ref: "./shared/errors.yaml#/components/responses/UpstreamUnavailable"
+  /internal/projection/snapshot:
+    post:
+      operationId: applyProjectionSnapshot
+      x-max-body-bytes: 10485760
+      tags:
+        - projection
+      summary: Apply the Control Plane's full credential projection
+      description: >-
+        Delivers the Control Plane's whole projection at a named
+        `snapshot_revision` and moves the consumer onto it: every row is
+        written as stated, unconditionally, and the position becomes
+        `snapshot_revision` in the same transaction — the semantics that make
+        bootstrap, recovery after data loss, and a re-snapshot onto a rewound
+        timeline all the same operation. Why a snapshot cannot chunk and where
+        the row bounds come from is stated in `shared/projection.yaml`.
+
+
+        The operation is idempotent and may be repeated any number of times:
+        the second application of the same snapshot lands on rows the first
+        already wrote. It is how a consumer that has never bootstrapped — or
+        whose position no longer joins the producer's timeline — is brought to
+        a state the incremental feed can continue from.
+      security:
+        - serviceCredential: []
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "./shared/projection.yaml#/components/schemas/ProjectionSnapshot"
+      responses:
+        "200":
+          description: The snapshot was applied; the position now names its boundary.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/projection.yaml#/components/schemas/ProjectionAppliedAck"
+        "400":
+          $ref: "./shared/errors.yaml#/components/responses/InvalidRequest"
+        "401":
+          $ref: "./shared/errors.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+        "502":
+          $ref: "./shared/errors.yaml#/components/responses/UpstreamUnavailable"
+  /internal/projection/changes:
+    post:
+      operationId: applyProjectionChanges
+      x-max-body-bytes: 10485760
+      tags:
+        - projection
+      summary: Apply a batch of the Control Plane's projected changes
+      description: >-
+        Delivers the next contiguous range of the Control Plane's change feed
+        and advances the consumer's position across it — rows and position in
+        one transaction, so a crash between the two is a replay rather than a
+        loss. The join rules that decide whether a batch is applied, ignored
+        as a duplicate, or refused whole are stated once in
+        `shared/projection.yaml`; on this surface they appear as the difference
+        between a 200, an acknowledging 200 for a batch already applied, and
+        the two 409s.
+
+
+        The 409s are refusals the producer acts on, not faults to retry
+        blindly: `revision_gap` says the batch does not join the position and
+        the producer must re-read it, `snapshot_required` says this timeline
+        cannot be continued at all and the producer must re-snapshot. Every
+        refusal leaves the position and the rows exactly as they were.
+      security:
+        - serviceCredential: []
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "./shared/projection.yaml#/components/schemas/ProjectionChangesBatch"
+      responses:
+        "200":
+          description: >-
+            The batch was applied, or had been applied already and is
+            acknowledged as the duplicate it is.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/projection.yaml#/components/schemas/ProjectionAppliedAck"
+        "400":
+          $ref: "./shared/errors.yaml#/components/responses/InvalidRequest"
+        "401":
+          $ref: "./shared/errors.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "./shared/errors.yaml#/components/responses/ProjectionConflict"
         "500":
           $ref: "./shared/errors.yaml#/components/responses/InternalError"
         "502":

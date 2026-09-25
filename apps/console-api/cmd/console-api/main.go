@@ -26,10 +26,12 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/adapters/inbound/http"
+	dataplaneadapter "github.com/ecoma-io/llm-gateway/apps/console-api/internal/adapters/outbound/dataplane"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/adapters/outbound/postgres"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/config"
@@ -51,6 +53,47 @@ var version = "dev"
 // loop an operator cannot see the shape of. The pool's own settings govern
 // every connection after this one dial.
 const postgresConnectTimeout = 5 * time.Second
+
+// projectionWG tracks the producer's loop goroutine so the pool is not closed
+// under a cycle that is still finishing. One goroutine, one Add, one Wait.
+var projectionWG sync.WaitGroup
+
+// runProjectionLoop reconciles the Data Plane's credential mirror with the
+// Control Plane's projection log until the process is asked to stop: one
+// Reconcile per interval, each under its own deadline, the first immediately.
+//
+// Every failure is a log line and nothing more. The loop deliberately does
+// not crash the process on a refused delivery or an unreachable peer — the
+// mirror's freshness is a management-plane concern and the protocol's answer
+// to a failed cycle is the next one — and it deliberately does not swallow
+// repeated failure either: the line is written every interval, so a producer
+// that cannot deliver is a log an operator cannot miss. A context
+// cancellation is not a failure: it is the stop signal arriving mid-cycle,
+// and it ends the loop quietly.
+func runProjectionLoop(ctx context.Context, producer *application.ProjectionDelivery, interval, timeout time.Duration) {
+	defer projectionWG.Done()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	runOnce := func() {
+		cycleCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		if err := producer.Reconcile(cycleCtx, false); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("console-api projection cycle failed: %v", err)
+		}
+	}
+
+	runOnce()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runOnce()
+		}
+	}
+}
 
 func main() {
 	// log without timestamps: the process has one startup line and one
@@ -91,7 +134,28 @@ func main() {
 	// before. The foundation phases (identity, commerce) ship their use cases
 	// and repositories tested at the application boundary; wiring them ahead
 	// of a caller would be composition guessed at, and a guessed composition
-	// is exactly what this file exists to refuse.
+	// is exactly what this file exists to refuse. The projection loop is the
+	// first caller this process has gained, and the wiring below is its
+	// composition.
+
+	// The Control Plane's state access, and the projection producer on top of
+	// it (ADR 0007). The store is the one object every persistence port
+	// resolves its units of work through; the log is the producer's read face
+	// onto the change log and the materialized snapshot. The identity use
+	// cases that write the log are not constructed yet — no HTTP surface
+	// reaches them — and are wired by the change that first serves one.
+	store := postgres.New(db)
+	projectionLog := postgres.NewProjectionLog(store)
+
+	// The Data Plane half of the producer: an HTTP client whose behaviour is
+	// deliberately the library default (the per-cycle deadline below is what
+	// bounds every call), and the adapter that speaks the management façade's
+	// projection contract with the credential this process was given. The
+	// credential travels on the wire and nowhere else — the adapter's errors
+	// are built from status codes and sentinels, never from the request.
+	client := &stdhttp.Client{}
+	consumer := dataplaneadapter.New(client, cfg.DataPlane.URL, cfg.DataPlane.Credential)
+	producer := application.NewProjectionDelivery(projectionLog, consumer)
 
 	// One startup line naming the target — host, port, database — and
 	// nothing else. The DSN carries the role's password, so the pieces are
@@ -138,11 +202,30 @@ func main() {
 		errCh <- run(ctx, stop, server, listener, cfg.ShutdownTimeout)
 	}()
 
+	// The projection producer's loop: one goroutine, one Reconcile per tick,
+	// and therefore no concurrent cycles to guard against — a cycle that
+	// overruns its interval simply delays the next one. Each cycle runs under
+	// its own deadline so a hung read or delivery fails the way any failed
+	// cycle does — logged, retried by the next tick — instead of wedging the
+	// loop forever. The first cycle runs immediately: a restart should
+	// reconcile at once, not wait an interval to discover nothing changed.
+	// A failed cycle is one log line, not a crash: delivery is at-least-once
+	// against a durable log, so the loop's answer to every failure is the
+	// next tick.
+	projectionWG.Add(1)
+	go runProjectionLoop(ctx, producer, cfg.DataPlane.ProjectionInterval, cfg.DataPlane.ProjectionTimeout)
+
 	log.Printf("console-api %s listening on %s", version, listener.Addr())
 	if err := <-errCh; err != nil {
 		log.Printf("console-api error: %v", err)
 		os.Exit(1)
 	}
+
+	// The pool closes after the projection loop has stopped, not before: the
+	// loop's cycle may still be finishing its last read on a pooled
+	// connection, and closing earlier would pull the pool out from under it —
+	// the same ordering the drain above observes for in-flight requests.
+	projectionWG.Wait()
 
 	// The pool is closed here, after run has returned, and not before: the
 	// drain inside run may still be finishing in-flight requests, and those

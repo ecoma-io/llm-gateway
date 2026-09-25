@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/application"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/projection"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/persistence"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/usagefacts"
 )
@@ -63,6 +65,31 @@ func (v silentVersions) HighestVersion(context.Context, string) (int, error) {
 	return 0, errors.New("the runtime surface has no catalog")
 }
 
+// noProjections is the projection applier this package's tests construct the
+// application with, and it fails the test if it is ever touched — the same
+// assertion as noFacts, for the same reason on the other port: applying the
+// credential mirror is the management listener's surface, and a request path
+// that wrote it would be a Control Plane decision taken at inference time.
+type noProjections struct{ t *testing.T }
+
+// Position implements persistence.ProjectionApplier.
+func (p noProjections) Position(context.Context) (projection.Position, error) {
+	p.t.Error("the runtime surface read the projection position; that is the management listener's surface, not this one")
+	return projection.Position{}, errors.New("the runtime surface has no projection applier")
+}
+
+// ApplySnapshot implements persistence.ProjectionApplier.
+func (p noProjections) ApplySnapshot(context.Context, projection.Snapshot, time.Time) (uint64, error) {
+	p.t.Error("the runtime surface applied a projection snapshot; that is the management listener's surface, not this one")
+	return 0, errors.New("the runtime surface has no projection applier")
+}
+
+// ApplyChanges implements persistence.ProjectionApplier.
+func (p noProjections) ApplyChanges(context.Context, projection.Batch) (uint64, error) {
+	p.t.Error("the runtime surface applied projection changes; that is the management listener's surface, not this one")
+	return 0, errors.New("the runtime surface has no projection applier")
+}
+
 // newTestApp returns the application under test for this package's handlers.
 //
 // It exists so that the ports this process needs — and this surface does not
@@ -71,5 +98,5 @@ func (v silentVersions) HighestVersion(context.Context, string) (int, error) {
 func newTestApp(t *testing.T, version string) *application.App {
 	t.Helper()
 	catalog := application.NewCatalog(silentStore{t: t}, silentBackends{}, silentAliases{}, silentVersions{t: t})
-	return application.New(version, noFacts{t: t}, catalog)
+	return application.New(version, noFacts{t: t}, catalog, noProjections{})
 }

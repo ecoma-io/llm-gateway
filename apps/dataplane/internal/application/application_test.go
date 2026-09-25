@@ -20,12 +20,13 @@ func TestVersionReturnsTheBuildVersion(t *testing.T) {
 }
 
 // newTestApp is the application the tests in this file drive: the real use
-// cases, the stub fact reader a test aims at, and the catalog over one empty
-// fake world — because a test of the fact reader has no opinion about the
-// catalog beyond its being present, and New refuses to build an App without
-// one for the reason its doc comment records.
+// cases, the stub fact reader a test aims at, the catalog over one empty fake
+// world, and an empty projection applier — because a test of the fact reader
+// has no opinion about the catalog or the mirror beyond their being present,
+// and New refuses to build an App without them for the reasons its doc comment
+// records.
 func newTestApp(facts *stubFacts) *App {
-	return New("v0.1.0", facts, newCatalog(newCatalogWorld()))
+	return New("v0.1.0", facts, newCatalog(newCatalogWorld()), &stubProjections{})
 }
 
 func TestNewPanicsOnAMissingCatalog(t *testing.T) {
@@ -34,7 +35,7 @@ func TestNewPanicsOnAMissingCatalog(t *testing.T) {
 			t.Error("New with no catalog did not panic")
 		}
 	}()
-	New("v0.1.0", &stubFacts{}, nil)
+	New("v0.1.0", &stubFacts{}, nil, &stubProjections{})
 }
 
 // stubFacts is the fact reader the tests below drive the use case with. It

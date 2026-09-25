@@ -17,10 +17,11 @@
 // made here: the façade reaches the Data Plane through an outbound port of its
 // own, over the Data Plane's private management listener, never through a
 // shared core module both transports depend on and never by reading the Data
-// Plane's tables. The usage-fact feed and the alias-group catalog read are that
-// seam in use — the ports live in internal/ports/outbound, and the HTTP adapter
-// behind them is the one outbound adapter composed below, satisfying both
-// because both are questions to the same listener with the same credential.
+// Plane's tables. The usage-fact feed, the alias-group catalog read and the
+// control-to-data projection (ADR 0007) are that seam in use — the ports live
+// in internal/ports/outbound, and the HTTP adapter behind them is the one
+// outbound adapter composed below, satisfying all three because all three are
+// questions to the same listener with the same credential.
 package main
 
 import (
@@ -133,13 +134,13 @@ func main() {
 func newHandler(cfg config.Config, client *stdhttp.Client) stdhttp.Handler {
 	dataPlane := dataplane.New(client, cfg.DataPlaneURL, cfg.DataPlaneCredential)
 	authenticator := http.NewServiceAuthenticator(cfg.ServiceCredential)
-	// One adapter value handed to both ports. That is the composition, not an
-	// accident of shared wiring: the feed and the catalog read are two
-	// questions to one listener over one credential, so the seam has one
-	// implementation and the two interfaces name the two halves of it. A second
-	// adapter here would be a second client, a second base URL and a second
-	// place to point one of them somewhere else.
-	return http.New(application.New(version, dataPlane, dataPlane), authenticator)
+	// One adapter value handed to every port. That is the composition, not an
+	// accident of shared wiring: the feed, the catalog read and the projection
+	// are three questions to one listener over one credential, so the seam has
+	// one implementation and the three ports are the typed views onto it. A
+	// second adapter here would be a second client, a second base URL and a
+	// second place to point one of them somewhere else.
+	return http.New(application.New(version, dataPlane, dataPlane, dataPlane), authenticator)
 }
 
 // run serves until the process is asked to stop, then drains.

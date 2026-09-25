@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/identity"
+	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/projection"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
@@ -17,6 +18,17 @@ import (
 // transitions converge on the domain's rules instead of one silently
 // overwriting a state its caller never saw: the loser of a swap re-reads and
 // re-applies from the state that actually exists.
+//
+// Every write that changes something the Data Plane's credential mirror
+// holds — accounts, and the api-key lifecycle — also records the projection
+// entry for it, inside the same unit of work (ADR 0007). The recording is
+// the last step of the write, after the authority row has moved: the entry
+// describes a change that happened, not one that is about to, and a
+// recording that fails rolls the authority write back with it, so there is
+// no state in which the Control Plane decided something its projection did
+// not hear. Only the writes that actually moved a row record: the loser of
+// a compare-and-swap describes nothing, because the winner's entry already
+// describes the row as it now is.
 //
 // Nothing constructs this type yet, and no HTTP surface reaches it: B2 is the
 // foundation phase, and the endpoints that will call these methods are later
@@ -69,18 +81,27 @@ type CredentialSource interface {
 // Identity is the identity foundation's use cases: accounts, users, API-key
 // ownership, and the API-key verification model.
 type Identity struct {
-	store    persistence.Store
-	accounts persistence.Accounts
-	users    persistence.Users
-	keys     persistence.APIKeys
+	store         persistence.Store
+	accounts      persistence.Accounts
+	users         persistence.Users
+	keys          persistence.APIKeys
+	projection    persistence.ProjectionChangeRecorder
+	projectionLog persistence.ProjectionLog
 }
 
 // NewIdentity builds the identity use cases around the ports they need. It
 // panics on a nil port for the reason NewFactIngestion panics: a port this
 // use case was promised and did not get is a wiring defect, and the middle of
 // a mint — after a transaction is open and a secret generated — is a strictly
-// worse place to learn about it.
-func NewIdentity(store persistence.Store, accounts persistence.Accounts, users persistence.Users, keys persistence.APIKeys) *Identity {
+// worse place to learn about it. The projection recorder is fifth and no
+// less required than the rest: a mint without its projection entry is a
+// credential the runtime never learns about, discovered only when the key
+// fails to authenticate — the worst possible place to learn about it. The
+// projection log is sixth because revocation reads the mirror to describe
+// the credential it is revoking — the digest exists in this plane's database
+// only inside the projection pipeline's own tables, and the mirror row is
+// where a read finds it.
+func NewIdentity(store persistence.Store, accounts persistence.Accounts, users persistence.Users, keys persistence.APIKeys, projectionRecorder persistence.ProjectionChangeRecorder, projectionLog persistence.ProjectionLog) *Identity {
 	switch {
 	case store == nil:
 		panic("application: NewIdentity requires a store")
@@ -90,8 +111,12 @@ func NewIdentity(store persistence.Store, accounts persistence.Accounts, users p
 		panic("application: NewIdentity requires a users repository")
 	case keys == nil:
 		panic("application: NewIdentity requires an api keys repository")
+	case projectionRecorder == nil:
+		panic("application: NewIdentity requires a projection change recorder")
+	case projectionLog == nil:
+		panic("application: NewIdentity requires a projection log")
 	}
-	return &Identity{store: store, accounts: accounts, users: users, keys: keys}
+	return &Identity{store: store, accounts: accounts, users: users, keys: keys, projection: projectionRecorder, projectionLog: projectionLog}
 }
 
 // MintedKey is what minting hands back, exactly once. Token is the only copy
@@ -132,7 +157,9 @@ func (k MintedKey) MarshalJSON() ([]byte, error) {
 }
 
 // CreateAccount opens an account: a fresh identity, a validated name, and the
-// aggregate's birth state, inserted as one unit of work.
+// aggregate's birth state, inserted as one unit of work — the projection
+// entry included, so the mirror learns the account in the same commit the
+// authority does.
 func (i *Identity) CreateAccount(ctx context.Context, name string) (identity.Account, error) {
 	id, err := identity.NewAccountID()
 	if err != nil {
@@ -142,8 +169,18 @@ func (i *Identity) CreateAccount(ctx context.Context, name string) (identity.Acc
 	if err != nil {
 		return identity.Account{}, fmt.Errorf("application: create account: %w", err)
 	}
+	projected, err := projection.NewAccount(string(account.ID), projection.AccountState(account.State))
+	if err != nil {
+		return identity.Account{}, fmt.Errorf("application: create account %s: %w", account.ID, err)
+	}
 	if err := i.store.WithinTx(ctx, func(txCtx context.Context) error {
-		return i.accounts.Create(txCtx, *account)
+		if err := i.accounts.Create(txCtx, *account); err != nil {
+			return err
+		}
+		// The authority row is in; the projection entry describes it. The
+		// recorded instant is the account's own creation instant, so the
+		// log's story and the row's timestamps are one story.
+		return i.projection.RecordAccountChange(txCtx, account.CreatedAt, projected)
 	}); err != nil {
 		return identity.Account{}, fmt.Errorf("application: create account %s: %w", account.ID, err)
 	}
@@ -183,6 +220,9 @@ func (i *Identity) CloseAccount(ctx context.Context, id identity.AccountID) erro
 // compare-and-swap, retrying from the fresh state when the swap loses. The
 // apply function is the aggregate's own method, so the domain — not this use
 // case — is what refuses illegal moves and what decides a move was a no-op.
+// The move that wins the swap records its projection entry in the same unit
+// of work; a lost swap records nothing, because the winner's entry already
+// describes the row as it now is.
 func (i *Identity) transitionAccount(ctx context.Context, id identity.AccountID, apply func(*identity.Account, time.Time) error) error {
 	return i.store.WithinTx(ctx, func(txCtx context.Context) error {
 		for attempt := 0; attempt < casMaxAttempts; attempt++ {
@@ -202,7 +242,11 @@ func (i *Identity) transitionAccount(ctx context.Context, id identity.AccountID,
 				return fmt.Errorf("application: transition account %s: %w", id, err)
 			}
 			if applied {
-				return nil
+				projected, err := projection.NewAccount(string(account.ID), projection.AccountState(account.State))
+				if err != nil {
+					return fmt.Errorf("application: transition account %s: %w", id, err)
+				}
+				return i.projection.RecordAccountChange(txCtx, account.UpdatedAt, projected)
 			}
 			// Lost the swap: the row moved under us, and the next iteration
 			// re-reads and re-applies from the state that actually exists.
@@ -299,14 +343,14 @@ func (i *Identity) transitionUser(ctx context.Context, id identity.UserID, apply
 // belong to that account and not be removed, because the ownership graph is
 // a tree and a forged cross-account creator would bend it.
 //
-// The mint is deliberately the Control Plane's last sight of the plaintext:
-// the digest returned alongside the token is the recorded form, and it is
-// the only part of the credential the projection phase may deliver onward
-// (ADR 0006 §8). The Data Plane's WithdrawCredential-shaped notification and
-// the projection delivery itself arrive with that phase — a revocation raced
-// against a not-yet-delivered credential is a state that phase's
-// owned-but-inactive recovery exists for, not one this use case pretends to
-// solve today.
+// The mint is deliberately the Control Plane's last sight of the plaintext.
+// The digest recorded alongside the ownership row is the credential the
+// projection delivers — the one form of the secret that exists outside this
+// call, hex-encoded, harmless to store and to ship, useless for presenting
+// the key (ADR 0006 §8, as amended by ADR 0007). It is recorded inside the
+// same transaction as the ownership row: a mint whose projection entry
+// failed rolls back whole, so no ownership record can exist whose credential
+// is missing from the pipeline the runtime verifies against.
 //
 // One residual is documented rather than locked away: the account-active and
 // creator checks read rows without locks, so a suspension (or a removal) can
@@ -355,7 +399,23 @@ func (i *Identity) MintAPIKey(ctx context.Context, accountID identity.AccountID,
 				return fmt.Errorf("application: mint api key: creator %s: %w", createdBy, identity.ErrCreatorRemoved)
 			}
 		}
-		return i.keys.Create(txCtx, *key)
+		if err := i.keys.Create(txCtx, *key); err != nil {
+			return err
+		}
+		// The credential enters the projection pipeline in the same commit
+		// as its ownership record, carrying the digest and nothing else;
+		// recorded_at is the key's own creation instant. Built here, at the
+		// point of recording, so the projection's grammar is the write's
+		// last question and never outranks the authority checks above it.
+		digest, err := projection.NewDigest(secret.Digest().Hex())
+		if err != nil {
+			return fmt.Errorf("application: mint api key %s: %w", key.ID, err)
+		}
+		projected, err := projection.NewCredential(string(key.ID), string(key.AccountID), string(digest), projection.CredentialActive, nil)
+		if err != nil {
+			return fmt.Errorf("application: mint api key %s: %w", key.ID, err)
+		}
+		return i.projection.RecordCredentialChange(txCtx, key.CreatedAt, projected)
 	}); err != nil {
 		return MintedKey{}, fmt.Errorf("application: mint api key %s: %w", key.ID, err)
 	}
@@ -375,7 +435,16 @@ func (i *Identity) APIKey(ctx context.Context, id identity.APIKeyID) (identity.A
 // confirmed by a read, not an error, so a retried revocation — or two racing
 // ones — converge instead of fighting. There is no un-revoke on this use
 // case, in the domain, or in the schema.
+//
+// The revocation is also the projection's deterministic revoke story
+// (ADR 0007): the authority row and the revoked-credential change commit in
+// one unit of work, stamped with the same instant, so the mirror learns the
+// credential is dead exactly when this transaction makes it dead. Only the
+// swap that won records: a revocation that lost its race describes a change
+// the winner's entry already carries, and recording it too would spend a
+// revision on nothing.
 func (i *Identity) RevokeAPIKey(ctx context.Context, id identity.APIKeyID) error {
+	at := time.Now()
 	return i.store.WithinTx(ctx, func(txCtx context.Context) error {
 		key, err := i.keys.ByID(txCtx, id)
 		if err != nil {
@@ -384,16 +453,42 @@ func (i *Identity) RevokeAPIKey(ctx context.Context, id identity.APIKeyID) error
 		if key.State == identity.APIKeyRevoked {
 			return nil
 		}
-		applied, err := i.keys.Revoke(txCtx, id, time.Now())
+		applied, err := i.keys.Revoke(txCtx, id, at)
 		if err != nil {
 			return fmt.Errorf("application: revoke api key %s: %w", id, err)
 		}
 		if applied {
-			return nil
+			// The revoked credential's log entry carries the row's whole
+			// state, and the digest lives only inside the projection
+			// pipeline's own tables — the ownership record is digest-free by
+			// the two-record model — so the mirror row is where a read finds
+			// it. The read runs in this same transaction, so the row it
+			// reads is the one this transaction is about to rewrite.
+			projected, err := i.projectionLog.Credential(txCtx, string(key.ID))
+			if errors.Is(err, persistence.ErrNotFound) {
+				// The key predates the projection foundation: its digest
+				// never existed in this database, so no mirror anywhere —
+				// here or on the Data Plane — holds the credential, and
+				// there is nothing to project. The revocation is still
+				// real: it is on the ownership record above, which is the
+				// authority (ADR 0007 records this recovery).
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("application: revoke api key %s: %w", id, err)
+			}
+			revoked, err := projection.NewCredential(string(key.ID), string(key.AccountID), string(projected.Digest), projection.CredentialRevoked, &at)
+			if err != nil {
+				return fmt.Errorf("application: revoke api key %s: %w", id, err)
+			}
+			return i.projection.RecordCredentialChange(txCtx, at, revoked)
 		}
 		// Lost the swap: another revocation completed first. Confirm the row
 		// really is revoked — it is the only state a lost revoke swap can
-		// mean, and a read is cheaper than trusting that arithmetic.
+		// mean, and a read is cheaper than trusting that arithmetic. This
+		// path records nothing: the winner's own transaction carried the
+		// change, and a second entry would be a revision spent on a state
+		// the mirror already holds.
 		key, err = i.keys.ByID(txCtx, id)
 		if err != nil {
 			return fmt.Errorf("application: revoke api key %s: %w", id, err)

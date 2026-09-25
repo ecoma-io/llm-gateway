@@ -25,7 +25,7 @@ func (f *fakeUsageFacts) ReadUsageEvents(_ context.Context, after string, limit 
 }
 
 func TestVersionReturnsTheBuildVersion(t *testing.T) {
-	app := New("v0.1.0", &fakeUsageFacts{}, &fakeCatalog{})
+	app := New("v0.1.0", &fakeUsageFacts{}, &fakeCatalog{}, &fakeProjection{})
 
 	if got, want := app.Version(), "v0.1.0"; got != want {
 		t.Errorf("Version() = %q, want %q", got, want)
@@ -34,12 +34,14 @@ func TestVersionReturnsTheBuildVersion(t *testing.T) {
 
 func TestNewPanicsOnAMissingPort(t *testing.T) {
 	tests := []struct {
-		name    string
-		usage   dataplane.UsageFacts
-		catalog dataplane.Catalog
+		name        string
+		usage       dataplane.UsageFacts
+		catalog     dataplane.Catalog
+		projections dataplane.ProjectionDelivery
 	}{
-		{name: "no usage-facts port", catalog: &fakeCatalog{}},
-		{name: "no catalog port", usage: &fakeUsageFacts{}},
+		{name: "no usage-facts port", catalog: &fakeCatalog{}, projections: &fakeProjection{}},
+		{name: "no catalog port", usage: &fakeUsageFacts{}, projections: &fakeProjection{}},
+		{name: "no projection port", usage: &fakeUsageFacts{}, catalog: &fakeCatalog{}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -48,7 +50,7 @@ func TestNewPanicsOnAMissingPort(t *testing.T) {
 					t.Errorf("New with %s did not panic", tt.name)
 				}
 			}()
-			New("v0.1.0", tt.usage, tt.catalog)
+			New("v0.1.0", tt.usage, tt.catalog, tt.projections)
 		})
 	}
 }

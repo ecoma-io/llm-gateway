@@ -107,6 +107,11 @@ func rules(self string) []rule {
 			allowed:   []string{"cmd", "internal/adapters/inbound"},
 			forbidden: []string{self + "/internal/application"},
 		},
+		{
+			why:       "the domain packages are the grammars — identity's ownership edges and, since the projection, the credential record whose one secret-bearing form is the digest. They are spoken by the use cases, by the ports that persist them and by the outbound adapters that translate them to storage and to the wire; an inbound surface that imported one would be handing aggregates and verification material to the transport instead of rendering its own response shapes",
+			allowed:   []string{"cmd", "internal/application", "internal/adapters/outbound", "internal/ports"},
+			forbidden: []string{self + "/internal/domain"},
+		},
 	}
 }
 
@@ -281,6 +286,7 @@ func TestTheRuleRosterIsTheDeclaredOne(t *testing.T) {
 		"<module>/internal/adapters/outbound/ <- cmd",
 		"<module>/internal/application <- cmd, internal/adapters/inbound",
 		"<module>/internal/config <- cmd",
+		"<module>/internal/domain <- cmd, internal/application, internal/adapters/outbound, internal/ports",
 		"<module>/internal/ports <- cmd, internal/application, internal/adapters, internal/ports",
 		"database/sql <- cmd, internal/ports, internal/adapters/outbound",
 		"github.com/valkey-io/valkey-go <- internal/adapters/outbound/valkey",

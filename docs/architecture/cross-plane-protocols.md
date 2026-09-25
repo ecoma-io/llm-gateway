@@ -3,11 +3,12 @@
 Reference page for what crosses the boundary between the Control Plane and the
 Data Plane, and how it is delivered. The decisions are
 [ADR 0006](../adr/0006-control-plane-and-data-plane.md) §5 (the communication
-rules) and §9 (the management surface and its service-auth boundary); that
-record wins over this page wherever the two disagree. Which record belongs to
-which plane is [planes and ownership](planes.md); how the calls are layered in
-code is [ports and adapters](ports.md); the money the second direction feeds is
-[accounting](accounting.md).
+rules) and §9 (the management surface and its service-auth boundary), and
+[ADR 0007](../adr/0007-control-to-data-projection.md) (the credential
+projection's protocol); those records win over this page wherever the two
+disagree. Which record belongs to which plane is [planes and ownership](planes.md);
+how the calls are layered in code is [ports and adapters](ports.md); the money
+the second direction feeds is [accounting](accounting.md).
 
 This page exists for the next cross-plane change. A new message between the
 planes is a configuration in the first direction, a fact in the second, or —
@@ -18,10 +19,10 @@ obligations is the mistake this page is written to make visible.
 
 ## The two directions
 
-| Direction      | Term                       | What crosses                                                                                        | Keyed by                                 |
-| -------------- | -------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------- |
-| Control → Data | configuration / projection | API-key runtime projection, entitlement and quota grants, catalog and routing config, egress policy | the entity's own identifier — idempotent |
-| Data → Control | fact / observation         | usage facts, request-outcome facts, quota-consumption facts, reconciliation state                   | `request_id` — idempotent                |
+| Direction      | Term                       | What crosses                                                                                        | Keyed by                                                                      |
+| -------------- | -------------------------- | --------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Control → Data | configuration / projection | API-key runtime projection, entitlement and quota grants, catalog and routing config, egress policy | the entity's own identifier for a command; the projection's revision position |
+| Data → Control | fact / observation         | usage facts, request-outcome facts, quota-consumption facts, reconciliation state                   | `request_id` — idempotent                                                     |
 
 Neither direction is "data synchronization": one side states what the Data
 Plane should hold, the other states what it observed. A projection in the first
@@ -31,11 +32,14 @@ second is not a copy of anything — it is the record.
 ## Control → Data: an idempotent command
 
 A management call asks the Data Plane to hold something: a catalogue row, a
-candidate order, a price revision, a key's runtime state, a capacity grant. The
-call is request/response, it is keyed by the entity's own identifier, and it is
+candidate order, a price revision, a capacity grant. The call is
+request/response, it is keyed by the entity's own identifier, and it is
 idempotent — applying the same instruction twice leaves the Data Plane in the
 same state as applying it once, which is what makes a retry safe without a
-distributed transaction.
+distributed transaction. The key credential is deliberately **not** on this
+list: it crosses as the projection below, because a mirror of thousands of
+rows needs order, replay and a position, and a command has none of those
+things to give it.
 
 Three properties hold for every call in this direction:
 
@@ -46,10 +50,10 @@ Three properties hold for every call in this direction:
   a management call is a request the Data Plane may reject, and the caller
   handles the rejection rather than assuming the change landed.
 - **Delivery to the runtime is a named, bounded property.** Where the
-  instruction seeds a projection the hot path reads — a key's revocation, a
-  capacity grant — the projection is stale by a bounded window rather than
-  consistent on commit, and that bound is a deployment property rather than an
-  accident (ADR 0006 §8).
+  instruction seeds a projection the hot path reads — a capacity grant, or the
+  entitlement that seeds one — the projection is stale by a bounded window
+  rather than consistent on commit, and that bound is a deployment property
+  rather than an accident (ADR 0006 §8).
 
 The transport is the chain
 `console-api application → dataplane.Management → HTTP adapter → dataplane-api → outbound port → HTTP adapter → dataplane private listener`
@@ -90,6 +94,140 @@ their discipline:
 `dataplane.yaml` declares the route on the façade; the listener side is this
 hop's second private protocol, pinned by that package's own route and
 protocol tests as the fact reader's is.
+
+## Control → Data: the credential projection
+
+The second protocol in this direction carries the one record whose authority is
+unambiguously the Control Plane's and whose reader is the Data Plane's hot
+path: the API-key credential and the account lifecycle that gates it
+([ADR 0007](../adr/0007-control-to-data-projection.md), which is the decision;
+this section is the protocol as the two ends speak it).
+
+The producer is a stateless reconciliation loop in `console-api` — one cycle
+per interval, no buffer, no cursor, no learned position of its own. Each cycle
+reads the Control Plane's log head and the Data Plane's position and answers
+the difference: deliver a snapshot when the position does not join this
+timeline, otherwise drain the log in batches until the feed is empty. The
+consumer is the Data Plane's mirror, and its half of the bargain is one
+transaction: **the rows and the position that says they were applied commit
+together**, which is the property every recovery story below stands on.
+
+### The chain and the three operations
+
+The same chain as every cross-plane call, three operations on it:
+
+| Operation          | Contracted at the façade             | Behind it, on the private listener          |
+| ------------------ | ------------------------------------ | ------------------------------------------- |
+| Read the position  | `GET /internal/projection/position`  | same path, answered from `projection_state` |
+| Deliver a snapshot | `POST /internal/projection/snapshot` | same path, replacing the mirror whole       |
+| Deliver a batch    | `POST /internal/projection/changes`  | same path, judged against the position      |
+
+The schemas are `api/openapi/shared/projection.yaml`; the operations are
+declared in `dataplane.yaml` because the façade is the surface an outside
+caller may rely on, and the listener behind it is the private protocol — the
+same division the usage-fact direction keeps, pinned by one protocol test on
+each side of the hop.
+
+One asymmetry with the fact feed is deliberate and worth naming, because it is
+the difference between the two protocols' middle hops. There, the **answer**
+crosses as values the façade reads once and re-encodes from its own hand. Here,
+the **request** crosses as bytes the façade refuses to touch: the delivery body
+is forwarded verbatim, undecoded and unvalidated, because the message is the
+producer's grammar, built and checked where it was assembled, and a middle hop
+that re-encoded it would be a second grammar — one that would strip exactly the
+unknown additive fields the version rule promises to carry. The version rides
+inside those bytes for the same reason: the façade does not judge it, because
+the two ends that must agree on a version are the producer that writes it and
+the listener that refuses an unknown one, and a middle hop restating the check
+would age at its own release cadence. What the façade
+owns on this hop is the transport around the bytes — the credential check
+before anything runs, the contract's ten-mebibyte body bound enforced before
+anything is forwarded — and the failure vocabulary, which is the next table.
+
+### The five rules
+
+They are stated in full in the contract fragment's header; they are the whole
+protocol, so they are named here too:
+
+1. **Order is a revision, never a clock.** Revisions come from a gapless
+   counter advanced inside the same transaction as the authoritative write
+   (ADR 0007 §1); `recorded_at` rides along for operators and is never an
+   ordering key. The ceiling is 2⁶³ − 1 — the wire's revisions are unsigned,
+   but both planes store them in `bigint`, so the contract's `maximum` turns
+   an oversized revision into a grammar refusal, not a storage error.
+2. **The timeline is named.** Every message and every position carries the
+   producer's `epoch` — how a database restored to an earlier instant is
+   noticed instead of silently skipping every change after the restore
+   (ADR 0007 §6). One operator step rides with this rule: the epoch is part
+   of the data a restore puts back, so the restore procedure re-mints it
+   (`UPDATE control.projection_revision SET epoch = gen_random_uuid()`) —
+   a restore that skipped the step would rewind the counter under the old
+   name, the one mismatch the epoch cannot see.
+3. **Bootstrap is a snapshot; everything after is a batch.** The snapshot is
+   unconditional — "be this state at this boundary" — and it sets the position
+   in the same transaction as the rows it carries. The producer may re-snapshot
+   at any time; zero is a legitimate boundary (ADR 0007 §4).
+4. **Delivery is at-least-once; application is idempotent.** Every entry is a
+   self-contained full-state row, never a delta, so a redelivery is harmless by
+   construction — and cheap: a batch wholly behind the position is acknowledged
+   without work.
+5. **The position advances in the same transaction as the rows it describes.**
+   A crash before the commit replays; a crash after it re-acknowledges. There
+   is no state in which rows are applied and the position does not say so.
+
+### The consumer's three-case rule
+
+The consumer judges each batch against its own stored position — never against
+the batch's `from_revision`, which names only what the producer believed — and
+answers with exactly one of three outcomes:
+
+| The batch's revisions against the stored position | Answer                                                                        | Why                                                                                            |
+| ------------------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `first == position + 1`                           | apply whole, under per-row `source_revision` guards, position = last revision | the ordinary case                                                                              |
+| `last <= position`                                | acknowledge, no work                                                          | a lost acknowledgement, not an error — this is what makes at-least-once free                   |
+| anything else (straddles or overshoots)           | refuse **whole** — `revision_gap`                                             | applying the entries that fit would strand the rest behind a position that has moved past them |
+
+A gap is never waited for. There is no buffer and no "hold until revision N
+shows up" — an aborted producer transaction releases its revision, so some gaps
+are permanent, and a wait with no bound is a stall with no signal. The gap's
+only answer is a re-snapshot, and the producer's own loop is what asks for it.
+
+One refusal rides inside the ordinary case: a batch that joins the position
+but delivers an entry moving a terminal row (`revoked`, `closed`) back to a
+live state is refused **whole** as `invalid_request` — and deliberately
+without a heal, because a snapshot would overwrite the terminal row the
+refusal protects. A conforming producer cannot express such an entry
+(ADR 0007 §5), so the drain wedges loudly every cycle until an operator
+looks at the channel.
+
+### What the refusals mean, and what the producer does
+
+The listener's refusal vocabulary is four codes with two statuses, and each
+names the producer's next move rather than describing a failure:
+
+| Code                                                                      | The listener answers                    | The producer's next move                                                                                                 |
+| ------------------------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `unsupported_version`                                                     | `400`                                   | fail loud, every cycle, until both ends speak the same version — never skipped, never retried into working               |
+| `invalid_request`                                                         | `400`                                   | fail loud — a message this process built cannot satisfy the grammar it speaks; no retry fixes that                       |
+| `revision_gap`                                                            | `409`                                   | re-snapshot **in the same cycle**; resume draining from the boundary the snapshot committed                              |
+| `snapshot_required`                                                       | `409`                                   | re-snapshot in the same cycle                                                                                            |
+| any other code, any other status, a transport failure, an unreadable body | the façade's `502 upstream_unavailable` | fail the cycle; the next interval retries — at-least-once against a durable log costs one redelivery and nothing durable |
+
+The rows split into two kinds of answer, and the split is the producer loop's
+whole judgement: the first two are verdicts ("this build is wrong" — surfacing
+them every cycle is the operator's signal), the next two are instructions
+("deliver differently" — the protocol's own recovery), and the last is
+everything unknown, which costs a log line and a wait. Nothing is ever skipped
+past a refusal: the three-case rule's third answer exists so that a batch that
+cannot join the position is refused loudly instead of applied partially, and
+the loop's answer to loud is a snapshot, not silence.
+
+Secrets stay out of the vocabulary by construction: the producer's errors are
+built from status codes and sentinels — the transport's own error text quotes
+the request URL and is dropped rather than wrapped, and a refusal body is read
+for its `error.code` and nothing else, under a size cap — so no credential, no
+DSN, no listener message text reaches a log line the loop writes every
+interval.
 
 ## Data → Control: facts, replayed
 
@@ -390,6 +528,13 @@ The first line is what the split exists for (ADR 0006 §2, §4); the second is
 why a management call is request/response with a defined failure rather than a
 two-phase commit; the third is why the consumer, not the producer, holds the
 position; the fourth is why nothing in the derivation needs a lock.
+
+The projection meets the same four lines in the first direction, with its own
+vocabulary: a Control Plane outage pauses the projection cycles and nothing
+else; a Data Plane outage costs one failed cycle per interval and one log line;
+a delivery failure leaves the change durable in the log, replayed by the first
+cycle that finds the mirror behind; and a duplicate is the three-case rule's
+second answer — an acknowledgement without work (ADR 0007 §5, §7).
 
 ### The fact source, decided and landed
 

@@ -21,6 +21,7 @@ package application
 import (
 	"errors"
 
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/persistence"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/usagefacts"
 )
 
@@ -93,30 +94,44 @@ type App struct {
 	version string
 	facts   usagefacts.Reader
 	catalog *Catalog
+
+	// projections is the port the credential mirror is applied through — the
+	// consumer side of the Control → Data projection (ADR 0007). It is the
+	// first port in this application an inbound surface writes through, and
+	// the writes it takes are the Control Plane's decisions, never this
+	// process's own.
+	projections persistence.ProjectionApplier
 }
 
 // New constructs the dataplane application around the build version supplied
-// by cmd/dataplane, the fact reader the composition root chose, and the
-// catalog use cases the management listener serves reads from.
+// by cmd/dataplane, the fact reader and the projection applier the
+// composition root chose, and the catalog use cases the management listener
+// serves reads from.
 //
 // The version argument is a plain string because the command's package-level
 // variable remains the one ldflags source; this package receives that value
 // and never recreates it. The reader is an interface because which store
-// answers behind it is the composition root's decision — and today that
-// decision resolves to an adapter whose answer is ErrSourceUnavailable, which
-// is the truth until the accounting schema exists. The catalog is the one
-// concrete use-case type here rather than an interface, because it is this
-// package's own aggregate of use cases over an outbound port — the boundary
-// points outward at persistence, and the management listener asks inward at
-// this; an interface between the two would be a seam inside the same module
-// with exactly one implementation. It panics on a nil catalog because the
+// answers behind it is the composition root's decision — today the runtime's
+// own usage_events table, read in the order the store committed it. The
+// applier is an interface for the same reason: PostgreSQL answers behind it,
+// but nothing here may know that. The catalog is the one concrete use-case
+// type here rather than an interface, because it is this package's own
+// aggregate of use cases over an outbound port — the boundary points outward
+// at persistence, and the management listener asks inward at this; an
+// interface between the two would be a seam inside the same module with
+// exactly one implementation. It panics on a nil catalog because the
 // group-version read is a served route: an App without one would answer a
-// real endpoint with a nil-pointer panic instead of refusing to start.
-func New(version string, facts usagefacts.Reader, catalog *Catalog) *App {
+// real endpoint with a nil-pointer panic instead of refusing to start. A nil
+// applier is a composition-root defect and panics, exactly as a nil version
+// would be.
+func New(version string, facts usagefacts.Reader, catalog *Catalog, projections persistence.ProjectionApplier) *App {
 	if catalog == nil {
 		panic("application: New requires a catalog")
 	}
-	return &App{version: version, facts: facts, catalog: catalog}
+	if projections == nil {
+		panic("application: New requires a projection applier; the credential mirror has nowhere to land without one")
+	}
+	return &App{version: version, facts: facts, catalog: catalog, projections: projections}
 }
 
 // Version returns the build version injected into the process. It is a plain
