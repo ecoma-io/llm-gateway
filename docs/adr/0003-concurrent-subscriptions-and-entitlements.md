@@ -154,6 +154,16 @@ a crash cannot leave quota without its grant history.
 > draws down. The uniqueness key and the all-or-nothing property are
 > unchanged.
 
+> **Implemented by B5, the commerce foundation — with one deliberate gap.**
+> What shipped is the roll's Commerce half: the entitlement inserts and the
+> guarded cycle advance in one unit of work, with each grant definition's
+> alias-group **name** resolved to the group's current version through the
+> Control → Data seam read _before_ the unit opens. The funding bucket and
+> its `grant` legs are the Accounting context's; they join the same unit of
+> work at settlement (B6) without changing the key or the all-or-nothing
+> property — until then the entitlement rows are the complete record of what
+> a cycle granted ([commerce](../architecture/commerce.md)).
+
 ### Admission and the allocation waterfall
 
 For a request on alias `a`, the account has a request **admission timestamp**

@@ -76,32 +76,137 @@ enabled".
   side of the same capacity, and the two are reconciled rather than merged
   ([ADR 0006](../adr/0006-control-plane-and-data-plane.md);
   [accounting](accounting.md)).
+- The version's `recurring_price_minor_units` is recorded because the plan's
+  terms are what a subscription pinned — it is informational in the commerce
+  foundation, and nothing in commerce charges it: the charging, the holds and
+  the settlement are the Accounting context's (B6,
+  [ADR 0004](../adr/0004-reserve-and-settle-accounting.md)). Commerce prices
+  the _entitlement_; it never moves money.
 
 ### The cycle roll is a transaction
 
-The roll — verify renewal → create each entitlement and its funding bucket →
-append `grant` ledger legs → advance cycle fields — is **one** transaction:
-the grant-cycle-roll member of ADR 0001's four cross-context coordinated
-transactions (rule 6) — cross-context because the entitlement is Commerce's
-and the bucket it creates is an Accounting aggregate (ADR 0001), with its
-`grant` legs — keyed by `(subscription_id, cycle_number)`. It is also
-entirely **Control-local**: both contexts it writes are in the Control Plane,
-so no plane boundary is crossed and the single write survives intact
-([ADR 0006](../adr/0006-control-plane-and-data-plane.md)'s rule above ADR
-0001's rule 6 — no transaction crosses a plane). What crosses the
-boundary is the roll's result: it **publishes the new capacity to the
-runtime's quota projection**, and that publication is the only way new
-capacity reaches the hot path. Like every Control → Data message it is keyed
-by the entity's own identifier, so a redelivered publication is a no-op. A
-worker retry after a crash cannot grant a cycle twice; a partial roll cannot
-exist, and the new cycle's capacity cannot reach the runtime twice.
+The full roll of ADR 0001 (rule 6) — verify renewal → create each entitlement
+and its funding bucket → append `grant` ledger legs → advance cycle fields —
+is the grant-cycle-roll coordinated transaction, entirely Control-local
+(ADR 0006's rule above ADR 0001's rule 6 — no transaction crosses a plane),
+keyed by `(subscription_id, cycle_number)`.
 
-The guarantee the single transaction used to carry across both sides survives
-as two facts instead of one: admission draws down one cycle's ceiling row in
-one Data-Plane transaction, so a request lands wholly in one cycle, and the
-new cycle's capacity arrives as an idempotent publication rather than as a
-row both planes can lock. Cycle membership is decided by the database clock
-(`transaction_timestamp()`), not by any gateway node's clock.
+**What the commerce foundation ships is the Commerce half of that
+transaction**: the entitlement inserts and the guarded cycle advance in one
+unit of work. A roll is one fact or none — either the cycle turned and its
+entitlement rows exist, or neither happened; the schema's
+`(subscription, cycle, grant_definition)` key is belt to the statement's
+braces, so a retried roll cannot grant a cycle twice. The Accounting half —
+the bucket row and its `grant` legs — arrives with the settlement phase
+(B6): it joins the same unit of work, it does not change its key or its
+all-or-nothing property, and until it lands the entitlement rows are the
+complete record of what a cycle granted.
+
+The roll's mechanics, as implemented:
+
+- **The scopes are resolved before the unit of work opens.** A grant
+  definition pins the alias-group **name**, never a version id; the roll
+  resolves every definition's name to that group's _current_ version id
+  through the Control → Data seam's group-version read
+  ([ADR 0006](../adr/0006-control-plane-and-data-plane.md) §5) _outside_ the
+  transaction — a roll never holds row locks while waiting on another process
+  over a network. The entitlement rows carry the resolved version ids, which
+  is the re-snapshotting: cycle N's scope is whatever the group meant at
+  cycle N's roll.
+- **The advance is a guarded single statement.** Every predicate the domain
+  checked on the way in — the state, the cycle number, the period having
+  ended on the database's clock, renewal enabled, no scheduled cancellation
+  reaching into the new cycle, the owner account still active — is repeated
+  in the advance's WHERE clause. The statement, not the earlier read, is
+  what makes the roll true; a verdict that does not fire rolls the whole
+  unit of work back and skips the row benignly.
+- **A worker retry after a crash cannot grant a cycle twice; a partial roll
+  cannot exist.** The lock the unit of work takes on the subscription row is
+  what keeps two rollers from both opening the next cycle — the second
+  blocks, re-reads the advanced cycle, and skips.
+
+What crosses the plane boundary is still only the roll's **result**: the
+capacity publication to the runtime's quota projection, keyed by the
+entity's own identifier so a redelivered publication is a no-op (the
+projection seeding is a later phase; the contract it will consume is
+[below](#the-projection-seed-contract)). Cycle membership is decided by the
+database clock (`transaction_timestamp()`), not by any gateway node's clock.
+
+### The due-work lanes
+
+One worker pass runs five lanes, in an order the model's dependencies fix,
+each bounded by its own batch limit:
+
+| #   | Lane                  | Fires when (database clock)                                               | Verdict                                                                         |
+| --- | --------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| 1   | Promotions            | a `pending` subscription's `start_at` has arrived                         | promote: activate with cycle 1 and insert its entitlements, one unit of work    |
+| 2   | Cancellations         | a scheduled `cancel_at` has passed                                        | complete: `active` → `cancelled`, keeping the instructed instant                |
+| 3   | Rolls                 | an active, renewing subscription's `period_end` has passed                | roll into the next cycle with its entitlements, one unit of work                |
+| 4   | Subscription expiries | a fixed-term subscription's term has ended without renewal or instruction | `active`/`suspended` → `expired`, history intact                                |
+| 5   | Entitlement expiries  | an active entitlement's cycle has ended                                   | `active` → `expired`, the record-keeping flip — enforcement is the projection's |
+
+Cancellations run before rolls so a due instruction ends the subscription
+before the roll asks whether to extend it; promotions run first because a
+due pending subscription is dead capacity until it activates; the expiry
+lanes only observe what the first three left behind.
+
+The lanes' shared vocabulary:
+
+- **The database clock decides everything due.** Every scan predicate and
+  every guarded statement tests `transaction_timestamp()` — reached through
+  the persistence Clock port, never the process wall clock — and the clock
+  read inside a unit of work is transaction-stable, so one read per unit is
+  one read per decision.
+- **A verdict that does not fire is a skip, not an error.** The world moved
+  between the scan and the statement; the row stays exactly as due as it
+  was, nothing rolls back half-way, and the next pass asks again.
+- **The first real failure stops the pass.** A persistence failure, or a
+  scope the catalog cannot resolve, ends the run; every completed row is
+  already its own committed fact, the remainder stay due, and the next pass
+  resumes from the scans. A group the catalog has never opened is that
+  second kind of failure on purpose — a plan granting a scope that resolves
+  to nothing is a commercial catalog defect, and a roll that "skipped" it
+  every pass would silently sell a plan that grants nothing.
+- **Batch limits are the caller's**, passed per lane; zero disables a lane.
+  The composition root owns the numbers; no lane infers one from another's.
+
+### The projection seed contract
+
+What a cycle grants reaches the runtime as the **seed of that cycle's quota
+projection** — the publication ADR 0001's rule 5 and
+[ADR 0006](../adr/0006-control-plane-and-data-plane.md) name, delivered after
+the roll's unit of work has committed. The commerce foundation defines the
+contract; building the projection and its delivery is a later phase, and
+nothing ships either yet. For one entitlement, a seed carries:
+
+| Field                        | Value                                                              |
+| ---------------------------- | ------------------------------------------------------------------ |
+| `entitlement_id`             | the seed's identity — the key a redelivery is a no-op against      |
+| `subscription_id`            | the grant's owner                                                  |
+| `cycle_number`               | which cycle the ceiling belongs to                                 |
+| `alias_group_version_id`     | the resolved scope, exactly as the entitlement row carries it      |
+| `dimension`                  | `cost` in the foundation; a later dimension seeds its own ceilings |
+| `granted_amount`             | the ceiling in minor units — what the projection starts from       |
+| `period_start`, `period_end` | the cycle's `[start, end)` bounds, UTC                             |
+
+Three properties are the contract's spine:
+
+- **Keyed by the entity's own identifier.** A redelivered seed is a no-op —
+  the same idempotence every Control → Data message carries
+  ([cross-plane protocols](cross-plane-protocols.md)).
+- **Complete on its own.** The projection derives expiry from the carried
+  bounds and never asks the Control Plane a question, the same rule the
+  settlement facts obey in the other direction. The entitlement-expiry lane's
+  record-keeping flip ([above](#the-due-work-lanes)) is not a message to the
+  runtime; the bounds are.
+- **One direction only.** A seed states a ceiling; it carries no consumption.
+  Drawdown happens in the runtime's admission transaction, and what was
+  consumed comes back as usage facts — the Data → Control direction.
+
+The PAYG half of the projection — the balance ceiling the waterfall spills
+against — seeds by the same rule, but a balance for it to carry does not
+exist until the Accounting context settles one (B6); its contract arrives
+then, and nothing above changes.
 
 ## Entitlement scope and the allocation waterfall
 
@@ -111,6 +216,14 @@ singleton wildcard version). Editing a group's membership creates a new
 version; entitlements keep the version they were granted with, so purchased
 scope never changes retroactively. Entitlements are denominated in ledger
 currency (dimension `cost`; further dimensions are named extensions).
+
+A grant definition pins the group's **name**, never a version id: at each
+cycle roll the name is resolved to whatever version of that group is current
+_then_ ([above](#the-cycle-roll-is-a-transaction)), and the entitlement row
+carries the resolved version id. The wildcard group `*` is a legal scope like
+any named one — a plan may grant it, and nothing in the waterfall or the
+access rule special-cases the grant; specificity and fallback fall out of the
+ordering, not of the scope.
 
 For a reservation of `n` on alias `a` at admission:
 
@@ -208,8 +321,12 @@ the bound. Consequences:
 ## PAYG activation and behaviour
 
 - **Activation** is the per-account enablement flag — operator-set today,
-  self-service later. It authorises spending; it funds nothing. The PAYG
-  funding-bucket row exists from account creation with a zero balance —
+  self-service later. It authorises spending; it funds nothing. The flag is a
+  Commerce-owned row keyed by the account (`control.account_payg` — an absent
+  row is PAYG off), and its funding-bucket reference is write-once: commerce
+  refuses to re-point an assigned bucket, while the bucket row it names
+  remains the Accounting context's (B6). The PAYG funding-bucket row exists
+  from account creation with a zero balance —
   created as the Accounting-side write of the account-creation workflow, a
   choreography over IDs rather than a shared transaction (ADR 0001; the
   bucket is an Accounting aggregate), so enabling is only a flag flip.

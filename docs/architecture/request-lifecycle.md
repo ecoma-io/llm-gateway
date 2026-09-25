@@ -203,17 +203,24 @@ browser → console-api ──┬── control database (identity, commerce, th
 dataplane-api`, and the runtime is not involved
   ([ADR 0006](../adr/0006-control-plane-and-data-plane.md) §5). The port is
   where the boundary is legible in code; the fact half of it has an adapter
-  spoken today ([above](#post-request-fact-delivery--a-separate-path)), while
-  the management half has none until the first management operation lands.
+  spoken today ([above](#post-request-fact-delivery--a-separate-path)), and
+  the management half now has its first spoken operation: the alias-group
+  current-version read, called through the `CatalogReader` port by the
+  commerce due-work lanes to resolve grant-definition scopes before their
+  units of work open ([commerce](commerce.md)). The interactive operations
+  the port is shaped for still have no use case behind it.
 - **It runs at a different tempo.** This path is human-paced and low-volume;
   the runtime's is latency-bound and the product's availability. Neither
   shares a process, a deploy or a database with the other.
 
-There is deliberately no normative step list for this path yet. The domains it
-would walk through — sign-in, subscription, configuration — are not built, and
-a numbered lifecycle for them would be a design the ADRs have not made. What
-is decided is that the path exists, that it is disjoint from the runtime's, and
-that its only way to reach the Data Plane is the management port.
+There is deliberately no normative step list for this path yet. The commerce
+domain's application half is built — the plan, subscription and PAYG use cases
+with their persistence ([commerce](commerce.md)) — but no transport serves
+them: the console client calls none of them yet, and sign-in and configuration
+are not built at all. A numbered lifecycle for the path would still be a
+design the ADRs have not made. What is decided is that the path exists, that
+it is disjoint from the runtime's, and that its only way to reach the Data
+Plane is the management port.
 
 ## Asynchronous analytics — a separate path
 
