@@ -75,8 +75,8 @@ func rules(self string) []rule {
 			forbidden: []string{"github.com/valkey-io/valkey-go"},
 		},
 		{
-			why:       "HTTP is a transport concern: the composition root and an inbound adapter may import it, and the application, the ports and any domain package may not — a second HTTP surface in this module is a request path nobody declared and nobody measures",
-			allowed:   []string{"cmd", "internal/adapters/inbound"},
+			why:       "HTTP is a transport concern: the composition root, an inbound adapter serving it, and the outbound adapters that dial away from this process may import it — an executor adapter speaks HTTP to its provider and the egress adapter dials through proxies — while the application, the ports and any domain package may not, because an HTTP surface there is a request path nobody declared and nobody measures",
+			allowed:   []string{"cmd", "internal/adapters/inbound", "internal/adapters/outbound"},
 			forbidden: []string{"net/http"},
 		},
 		{
@@ -289,7 +289,7 @@ func TestTheRuleRosterIsTheDeclaredOne(t *testing.T) {
 		"<module>/internal/ports <- cmd, internal/application, internal/adapters, internal/ports",
 		"database/sql <- cmd, internal/ports, internal/adapters/outbound",
 		"github.com/valkey-io/valkey-go <- internal/adapters/outbound/valkey",
-		"net/http <- cmd, internal/adapters/inbound",
+		"net/http <- cmd, internal/adapters/inbound, internal/adapters/outbound",
 	}
 	sort.Strings(want)
 

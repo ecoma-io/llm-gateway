@@ -68,8 +68,12 @@ var capabilities = []capability{
 	{
 		prefix: "net/http",
 		// A second HTTP surface in this module: the transport imported by a
-		// package that is not a transport.
-		permitted: "internal/adapters/inbound/http",
+		// package that is not a transport. The permitted side is the outbound
+		// tree — an executor adapter speaks HTTP to its provider and the egress
+		// adapter dials through proxies, the widening this module's provider
+		// foundation makes deliberately — and the refused side is unchanged:
+		// the application still never holds a client of its own.
+		permitted: "internal/adapters/outbound",
 		refused:   "internal/application",
 	},
 	{
