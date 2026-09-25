@@ -45,10 +45,10 @@ import (
 var ErrNotFound = errors.New("persistence: not found")
 
 // Pinger reports whether the backing store is answering right now. Readiness
-// is what it is for: when a handler serves /readyz it will gate on this — a
-// gate no wiring reaches today, which is why /readyz still answers
-// statically — and nothing else should treat a successful ping as evidence
-// that a particular query will succeed.
+// is what it is for: /readyz gates on this, over the port itself rather than
+// through the application — there is no use case for a ping — and nothing else
+// should treat a successful ping as evidence that a particular query will
+// succeed.
 type Pinger interface {
 	// Ping verifies that a connection to the store can be made — or is
 	// already pooled — within ctx.

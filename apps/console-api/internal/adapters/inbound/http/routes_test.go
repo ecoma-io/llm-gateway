@@ -34,7 +34,7 @@ const runtimeNamespace = "/v1/"
 // alone.
 func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 	got := []string{}
-	for _, rt := range routes(application.New("test")) {
+	for _, rt := range routes(application.New("test"), &answeringPinger{}) {
 		got = append(got, rt.method+" "+rt.path)
 	}
 	sort.Strings(got)
@@ -51,7 +51,7 @@ func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 // exists to hold, in the one place it is mechanically checkable: whatever the
 // Control Plane API grows, it does not grow the LLM request path.
 func TestTheControlPlaneServesNoInferenceRoute(t *testing.T) {
-	for _, rt := range routes(application.New("test")) {
+	for _, rt := range routes(application.New("test"), &answeringPinger{}) {
 		if strings.HasPrefix(rt.path, runtimeNamespace) {
 			t.Errorf("the Control Plane API declares %s %s: %s belongs to the Data Plane runtime (ADR 0006)", rt.method, rt.path, runtimeNamespace)
 		}
@@ -65,7 +65,7 @@ func TestTheControlPlaneServesNoInferenceRoute(t *testing.T) {
 // in server.go, so nothing downstream would correct it.
 func TestEveryRouteIsMountable(t *testing.T) {
 	seen := map[string]bool{}
-	for _, rt := range routes(application.New("test")) {
+	for _, rt := range routes(application.New("test"), &answeringPinger{}) {
 		if !strings.HasPrefix(rt.path, "/") {
 			t.Errorf("%s %s: a route path must begin with /", rt.method, rt.path)
 		}

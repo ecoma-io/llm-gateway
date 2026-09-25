@@ -3,7 +3,8 @@
 //
 // It owns transport concerns — routing, middleware, request identifiers and
 // wire errors — then calls the application for use-case work. Product endpoints
-// do not exist yet: health and readiness remain infrastructure-level, while
+// do not exist yet: liveness stays infrastructure-level, readiness gates on the
+// Control Plane's own store through the narrow port the probe needs, and
 // GET /version proves the HTTP → application → response path every domain
 // endpoint will follow. The public contract is api/openapi/console.yaml; it
 // changes before this package does, never after.
@@ -22,6 +23,7 @@ import (
 	"path"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/application"
+	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
 const (
@@ -40,17 +42,33 @@ const (
 	// cause. A client can act on the status and request ID; it must not learn
 	// about a database, a provider, a path, or a stack frame it cannot fix.
 	internalErrorMessage = "internal error"
+
+	// notReadyMessage is the same discipline for the readiness probe's one
+	// refusal: the client learns that this service cannot receive traffic yet,
+	// and nothing about which dependency is missing or why it is not answering.
+	notReadyMessage = "the service is not ready to receive traffic"
 )
 
 // New returns the console-api's HTTP handler: middleware first, routes after.
 //
+// readiness is the persistence.Pinger the readiness probe gates on, carried
+// alongside the application rather than through it: the probe asks a fact
+// about this process's wiring — can the pool answer — and no use case produces
+// that, so the narrow port the store already satisfies is the whole of what
+// this package is handed for it. A nil readiness is refused here rather than
+// answered around, because a probe with no store behind it is exactly the
+// static /readyz this replaces.
+//
 // The surface itself is declared in routes.go and mounted here; this function
 // owns everything around it — the middleware, the two fallbacks below, and the
 // order they are composed in.
-func New(app *application.App) stdhttp.Handler {
+func New(app *application.App, readiness persistence.Pinger) stdhttp.Handler {
+	if readiness == nil {
+		panic("http: New requires a readiness Pinger; /readyz has nothing to gate on without one")
+	}
 	mux := stdhttp.NewServeMux()
 
-	for _, rt := range routes(app) {
+	for _, rt := range routes(app, readiness) {
 		register(mux, rt)
 	}
 
@@ -148,6 +166,9 @@ func writeError(w stdhttp.ResponseWriter, r *stdhttp.Request, err error) {
 		// not belong in an operator's log line. Log the correlation fact only.
 		log.Printf("%s request_id=%s internal error", serviceName, requestID)
 	}
+	// The readiness refusal is not this branch: its dependency name is the one
+	// operational fact the operator needs, and notReady writes that line
+	// itself before getting here.
 	writeJSON(w, status, errorEnvelope{
 		Error:     errorBody{Code: code, Message: message},
 		RequestID: requestID,
@@ -212,4 +233,22 @@ func (methodNotAllowedError) Error() string {
 
 func (methodNotAllowedError) response() (int, string, string) {
 	return stdhttp.StatusMethodNotAllowed, "method_not_allowed", "method not allowed"
+}
+
+// notReadyError is the transport fact that the process is up and one of its
+// own dependencies is not: the readiness probe's one refusal. It maps itself
+// like its siblings, because readiness is a fact about this process's wiring
+// and no use case produced it. The code is service_unavailable rather than
+// internal because the condition is expected to clear — a caller retries
+// later rather than differently — and the message is fixed because which
+// dependency is missing is the operator's fact, carried by the log line in
+// notReady, never the client's.
+type notReadyError struct{}
+
+func (notReadyError) Error() string {
+	return "not ready"
+}
+
+func (notReadyError) response() (int, string, string) {
+	return stdhttp.StatusServiceUnavailable, "service_unavailable", notReadyMessage
 }

@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	stdhttp "net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +17,55 @@ import (
 // a dead listener is not swallowed — only exists once a socket is involved.
 // Handler behaviour belongs to internal/adapters/inbound/http and is tested there through
 // httptest, without a process.
+
+// TestNewHandlerGatesReadinessOnTheStoreItWasGiven is the wiring test: the
+// composition the process actually serves, driven through both answers of the
+// store it is handed. A handler rebuilt without the store is the static
+// /readyz this composition removed, and nothing else in this package would
+// notice — the route package proves the probe gates, this proves the process
+// gave it something to gate on.
+func TestNewHandlerGatesReadinessOnTheStoreItWasGiven(t *testing.T) {
+	tests := []struct {
+		name       string
+		pingErr    error
+		wantStatus int
+	}{
+		{name: "a store that answers is ready", wantStatus: stdhttp.StatusOK},
+		{name: "a store that does not answer is not ready", pingErr: errors.New("ping: connection refused"), wantStatus: stdhttp.StatusServiceUnavailable},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := newHandler("v0.1.0", answeringStore{pingErr: tt.pingErr})
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(stdhttp.MethodGet, "/readyz", nil))
+
+			if rec.Code != tt.wantStatus {
+				t.Errorf("GET /readyz: status = %d, want %d", rec.Code, tt.wantStatus)
+			}
+		})
+	}
+
+	// The same handler still serves the version stamped into the process: the
+	// store is a dependency of the probe, not a replacement for the
+	// application.
+	rec := httptest.NewRecorder()
+	newHandler("v0.1.0", answeringStore{}).ServeHTTP(rec, httptest.NewRequest(stdhttp.MethodGet, "/version", nil))
+	if got := rec.Body.String(); got != "{\"version\":\"v0.1.0\"}\n" {
+		t.Errorf("GET /version: body = %q, want the stamped version", got)
+	}
+}
+
+// answeringStore stands in for the persistence.Store the process builds from
+// its pool: the one member the readiness probe asks, and the answer a test
+// wants.
+type answeringStore struct {
+	pingErr error
+}
+
+// Ping implements the readiness port the server constructor is handed.
+func (s answeringStore) Ping(context.Context) error { return s.pingErr }
 
 func TestRunDrainsAnInFlightRequestBeforeReturning(t *testing.T) {
 	listener := listenForTest(t)
