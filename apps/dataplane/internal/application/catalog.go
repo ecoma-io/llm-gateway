@@ -20,15 +20,25 @@ import (
 // overwriting a state its caller never saw. The loser of a swap re-reads and
 // re-applies from the state that actually exists.
 //
-// No production code constructs this type yet, and no HTTP surface reaches
-// it: B3 is the foundation phase, and the management surface that will call
-// these methods is a later phase's contract change — an OpenAPI edit is
-// explicitly out of scope here. (The test suite constructs it over fakes;
-// production wiring arrives with the runtime phase.) That is also why no
-// method maps failures to application.Error categories: the transport that
-// owns that mapping does not exist yet, and inventing its statuses ahead of
-// it would be a shape guessed twice. Callers match the domain's sentinels
+// Production constructs this type in cmd/dataplane over the PostgreSQL
+// adapters, and one read of it is served over the management chain today:
+// CurrentGroupVersion is the catalog fact the Control Plane's commerce roll
+// asks for before it can pin an entitlement's scope (ADR 0006 §7). The
+// lifecycle moves below are still write-side only, and no HTTP surface reaches
+// them — the management operations that will drive them are later phases'
+// contract changes, and an OpenAPI edit for those stays out of scope until
+// there is something to document. That is also why no method below maps
+// failures to application.Error categories: the transport that would own that
+// mapping does not exist for them yet, and inventing its statuses ahead of it
+// would be a shape guessed twice. Callers match the domain's sentinels
 // (errors.Is) and the persistence port's ErrNotFound.
+//
+// The one method that leaves that shape is the read, precisely because a
+// transport does reach it: its not-found outcome crosses the private protocol
+// as a contracted 404, so CurrentGroupVersion carries it as this package's
+// NotFound — the one application.Error category a Catalog method produces —
+// rather than leaving the transport to re-decide what a persistence sentinel
+// means on the wire.
 //
 // What this layer deliberately does not do: resolve an alias to a route. A
 // request naming an alias is admitted against the aggregate's bounds and
@@ -402,4 +412,57 @@ func (c *Catalog) GroupVersion(ctx context.Context, groupName string, version in
 		return nil, fmt.Errorf("application: read group version %s@%d: %w", groupName, version, err)
 	}
 	return snapshot, nil
+}
+
+// CurrentGroupVersion returns the snapshot a Control Plane entitlement pins:
+// the group's highest version, because that is what "current" means in this
+// catalog — OpenGroupVersion above opens highest+1 and never edits what
+// exists, so the newest number is by construction the snapshot a roll would
+// have pinned, and the schema's column comment states the same rule in its
+// own vocabulary. The read is two statements — the highest number, then the
+// snapshot at it — and they are deliberately not pinned into one instant:
+// versions are immutable, so the worst a concurrent open between the two
+// statements can produce is the snapshot that was current an instant earlier,
+// which is still a real version whose membership never changes. A caller that
+// pins that id pinned something true; the roll that raced it belongs to the
+// next grant, not to a retry of this read.
+//
+// A group with no version at all is an answer, not a failure of the read: a
+// Control Plane asks before the operator has provisioned, and the wildcard
+// `*` is only another name here — it is created by OpenWildcardVersion like
+// any other row, so an unprovisioned `*` misses exactly the way an
+// unprovisioned named group does. The outcome is this package's NotFound,
+// which the management surface maps to its 404; everything else — a store
+// that will not answer, a statement that will not run — stays a wrapped
+// infrastructure error, because a caller must not be invited to treat "the
+// catalog is down" as "this group does not exist" and pin a scope on the
+// difference.
+func (c *Catalog) CurrentGroupVersion(ctx context.Context, groupName string) (*catalog.AliasGroupVersion, error) {
+	highest, err := c.versions.HighestVersion(ctx, groupName)
+	if err != nil {
+		return nil, fmt.Errorf("application: read current group version %s: %w", groupName, err)
+	}
+	if highest == 0 {
+		// The port's 0 — the same 0 that lets `highest + 1` open version 1
+		// without a special case — is here the not-found it means.
+		return nil, NotFound("no version of the requested alias group exists")
+	}
+	snapshot, err := c.versions.ByGroupAndVersion(ctx, groupName, highest)
+	if err != nil {
+		return nil, fmt.Errorf("application: read current group version %s@%d: %w", groupName, highest, err)
+	}
+	return snapshot, nil
+}
+
+// CurrentGroupVersion on App is the shape the management listener calls. The
+// method is one receiver wide on purpose, the same discipline
+// ReadUsageEvents holds: inbound adapters call the application, not each
+// other's use-case types, so a surface's vocabulary stays the boundary's own
+// and a handler cannot reach past it into a use-case struct it half-owns.
+// It returns the domain snapshot whole and lets the transport choose the
+// three fields the private protocol carries — the member set is not among
+// them, because which aliases a version contains is admission's question,
+// asked inside this process, never the Control Plane's over this read.
+func (app *App) CurrentGroupVersion(ctx context.Context, groupName string) (*catalog.AliasGroupVersion, error) {
+	return app.catalog.CurrentGroupVersion(ctx, groupName)
 }

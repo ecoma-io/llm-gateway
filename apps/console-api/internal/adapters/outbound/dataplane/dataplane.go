@@ -1,7 +1,8 @@
-// Package dataplane is the console-api's outbound HTTP adapter for the usage
-// fact feed: the Direction Data → Control half of the one cross-plane seam
-// (ADR 0006 §5), spoken over the management contract in
-// api/openapi/shared/usage-facts.yaml and its operation in dataplane.yaml.
+// Package dataplane is the console-api's outbound HTTP adapter for the
+// cross-plane seam's spoken operations (ADR 0006 §5), over the management
+// contract in api/openapi/dataplane.yaml: the usage fact feed's pages (Data →
+// Control) and the alias-group version read the commerce roll resolves its
+// scopes with (Control → Data).
 //
 // It is the mirror of this module's other outbound adapters in everything but
 // its dependency: postgres and valkey reach infrastructure this deployment
@@ -53,6 +54,17 @@ import (
 // nothing in the Control Plane chooses which path the feed lives at.
 const usageEventsPath = "/internal/usage-events"
 
+// currentGroupVersionPath is the fixed part of the group-version read's path,
+// as dataplane.yaml declares it: the group name is the one path segment
+// between this prefix and the /versions/current suffix, escaped. Like
+// usageEventsPath it is the contract's, not the caller's.
+const (
+	currentGroupVersionPrefix = "/internal/alias-groups/"
+	// currentGroupVersionSuffix completes the contract's path;
+	// the read is of a group's *current* version, not of the group.
+	currentGroupVersionSuffix = "/versions/current"
+)
+
 // usageCursorMaxLength is the bound the contract puts on a cursor
 // (`shared/usage-facts.yaml`, UsageCursor: `maxLength: 512`), and it is checked
 // on the way *in* rather than trusted.
@@ -100,12 +112,14 @@ type Client struct {
 	credential string
 }
 
-// New returns the feed reader described by a client, a base URL and a service
+// New returns the management client described by a base URL and a service
 // credential. The base URL may carry a path prefix — a deployment behind a
 // gateway serves the management surface under one — but not a query or a
 // fragment: either would be silently merged into, or dropped from, every
 // request this adapter builds, and a configuration value that part of the
-// request ignores is a configuration value that lies about what it does.
+// request ignores is a configuration value that lies about what it does. Each
+// operation's path is joined per call, so one client speaks every operation
+// the contract gives this seam.
 //
 // It panics on a nil *http.Client, on a base URL that is not an absolute
 // http(s) URL and on an empty credential, for the reason postgres.New panics
@@ -133,14 +147,25 @@ func New(httpClient *http.Client, baseURL, credential string) *Client {
 		panic("dataplane: New requires a service credential")
 	}
 
-	base.Path = strings.TrimSuffix(base.Path, "/") + usageEventsPath
 	return &Client{httpClient: httpClient, endpoint: *base, credential: credential}
 }
 
 // Compile-time proof that the adapter satisfies the port it claims to, so a
 // signature drifting from the seam is a build failure rather than a discovery
 // at the composition root.
-var _ port.UsageFacts = (*Client)(nil)
+var (
+	_ port.UsageFacts    = (*Client)(nil)
+	_ port.CatalogReader = (*Client)(nil)
+)
+
+// url returns the client's endpoint with path appended — one operation path
+// per call, because the client now speaks two of the contract's operations
+// and a base URL pre-joined to one of them would be wrong for the other.
+func (c *Client) url(path string) url.URL {
+	joined := c.endpoint
+	joined.Path = strings.TrimSuffix(joined.Path, "/") + path
+	return joined
+}
 
 // ReadUsageEvents fetches the page of facts strictly after `after`, and maps
 // the answer onto the port's Page.
@@ -153,7 +178,7 @@ var _ port.UsageFacts = (*Client)(nil)
 // untouched. Nothing here trims it, defaults it, validates its shape, compares
 // it or derives one.
 func (c *Client) ReadUsageEvents(ctx context.Context, after string, limit int) (port.Page, error) {
-	requestURL := c.endpoint
+	requestURL := c.url(usageEventsPath)
 	query := requestURL.Query()
 	if after != "" {
 		query.Set("after", after)
@@ -325,6 +350,100 @@ func (r eventResponse) event() (port.Event, error) {
 		OccurredAt:    *r.OccurredAt,
 		Payload:       *r.Payload,
 	}, nil
+}
+
+// CurrentGroupVersion asks the Data Plane which version of the named alias
+// group is current, and maps the answer onto the port's GroupVersion.
+//
+// The group name is the request's one variable, and it travels as one escaped
+// path segment — url.PathEscape, not query or body, because that is where the
+// contract puts it and the wildcard group's name "*" must arrive as a
+// segment of its own. The escaped segment is therefore carried in RawPath
+// beside the decoded one in Path: String() emits RawPath when it is a valid
+// encoding of Path, and an escape carried in Path alone would be re-escaped
+// into %25 on the wire — the wildcard would travel as %252A, and the
+// catalog would look up a name its grammar cannot hold.
+//
+// Nothing here interprets the name: whether a group exists is the catalog's
+// answer, and a group that has none is the one status — 404 — this
+// operation distinguishes, because it is the one its caller acts on
+// differently from every transport failure.
+func (c *Client) CurrentGroupVersion(ctx context.Context, groupName string) (port.GroupVersion, error) {
+	if groupName == "" {
+		return port.GroupVersion{}, errors.New("dataplane: current group version requires a group name")
+	}
+	requestURL := c.url(currentGroupVersionPrefix + groupName + currentGroupVersionSuffix)
+	requestURL.RawPath = currentGroupVersionPrefix + url.PathEscape(groupName) + currentGroupVersionSuffix
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL.String(), nil)
+	if err != nil {
+		return port.GroupVersion{}, fmt.Errorf("dataplane: build the group version request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+c.credential)
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return port.GroupVersion{}, fmt.Errorf("dataplane: read current group version: %w", transportCause(err))
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	switch response.StatusCode {
+	case http.StatusOK:
+		// The body is decoded below; a 200 that will not decode is the peer
+		// breaking the contract, and the refusal is the answer.
+	case http.StatusNotFound:
+		return port.GroupVersion{}, fmt.Errorf("dataplane: read current group version %q: %w", groupName, port.ErrGroupNotFound)
+	default:
+		// As with the feed: one status in the message, no URL — the status is
+		// the part an operator needs, and the credential is in the request.
+		return port.GroupVersion{}, fmt.Errorf("dataplane: read current group version: unexpected status %d", response.StatusCode)
+	}
+
+	var body groupVersionResponse
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		return port.GroupVersion{}, fmt.Errorf("dataplane: read current group version: %w: the body would not decode as a group version: %w", port.ErrMalformedAnswer, err)
+	}
+	groupVersion, err := body.groupVersion(groupName)
+	if err != nil {
+		return port.GroupVersion{}, fmt.Errorf("dataplane: read current group version: %w: %w", port.ErrMalformedAnswer, err)
+	}
+	return groupVersion, nil
+}
+
+// groupVersionResponse is the wire shape of the group-version read, field for
+// field as the contract declares it. The required fields are pointers for the
+// reason the page's are: with a plain value, a body that omits the field
+// reads as the zero value and the omission passes as an answer.
+type groupVersionResponse struct {
+	GroupName      *string `json:"group_name"`
+	Version        *int    `json:"version"`
+	GroupVersionID *string `json:"group_version_id"`
+}
+
+// groupVersion translates the wire shape and refuses every way it can fail to
+// be an answer to the question asked: each field present, the version at
+// least the 1 the catalog's numbering starts at, and the echoed group name
+// the one this request named — an answer about a different group is not an
+// answer, and a caller that pinned it would scope an entitlement by a
+// version the question was never about. Every refusal wraps the port's
+// ErrMalformedAnswer, so a caller distinguishes the peer breaking the
+// contract from a transport failure without parsing text.
+func (r groupVersionResponse) groupVersion(asked string) (port.GroupVersion, error) {
+	switch {
+	case r.GroupName == nil:
+		return port.GroupVersion{}, errors.New("dataplane: the group version answer carried no group_name, which the contract requires")
+	case r.Version == nil:
+		return port.GroupVersion{}, errors.New("dataplane: the group version answer carried no version, which the contract requires")
+	case *r.Version < 1:
+		return port.GroupVersion{}, fmt.Errorf("dataplane: the group version answer carried version %d, and versions start at 1", *r.Version)
+	case r.GroupVersionID == nil:
+		return port.GroupVersion{}, errors.New("dataplane: the group version answer carried no group_version_id, which the contract requires")
+	case *r.GroupVersionID == "":
+		return port.GroupVersion{}, errors.New("dataplane: the group version answer carried an empty group_version_id")
+	case *r.GroupName != asked:
+		return port.GroupVersion{}, fmt.Errorf("dataplane: the group version answer names %q, not the %q this call asked about", *r.GroupName, asked)
+	}
+	return port.GroupVersion{GroupName: *r.GroupName, Version: *r.Version, GroupVersionID: *r.GroupVersionID}, nil
 }
 
 // transportCause strips the URL net/http attaches to a failed request.

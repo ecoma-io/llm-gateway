@@ -1,16 +1,16 @@
 // Package application is the console-api's use-case boundary.
 //
 // HTTP translates a request into a call here, and translates this package's
-// result or typed error back into a response. Product domains do not exist yet:
-// version is the one process fact an HTTP caller may ask the application for,
-// which makes this package a boundary without pretending it is a domain.
+// result or typed error back into a response. Two product domains live here
+// so far — identity, the ownership root, and commerce, the commercial
+// authority — beside version, the one process fact an HTTP caller may ask the
+// application for today.
 //
-// What the Control Plane's domain eventually becomes — accounts, sessions,
-// subscriptions, entitlements, the financial ledger — lands in an
-// internal/domain package this one depends on. Nothing here reaches for an
-// adapter: the outbound ports this application would call live in
-// internal/ports/outbound, and a concrete PostgreSQL or Valkey type appearing
-// in this file would be the boundary failing, not a shortcut.
+// Every domain lands in an internal/domain package this one depends on.
+// Nothing here reaches for an adapter: the outbound ports this application
+// calls live in internal/ports/outbound, and a concrete PostgreSQL, Valkey or
+// HTTP type appearing in this package would be the boundary failing, not a
+// shortcut.
 package application
 
 import "errors"

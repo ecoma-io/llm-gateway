@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/application"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/persistence"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/usagefacts"
 )
 
@@ -26,12 +27,49 @@ func (f noFacts) Read(context.Context, string, int) (usagefacts.Page, error) {
 	return usagefacts.Page{}, errors.New("the runtime surface has no fact reader")
 }
 
+// The catalog ports behind the application this package's tests build. They
+// are the same assertion as noFacts, one layer further out: the runtime's
+// surface answers no catalog question — the group-version read is the
+// management listener's operation, and a runtime route that reached into the
+// catalog would put a cross-plane fact on the address that serves LLM
+// traffic — so each port fails the test it is reached from. The catalog itself
+// is the real one over these ports, because the use case is concrete rather
+// than an interface and New refuses an App without one; what is stubbed is the
+// store it would have to ask, which is where a leak would show.
+type silentStore struct {
+	persistence.Store
+	t *testing.T
+}
+
+// WithinTx implements persistence.Store.
+func (s silentStore) WithinTx(context.Context, func(context.Context) error) error {
+	s.t.Error("the runtime surface opened a unit of work against the catalog; that is the management listener's surface, not this one")
+	return errors.New("the runtime surface has no catalog")
+}
+
+type silentBackends struct{ persistence.Backends }
+
+type silentAliases struct{ persistence.ModelAliases }
+
+type silentVersions struct {
+	persistence.AliasGroupVersions
+	t *testing.T
+}
+
+// HighestVersion implements persistence.AliasGroupVersions — the first read
+// CurrentGroupVersion makes, and so the one a leaking route hits first.
+func (v silentVersions) HighestVersion(context.Context, string) (int, error) {
+	v.t.Error("the runtime surface read the catalog; that is the management listener's surface, not this one")
+	return 0, errors.New("the runtime surface has no catalog")
+}
+
 // newTestApp returns the application under test for this package's handlers.
 //
-// It exists so that the fact reader this process needs — and this surface does
-// not use — is stated once, in a file whose name says why it is there, instead
+// It exists so that the ports this process needs — and this surface does not
+// use — are stated once, in a file whose name says why it is there, instead
 // of at every call site as an argument a reader has to interpret.
 func newTestApp(t *testing.T, version string) *application.App {
 	t.Helper()
-	return application.New(version, noFacts{t: t})
+	catalog := application.NewCatalog(silentStore{t: t}, silentBackends{}, silentAliases{}, silentVersions{t: t})
+	return application.New(version, noFacts{t: t}, catalog)
 }

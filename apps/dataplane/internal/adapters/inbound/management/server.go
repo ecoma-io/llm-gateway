@@ -92,7 +92,13 @@ func New(app *application.App, credential string) stdhttp.Handler {
 	// redirect through, and every reachable response stays the one JSON shape
 	// the protocol declares.
 	handler := stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-		if r.URL.Path != cleanPath(r.URL.Path) {
+		// The structure is judged on the escaped path, not the decoded one:
+		// %2F is a character inside one segment, and judging the decoded form
+		// would refuse names whose encoding merely looks like a doubled
+		// slash or a dot segment — names the group grammar admits and the
+		// contract promises travel as one segment.
+		escaped := r.URL.EscapedPath()
+		if escaped != cleanPath(escaped) {
 			writeFailure(w, r, notFoundFailure())
 			return
 		}

@@ -61,8 +61,8 @@ func routes(app *application.App) []route {
 				writeJSON(w, stdhttp.StatusOK, versionResponse{Version: app.Version()})
 			},
 		},
-		// The fact feed: the one cross-plane operation that exists today, and
-		// the only one on this surface that a caller authenticates for. The
+		// The fact feed: the first cross-plane operation, and the first one on
+		// this surface that a caller authenticates for. The
 		// path string is the one the façade contracts, and it is the same
 		// string here on purpose rather than by coincidence — the façade names
 		// the path itself rather than rewriting one it was given, so there is
@@ -71,15 +71,33 @@ func routes(app *application.App) []route {
 		// own statuses from what this listener said. The protocol itself,
 		// and the reason it is a page in a document rather than a fourth
 		// OpenAPI file, are in docs/architecture/cross-plane-protocols.md.
-		//
-		// It is deliberately the only authenticated row: a second one arrives
-		// with a second operation, and the guard is written so that adding it
-		// unauthenticated is a visible decision on the row rather than an
-		// omission nobody reads.
 		{
 			method:        stdhttp.MethodGet,
 			path:          "/internal/usage-events",
 			handler:       usageEvents(app),
+			authenticated: true,
+		},
+		// The catalog read the Control Plane's commerce roll makes: for one
+		// alias-group name, which catalog version is currently current, so an
+		// entitlement can pin that version's immutable id as its scope. It is
+		// the second authenticated row, and the guard is written so that a
+		// future unauthenticated row stays a visible decision on the row rather
+		// than an omission nobody reads — a catalog fact is exactly the thing
+		// ADR 0006 §7 says never leaves except to the other plane's service
+		// identity.
+		//
+		// The same string-not-rewritten rule holds: groupVersionPath is what
+		// the façade calls, and the path template lives in
+		// api/openapi/dataplane.yaml because from the Control Plane's side of
+		// the seam this operation is ordinary contract surface. Here it is the
+		// private protocol's path — the segment the caller names travels
+		// through it unmodified, and what this listener answers is a catalog
+		// fact, not a page of a feed: three fields, one of them the id the
+		// control database stores.
+		{
+			method:        stdhttp.MethodGet,
+			path:          groupVersionPath,
+			handler:       currentGroupVersion(app),
 			authenticated: true,
 		},
 	}

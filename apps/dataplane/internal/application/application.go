@@ -92,19 +92,31 @@ func Internal(cause error) *Error {
 type App struct {
 	version string
 	facts   usagefacts.Reader
+	catalog *Catalog
 }
 
 // New constructs the dataplane application around the build version supplied
-// by cmd/dataplane and the fact reader the composition root chose.
+// by cmd/dataplane, the fact reader the composition root chose, and the
+// catalog use cases the management listener serves reads from.
 //
 // The version argument is a plain string because the command's package-level
 // variable remains the one ldflags source; this package receives that value
 // and never recreates it. The reader is an interface because which store
 // answers behind it is the composition root's decision — and today that
 // decision resolves to an adapter whose answer is ErrSourceUnavailable, which
-// is the truth until the accounting schema exists.
-func New(version string, facts usagefacts.Reader) *App {
-	return &App{version: version, facts: facts}
+// is the truth until the accounting schema exists. The catalog is the one
+// concrete use-case type here rather than an interface, because it is this
+// package's own aggregate of use cases over an outbound port — the boundary
+// points outward at persistence, and the management listener asks inward at
+// this; an interface between the two would be a seam inside the same module
+// with exactly one implementation. It panics on a nil catalog because the
+// group-version read is a served route: an App without one would answer a
+// real endpoint with a nil-pointer panic instead of refusing to start.
+func New(version string, facts usagefacts.Reader, catalog *Catalog) *App {
+	if catalog == nil {
+		panic("application: New requires a catalog")
+	}
+	return &App{version: version, facts: facts, catalog: catalog}
 }
 
 // Version returns the build version injected into the process. It is a plain

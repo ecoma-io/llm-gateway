@@ -43,6 +43,7 @@ func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 
 	want := []string{
 		"GET /healthz",
+		"GET /internal/alias-groups/{group_name}/versions/current",
 		"GET /internal/usage-events",
 		"GET /readyz",
 		"GET /version",
@@ -140,10 +141,10 @@ func TestEveryRouteIsMountable(t *testing.T) {
 }
 
 // newTestApp returns the application this package's tables are built against.
-// The reader is the stub in management_test.go: building a route table reads no
-// facts, so it stays untouched, and the tests that do read record what they saw
-// there.
+// The reader is the stub in management_test.go and the catalog the stub world
+// in groupversions_test.go: building a route table reads neither, so both stay
+// untouched, and the tests that do read record what they saw there.
 func newTestApp(t *testing.T) *application.App {
 	t.Helper()
-	return application.New("test", &stubFacts{})
+	return application.New("test", &stubFacts{}, newStubCatalog(&stubVersions{}))
 }

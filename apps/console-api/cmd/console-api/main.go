@@ -84,7 +84,14 @@ func main() {
 		log.Printf("console-api postgres: %v", err)
 		os.Exit(1)
 	}
-	// The persistence.Store is constructed here (postgres.New(db)) by the change that first gives a use case a query to run against Control Plane state.
+	// The persistence.Store, the repositories and the use cases are
+	// constructed here (postgres.New, the NewXxx repositories, application's
+	// NewXxx use cases) by the change that first puts a caller on the other
+	// side of them in this process — an HTTP route, a worker loop — not
+	// before. The foundation phases (identity, commerce) ship their use cases
+	// and repositories tested at the application boundary; wiring them ahead
+	// of a caller would be composition guessed at, and a guessed composition
+	// is exactly what this file exists to refuse.
 
 	// One startup line naming the target — host, port, database — and
 	// nothing else. The DSN carries the role's password, so the pieces are

@@ -472,6 +472,74 @@ func TestGroupVersionReadMissIsThePortSentinel(t *testing.T) {
 	}
 }
 
+func TestCurrentGroupVersionReturnsTheHighestSnapshot(t *testing.T) {
+	world := newCatalogWorld()
+	cat := newCatalog(world)
+	members := []catalog.AliasID{"alias-1", "alias-2"}
+	if _, err := cat.OpenGroupVersion(t.Context(), "frontier", members); err != nil {
+		t.Fatalf("first OpenGroupVersion returned error: %v", err)
+	}
+	second, err := cat.OpenGroupVersion(t.Context(), "frontier", members)
+	if err != nil {
+		t.Fatalf("second OpenGroupVersion returned error: %v", err)
+	}
+
+	current, err := cat.CurrentGroupVersion(t.Context(), "frontier")
+	if err != nil {
+		t.Fatalf("CurrentGroupVersion returned error: %v", err)
+	}
+	if current.Version != 2 || current.ID != second.ID {
+		t.Fatalf("current = %s@%d, want the highest snapshot %s@2", current.ID, current.Version, second.ID)
+	}
+	if len(current.Members) != 2 {
+		t.Errorf("members = %d, want the snapshot's whole set — the read is of the version, not of a summary of it", len(current.Members))
+	}
+}
+
+func TestCurrentGroupVersionOnAnUnprovisionedGroupIsNotFound(t *testing.T) {
+	world := newCatalogWorld()
+	cat := newCatalog(world)
+
+	_, err := cat.CurrentGroupVersion(t.Context(), "frontier")
+	if applicationErr, ok := As(err); !ok || applicationErr.Code != CodeNotFound {
+		t.Fatalf("CurrentGroupVersion error = %v, want this package's NotFound — an unprovisioned group is an answer the surface maps, not an infrastructure failure", err)
+	}
+	if errors.Is(err, persistence.ErrNotFound) {
+		t.Errorf("the not-found leaked the port's sentinel: a caller matching persistence.ErrNotFound would misread every future miss")
+	}
+}
+
+func TestCurrentGroupVersionReadsTheWildcardLikeAnyGroup(t *testing.T) {
+	world := newCatalogWorld()
+	cat := newCatalog(world)
+	wildcard, err := cat.OpenWildcardVersion(t.Context())
+	if err != nil {
+		t.Fatalf("OpenWildcardVersion returned error: %v", err)
+	}
+
+	current, err := cat.CurrentGroupVersion(t.Context(), catalog.GroupWildcardName)
+	if err != nil {
+		t.Fatalf("CurrentGroupVersion(%q) returned error: %v", catalog.GroupWildcardName, err)
+	}
+	if current.Version != 1 || current.ID != wildcard.ID || len(current.Members) != 0 {
+		t.Errorf("wildcard = %s@%d with %d members, want the singleton's id at version 1 with none", current.ID, current.Version, len(current.Members))
+	}
+}
+
+func TestCurrentGroupVersionKeepsAStoreFailureOutOfTheNotFoundLane(t *testing.T) {
+	world := newCatalogWorld()
+	world.highestReadFailure = errCandidateInsert // any infrastructure failure will do
+	cat := newCatalog(world)
+
+	_, err := cat.CurrentGroupVersion(t.Context(), "frontier")
+	if _, categorised := As(err); categorised {
+		t.Fatalf("CurrentGroupVersion error = %v, want a raw wrapped failure — a store that will not answer is not a group that does not exist", err)
+	}
+	if !errors.Is(err, errCandidateInsert) {
+		t.Errorf("the store failure did not survive the wrap: %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // construction
 // ---------------------------------------------------------------------------

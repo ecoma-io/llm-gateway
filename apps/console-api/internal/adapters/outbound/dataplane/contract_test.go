@@ -234,3 +234,41 @@ func scanContract(t *testing.T, path string) contractDocument {
 	}
 	return document
 }
+
+// dataplaneContractPath locates the seam's own document, the same six levels
+// up as the shared one. This module was the one end of the group-version read
+// that held no copy of the document's words — the read's other three ends
+// each pin theirs — and a pin a side does not hold is an agreement it can
+// silently leave.
+const dataplaneContractPath = "../../../../../../api/openapi/dataplane.yaml"
+
+// TestTheReadThisClientSendsIsTheOperationTheContractDeclares pins the
+// group-version read against dataplane.yaml: the path this client builds is
+// one the document declares, and the body the decoder reads is the schema
+// the document describes, field for field and bound for bound.
+func TestTheReadThisClientSendsIsTheOperationTheContractDeclares(t *testing.T) {
+	document := scanContract(t, dataplaneContractPath)
+
+	// The path this client builds — the operation's own literal, with the
+	// contract's parameter standing where the escaped group name travels.
+	requested := currentGroupVersionPrefix + "{group_name}" + currentGroupVersionSuffix
+	if !slices.Contains(document.children["paths"], requested) {
+		t.Fatalf("%s declares the paths %v; the client builds %q", dataplaneContractPath, document.children["paths"], requested)
+	}
+
+	// The body's fields, exactly as the schema names them.
+	const schema = "components.schemas.CurrentAliasGroupVersion.properties"
+	declared := document.children[schema]
+	if len(declared) == 0 {
+		t.Fatalf("%s declares no %s; this pin proves nothing until the scan finds it", dataplaneContractPath, schema)
+	}
+	sort.Strings(declared)
+	if got := jsonFieldNames(t, groupVersionResponse{}); !slices.Equal(got, declared) {
+		t.Errorf("this adapter decodes %v and %s declares %v; a name on one side and not the other decodes to a nil pointer rather than failing, so the disagreement would arrive as a refused answer rather than as an error", got, dataplaneContractPath, declared)
+	}
+
+	// And the one number the decoder enforces: the version floor.
+	if got, want := document.numbers["components.schemas.CurrentAliasGroupVersion.properties.version.minimum"], 1; got != want {
+		t.Errorf("the contract declares version minimum %d, and this decoder enforces %d", got, want)
+	}
+}

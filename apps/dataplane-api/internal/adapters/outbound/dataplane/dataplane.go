@@ -39,6 +39,7 @@ import (
 	stdhttp "net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -58,10 +59,28 @@ import (
 // contract with its caller, and this line is the application's own call out
 // (docs/architecture/cross-plane-protocols.md).
 //
-// It is a constant rather than an argument because this adapter serves one
-// operation: the day the façade fronts a second one, that is a new method and a
-// visible second path here, not a parameter every call site has to get right.
+// It is a constant rather than an argument because this adapter's paths are
+// the operations it serves, named once where a reviewer reads them: a new
+// operation is a new method and a new visible path here, not a parameter every
+// call site has to get right.
 const usageEventsPath = "/internal/usage-events"
+
+// currentGroupVersionPath is the catalog read this adapter calls for the
+// Control Plane's commerce roll, and it is the private protocol's path for the
+// same reason usageEventsPath is: named here, sent as spelled, never
+// re-derived from the request that came in. It is pinned by the same pair of
+// protocol tests.
+//
+// The middle segment is the operation's one parameter, and it is substituted —
+// not templated through a router — because this adapter makes one request per
+// call and the substitution is the whole of the path logic. The placeholder is
+// named in a constant beside the path so the two cannot drift apart over which
+// segment the group's name belongs to.
+const currentGroupVersionPath = "/internal/alias-groups/{group_name}/versions/current"
+
+// groupNamePlaceholder is the segment of currentGroupVersionPath that carries
+// the group's name.
+const groupNamePlaceholder = "{group_name}"
 
 // usageCursorMaxLength is the bound the façade's contract puts on a cursor
 // (`shared/usage-facts.yaml`, UsageCursor: `maxLength: 512`), and it is applied
@@ -76,19 +95,24 @@ const usageEventsPath = "/internal/usage-events"
 // is one the other accepts.
 const usageCursorMaxLength = 512
 
-// Client is the Data Plane management listener seen as the usage-fact port.
+// Client is the Data Plane management listener seen as the ports this
+// application serves: the usage-fact feed and the alias-group catalog read,
+// over one listener, with one credential.
 type Client struct {
 	client     *stdhttp.Client
 	baseURL    string
 	credential string
 }
 
-// compile-time proof that the adapter satisfies the port it claims to. A method
-// rename on either side is a build failure here rather than a runtime surprise
-// at the first poll.
-var _ dataplane.UsageFacts = (*Client)(nil)
+// compile-time proof that the adapter satisfies the ports it claims to. A
+// method rename on either side is a build failure here rather than a runtime
+// surprise at the first poll.
+var (
+	_ dataplane.UsageFacts = (*Client)(nil)
+	_ dataplane.Catalog    = (*Client)(nil)
+)
 
-// New returns the usage-fact port backed by client, calling the listener at
+// New returns the Data Plane ports backed by client, calling the listener at
 // baseURL and presenting credential as the service identity.
 //
 // It panics on a nil client rather than storing one, for the reason the
@@ -164,6 +188,116 @@ func (c *Client) ReadUsageEvents(ctx context.Context, after string, limit int) (
 		// adapter from the sentinel, not from this number.
 		return dataplane.Page{}, fmt.Errorf("%w: the data plane answered %d", dataplane.ErrUpstreamUnavailable, response.StatusCode)
 	}
+}
+
+// CurrentGroupVersion implements the port. See dataplane.Catalog for the
+// contract; what this implementation adds is the wire.
+//
+// The request carries the caller's context for the same reason the feed read
+// above carries it: a commerce roll that gives up cancels this read rather
+// than leaving it to occupy a connection until some timeout nobody measured
+// expires.
+func (c *Client) CurrentGroupVersion(ctx context.Context, groupName string) (dataplane.GroupVersion, error) {
+	request, err := c.groupVersionRequest(ctx, groupName)
+	if err != nil {
+		return dataplane.GroupVersion{}, fmt.Errorf("%w: the management request could not be built", dataplane.ErrUpstreamUnavailable)
+	}
+
+	response, err := c.client.Do(request)
+	if err != nil {
+		// The cause is dropped here too, for the reason given above: net/http
+		// builds the text of a transport failure around the request URL, and
+		// the URL names this deployment's private addressing.
+		return dataplane.GroupVersion{}, fmt.Errorf("%w: the management call did not complete", dataplane.ErrUpstreamUnavailable)
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	switch response.StatusCode {
+	case stdhttp.StatusOK:
+		return c.groupVersion(response)
+	case stdhttp.StatusNotFound:
+		// The catalog's answer — no version of that group exists — is carried
+		// as its own sentinel rather than folded into the unavailable case
+		// below, because the two tell a caller to do opposite things: a roll
+		// that learns the group is unprovisioned stops, while one that could
+		// not reach the catalog retries. It is decided here and not relayed,
+		// like every answer this hop translates; the status is the private
+		// protocol's, and the façade's own 404 is chosen above from the
+		// sentinel, not from this number. The group's name is kept in the
+		// cause because it is what an operator debugging a failed roll needs,
+		// and a cause stays behind this process's edge.
+		return dataplane.GroupVersion{}, fmt.Errorf("%w: the group %q has no version", dataplane.ErrGroupVersionNotFound, groupName)
+	default:
+		// Everything else is one condition, exactly as it is for the feed:
+		// the answer is unknown, and this process holds nothing it could
+		// answer with instead. That includes the private listener refusing
+		// this process's own credential, which is a deployment fault and not
+		// to be reported as the caller's.
+		return dataplane.GroupVersion{}, fmt.Errorf("%w: the data plane answered %d", dataplane.ErrUpstreamUnavailable, response.StatusCode)
+	}
+}
+
+// groupVersionRequest builds the catalog read's one call. The group's name is
+// substituted into the path's placeholder and nothing else is invented: no
+// query, because the operation declares none, and no header beyond the
+// credential, because this adapter's opinions about the request are the
+// protocol's.
+//
+// PathEscape rather than no escaping at all, and rather than the query
+// escaping the feed's cursor gets: the name is a path segment, and the
+// characters that would end it early — a `/`, which the catalog's name grammar
+// admits, above all — have to arrive as one segment for the listener's route to
+// match. The listener decodes the segment back before the catalog sees it, so
+// the name still crosses exactly as it was given; a caller that sent `*` gets
+// `%2A` on the wire and `*` in the catalog, which is the same sentence with an
+// encoding in it.
+func (c *Client) groupVersionRequest(ctx context.Context, groupName string) (*stdhttp.Request, error) {
+	// Concatenation for the reason request above gives: internal/config has
+	// already established that baseURL is an origin with no path, so
+	// substituting into the operation's own path cannot produce a doubled
+	// slash or swallow a prefix an operator meant. Replace and not a template
+	// engine, because the substitution is one segment and the placeholder is
+	// named in a constant beside the path it belongs to.
+	segment := strings.Replace(currentGroupVersionPath, groupNamePlaceholder, url.PathEscape(groupName), 1)
+	endpoint := c.baseURL + segment
+
+	request, err := stdhttp.NewRequestWithContext(ctx, stdhttp.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Authorization", "Bearer "+c.credential)
+	return request, nil
+}
+
+// groupVersion reads a success body into the port's vocabulary.
+//
+// The tolerance rules are the page reader's, applied to a smaller body: unknown
+// keys are ignored — the Data Plane may add a field to this object before this
+// module ships — and a body that cannot be read at all is
+// ErrUpstreamUnavailable, because answering with part of a version would be
+// this process inventing the rest of a scope.
+//
+// Every field the contract marks required is checked, presence and declared
+// bound together: an absent group_name, an empty one, an absent version, a
+// version below 1, an absent id or an empty one are all refused rather than
+// filled in. A zero version answered as if it meant something would put a
+// scope pin on a number the catalog never issued, and an id-less version would
+// have an entitlement storing nothing and calling it a scope. The bounds are
+// this document's own (`minLength: 1`, `minimum: 1`), which is why keeping
+// them belongs here and not at the consumer.
+//
+// What is deliberately not checked is the id's uuid grammar. The contract
+// types the field `format: uuid`, and `format` is an annotation the producer
+// declares rather than a rule this consumer re-judges: the façade carries the
+// id and never compares, resolves or stores it, so a grammar check here would
+// be a second definition of a format this process has no use for — the same
+// reason the page reader leaves an unfamiliar payload shape alone.
+func (c *Client) groupVersion(response *stdhttp.Response) (dataplane.GroupVersion, error) {
+	var body currentGroupVersionBody
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		return dataplane.GroupVersion{}, fmt.Errorf("%w: the data plane answered with a body this facade cannot read", dataplane.ErrUpstreamUnavailable)
+	}
+	return body.groupVersion()
 }
 
 // request builds the one call this adapter makes. The query is assembled from
@@ -336,4 +470,50 @@ type eventBody struct {
 	SchemaVersion *int             `json:"schema_version"`
 	OccurredAt    *time.Time       `json:"occurred_at"`
 	Payload       *json.RawMessage `json:"payload"`
+}
+
+// currentGroupVersionBody is the wire shape of the private listener's catalog
+// answer: the same three fields, in the same spellings, as CurrentAliasGroupVersion
+// in api/openapi/dataplane.yaml — the version is one version, and the hops are
+// two. It is written here rather than derived from the façade's own response
+// type for the same reason pageBody is: the port speaks in values, the inbound
+// adapter owns the JSON this application writes, and the separation is what
+// keeps this hop a translation rather than a relay.
+//
+// Every field is a pointer, for the reason the page shape's comment gives: a
+// plain value would answer an omitted field with the Go zero value and the
+// version would read as well-formed all the way to an entitlement that pinned
+// it. Version is `*int` rather than a pointer-less int for exactly that
+// reason — a `0` from a missing field and a `0` from the Data Plane are
+// different facts, and only one of them is an answer.
+type currentGroupVersionBody struct {
+	GroupName      *string `json:"group_name"`
+	Version        *int    `json:"version"`
+	GroupVersionID *string `json:"group_version_id"`
+}
+
+// groupVersion validates the decoded body and translates it into the port's
+// value. The refusal order follows the contract's own listing, so a body that
+// is wrong in two ways is reported against the first one a reader of the
+// document would have met.
+func (b currentGroupVersionBody) groupVersion() (dataplane.GroupVersion, error) {
+	switch {
+	case b.GroupName == nil:
+		return dataplane.GroupVersion{}, fmt.Errorf("%w: the data plane answered with a version carrying no group_name field, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
+	case *b.GroupName == "":
+		return dataplane.GroupVersion{}, fmt.Errorf("%w: the data plane answered with a version carrying an empty group_name, below the length this surface contracts", dataplane.ErrUpstreamUnavailable)
+	case b.Version == nil:
+		return dataplane.GroupVersion{}, fmt.Errorf("%w: the data plane answered with a version carrying no version field, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
+	case *b.Version < 1:
+		return dataplane.GroupVersion{}, fmt.Errorf("%w: the data plane answered with a version of %d, below the 1 this surface contracts", dataplane.ErrUpstreamUnavailable, *b.Version)
+	case b.GroupVersionID == nil:
+		return dataplane.GroupVersion{}, fmt.Errorf("%w: the data plane answered with a version carrying no group_version_id field, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
+	case *b.GroupVersionID == "":
+		return dataplane.GroupVersion{}, fmt.Errorf("%w: the data plane answered with a version carrying an empty group_version_id, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
+	}
+	return dataplane.GroupVersion{
+		GroupName:      *b.GroupName,
+		Version:        *b.Version,
+		GroupVersionID: *b.GroupVersionID,
+	}, nil
 }

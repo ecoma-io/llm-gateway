@@ -83,7 +83,13 @@ func New(app *application.App, authenticator dataplane.Authenticator) stdhttp.Ha
 	// the transport answers it here instead of letting the redirect through,
 	// and every reachable response stays inside api/openapi/dataplane.yaml.
 	handler := stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-		if r.URL.Path != cleanPath(r.URL.Path) {
+		// The structure is judged on the escaped path, not the decoded one:
+		// %2F is a character inside one segment, and judging the decoded form
+		// would refuse names whose encoding merely looks like a doubled
+		// slash or a dot segment — names the contract promises travel as one
+		// segment and the group grammar admits.
+		escaped := r.URL.EscapedPath()
+		if escaped != cleanPath(escaped) {
 			writeError(w, r, notFoundError{})
 			return
 		}

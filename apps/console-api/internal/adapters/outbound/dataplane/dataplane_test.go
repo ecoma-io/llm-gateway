@@ -636,3 +636,79 @@ func TestNewRefusesACombinationItCannotServe(t *testing.T) {
 		})
 	}
 }
+
+// TestCurrentGroupVersionWalksTheContractPath pins the read's whole wire
+// shape: the contract's path with the group name as its one escaped segment —
+// the wildcard group's "*" must arrive %2A-escaped, a segment of its own —
+// the credential header, and the answer translated field for field.
+func TestCurrentGroupVersionWalksTheContractPath(t *testing.T) {
+	var seen *http.Request
+	client := New(
+		capturingClient(&seen, jsonResponse(http.StatusOK,
+			`{"group_name":"*","version":1,"group_version_id":"0198f0a4-3f6c-7000-8000-000000000001"}`)),
+		baseURL,
+		credential,
+	)
+
+	groupVersion, err := client.CurrentGroupVersion(context.Background(), "*")
+	if err != nil {
+		t.Fatalf("CurrentGroupVersion(*) error = %v, want nil", err)
+	}
+	if seen == nil {
+		t.Fatal("the transport was never called")
+	}
+	if got, want := seen.URL.Path, "/management/internal/alias-groups/*/versions/current"; got != want {
+		t.Errorf("decoded path = %q, want %q", got, want)
+	}
+	// The wire line is the assertion that matters: an escape carried in the
+	// decoded Path field alone is re-escaped by String() into %252A, and a
+	// test that read only the decoded field would stay green while the
+	// wildcard became unreachable.
+	if got, want := seen.URL.RequestURI(), "/management/internal/alias-groups/%2A/versions/current"; got != want {
+		t.Errorf("wire line = %q, want %q — the wildcard escapes exactly once", got, want)
+	}
+	if got, want := seen.URL.RawQuery, ""; got != want {
+		t.Errorf("raw query = %q, want none", got)
+	}
+	if got, want := seen.Header.Get("Authorization"), "Bearer "+credential; got != want {
+		t.Errorf("Authorization = %q, want %q", got, want)
+	}
+	if got, want := seen.Method, http.MethodGet; got != want {
+		t.Errorf("method = %s, want %s", got, want)
+	}
+	if groupVersion.GroupName != "*" || groupVersion.Version != 1 ||
+		groupVersion.GroupVersionID != "0198f0a4-3f6c-7000-8000-000000000001" {
+		t.Fatalf("answer = %+v, want the three fields the contract carried", groupVersion)
+	}
+}
+
+// TestCurrentGroupVersionDistinguishesAMissFromAFailure pins the one status
+// this operation may act on: a 404 is the catalog's answer that the group has
+// no version — the lane-stopping ErrGroupNotFound — while every other status
+// is a transport failure that must not be mistaken for it.
+func TestCurrentGroupVersionDistinguishesAMissFromAFailure(t *testing.T) {
+	newClient := func(response *http.Response) *Client {
+		var seen *http.Request
+		return New(capturingClient(&seen, response), baseURL, credential)
+	}
+
+	if _, err := newClient(jsonResponse(http.StatusNotFound,
+		`{"error":{"code":"not_found","message":"no version of the requested alias group exists"}}`)).
+		CurrentGroupVersion(context.Background(), "api"); !errors.Is(err, port.ErrGroupNotFound) {
+		t.Fatalf("404 error = %v, want port.ErrGroupNotFound", err)
+	}
+	if _, err := newClient(jsonResponse(http.StatusBadGateway, `{})`)).
+		CurrentGroupVersion(context.Background(), "api"); err == nil || errors.Is(err, port.ErrGroupNotFound) {
+		t.Fatalf("502 error = %v, want a transport failure that is not ErrGroupNotFound", err)
+	}
+	if _, err := newClient(jsonResponse(http.StatusOK,
+		`{"group_name":"other","version":1,"group_version_id":"0198f0a4-3f6c-7000-8000-000000000001"}`)).
+		CurrentGroupVersion(context.Background(), "api"); !errors.Is(err, port.ErrMalformedAnswer) {
+		t.Fatalf("an answer about a different group = %v, want port.ErrMalformedAnswer", err)
+	}
+	if _, err := newClient(jsonResponse(http.StatusOK,
+		`{"version":1,"group_version_id":"0198f0a4-3f6c-7000-8000-000000000001"}`)).
+		CurrentGroupVersion(context.Background(), "api"); !errors.Is(err, port.ErrMalformedAnswer) {
+		t.Fatalf("an answer with no group_name = %v, want port.ErrMalformedAnswer", err)
+	}
+}

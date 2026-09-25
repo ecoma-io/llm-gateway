@@ -10,9 +10,11 @@ code is [ports and adapters](ports.md); the money the second direction feeds is
 [accounting](accounting.md).
 
 This page exists for the next cross-plane change. A new message between the
-planes is either a configuration in the first direction or a fact in the
-second, and the two have different obligations — a change that mixes them is
-the mistake this page is written to make visible.
+planes is a configuration in the first direction, a fact in the second, or —
+since the commerce foundation — a **read** in the first: a question about what
+the Data Plane already holds, documented with the other two because it rides
+their chain and must keep their discipline. A change that mixes their
+obligations is the mistake this page is written to make visible.
 
 ## The two directions
 
@@ -53,6 +55,42 @@ The transport is the chain
 `console-api application → dataplane.Management → HTTP adapter → dataplane-api → outbound port → HTTP adapter → dataplane private listener`
 (ADR 0006 §9).
 
+Everything above describes a command. The direction also carries its first
+**read** — the alias-group current-version lookup,
+`GET /internal/alias-groups/{group_name}/versions/current`, which the commerce
+due-work lanes call to resolve grant-definition scopes before their units of
+work open ([commerce](commerce.md)). It rides the same chain, the same
+service-auth boundary and the same two-hop shape as the commands, and it keeps
+their discipline:
+
+- **The façade translates, never relays.** A `404` is the catalog's answer
+  that the group has no version, carried to the caller as its port's
+  not-found sentinel; every other status, and every unreadable answer, is
+  `502 upstream_unavailable`. No byte of the private listener's body reaches
+  a Control Plane caller, exactly as in the fact direction.
+- **The group name is one path segment, escaped.** The wildcard group's `*`
+  travels percent-encoded; the segment's form is part of the contract, not
+  the caller's choice.
+- **A route-absent `404` is indistinguishable from a catalog miss.** The
+  façade translates every listener `404` the same way, so a private hop the
+  deployment never routed — a version skew where the façade runs ahead of
+  its listener — arrives as the port's not-found sentinel too, the same
+  answer a group with no version gets. The skew is therefore fail-safe: the
+  roll stops its pass and sells nothing, exactly as a real catalog defect
+  makes it. What it is not is separable — telling "route missing" from
+  "group missing" apart would need the listener to speak a second status
+  code the contract does not give it, and the roll's operator-facing
+  symptom ("a plan grants a scope that resolves to nothing") names the
+  commercial truth either way.
+- **A miss is an answer, not a transport failure.** The roll lane stops its
+  pass on one on purpose — a plan granting a scope that resolves to nothing
+  is a commercial catalog defect, and skipping it every pass would silently
+  sell a plan that grants nothing.
+
+`dataplane.yaml` declares the route on the façade; the listener side is this
+hop's second private protocol, pinned by that package's own route and
+protocol tests as the fact reader's is.
+
 ## Data → Control: facts, replayed
 
 ### The chain
@@ -86,7 +124,9 @@ deliberately not a fourth OpenAPI document: `api/openapi/` holds the surfaces
 something outside this repository talks to, and a document exists to state what
 such a caller may rely on. What a caller does rely on is contracted where that
 caller's surface is — `dataplane.yaml` declares `GET /internal/usage-events` on
-the **façade**, and `shared/usage-facts.yaml` carries the page it may expect.
+the **façade**, `shared/usage-facts.yaml` carries the page it may expect, and
+the same document declares the façade's group-version read
+([above](#control--data-an-idempotent-command)).
 
 The distinction is the one thing about this hop that is easy to get wrong, so it
 is worth stating flatly: **`dataplane.yaml` is dataplane-api's contract.** The

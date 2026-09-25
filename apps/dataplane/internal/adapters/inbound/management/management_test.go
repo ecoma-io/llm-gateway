@@ -49,7 +49,7 @@ const (
 // break.
 func serve(t *testing.T, facts *stubFacts, request *stdhttp.Request) *httptest.ResponseRecorder {
 	t.Helper()
-	handler := New(application.New("v0.1.0", facts), serviceCredential)
+	handler := New(application.New("v0.1.0", facts, newStubCatalog(&stubVersions{})), serviceCredential)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, request)
 	return rec

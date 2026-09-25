@@ -15,12 +15,14 @@
 // before. The database is the exception whose time has come: its pool is opened
 // and pinged here at startup, because intake, reservations and usage are
 // durable only through the database this process owns. The persistence.Store
-// over that pool is still not constructed — no use case runs a query yet, and
-// it is wired by the change that first does. The fact reader is constructed
-// over the same pool and answers from the usage_events table the runtime
-// storage schema creates: replaying what this process recorded, in the order
-// the store committed it, to whoever presents a position the stream can still
-// honour.
+// over that pool is constructed here too, and this is the change that first
+// wires it: the catalog read the Control Plane's commerce roll makes is the
+// first use case that runs a query, so the store and the catalog repositories
+// over it are built below rather than deferred again. The fact reader is
+// constructed over the same pool and answers from the usage_events table the
+// runtime storage schema creates: replaying what this process recorded, in the
+// order the store committed it, to whoever presents a position the stream can
+// still honour.
 //
 // There are two listeners and one application between them. The runtime's is the
 // public surface, opened on DATAPLANE_ADDR always; the management surface is
@@ -134,10 +136,11 @@ func main() {
 		log.Printf("dataplane postgres: %v", err)
 		os.Exit(1)
 	}
-	// The persistence.Store over this pool is still not constructed: no use
-	// case runs a query yet, and postgres.New(pool) is wired by the change
-	// that first does. The fact reader is over the same pool already — bind
-	// takes it, because the reader exists and answers from usage_events.
+	// The persistence.Store over this pool is constructed in bind, together
+	// with the catalog repositories it backs — this is the change that first
+	// runs a query, the one the deferral here was waiting for. The usage-fact
+	// reader rides the same pool, and answers from the usage_events table the
+	// runtime storage schema creates.
 
 	// Every listener is bound before any of them serves. A process that
 	// answered on the runtime port while its management port was already taken
@@ -191,6 +194,11 @@ func postgresLocation(cfg config.Config) string {
 // bind opens every listener this configuration asks for and wires the handlers
 // onto them.
 //
+// The pool arrives here rather than the adapters being built beside the open in
+// main so that the whole composition — store, repositories, application,
+// listeners — is one function a reader can read top to bottom as "what this
+// process is made of".
+//
 // The application is constructed once and shared, because it is one process
 // with one set of outbound ports; the two listeners are two surfaces over it.
 // That is also why the runtime handler is built here and not inside the
@@ -198,10 +206,25 @@ func postgresLocation(cfg config.Config) string {
 // an administrative port was configured.
 //
 // The pool arrives as an argument rather than being reopened here because the
-// fact reader is built over it: one database, one pool, and the composition
-// root is where the two adapters that share it meet.
+// two adapters are built over it: one database, one pool, and the composition
+// root is where adapters that share it meet.
 func bind(cfg config.Config, pool *sql.DB) ([]service, error) {
-	app := application.New(version, postgres.NewUsageFacts(pool))
+	// One store over the pool, and the catalog's four repositories over that
+	// store — every one of them the same postgres adapter, because the catalog
+	// is this plane's own database and there is exactly one of it. The
+	// repositories share the store rather than each opening their own so a
+	// unit of work spans them: the alias aggregate is written as a row and its
+	// candidates in one transaction, and that guarantee is made here, at
+	// composition, not inside a use case that reaches for a global. The
+	// usage-fact reader is the second adapter over the same pool.
+	catalogStore := postgres.New(pool)
+	catalog := application.NewCatalog(
+		catalogStore,
+		postgres.NewBackends(catalogStore),
+		postgres.NewModelAliases(catalogStore),
+		postgres.NewAliasGroupVersions(catalogStore),
+	)
+	app := application.New(version, postgres.NewUsageFacts(pool), catalog)
 
 	runtimeListener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {

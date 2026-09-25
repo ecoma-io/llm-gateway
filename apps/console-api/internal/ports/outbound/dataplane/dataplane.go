@@ -18,32 +18,34 @@
 // as grants, not as shared tables, because neither plane may read the other's
 // database (ADR 0006 §5, §7).
 //
-// Exactly two operations are enumerated here, because they are the two the
-// architecture already fixes end to end: a credential the Control Plane has
-// withdrawn must stop being accepted at the runtime, within a bounded
-// staleness window rather than the moment the withdrawal commits (ADR 0006
-// §8); and the usage facts the runtime recorded must be readable by the
-// Control Plane, idempotently and with replay, so that settlement survives
-// either side crashing (ADR 0006 §5). The other operations a management
-// surface will eventually need — a grant, a capacity publication, a cache
-// invalidation — are not declared here as guesses: each arrives with the use
-// case that has to make it, and a port method with no caller is a shape
-// invented twice.
+// Exactly two operations were enumerated here when the seam was drawn, because
+// they were the two the architecture already fixed end to end: a credential
+// the Control Plane has withdrawn must stop being accepted at the runtime,
+// within a bounded staleness window rather than the moment the withdrawal
+// commits (ADR 0006 §8); and the usage facts the runtime recorded must be
+// readable by the Control Plane, idempotently and with replay, so that
+// settlement survives either side crashing (ADR 0006 §5). The commerce roll
+// is the third caller the seam has been waiting for, and it arrives with the
+// one read its transaction needs: which alias-group version is current for a
+// group name, answered by the Data Plane that owns the catalog (ADR 0006 §5),
+// so an entitlement can pin a scope by id without this plane ever reading the
+// catalog's tables. The other operations a management surface will eventually
+// need — a grant, a capacity publication, a cache invalidation — are still not
+// declared as guesses: each arrives with the use case that has to make it,
+// and a port method with no caller is a shape invented twice.
 //
-// The fact half is implemented and the management half is not.
-// internal/adapters/outbound/dataplane speaks the feed's HTTP contract and
-// internal/application's FactIngestion drives it through the persistence
-// port's cursor, which is what makes the Control Plane's position durable; no
-// process constructs that use case yet, because the loop that calls it arrives
-// with the schema the facts are stored in. Management still has neither an
-// adapter nor a use case: the API-key lifecycle's ownership half has landed
-// (the identity domain and the control database's records), and what calls
-// WithdrawCredential — the revocation that reaches the projection, with the
-// owned-but-inactive recovery ADR 0006 §8 describes — arrives with the
-// Control → Data credential projection it belongs to. The port exists ahead of
-// its callers because the seam has to exist before either side of it is
-// built, and because its absence would leave a future author with no recorded
-// answer to "how does the Control Plane talk to the Data Plane?".
+// The fact half is implemented, and the seam's wire half is served by the
+// adapter beside it in internal/adapters/outbound/dataplane, which claims
+// UsageFacts and CatalogReader. Management as a whole still has no full
+// implementation: WithdrawCredential remains a declared callerless method —
+// the credential projection that needs it is a later phase's designed change
+// (ADR 0006 §8) — while CurrentGroupVersion is spoken over the management
+// contract in api/openapi/dataplane.yaml by the commerce roll, which takes the
+// narrow CatalogReader rather than the whole interface it does not use. The
+// port exists ahead of its callers because the seam has to exist before either
+// side of it is built, and because its absence would leave a future author
+// with no recorded answer to "how does the Control Plane talk to the Data
+// Plane?".
 package dataplane
 
 import (
@@ -70,6 +72,68 @@ type Management interface {
 	// Plane keeps the credential's revocation pending until the Data Plane has
 	// acknowledged it.
 	WithdrawCredential(ctx context.Context, credentialID string) error
+
+	// CurrentGroupVersion returns the version of the named alias group that
+	// is current in the Data Plane's catalog right now — the snapshot id a
+	// commerce entitlement pins as its scope when a cycle rolls.
+	//
+	// "Current" is the catalog's own rule (the group's highest version), and
+	// the answer is a point-in-time reading, not a subscription: the Data
+	// Plane may open the group's next version the instant after answering,
+	// and this plane's already-rolled entitlements keep the version they
+	// pinned — purchased scope never changes retroactively (ADR 0003). The
+	// commerce roll resolves names before it opens its unit of work and
+	// treats a transport failure as the roll's "not now": the subscription
+	// stays due and the next pass asks again.
+	//
+	// A group the catalog has never opened is ErrGroupNotFound; a failure to
+	// reach the Data Plane is a transport error. The wildcard group is a
+	// group like any other here — its name is "*", and the catalog holds a
+	// version for it from the moment the catalog is provisioned.
+	CurrentGroupVersion(ctx context.Context, groupName string) (GroupVersion, error)
+}
+
+// GroupVersion is the one fact this seam carries about a catalog group: its
+// name, the version that is current, and the immutable id of that version's
+// snapshot — the id a commerce entitlement stores and the runtime's
+// membership checks resolve against. The name is carried beside the id so a
+// caller can confirm it asked about the group it meant to; the id is the
+// only part with a future.
+type GroupVersion struct {
+	GroupName      string
+	Version        int
+	GroupVersionID string
+}
+
+// ErrGroupNotFound reports that the Data Plane's catalog holds no version of
+// the named group. It is distinct from a transport failure because it asks
+// for a different response: a transport error is retried, while a group that
+// does not exist will not begin to — a grant definition naming such a group
+// is a commercial catalog error, and the roll that met it must stop and say
+// so rather than spin.
+var ErrGroupNotFound = errors.New("the data plane's catalog holds no version of that alias group")
+
+// ErrMalformedAnswer reports that the Data Plane answered 200 with a body
+// that is not the group-version answer the contract describes — a field
+// absent or null, a version below the 1 the catalog's numbering starts at,
+// or an echo of a group this call did not ask about. It is the read's
+// counterpart of the fact feed's ErrMalformedPage, and exists for the same
+// reason: a consumer must be able to tell "the peer broke the contract"
+// apart from every transport failure, because the first is a version-skew
+// or a defect to stop on, and the second is a retry.
+var ErrMalformedAnswer = errors.New("the data plane answered with a malformed group-version body")
+
+// CatalogReader is the read this seam carries from the Data Plane's catalog:
+// the group-version lookup the commerce roll resolves its entitlement scopes
+// with. It stands beside Management rather than inside it on purpose —
+// Management's one method is still waiting for the credential projection that
+// will call it, and a use case that needs only the read should not have to
+// name the withdrawal it never makes.
+type CatalogReader interface {
+	// CurrentGroupVersion is documented on Management, where the seam's
+	// operations are enumerated; the interface exists so the composition
+	// root can hand the commerce use cases exactly the seam they use.
+	CurrentGroupVersion(ctx context.Context, groupName string) (GroupVersion, error)
 }
 
 // Event is one immutable fact the runtime recorded, as the feed carries it.

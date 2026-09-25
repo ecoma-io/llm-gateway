@@ -33,6 +33,16 @@ what concurrent requests can reserve, and when PAYG may be spent.
   dimension), and an amount. A plan version may not contain two definitions
   with the same `(alias_group_version, dimension)`. A plan grants nothing by
   itself.
+
+  > **Amended by B5's implementation.** The definition's stored scope is the
+  > alias-group **name**, not a version: the version is resolved from the
+  > name at each cycle's roll (the resolution this ADR already describes
+  > below), and the uniqueness that guards a version's definition set is
+  > correspondingly `(alias_group_name, dimension)`. Storing the name is
+  > what makes the every-roll re-snapshot true for a definition authored
+  > once — a definition naming a version would have pinned the snapshot at
+  > authoring time, and the roll would have had nothing to resolve.
+
 - **Subscription** — one account's instantiation of one specific plan
   **version**, which it pins forever: a plan change means a new version and a
   new subscription (or an explicit migration), never an edit in place. Any
@@ -153,6 +163,16 @@ a crash cannot leave quota without its grant history.
 > (ADR 0001, rule 5); the projection, not this transaction, is what admission
 > draws down. The uniqueness key and the all-or-nothing property are
 > unchanged.
+
+> **Implemented by B5, the commerce foundation — with one deliberate gap.**
+> What shipped is the roll's Commerce half: the entitlement inserts and the
+> guarded cycle advance in one unit of work, with each grant definition's
+> alias-group **name** resolved to the group's current version through the
+> Control → Data seam read _before_ the unit opens. The funding bucket and
+> its `grant` legs are the Accounting context's; they join the same unit of
+> work at settlement (B6) without changing the key or the all-or-nothing
+> property — until then the entitlement rows are the complete record of what
+> a cycle granted ([commerce](../architecture/commerce.md)).
 
 ### Admission and the allocation waterfall
 

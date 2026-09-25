@@ -34,9 +34,17 @@ const settledPageBody = `{"events":[{"request_id":"req_01HZ","kind":"settled","s
 // kept as the parsed parameters rather than as the request, because a missing
 // parameter and an empty one are different answers and half of what the test
 // below pins is that difference.
+//
+// rawPath is the path as it arrived on the wire, percent-encoding and all, kept
+// beside the decoded `path`: the catalog read's group name is a segment the
+// adapter escapes before sending, and `*` arriving as `%2A` and `team/model`
+// arriving as `team%2Fmodel` is precisely the fact the wire-level test wants —
+// the decoded path cannot tell those two spellings apart from any other.
 type recordedCall struct {
 	authorization string
 	path          string
+	rawPath       string
+	rawQuery      string
 	after         []string
 	limit         []string
 }
@@ -61,6 +69,8 @@ func (u *upstream) record(r *stdhttp.Request) recordedCall {
 	call := recordedCall{
 		authorization: r.Header.Get("Authorization"),
 		path:          r.URL.Path,
+		rawPath:       r.URL.EscapedPath(),
+		rawQuery:      r.URL.RawQuery,
 		after:         query["after"],
 		limit:         query["limit"],
 	}

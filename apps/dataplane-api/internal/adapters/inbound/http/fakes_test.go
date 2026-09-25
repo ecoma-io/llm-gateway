@@ -45,12 +45,35 @@ func (f *fakeUsageFacts) ReadUsageEvents(_ context.Context, after string, limit 
 // called reports whether anything reached the port.
 func (f *fakeUsageFacts) called() bool { return len(f.calls) > 0 }
 
+// fakeCatalog is the catalog port as the handler tests see it: one version to
+// answer with, or a failure to answer with instead, plus the record of every
+// name it was asked for. It is the same kind of hand-written double as
+// fakeUsageFacts, and the recorded names are what make the wildcard row in
+// aliasgroups_test.go an assertion about what crossed rather than a status
+// that happened to be green.
+type fakeCatalog struct {
+	version dataplane.GroupVersion
+	err     error
+	names   []string
+}
+
+func (f *fakeCatalog) CurrentGroupVersion(_ context.Context, groupName string) (dataplane.GroupVersion, error) {
+	f.names = append(f.names, groupName)
+	if f.err != nil {
+		return dataplane.GroupVersion{}, f.err
+	}
+	return f.version, nil
+}
+
+// called reports whether anything reached the port.
+func (f *fakeCatalog) called() bool { return len(f.names) > 0 }
+
 // testApp is the application the route-table tests read a surface from. The
-// port is a fake because those tests serve no request — they assert the table
+// ports are fakes because those tests serve no request — they assert the table
 // as data, and the handler behaviour is driven through the tests in
-// usageevents_test.go.
+// usageevents_test.go and aliasgroups_test.go.
 func testApp() *application.App {
-	return application.New("test", &fakeUsageFacts{})
+	return application.New("test", &fakeUsageFacts{}, &fakeCatalog{})
 }
 
 // testHandler returns the real handler over app and the real authenticator
