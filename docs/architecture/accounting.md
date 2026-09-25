@@ -249,22 +249,25 @@ tail, whose per-bucket `amount` is the held amount that reservation booked
 ([cross-plane protocols](cross-plane-protocols.md)), and the `hold` leg is
 booked here from that tail — before the `release`/`consume` legs it funds,
 which the engine requires anyway (a release names a reservation that has a
-hold leg on file, and a consume draws against held). Idempotency is by
-`request_id`, on the leg's own uniqueness, and B12's applier is the caller
-that will do it — B6 shipped the primitive and no caller, and no other channel
-exists: the feed is the only path by which a `dataplane` row becomes a
-`control` row ([data implications](data-implications.md)), and the management
-surface contracts no read of live reservations.
+hold leg on file, and a consume draws against held). Idempotency runs through
+the fact: the applier keys on `request_id`, and a replayed leg collides on its
+own uniqueness — `(reservation_id, funding_bucket_id, kind)` for a hold —
+rather than moving money twice. B12's applier is the caller that will do it —
+B6 shipped the primitive and no caller, and no other channel exists: the feed
+is the only path by which a `dataplane` row becomes a `control` row ([data
+implications](data-implications.md)), and the management surface contracts no
+read of live reservations.
 
 The consequence for the projection above is exact: a bucket's cached `held`
 is algebra over holds whose terminal fact has already been applied, never the
-runtime's in-flight total. The two differ by exactly the reservations still
-open in the Data Plane — the window between a committed reservation and its
-settlement that ADR 0006 names as a bounded property, for reconciliation
-(B13) to converge — and the hold guard's `available ≥ take` is judged against
-the bucket as the applied facts left it, not as admission left it. The guard
-that refuses an overdraw at admission is the runtime's projection, not this
-column; `held` is the ledger's record of what was held and how it ended.
+runtime's in-flight total. The two differ by the reservations still open in
+the Data Plane, plus the delivery latency of those reservations' facts — the
+window between a committed reservation and its settlement that ADR 0006 names
+as a bounded property, for reconciliation (B13) to converge — and the hold
+guard's `available ≥ take` is judged against the bucket as the applied facts
+left it, not as admission left it. The guard that refuses an overdraw at
+admission is the runtime's projection, not this column; `held` is the ledger's
+record of what was held and how it ended.
 
 No kind can make any of the three negative. The non-adjustment kinds cannot
 — consume's guard checks the take against held _and_ settled before either
@@ -304,10 +307,7 @@ assignment naming another account's bucket is an error, not a silent no-op).
 correction that states its settled/held deltas explicitly, with the reason and
 the original entry it corrects; it is never an automatic overdraw path (the
 reservation ceiling means automatic debt cannot arise) and never a credit
-mechanism (the no-credit rule above). A bucket's cached `held` is as complete
-as its legs and no more: it is held-and-returned, never held-and-outstanding,
-and the completeness window is a fact-delivery latency plus the reservations
-still open in the Data Plane.
+mechanism (the no-credit rule above).
 
 The legs carry their own provenance promises in the engine: a `release` names
 a reservation this bucket actually booked a `hold` for, and an `adjustment`
