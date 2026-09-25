@@ -29,7 +29,10 @@
 -- seq but committed after a higher one would have its fact land behind the
 -- consumer's cursor forever — a settled request that is never delivered, with
 -- no error anywhere. The append statement is therefore the LAST write of the
--- settlement unit of work: it serialises only the tail of each settlement.
+-- settlement unit of work: it serialises only the tail of each settlement,
+-- and the store refuses an append that arrives with no unit of work at all —
+-- a sequence allocated outside one could commit apart from its fact, which is
+-- the tearing this ordering exists to make impossible.
 -- Aborted units roll the counter back (no hole at all; the contract's
 -- gap-awareness is satisfied a fortiori). The row's `epoch` is minted by the
 -- server on first append — never in a migration — so a database that loses its
@@ -68,8 +71,9 @@
 --
 -- GUARD NUMBERS, and where their siblings live: the payload CHECK caps the
 -- serialised text at 32768 octets (the reader re-serialises the text form, so
--- that is what is bounded; octet_length has no jsonb overload). The writer
----side domain cap is half of it, 16384 bytes of serialised JSON, and produces
+-- that is what is bounded; octet_length has no jsonb overload). The
+-- writer-side domain cap is half of it, 16384 bytes of serialised JSON, and
+-- produces
 -- the legible error at the write site; the derived read-side backstop
 -- (limit × 32KiB) is recorded in cross-plane-protocols.md. Free-text columns
 -- carry octet_length caps because every value on them arrives from a client,
@@ -90,7 +94,12 @@
 -- Control-Plane-owned identity/limit/state columns and NEVER `available` —
 -- spent capacity must never be resurrected by a republication. Capacity
 -- increases beyond the original grant arrive as their own guarded refill
--- operation, not as a re-seed. A missing row at admission (publication lag)
+-- operation, not as a re-seed, and each refill carries the Control Plane's
+-- refill identity: quota_refills below records every identity once, so a
+-- redelivered refill answers "already applied" instead of minting twice, and
+-- one that arrives after the projection moved past its guard revision answers
+-- "stale" — the identity is spent unapplied, and the increase must be
+-- re-derived under a new one. A missing row at admission (publication lag)
 -- is capacity the runtime cannot see: admission treats it as zero.
 --
 -- Every terminal-state guard is stated twice on purpose: as column CHECKs (a
@@ -216,9 +225,11 @@ CREATE TABLE public.request_attempts (
     provider_input_tokens bigint CHECK (provider_input_tokens >= 0),
     provider_output_tokens bigint CHECK (provider_output_tokens >= 0),
     delivery_tokens bigint CHECK (delivery_tokens >= 0),
-    -- The one sanctioned jsonb on this schema: opaque provider telemetry,
-    -- preserved for debugging (ADR 0002). Same object + size guard as the
-    -- fact payload below.
+    -- One of the schema's two sanctioned jsonb columns (the other is the fact
+    -- payload below): opaque provider telemetry, preserved for debugging
+    -- (ADR 0002). Same object + size guard as the payload's, because neither
+    -- column may become a place where an unbounded blob rides past every
+    -- other guard.
     provider_error jsonb CHECK (
         provider_error IS NULL
         OR (jsonb_typeof(provider_error) = 'object' AND octet_length(provider_error::text) <= 65536)
@@ -261,7 +272,9 @@ ALTER TABLE public.requests
 -- directions, and admission's own transaction is what keeps the pair atomic.
 -- The terminal pointer is written once, at finalisation ("immutable
 -- afterwards" is scoped to the replay-identity fields: account, key, digest,
--- request_id). final_status NULL means the original is still executing: a
+-- request_id — and that scope is engine-enforced, by
+-- request_intake_identity_immutability below). final_status NULL means the
+-- original is still executing: a
 -- replay arriving then is refused with retry-later semantics, never queued.
 CREATE TABLE public.request_intake (
     account_id text NOT NULL CHECK (octet_length(account_id) <= 128),
@@ -391,6 +404,25 @@ CREATE TABLE public.quota_projections (
     )
 );
 
+-- Refills are the one operation here that MINTS capacity, which is why they
+-- carry an identity and this table exists: the refill message crosses the
+-- plane boundary at-least-once, and the unique below is the engine guard that
+-- turns the redelivery into a recorded no-op instead of a second mint. A
+-- refill whose guard revision has already passed is recorded under its
+-- identity but raises nothing — the identity is spent unapplied, and the
+-- increase must arrive again under a new one; that asymmetry is deliberate,
+-- because the alternative (raising on a stale guard) is drawing against a
+-- grant state the Control Plane has already superseded. The row is the
+-- receipt: "this identity was seen at this revision", whatever the outcome.
+CREATE TABLE public.quota_refills (
+    funding_bucket_id text NOT NULL REFERENCES public.quota_projections (funding_bucket_id),
+    refill_id text NOT NULL CHECK (octet_length(refill_id) <= 128),
+    amount bigint NOT NULL CHECK (amount > 0),
+    at_revision bigint NOT NULL CHECK (at_revision >= 0),
+    applied_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
+    CONSTRAINT quota_refills_refill_id_key UNIQUE (refill_id)
+);
+
 -- One settled (or released/expired) request has exactly one
 -- settlement-relevant fact, enforced by the engine: the dedup partial unique
 -- below is what keeps a duplicated or out-of-order close from poisoning a
@@ -408,7 +440,7 @@ CREATE TABLE public.usage_events (
     kind text NOT NULL CHECK (kind IN ('settled', 'released', 'expired', 'unbillable_orphaned')),
     schema_version integer NOT NULL CHECK (schema_version >= 1),
     capture_method text CHECK (capture_method IN ('reported', 'gateway_observed', 'reservation_floor')),
-    committed_attempt_id uuid REFERENCES public.request_attempts (id),
+    committed_attempt_id uuid,
     provider_input_tokens bigint CHECK (provider_input_tokens >= 0),
     provider_output_tokens bigint CHECK (provider_output_tokens >= 0),
     delivery_tokens bigint CHECK (delivery_tokens >= 0),
@@ -416,7 +448,7 @@ CREATE TABLE public.usage_events (
     input_unit_price bigint CHECK (input_unit_price >= 0),
     output_unit_price bigint CHECK (output_unit_price >= 0),
     settled_amount bigint CHECK (settled_amount >= 0),
-    corrects_append_seq bigint REFERENCES public.usage_events (append_seq),
+    corrects_append_seq bigint,
     payload jsonb NOT NULL,
     occurred_at timestamptz NOT NULL,
     -- jsonb admits scalars, arrays and `null` as valid values; the contract
@@ -459,8 +491,30 @@ CREATE TABLE public.usage_events (
             AND provider_output_tokens IS NULL
             AND delivery_tokens IS NULL
         )
-    )
+    ),
+    -- (request_id, append_seq) exists to be referenced: the correction pointer
+    -- must name a fact OF THIS REQUEST, and a plain FK on append_seq alone
+    -- would let a correction claim another request's fact as its target.
+    CONSTRAINT usage_events_request_seq_key UNIQUE (request_id, append_seq)
 );
+
+-- These two pointers cannot be declared inline: one references the attempts
+-- table above, the other this table's own (request_id, append_seq) key. Both
+-- take the composite form for the same reason requests_committed_attempt_fkey
+-- does — usage-bearing facts and corrections name rows OF THEIR OWN REQUEST
+-- and no other; a plain FK on id or on append_seq alone would accept another
+-- request's attempt or another request's fact. The NULL halves — a released
+-- or expired fact names no attempt, a first fact corrects nothing — skip
+-- enforcement by MATCH SIMPLE's default.
+ALTER TABLE public.usage_events
+    ADD CONSTRAINT usage_events_committed_attempt_fkey
+    FOREIGN KEY (request_id, committed_attempt_id)
+    REFERENCES public.request_attempts (request_id, id);
+
+ALTER TABLE public.usage_events
+    ADD CONSTRAINT usage_events_correction_targets_same_request_fkey
+    FOREIGN KEY (request_id, corrects_append_seq)
+    REFERENCES public.usage_events (request_id, append_seq);
 
 -- The dedup guards themselves. Both are partial, so a correction fact (whose
 -- corrects_append_seq is set) never collides with the fact it corrects, and
@@ -490,11 +544,13 @@ CREATE TABLE public.usage_events_stream (
 -- ALREADY terminal (the WHEN clause), so every open-row write — lease
 -- renewals, telemetry updates — costs nothing but the WHEN evaluation, and a
 -- CAS UPDATE that misses matches no rows and fires nothing. request_attempts
--- gets no trigger: its sanctioned telemetry update is a real write path.
--- request_intake's one-time terminal pointer is guarded by its pairing
--- CHECKs and the write-once port contract.
+-- gets no terminal trigger: its sanctioned telemetry update is a real write
+-- path. Every function below pins its search path: a trigger runs inside the
+-- writing session, and an unqualified name in the body would resolve against
+-- whatever search_path the caller set, not against this schema's intent.
 CREATE FUNCTION public.reject_terminal_row_update() RETURNS trigger
     LANGUAGE plpgsql
+    SET search_path = pg_catalog
     AS $$
 BEGIN
     RAISE EXCEPTION '% has a terminal row that cannot be updated', TG_TABLE_NAME;
@@ -513,12 +569,163 @@ CREATE TRIGGER reservations_terminal_immutability
     WHEN (OLD.state IN ('settled', 'released', 'expired'))
     EXECUTE FUNCTION public.reject_terminal_row_update();
 
--- The reaper's scan: open reservations whose hold has lapsed and whose lease
--- is dead, over a forever-retained table where open rows are a vanishing
--- fraction. The INCLUDE keeps the sweep index-only; the reaper's own
--- predicate also requires lease_expires_at to have passed, and compares
--- against clock_timestamp() (advancing), not transaction_timestamp() (frozen
--- for the transaction).
+-- The intake's replay identity is engine-immutable, not merely write-once by
+-- port contract: a decided record whose account, key, digest or request could
+-- be rewritten would be a different request wearing the first one's
+-- idempotency, and the schema is the last guard against exactly that. The
+-- terminal pointer (final_status and its reason columns) stays free to be
+-- written by finalisation — the trigger checks the identity fields only.
+CREATE FUNCTION public.reject_intake_identity_rewrite() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog
+    AS $$
+BEGIN
+    IF NEW.account_id IS DISTINCT FROM OLD.account_id
+       OR NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key
+       OR NEW.request_digest IS DISTINCT FROM OLD.request_digest
+       OR NEW.request_id IS DISTINCT FROM OLD.request_id THEN
+        RAISE EXCEPTION '% has a decided replay identity that cannot be rewritten', TG_TABLE_NAME;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER request_intake_identity_immutability
+    BEFORE UPDATE ON public.request_intake
+    FOR EACH ROW
+    EXECUTE FUNCTION public.reject_intake_identity_rewrite();
+
+-- The allocation legs are the reservation's memory, and the memory must
+-- re-derive the hold: their sum IS the reserved amount, their ordinals count
+-- from 1 without gaps, and no bucket appears twice (the two uniques inside
+-- the table keep one leg per ordinal and one per bucket; this trigger keeps
+-- the set they form equal to the hold). Stated twice on purpose, like every
+-- invariant in this file: validateAllocations in the domain refuses the
+-- malformed set at the call site, and this statement trigger — judged over
+-- the INSERT's transition relation, so a multi-leg insert is seen whole —
+-- refuses it at the engine no matter who wrote it.
+CREATE FUNCTION public.reject_legs_that_do_not_rederive_the_hold() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog
+    AS $$
+DECLARE
+    held record;
+BEGIN
+    FOR held IN
+        SELECT inserted_legs.reservation_id,
+               reservations.reserved_amount,
+               sum(inserted_legs.amount) AS leg_sum,
+               count(*) AS leg_count,
+               count(DISTINCT inserted_legs.funding_bucket_id) AS bucket_count,
+               min(inserted_legs.ordinal) AS first_ordinal,
+               max(inserted_legs.ordinal) AS last_ordinal
+        FROM inserted_legs
+        JOIN public.reservations ON reservations.id = inserted_legs.reservation_id
+        GROUP BY inserted_legs.reservation_id, reservations.reserved_amount
+    LOOP
+        IF held.leg_sum <> held.reserved_amount
+           OR held.first_ordinal <> 1
+           OR held.last_ordinal <> held.leg_count
+           OR held.bucket_count <> held.leg_count THEN
+            RAISE EXCEPTION '% has allocation legs that do not re-derive its hold', held.reservation_id;
+        END IF;
+    END LOOP;
+    RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER reservation_allocations_rederive_the_hold
+    AFTER INSERT ON public.reservation_allocations
+    REFERENCING NEW TABLE AS inserted_legs
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION public.reject_legs_that_do_not_rederive_the_hold();
+
+-- And the memory is never rewritten: legs record what the runtime drew down,
+-- so each is inserted once — the whole leg set inside the reservation's
+-- opening transaction, before the hold can be closed by anyone — and never
+-- updated or deleted afterwards.
+CREATE FUNCTION public.reject_allocation_leg_rewrite() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog
+    AS $$
+BEGIN
+    RAISE EXCEPTION '% has an allocation leg that cannot be rewritten', TG_TABLE_NAME;
+END;
+$$;
+
+CREATE TRIGGER reservation_allocations_immutability
+    BEFORE UPDATE OR DELETE ON public.reservation_allocations
+    FOR EACH ROW
+    EXECUTE FUNCTION public.reject_allocation_leg_rewrite();
+
+-- The fact payload's envelope is engine-checked, not only writer-checked. The
+-- domain marshals the version-1 allocation envelope through a struct and the
+-- CHECK above bounds its size; this trigger is the twin that holds for a row
+-- written by any other hand: exactly one key — allocations — naming an array
+-- of legs shaped like the domain's (non-empty funding bucket, positive
+-- integer amount, ordinal counting contiguously from 1, no bucket twice). A
+-- payload this build cannot decode as an allocation tail would otherwise be
+-- the one place foreign material could ride into a forever-retained money
+-- table (this file's doctrine: the engine is the final guard). The integer
+-- spellings are demanded in the text form too, not only by value: a
+-- consumer's decoder binds these fields to integer types, and a payload the
+-- engine accepts but the consumer cannot decode would wedge the feed page it
+-- lands in.
+CREATE FUNCTION public.reject_undeliverable_fact_payload() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog
+    AS $$
+DECLARE
+    legs jsonb;
+    leg jsonb;
+    duplicates integer;
+    i integer;
+BEGIN
+    IF jsonb_typeof(NEW.payload -> 'allocations') IS DISTINCT FROM 'array'
+       OR NEW.payload - 'allocations' <> '{}'::jsonb THEN
+        RAISE EXCEPTION '% has a payload that is not exactly the version-1 allocation envelope', TG_TABLE_NAME;
+    END IF;
+    legs := NEW.payload -> 'allocations';
+    FOR i IN 0 .. (jsonb_array_length(legs) - 1) LOOP
+        leg := legs -> i;
+        IF jsonb_typeof(leg) IS DISTINCT FROM 'object'
+           OR leg - 'funding_bucket_id' - 'amount' - 'ordinal' <> '{}'::jsonb
+           OR jsonb_typeof(leg -> 'funding_bucket_id') IS DISTINCT FROM 'string'
+           OR octet_length(leg ->> 'funding_bucket_id') NOT BETWEEN 1 AND 128
+           OR jsonb_typeof(leg -> 'amount') IS DISTINCT FROM 'number'
+           OR leg ->> 'amount' !~ '^[1-9][0-9]*$'
+           OR (leg ->> 'amount')::bigint <= 0
+           OR jsonb_typeof(leg -> 'ordinal') IS DISTINCT FROM 'number'
+           OR leg ->> 'ordinal' !~ '^[1-9][0-9]*$'
+           OR (leg ->> 'ordinal')::integer IS DISTINCT FROM i + 1 THEN
+            RAISE EXCEPTION '% has a payload leg that is not an allocation of the version-1 envelope', TG_TABLE_NAME;
+        END IF;
+        SELECT count(*) INTO duplicates
+        FROM jsonb_array_elements(legs) AS other
+        WHERE other -> 'funding_bucket_id' = leg -> 'funding_bucket_id';
+        IF duplicates <> 1 THEN
+            RAISE EXCEPTION '% has a payload leg naming its funding bucket twice', TG_TABLE_NAME;
+        END IF;
+    END LOOP;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER usage_events_payload_envelope
+    BEFORE INSERT OR UPDATE OF payload ON public.usage_events
+    FOR EACH ROW
+    EXECUTE FUNCTION public.reject_undeliverable_fact_payload();
+
+-- The reaper's scan: open reservations whose hold window AND whose lease have
+-- both lapsed, over a forever-retained table where open rows are a vanishing
+-- fraction. The index leads on expires_at — the sweep's distinguishing
+-- predicate — and carries lease_expires_at so the surviving minority's second
+-- condition is evaluated from the index tuple rather than the heap. The sweep
+-- is not index-only — the reaper takes whole rows to expire them — and both
+-- its conditions compare against clock_timestamp() (advancing), not
+-- transaction_timestamp() (frozen for the transaction). A lapsed lease with a
+-- live window is a holder mid-renewal-hiccup, not a corpse: taking it would
+-- burn the settlement dedup slot on a hold its request may still settle.
 CREATE INDEX reservations_open_expiry
     ON public.reservations (expires_at) INCLUDE (lease_expires_at)
     WHERE state = 'open';
