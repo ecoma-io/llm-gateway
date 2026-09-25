@@ -282,9 +282,16 @@ CREATE TABLE public.request_intake (
     ),
     created_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
     CONSTRAINT request_intake_scope_key UNIQUE (account_id, idempotency_key),
+    -- The pointer is all-or-nothing at its base: a reason column exists only
+    -- under a status that names it. Which reason each status carries is the
+    -- three shape CHECKs below — succeeded carries none, and that is exactly
+    -- why this constraint demands a status for any reason, not the reverse:
+    -- a pairing spelled "status NULL iff both reasons NULL" would make a
+    -- succeeded pointer (status set, both reasons NULL) unwritable, the one
+    -- terminal fate the replay record most needs to point at.
     CONSTRAINT request_intake_final_pairing CHECK (
-        (final_status IS NULL)
-        = (final_rejection_reason IS NULL AND final_failure_reason IS NULL)
+        final_status IS NOT NULL
+        OR (final_rejection_reason IS NULL AND final_failure_reason IS NULL)
     ),
     CONSTRAINT request_intake_final_rejected_shape CHECK (
         final_status <> 'rejected'

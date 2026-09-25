@@ -48,6 +48,18 @@ func NewRequestRepository(store persistence.Store) *RequestRepository {
 
 // Insert implements persistence.RequestRepository.
 func (repository *RequestRepository) Insert(ctx context.Context, request execution.Request) error {
+	// The price columns ride the snapshot's presence, not its arithmetic: the
+	// schema's requests_price_snapshot_pairing prices each unit column NULL
+	// exactly when the revision is NULL, so a row written "with the fields
+	// known so far" — a rejection, which carries no snapshot — must carry no
+	// prices either. An admitted request always has a revision (NewRequest
+	// refuses its absence), so the free-model zero price is still written as
+	// a real zero.
+	var inputUnitPrice, outputUnitPrice any
+	if request.Price.RevisionID != "" {
+		inputUnitPrice = int64Value(request.Price.InputUnitPrice)
+		outputUnitPrice = int64Value(request.Price.OutputUnitPrice)
+	}
 	_, err := repository.store.Querier(ctx).ExecContext(ctx, requestInsert,
 		string(request.ID),
 		request.AccountID,
@@ -56,8 +68,8 @@ func (repository *RequestRepository) Insert(ctx context.Context, request executi
 		intOrNil(request.InputTokens),
 		intOrNil(request.MaxOutputTokens),
 		textOrNil(request.Price.RevisionID),
-		int64Value(request.Price.InputUnitPrice),
-		int64Value(request.Price.OutputUnitPrice),
+		inputUnitPrice,
+		outputUnitPrice,
 		string(request.Status),
 		textOrNil(string(request.RejectionReason)),
 		textOrNil(string(request.FailureReason)),
