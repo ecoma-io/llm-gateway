@@ -46,6 +46,27 @@
 --   quarantined fact are different sentences about the same feed, and one
 --   row cannot be both; the schema does not force them into one table with
 --   a disposition flag a partial index would then have to unpick.
+--
+--   The quarantine's bounds bound storage, not the feed. Every refusal the
+--   consumer classifies as quarantinable must be recordable — a CHECK that
+--   restates the feed's grammar would turn the promised record-and-advance
+--   into a constraint failure and a wedged feed, which is the outcome the
+--   table exists to prevent. So the identity columns carry bounds above
+--   anything the consumer can hand them (the adapter clamps at the record
+--   boundary the way the reason is truncated), the payload keeps only the
+--   size the interpreter already enforces before recording (an empty
+--   payload is admissible evidence — it records as empty), and
+--   schema_version carries no shape at all: a version this build does not
+--   know is precisely what the column exists to carry whole. append_seq
+--   stays >= 1 because that shape never reaches this table as a fact
+--   disposition — the feed adapter refuses it at the page boundary
+--   upstream.
+--
+--   Lane-convention deviation, recorded: 000006 supplies timestamps from
+--   the application; this migration defaults applied_at, quarantined_at
+--   and updated_at from the clock, because the consumer's own writes are
+--   the only writers and the instant of recording is the engine's fact
+--   about the row, not the caller's claim.
 
 CREATE TABLE control.ingestion_cursor (
     id integer NOT NULL,
@@ -101,6 +122,15 @@ CREATE TABLE control.applied_facts (
     CONSTRAINT applied_facts_capture_shape CHECK (
         (kind IN ('settled', 'unbillable_orphaned')) = (capture_method IS NOT NULL)
     ),
+    -- The kind's class is derivable, not free: the pairing the idempotency
+    -- contract rests on is a schema promise here, not application
+    -- discipline — a row filing a settlement's kind under the orphan class
+    -- (or the reverse) would slip the exactly-once boundary this table
+    -- exists to enforce.
+    CONSTRAINT applied_facts_kind_class_pairing CHECK (
+        (kind_class = 'settlement') = (kind IN ('settled', 'released', 'expired'))
+        AND (kind_class = 'unbillable_orphaned') = (kind = 'unbillable_orphaned')
+    ),
     CONSTRAINT applied_facts_settlement_fkey
         FOREIGN KEY (settlement_id) REFERENCES control.settlements (id)
 );
@@ -133,15 +163,19 @@ CREATE TABLE control.quarantined_facts (
     -- crash finds its quarantine already recorded and records nothing
     -- twice.
     CONSTRAINT quarantined_facts_fact_unique UNIQUE (request_id, append_seq, kind),
-    CONSTRAINT quarantined_facts_request_id_grammar
-        CHECK (char_length(request_id) BETWEEN 1 AND 256),
+    -- Bounds of evidence, not of the feed grammar: an empty request_id, an
+    -- unknown kind of any length this column can hold, a schema version
+    -- this build has never heard of and an empty payload are exactly the
+    -- refusals this table records, so none may be refused here in turn.
+    -- The adapter clamps the two identity columns to these bounds at the
+    -- record boundary, the way it truncates the reason to its bound.
+    CONSTRAINT quarantined_facts_request_id_evidence
+        CHECK (char_length(request_id) <= 4096),
     CONSTRAINT quarantined_facts_append_seq_positive CHECK (append_seq >= 1),
-    CONSTRAINT quarantined_facts_kind_grammar
-        CHECK (char_length(kind) BETWEEN 1 AND 64),
-    CONSTRAINT quarantined_facts_schema_version_shape
-        CHECK (schema_version >= 1),
-    CONSTRAINT quarantined_facts_payload_grammar
-        CHECK (octet_length(payload) BETWEEN 1 AND 32768),
+    CONSTRAINT quarantined_facts_kind_evidence
+        CHECK (char_length(kind) <= 256),
+    CONSTRAINT quarantined_facts_payload_evidence
+        CHECK (octet_length(payload) <= 32768),
     CONSTRAINT quarantined_facts_reason_grammar
         CHECK (char_length(reason) BETWEEN 1 AND 512)
 );
@@ -171,3 +205,35 @@ the transaction that advanced past them — the explicit, operator-visible
 disposition for a fact it cannot decode or apply. Never a silent skip.';
 COMMENT ON COLUMN control.quarantined_facts.reason IS
 'The consumer''s own refusal vocabulary: why this fact was not applied.';
+
+-- ---------------------------------------------------------------------------
+-- Engine guards: the two effect tables are history, like their lane
+-- siblings. The consumer appends rows and nothing else — a correction to
+-- the idempotency ledger or to a quarantine is a new row's business (or a
+-- human operator's), never an edit to the record the disposition made.
+-- ---------------------------------------------------------------------------
+
+CREATE FUNCTION control.applied_facts_append_only() RETURNS trigger
+LANGUAGE plpgsql AS $applied_facts_append_only$ BEGIN
+    RAISE EXCEPTION 'control.applied_facts is append-only: % is refused (the idempotency ledger records applications; it does not revise them)', TG_OP;
+END;
+$applied_facts_append_only$;
+
+CREATE TRIGGER applied_facts_append_only_guard
+    BEFORE UPDATE OR DELETE ON control.applied_facts
+    FOR EACH STATEMENT EXECUTE FUNCTION control.applied_facts_append_only();
+
+CREATE FUNCTION control.quarantined_facts_append_only() RETURNS trigger
+LANGUAGE plpgsql AS $quarantined_facts_append_only$ BEGIN
+    RAISE EXCEPTION 'control.quarantined_facts is append-only: % is refused (a quarantine is the evidence a refusal produced; it is kept, not edited)', TG_OP;
+END;
+$quarantined_facts_append_only$;
+
+CREATE TRIGGER quarantined_facts_append_only_guard
+    BEFORE UPDATE OR DELETE ON control.quarantined_facts
+    FOR EACH STATEMENT EXECUTE FUNCTION control.quarantined_facts_append_only();
+
+COMMENT ON FUNCTION control.applied_facts_append_only() IS
+    'Fact-ingestion engine guard: the idempotency ledger is history. A replay is answered by reading the row, never by rewriting it.';
+COMMENT ON FUNCTION control.quarantined_facts_append_only() IS
+    'Fact-ingestion engine guard: a quarantined fact is the verbatim evidence of a refusal. Resolving it is an operator''s act on the feed, not an edit to the record.';

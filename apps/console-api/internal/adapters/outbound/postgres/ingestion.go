@@ -39,6 +39,19 @@ var errQuarantineOutsideUnitOfWork = errors.New("refused: a quarantined-fact rec
 // the record rather than turned into a second refusal about the first.
 const maxReasonRunes = 512
 
+// maxRequestIDEvidenceRunes and maxKindEvidenceRunes are the evidence
+// bounds the quarantine's own columns set for the two identity strings a
+// refused fact may carry (quarantined_facts_request_id_evidence,
+// quarantined_facts_kind_evidence). They are deliberately wider than the
+// feed grammar — a refusal outside the grammar is exactly what this table
+// exists to record — and the record clamps to them the way it truncates
+// the reason: a quarantine that cannot be recorded is not a recorded
+// refusal but the wedged feed the table was built to prevent.
+const (
+	maxRequestIDEvidenceRunes = 4096
+	maxKindEvidenceRunes      = 256
+)
+
 // NewAppliedFacts returns the persistence port's idempotency ledger, backed
 // by store. It panics on a nil store for the reason every constructor in
 // this package does.
@@ -49,8 +62,9 @@ func NewAppliedFacts(store persistence.Store) persistence.AppliedFacts {
 	return &appliedFactsRepo{store: store}
 }
 
-// NewQuarantinedFacts returns the persistence port's quarantine, backed by
-// store.
+// NewQuarantinedFacts returns the persistence port's quarantine, backed
+// by store. It panics on a nil store for the reason every constructor in
+// this package does.
 func NewQuarantinedFacts(store persistence.Store) persistence.QuarantinedFacts {
 	if store == nil {
 		panic("postgres: NewQuarantinedFacts requires a non-nil persistence.Store")
@@ -127,7 +141,9 @@ func (r *quarantinedFactsRepo) Record(ctx context.Context, quarantined persisten
 			 settled_amount, corrects_append_seq, reason)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		ON CONFLICT (request_id, append_seq, kind) DO NOTHING
-	`, quarantined.RequestID, quarantined.AppendSeq, quarantined.Kind, quarantined.SchemaVersion,
+	`, clampEvidence(quarantined.RequestID, maxRequestIDEvidenceRunes),
+		quarantined.AppendSeq, clampEvidence(quarantined.Kind, maxKindEvidenceRunes),
+		quarantined.SchemaVersion,
 		quarantined.OccurredAt, string(quarantined.Payload),
 		quarantined.CaptureMethod, quarantined.CommittedAttemptID,
 		quarantined.ProviderInputTokens, quarantined.ProviderOutputTokens, quarantined.DeliveryTokens,
@@ -139,6 +155,21 @@ func (r *quarantinedFactsRepo) Record(ctx context.Context, quarantined persisten
 			quarantined.RequestID, quarantined.AppendSeq, err)
 	}
 	return nil
+}
+
+// clampEvidence bounds an identity string of a refused fact to the length
+// its quarantine column records, by runes — the same discipline as
+// truncateReason, applied to the columns whose values the consumer does
+// not control. The bound sits far above the feed grammar, so it is
+// reached only by exactly the out-of-grammar facts whose record is the
+// table's purpose; a clamp there still leaves the row — id, seq, and the
+// reason's own words — an operator can act on.
+func clampEvidence(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	runes := []rune(s)
+	return strings.TrimSpace(string(runes[:maxRunes]))
 }
 
 // truncateReason bounds the refusal reason to the length the schema records,

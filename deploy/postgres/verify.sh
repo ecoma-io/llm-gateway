@@ -1783,9 +1783,33 @@ VALUES ('verify probe request two classes', 'unbillable_orphaned', 'unbillable_o
 SELECT count(*) FROM control.applied_facts WHERE request_id = 'verify probe request two classes';
 ROLLBACK;")" "2"
 
-expect_constraint_failure "a quarantined fact outside the payload grammar is refused" quarantined_facts_payload_grammar "
+expect_constraint_failure "a quarantined fact outside the payload bound is refused" quarantined_facts_payload_evidence "
 INSERT INTO control.quarantined_facts (request_id, append_seq, kind, schema_version, occurred_at, payload, reason)
-VALUES ('verify probe request', 7, 'settled', 1, now(), '', 'payload is not the version-1 allocation envelope')"
+VALUES ('verify probe request', 7, 'settled', 1, now(), repeat('x', 32769), 'the payload is over the size a quarantine can record verbatim')"
+
+expect_constraint_failure "an applied fact whose kind contradicts its class is refused" applied_facts_kind_class_pairing "
+INSERT INTO control.applied_facts (request_id, kind_class, kind, append_seq, capture_method)
+VALUES ('verify probe request', 'unbillable_orphaned', 'settled', 21, 'provider_reported')"
+
+expect_constraint_failure "an UPDATE of the applied-fact ledger is refused" "applied_facts is append-only" "
+UPDATE control.applied_facts SET kind = 'settled' WHERE request_id = 'verify probe request'"
+
+expect_constraint_failure "a DELETE from the quarantine is refused" "quarantined_facts is append-only" "
+DELETE FROM control.quarantined_facts WHERE request_id = 'verify probe request'"
+
+# The quarantine records the refusals the feed grammar would refuse:
+# an empty request_id, an unknown kind of any length the column holds,
+# a schema version this build does not know. A CHECK that restated the
+# feed grammar here would wedge the feed on exactly the fact the
+# quarantine exists to record past.
+assert_equals "a refusal outside the feed grammar is recorded verbatim" \
+	"$(psql_scalar "$control_db" "
+BEGIN;
+INSERT INTO control.quarantined_facts (request_id, append_seq, kind, schema_version, occurred_at, payload, reason)
+VALUES ('', 31, repeat('k', 70), 0, now(), '', 'the fact''s columns do not meet the feed grammar');
+SELECT (SELECT count(*) FROM control.quarantined_facts WHERE request_id = '') || '|' ||
+       (SELECT schema_version FROM control.quarantined_facts WHERE request_id = '');
+ROLLBACK;")" "1|0"
 
 expect_constraint_failure "a second quarantine of one fact is refused" quarantined_facts_fact_unique "
 WITH seeded AS (

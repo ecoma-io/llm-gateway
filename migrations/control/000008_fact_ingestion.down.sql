@@ -9,3 +9,5 @@
 DROP TABLE control.quarantined_facts;
 DROP TABLE control.applied_facts;
 DROP TABLE control.ingestion_cursor;
+DROP FUNCTION control.quarantined_facts_append_only();
+DROP FUNCTION control.applied_facts_append_only();

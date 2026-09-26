@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/accounting"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
@@ -320,6 +321,79 @@ func TestQuarantinedFactsRecordRefusesToRunAutocommitted(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "unit of work") {
 		t.Fatalf("Record() outside a unit of work = %v, want the refusal", err)
+	}
+}
+
+func TestAQuarantineRecordsTheRefusalsTheFeedGrammarWouldRefuse(t *testing.T) {
+	// The bounds on this table are bounds of evidence, not of the feed
+	// grammar: an empty request_id, an unknown kind longer than the feed
+	// would spell, a schema version this build has never heard of and an
+	// empty payload are exactly the refusals the record exists to keep. Any
+	// of them refused here in turn would turn the promised record-and-
+	// advance into the wedged feed the disposition exists to prevent. The
+	// identity strings clamp to their columns at the record, the way the
+	// reason truncates to its own.
+	store, _, quarantined, _ := integrationIngestion(t)
+	ctx := t.Context()
+
+	// Nothing here deletes and the fixture persists, so the quarantines
+	// whose identity has no run-unique part ride on run-unique sequences.
+	longID := strings.Repeat("r", 5000)
+	shapes := []persistence.QuarantinedFact{
+		{
+			RequestID:     "",
+			AppendSeq:     time.Now().UnixNano(),
+			Kind:          strings.Repeat("k", 300),
+			SchemaVersion: 0,
+			OccurredAt:    time.Now().UTC(),
+			Payload:       nil,
+			Reason:        "the fact's columns do not meet the feed grammar",
+		},
+		{
+			RequestID:     longID,
+			AppendSeq:     time.Now().UnixNano() + 1,
+			Kind:          "refunded",
+			SchemaVersion: -4,
+			OccurredAt:    time.Now().UTC(),
+			Payload:       []byte("{}"),
+			Reason:        "ingestion: unknown payload schema version",
+		},
+	}
+	for _, shape := range shapes {
+		shape := shape
+		if err := store.WithinTx(ctx, func(txCtx context.Context) error {
+			return quarantined.Record(txCtx, shape)
+		}); err != nil {
+			t.Fatalf("Record() a refusal outside the feed grammar: %v", err)
+		}
+	}
+
+	// The out-of-grammar rows stand as recorded — the empty identity
+	// verbatim, the over-long one clamped to its column's bound.
+	var emptyKind string
+	if err := store.Querier(ctx).QueryRowContext(ctx, `
+		SELECT kind FROM control.quarantined_facts
+		WHERE request_id = '' AND schema_version = 0
+		ORDER BY quarantined_at DESC LIMIT 1
+	`).Scan(&emptyKind); err != nil {
+		t.Fatalf("read the empty-identity quarantine back: %v", err)
+	}
+	if utf8.RuneCountInString(emptyKind) != 256 {
+		t.Fatalf("clamped kind length = %d, want the column's 256", utf8.RuneCountInString(emptyKind))
+	}
+	var storedID string
+	if err := store.Querier(ctx).QueryRowContext(ctx, `
+		SELECT request_id FROM control.quarantined_facts
+		WHERE kind = 'refunded' AND schema_version = -4
+		ORDER BY quarantined_at DESC LIMIT 1
+	`).Scan(&storedID); err != nil {
+		t.Fatalf("read the over-long identity back: %v", err)
+	}
+	if utf8.RuneCountInString(storedID) != 4096 {
+		t.Fatalf("clamped request_id length = %d, want the column's 4096", utf8.RuneCountInString(storedID))
+	}
+	if storedID != longID[:len(string([]rune(longID)[:4096]))] {
+		t.Error("the clamp did not keep the evidence's head")
 	}
 }
 
