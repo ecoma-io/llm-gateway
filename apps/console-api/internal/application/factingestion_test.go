@@ -119,9 +119,9 @@ func TestAFactIsTranslatedIntoTheStoresOwnVocabulary(t *testing.T) {
 		t.Fatalf("Replay() error = %v, want nil", err)
 	}
 
-	fact, applied := world.effects["req-1"]
+	fact, applied := world.effect("req-1", "settled")
 	if !applied {
-		t.Fatal("the applier recorded no effect for req-1")
+		t.Fatal("the applier recorded no effect for req-1's settlement class")
 	}
 	want := persistence.Fact{
 		RequestID:     "req-1",
@@ -221,10 +221,10 @@ func TestAFailedAdvanceRollsBackTheAppliedFacts(t *testing.T) {
 	}
 }
 
-// TestAReplayedPageHasNoSecondEffect is request_id idempotency seen from
+// TestAReplayedPageHasNoSecondEffect is kind-classed idempotency seen from
 // outside the applier: the same range read twice delivers every fact twice, and
-// the applier's state still holds one effect per request_id. The use case must
-// not filter the redelivery itself — the applier owns idempotency, and a
+// the applier's state still holds one effect for the fact's class. The use case
+// must not filter the redelivery itself — the applier owns idempotency, and a
 // consumer that skipped facts it believed it had seen would be ordering by
 // something it does not own.
 func TestAReplayedPageHasNoSecondEffect(t *testing.T) {
@@ -260,7 +260,7 @@ func TestAReplayedPageHasNoSecondEffect(t *testing.T) {
 		t.Errorf("req-1 was delivered %d time(s), want %d — replay is normal and the applier is what absorbs it", got, want)
 	}
 	if got, want := len(world.effects), 1; got != want {
-		t.Errorf("effects after the replay = %d, want %d: applying the same request_id twice is a no-op", got, want)
+		t.Errorf("effects after the replay = %d, want %d: delivering the same fact class twice is a no-op", got, want)
 	}
 	if got, want := world.position, "cursor-2"; got != want {
 		t.Errorf("position = %q, want %q", got, want)

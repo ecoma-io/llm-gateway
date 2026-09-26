@@ -1309,6 +1309,33 @@ WITH account AS (
 INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, command_key, price_revision_id, input_unit_price, output_unit_price, sequence, created_at)
 SELECT 'c9000000-0000-7000-8000-0000000000c1', id, 'topup', 100, 100, 0, 'verify probe key', 'verify probe revision', 1, 2, 1, now() FROM bucket"
 
+# And the guard's floor is zero, not one: a free-priced model is a legal
+# configuration the whole money chain agrees on (the Data Plane price list,
+# the fact contract's `minimum: 0`, the ledger domain), and 000007 dropped
+# the strict positivity that made it unbookable. A consume leg priced at
+# zero on one arm must land — its refusal here would be the feed-wedging
+# defect this step exists to keep out.
+assert_equals "a consume leg priced at zero on one arm books" \
+	"$(psql_scalar "$control_db" "
+BEGIN;
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000a3', 'verify probe', 'active', now(), now())
+  RETURNING id
+), bucket AS (
+  INSERT INTO control.funding_buckets (id, account_id, status, version, last_sequence, settled_amount, held_amount, available_amount, created_at, updated_at)
+  SELECT 'b9000000-0000-7000-8000-0000000000b3', id, 'active', 1, 1, 100, 40, 60, now(), now() FROM account
+  RETURNING id
+), settlement AS (
+  INSERT INTO control.settlements (id, request_id, settled_total, created_at)
+  VALUES ('d9000000-0000-7000-8000-0000000000d3', 'verify probe request zero price', 30, now())
+  RETURNING id
+)
+INSERT INTO control.ledger_entries (id, funding_bucket_id, kind, amount, settled_delta, held_delta, settlement_id, price_revision_id, input_unit_price, output_unit_price, sequence, created_at)
+SELECT 'c9000000-0000-7000-8000-0000000000c3', bucket.id, 'consume', 30, -30, -30, settlement.id, 'verify probe revision', 0, 5, 1, now() FROM bucket, settlement
+RETURNING 'ok';
+ROLLBACK;")" "ok"
+
 expect_constraint_failure "a hold without its reservation is refused" ledger_entries_reference_shape "
 WITH account AS (
   INSERT INTO control.accounts (id, name, state, created_at, updated_at)

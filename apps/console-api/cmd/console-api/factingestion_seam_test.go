@@ -85,12 +85,39 @@ func (f *feedServer) askedFor() []string {
 // both.
 type seamWorld struct {
 	position string
-	effects  map[string]persistence.Fact
+	effects  map[factKey]persistence.Fact
 	log      []string
 }
 
 func newSeamWorld(position string) *seamWorld {
-	return &seamWorld{position: position, effects: map[string]persistence.Fact{}}
+	return &seamWorld{position: position, effects: map[factKey]persistence.Fact{}}
+}
+
+// effect reads the recorded effect for one of a request's kind classes.
+func (w *seamWorld) effect(requestID, kind string) (persistence.Fact, bool) {
+	fact, ok := w.effects[factKey{requestID: requestID, class: kindClass(kind)}]
+	return fact, ok
+}
+
+// factKey is the identity a delivery deduplicates on — the fact contract's
+// kind-classed idempotency. A request's settled, released and expired facts
+// are one class and a redelivery of it is a replay; an unbillable orphan is
+// separate bookkeeping that coexists with the settlement. A kind the contract
+// does not define falls outside both classes and can never pass for a replay.
+type factKey struct {
+	requestID string
+	class     string
+}
+
+func kindClass(kind string) string {
+	switch kind {
+	case "settled", "released", "expired":
+		return "settlement"
+	case "unbillable_orphaned":
+		return "unbillable_orphaned"
+	default:
+		return "unclassifiable:" + kind
+	}
 }
 
 // seamStore is the unit of work. It snapshots the durable state at begin and
@@ -104,9 +131,9 @@ type seamStore struct {
 func (s seamStore) WithinTx(ctx context.Context, fn func(context.Context) error) error {
 	s.world.log = append(s.world.log, "begin")
 	position := s.world.position
-	effects := make(map[string]persistence.Fact, len(s.world.effects))
-	for requestID, fact := range s.world.effects {
-		effects[requestID] = fact
+	effects := make(map[factKey]persistence.Fact, len(s.world.effects))
+	for key, fact := range s.world.effects {
+		effects[key] = fact
 	}
 
 	if err := fn(context.WithValue(ctx, seamTxKey{}, true)); err != nil {
@@ -146,7 +173,11 @@ type seamApplier struct{ world *seamWorld }
 
 func (a seamApplier) Apply(_ context.Context, fact persistence.Fact) error {
 	a.world.log = append(a.world.log, "apply:"+fact.RequestID)
-	a.world.effects[fact.RequestID] = fact
+	key := factKey{requestID: fact.RequestID, class: kindClass(fact.Kind)}
+	if _, applied := a.world.effects[key]; applied {
+		return nil
+	}
+	a.world.effects[key] = fact
 	return nil
 }
 
@@ -207,8 +238,8 @@ func TestAMalformedPageOnTheWireNeverMovesTheDurablePosition(t *testing.T) {
 	if got, want := result.Applied, 1; got != want {
 		t.Errorf("Applied = %d, want %d", got, want)
 	}
-	if _, applied := world.effects["req-1"]; !applied {
-		t.Error("the applier recorded no effect for req-1; the range the malformed page hid was never processed")
+	if _, applied := world.effect("req-1", "settled"); !applied {
+		t.Error("the applier recorded no effect for req-1's settlement class; the range the malformed page hid was never processed")
 	}
 	if got, want := world.position, "cursor-2"; got != want {
 		t.Errorf("position = %q, want %q", got, want)
@@ -218,5 +249,84 @@ func TestAMalformedPageOnTheWireNeverMovesTheDurablePosition(t *testing.T) {
 	}
 	if got, want := feed.askedFor(), []string{initial, initial}; !slices.Equal(got, want) {
 		t.Errorf("the feed was asked for %v, want %v", got, want)
+	}
+}
+
+// coexistencePageBody carries, for one request, the orphan fact and the
+// settled fact the contract says may coexist: the request was admitted, its
+// provider attempt failed in a way that leaves no billable usage, and the
+// runtime recorded both the orphan's bookkeeping and the settlement that
+// released the hold. Deduplicating by request_id alone would swallow the
+// second fact as a replay of the first.
+const coexistencePageBody = `{"events":[` +
+	`{"append_seq":3,"request_id":"req-1","kind":"unbillable_orphaned","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"allocations":[]}},` +
+	`{"append_seq":4,"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:13Z","payload":{"allocations":[{"funding_bucket_id":"bucket-1","amount":4200,"ordinal":1}]}}` +
+	`],"next_cursor":"cursor-2","has_more":false}`
+
+// replayedSettlementPageBody redelivers the same request's settlement class on
+// a later append_seq — what a replayed range after a crash looks like on the
+// wire.
+const replayedSettlementPageBody = `{"events":[` +
+	`{"append_seq":9,"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:14Z","payload":{"allocations":[{"funding_bucket_id":"bucket-1","amount":4200,"ordinal":1}]}}` +
+	`],"next_cursor":"cursor-3","has_more":false}`
+
+// TestAnOrphanAndASettlementForOneRequestAreTwoEffects pins the seam's
+// idempotency to the identity the contract defines. Two facts for one
+// request_id arrive on one page and both must record an effect — the
+// unbillable orphan is separate bookkeeping, not a replay of the settlement —
+// and a later redelivery of the settlement class must be a no-op rather than a
+// second effect. Every hop here is the real decoder; only the applier is a
+// fake, which is why this file exists: the fake is the reference semantic an
+// implementation of FactApplier has to match.
+func TestAnOrphanAndASettlementForOneRequestAreTwoEffects(t *testing.T) {
+	const initial = "cursor-1"
+
+	feed := newFeedServer(t, coexistencePageBody)
+	client := dataplaneadapter.New(feed.server.Client(), feed.server.URL, seamCredential)
+	world := newSeamWorld(initial)
+	ingestion := application.NewFactIngestion(client, seamStore{world: world}, seamCursor{world: world}, seamApplier{world: world})
+
+	result, err := ingestion.Replay(context.Background())
+	if err != nil {
+		t.Fatalf("Replay() error = %v, want nil", err)
+	}
+	if got, want := result.Applied, 2; got != want {
+		t.Errorf("Applied = %d, want %d: both facts for the request apply", got, want)
+	}
+	if _, applied := world.effect("req-1", "unbillable_orphaned"); !applied {
+		t.Error("the applier recorded no effect for req-1's orphan fact; a class that coexists with the settlement was dropped")
+	}
+	if _, applied := world.effect("req-1", "settled"); !applied {
+		t.Error("the applier recorded no effect for req-1's settled fact; the orphan swallowed its settlement")
+	}
+	if got, want := len(world.effects), 2; got != want {
+		t.Errorf("effects = %d, want %d: one per kind class, not one per request_id", got, want)
+	}
+	if got, want := world.position, "cursor-2"; got != want {
+		t.Errorf("position = %q, want %q", got, want)
+	}
+
+	// The settlement class arrives again — appended later by the runtime, or
+	// replayed after a crash, indistinguishably on this wire. The delivery is
+	// real and the position moves; the effect is not repeated.
+	feed.setBody(replayedSettlementPageBody)
+	result, err = ingestion.Replay(context.Background())
+	if err != nil {
+		t.Fatalf("second Replay() error = %v, want nil", err)
+	}
+	if got, want := result.Applied, 1; got != want {
+		t.Errorf("Applied = %d, want %d: the redelivery is still applied, idempotently", got, want)
+	}
+	if got, want := len(world.effects), 2; got != want {
+		t.Errorf("effects after the replay = %d, want %d: a replayed class books no second effect", got, want)
+	}
+	if got, want := world.position, "cursor-3"; got != want {
+		t.Errorf("position = %q, want %q", got, want)
+	}
+	if got, want := world.log, []string{
+		"begin", "apply:req-1", "apply:req-1", "advance:cursor-2", "commit",
+		"begin", "apply:req-1", "advance:cursor-3", "commit",
+	}; !slices.Equal(got, want) {
+		t.Errorf("the flow observed %v, want %v", got, want)
 	}
 }

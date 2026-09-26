@@ -51,10 +51,11 @@ const (
 )
 
 // PriceSnapshot is the consume leg's price provenance, copied by value from
-// the revision the consume was priced against. The B12 catalog owns
-// revisions — this is a textual reference and two copied unit prices, not a
-// foreign key, because the settlement must be derivable from the fact alone
-// and a price later re-derived from a moving table is not provenance.
+// the revision the consume was priced against. The Data Plane's client price
+// list owns revisions (ADR 0005's catalog tables): the revision id travels
+// here as a textual reference and the two unit prices as copied values, not
+// as a foreign key, because the settlement must be derivable from the fact
+// alone and a price later re-derived from a moving table is not provenance.
 type PriceSnapshot struct {
 	RevisionID      PriceRevisionID
 	InputUnitPrice  Amount
