@@ -193,8 +193,11 @@ type Event struct {
 	// CommittedAttemptID names the upstream call the usage belongs to. Nil
 	// where the fact names no attempt.
 	CommittedAttemptID *string
-	// ProviderInputTokens and ProviderOutputTokens are the provider's own
-	// report as the gateway recorded it. Nil where no report arrived.
+	// ProviderInputTokens and ProviderOutputTokens are the output figures
+	// the settlement priced, under the substitution ladder the producing
+	// runtime applies (capture_method attests which arm priced); the
+	// provider's raw report stays behind the attempt row as telemetry. Nil
+	// on the facts that carry no usage.
 	ProviderInputTokens  *int64
 	ProviderOutputTokens *int64
 	// DeliveryTokens is the gateway's own count of what reached the client.

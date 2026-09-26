@@ -107,6 +107,14 @@ type SettlePlan struct {
 // than trusted from construction: the fields are exported, and a settlement
 // is exactly the place a shortcut must not survive.
 //
+// An empty allocation list is one legitimate settlement, not a shortcut: the
+// zero-priced request's hold holds nothing and its fact carries no legs, so
+// its settlement is the header alone at total zero — recorded as settled
+// rather than left for the feed to deliver forever. Any allocation present
+// is validated in full; what the empty case cannot do is smuggle in a
+// nonzero total, which it cannot, because the total is derived from the
+// legs and there are none.
+//
 // One leg pair at most per bucket: the ledger's (settlement_id,
 // funding_bucket_id, kind) uniqueness is the schema pinning the one-call
 // waterfall this builder exists to keep, so a caller handing two
@@ -121,9 +129,6 @@ func BuildSettle(settlementID SettlementID, requestID RequestID, allocations []A
 	}
 	if newEntryID == nil {
 		return SettlePlan{}, fmt.Errorf("accounting: build settle: %w: nil entry id minter", ErrInvalidReference)
-	}
-	if len(allocations) == 0 {
-		return SettlePlan{}, fmt.Errorf("accounting: build settle: %w: a settlement names at least one allocation", ErrInvalidSettlement)
 	}
 
 	seen := make(map[FundingBucketID]struct{}, len(allocations))

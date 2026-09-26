@@ -221,10 +221,14 @@ Each stage's contract, in the vocabulary the rest of this page already uses:
   terminal pointer in the same unit of work. An attempt ends in `succeeded`,
   `failed`, or `failed_after_commitment`; only the committed attempt is
   named by the ending's fact.
-- **Commitment.** The first content-bearing byte forwarded to the client
-  freezes the candidate and the ending's shape ([routing](routing.md)):
-  before it, failure means fallback or a whole release; after it, failure is
-  delivered inside the answer and settles on what was delivered.
+- **Commitment.** The answer's first forwarded content freezes the candidate
+  and the ending's shape ([routing](routing.md)). A stream commits at its
+  first content-bearing chunk — or at the flush of a preamble buffer grown
+  to its cap, a cap-sized preamble being content for commitment purposes —
+  and a buffered answer commits when its completed body first reaches the
+  client. Before commitment, failure means fallback or a whole release;
+  after it, failure is delivered inside the answer and settles on what was
+  delivered.
 - **Partial stream.** A stream that dies — or a client that leaves — after
   commitment settles on the delivered bytes (capture `gateway_observed`);
   the provider's usage for the unread remainder is attempt telemetry only

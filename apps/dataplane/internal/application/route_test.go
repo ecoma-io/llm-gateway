@@ -844,6 +844,157 @@ func TestRoutingStrandsTheHoldWhenTheEndingExhaustsItsBudget(t *testing.T) {
 	}
 }
 
+// TestRoutingStrandsTheHoldWhenTheSettleLadderExhausts: a settle unit that
+// fails after commitment never falls through to a release — a release whose
+// compare-and-set then wins would publish "released, unused" over an answer
+// the client is already reading, and the feed's last word would be a
+// falsehood. The hold stands for the sweep instead: the walk fails as an
+// internal error, nothing is appended, and nothing is given back.
+func TestRoutingStrandsTheHoldWhenTheSettleLadderExhausts(t *testing.T) {
+	routing, world, _, in := routingFixture(t)
+	world.seedCandidates("test-model",
+		catalog.Candidate{ID: "cand-a", BackendID: "backend-a", ProviderModel: "model-a", Position: 1})
+	world.seedBackend("backend-a", catalog.BackendActive)
+	exec := &fakeExecutor{}
+	exec.act = func(sink executors.Sink) { _ = sink.Content([]byte(`{"answer":true}`)) }
+	exec.results = []executors.Result{okExec(20, 8)}
+	routing.registry = executors.NewRegistry(map[catalog.BackendID]executors.Executor{"backend-a": exec})
+	// The fault bites the ending's attempt insert — a step only the settle
+	// unit takes — for the whole ladder, while every step a release unit
+	// would take stays healthy: exactly the sequence where the old shape
+	// converted the exhaustion into a release.
+	world.attemptFailure = fakePGError{code: "40001"}
+	world.attemptFailures = 3
+
+	_, err := routing.Serve(context.Background(), in)
+	if err == nil {
+		t.Fatalf("Serve answered an ending whose settle ladder never landed, want the internal failure")
+	}
+	if closes := world.count("reservation.close"); closes != 3 {
+		t.Fatalf("the ending attempted %d closes, want the settle ladder's 3 and no release's fourth", closes)
+	}
+	if returns := world.count("ledger.return"); returns != 0 {
+		t.Fatalf("the stranded ending gave capacity back %d times, want none — a release never ran", returns)
+	}
+	if world.commitCount() != 1 {
+		t.Fatalf("the world committed %d units, want only admission's", world.commitCount())
+	}
+	if reservation := admissionReservationRow(t, world); reservation.State != accounting.StateOpen {
+		t.Fatalf("the hold is %s, want open — stranded, the reaper's to reclaim", reservation.State)
+	}
+	if row := admissionRequestRow(t, world); row.Status != execution.StatusExecuting {
+		t.Fatalf("the request is %s, want executing — no ending was ever stated", row.Status)
+	}
+	if intake := admissionIntakeRow(t, world, admissionAccount, "replay-key-1"); intake.FinalStatus != nil {
+		t.Fatalf("the replay record is terminal, want it still waiting on the stranded walk")
+	}
+	if len(world.facts) != 0 {
+		t.Fatalf("the stranded ending appended a fact, want none")
+	}
+}
+
+// TestRoutingSettleRefusesADuplicateSettlementFactAsABug: a second
+// settlement-relevant fact behind a CAS the unit owns is the feed's
+// invariants broken — the append refuses through the dedup unique's
+// sentinel, the unit rolls back whole, and the refusal is not retried,
+// because a retry cannot improve a broken invariant.
+func TestRoutingSettleRefusesADuplicateSettlementFactAsABug(t *testing.T) {
+	routing, world, _, in := routingFixture(t)
+	world.seedCandidates("test-model",
+		catalog.Candidate{ID: "cand-a", BackendID: "backend-a", ProviderModel: "model-a", Position: 1})
+	world.seedBackend("backend-a", catalog.BackendActive)
+	exec := &fakeExecutor{}
+	exec.act = func(sink executors.Sink) { _ = sink.Content([]byte(`{"answer":true}`)) }
+	exec.results = []executors.Result{okExec(20, 8)}
+	routing.registry = executors.NewRegistry(map[catalog.BackendID]executors.Executor{"backend-a": exec})
+	world.factDuplicate = true
+
+	if _, err := routing.Serve(context.Background(), in); err == nil {
+		t.Fatalf("Serve answered a settlement whose fact the dedup unique refused, want the internal failure")
+	}
+	if closes := world.count("reservation.close"); closes != 1 {
+		t.Fatalf("the ending attempted %d closes, want 1 — the refusal is a bug, not contention to retry", closes)
+	}
+	if world.rollbackCount() != 1 || world.commitCount() != 1 {
+		t.Fatalf("the ending committed %d and rolled back %d beyond admission's commit, want the ending rolled back whole", world.commitCount()-1, world.rollbackCount())
+	}
+	if reservation := admissionReservationRow(t, world); reservation.State != accounting.StateOpen {
+		t.Fatalf("the hold is %s, want open — the rolled-back unit left it standing", reservation.State)
+	}
+	if len(world.facts) != 0 {
+		t.Fatalf("the refused settlement left a fact behind, want none")
+	}
+}
+
+// TestRoutingObservesTheClose: every stated ending hands a wired observer
+// its structured record — the observability contract's fields, filled from
+// what the ending proved, and nothing on the shape that could carry a
+// prompt, a credential or a provider response. A nil observer is the
+// wired-nothing default, which is why every other test in this file runs
+// without one and passes.
+func TestRoutingObservesTheClose(t *testing.T) {
+	routing, world, _, in := routingFixture(t)
+	first, second := twoCandidateWorld(world)
+	first.results = []executors.Result{failExec(execution.ErrorRateLimited)}
+	second.act = func(sink executors.Sink) { _ = sink.Content([]byte(`{"answer":true}`)) }
+	second.results = []executors.Result{okExec(101, 55)}
+	routing.registry = executors.NewRegistry(map[catalog.BackendID]executors.Executor{
+		"backend-a": first,
+		"backend-b": second,
+	})
+	var observed []CloseObservation
+	routing.ObserveClose = func(o CloseObservation) { observed = append(observed, o) }
+
+	if _, err := routing.Serve(context.Background(), in); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("the walk observed %d closings, want the one settlement", len(observed))
+	}
+	o := observed[0]
+	committed := world.attempts[1]
+	fact := world.facts[len(world.facts)-1]
+	if o.FinalStatus != string(execution.StatusSucceeded) || !o.Committed || o.UsageState != CloseUsageClaimed {
+		t.Fatalf("the observation reads %s/%v/%s, want a committed, claimed success", o.FinalStatus, o.Committed, o.UsageState)
+	}
+	if o.RequestID != string(committed.RequestID) || o.AttemptID != string(committed.ID) {
+		t.Fatalf("the observation names %s/%s, want the committed walk's request and attempt", o.RequestID, o.AttemptID)
+	}
+	if o.UsageEventID != fact.AppendSeq {
+		t.Fatalf("the observation's event id = %d, want the settled fact's feed position %d", o.UsageEventID, fact.AppendSeq)
+	}
+	if o.Provider != "model-b" || o.Backend != "backend-b" || o.Candidate != 1 {
+		t.Fatalf("the observation's attribution reads %s/%s/%d, want the second candidate", o.Provider, o.Backend, o.Candidate)
+	}
+	if o.InputTokens == nil || *o.InputTokens != 71 || o.OutputTokens == nil || *o.OutputTokens != 16 || o.DeliveryTokens == nil || *o.DeliveryTokens != 15 {
+		t.Fatalf("the observation's counts read %v/%v/%v, want the clamped pair and the delivery", o.InputTokens, o.OutputTokens, o.DeliveryTokens)
+	}
+}
+
+// TestRoutingObservesTheRelease: the release's observation states an ending
+// that claimed nothing — no attempt named, commitment false, and the feed
+// position of the released fact.
+func TestRoutingObservesTheRelease(t *testing.T) {
+	routing, world, _, in := routeFixture(t) // the empty registry walks to no_candidate
+	var observed []CloseObservation
+	routing.ObserveClose = func(o CloseObservation) { observed = append(observed, o) }
+
+	if _, err := routing.Serve(context.Background(), in); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("the walk observed %d closings, want the one release", len(observed))
+	}
+	o := observed[0]
+	fact := world.facts[len(world.facts)-1]
+	if o.FinalStatus != string(execution.StatusRejected) || o.Committed || o.UsageState != CloseUsageUnclaimed {
+		t.Fatalf("the observation reads %s/%v/%s, want an unclaimed, uncommitted rejection", o.FinalStatus, o.Committed, o.UsageState)
+	}
+	if o.AttemptID != "" || o.UsageEventID != fact.AppendSeq {
+		t.Fatalf("the release observation names attempt %q at event %d, want no attempt and the released fact's position", o.AttemptID, o.UsageEventID)
+	}
+}
+
 // TestRoutingDoesNotRetryTheEndingOnAHardFailure: an ending failure that is
 // not contention is not retried — a second attempt would only repeat it.
 func TestRoutingDoesNotRetryTheEndingOnAHardFailure(t *testing.T) {
@@ -972,7 +1123,14 @@ func clampedPtr(v int64) *int64 { return &v }
 // after commitment. Every case's pair prices at or below the hold — the
 // invariant the clamping exists to keep.
 func TestSettleBasisCases(t *testing.T) {
-	admitted := &Admission{InputTokens: 5, OutputBasis: 16, Hold: 37}
+	// The prices make the hold guard below bite: at a minor unit per token,
+	// Hold(5, 16, 1M, 2M) = 37, the hold the fixture carries, so every row's
+	// amount is a real number the guard actually compares — not a zero
+	// priced against a ceiling.
+	admitted := &Admission{
+		InputTokens: 5, OutputBasis: 16, Hold: 37,
+		Price: catalog.PriceSnapshot{InputUnitPrice: 1_000_000, OutputUnitPrice: 2_000_000},
+	}
 	delivered := []byte(`{"answer":true}`) // 15 bytes, the delivery figure on every row
 
 	cases := []struct {
@@ -1029,6 +1187,62 @@ func TestSettleBasisCases(t *testing.T) {
 			}
 			if amount > admitted.Hold {
 				t.Fatalf("the settled amount = %d, above the hold %d — the bound the arithmetic exists to keep", amount, admitted.Hold)
+			}
+		})
+	}
+}
+
+// TestSettleBasisDeliveredBeyondTheBasis is the regime the first table's
+// fixture cannot reach: a delivered count the basis cannot cover. The clamp
+// binds, the reservation's own figure is what settles, and the capture
+// attests the floor — while the delivery column still carries the full count
+// the client provably received. Without the clamp these pairs price above
+// the hold: delivered bytes are wire bytes and the basis is the token
+// ceiling the hold was sized with, so the unclamped arms breached the
+// ending's first law in ordinary traffic.
+func TestSettleBasisDeliveredBeyondTheBasis(t *testing.T) {
+	admitted := &Admission{
+		InputTokens: 5, OutputBasis: 8, Hold: 21,
+		Price: catalog.PriceSnapshot{InputUnitPrice: 1_000_000, OutputUnitPrice: 2_000_000},
+	}
+	delivered := []byte(`{"answer":true}`) // 15 delivered bytes against an 8 basis
+
+	cases := []struct {
+		name         string
+		streamFailed bool
+		reportedIn   *int64
+		reportedOut  *int64
+		wantCapture  accounting.CaptureMethod
+		wantInput    int64
+		wantOutput   int64
+	}{
+		{"failed: the delivered bytes clamp to the basis", true, nil, nil, accounting.CaptureReservationFloor, 5, 8},
+		{"failed: clamped past a report that named less", true, nil, clampedPtr(3), accounting.CaptureReservationFloor, 5, 8},
+		{"completed: the unreported delivery clamps to the basis", false, nil, nil, accounting.CaptureReservationFloor, 5, 8},
+		{"completed: input unreported, output clamped", false, nil, clampedPtr(77), accounting.CaptureReservationFloor, 5, 8},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			usage := settleBasis(admitted, delivered, tc.reportedIn, tc.reportedOut, tc.streamFailed)
+			if usage.capture != tc.wantCapture {
+				t.Fatalf("capture = %s, want %s — the clamp that bound is the reservation's own figure settling", usage.capture, tc.wantCapture)
+			}
+			if usage.input == nil || *usage.input != tc.wantInput {
+				t.Fatalf("input = %v, want %d", usage.input, tc.wantInput)
+			}
+			if usage.output == nil || *usage.output != tc.wantOutput {
+				t.Fatalf("output = %v, want the %d basis the delivered count was clamped to", usage.output, tc.wantOutput)
+			}
+			if usage.delivery == nil || *usage.delivery != 15 {
+				t.Fatalf("delivery = %v, want the 15 bytes delivered — the clamp bounds the priced figure, never the recorded one", usage.delivery)
+			}
+			amount, err := settleAmount(usage, admitted.Price)
+			if err != nil {
+				t.Fatalf("settleAmount: %v", err)
+			}
+			if amount != admitted.Hold {
+				t.Fatalf("the settled amount = %d, want %d — the clamped pair prices exactly at the hold", amount, admitted.Hold)
 			}
 		})
 	}

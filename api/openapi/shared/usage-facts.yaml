@@ -240,6 +240,11 @@ components:
             settled total (ADR 0006, amendments to ADR 0004).
         capture_method:
           type: [string, "null"]
+          enum:
+            - reported
+            - gateway_observed
+            - reservation_floor
+            - null
           description: >-
             How the fact's usage figures were known — `reported` when the
             provider's own figures priced as given, `gateway_observed` when a
@@ -255,20 +260,26 @@ components:
           type: [integer, "null"]
           minimum: 0
           description: >-
-            The provider's own input-usage report as the gateway recorded it,
-            bounded by the reservation where the reservation's figure was
-            lower. Null when no report arrived; null on `released` and
-            `expired`.
+            The input figure the settlement priced — not the provider's raw
+            report. The provider's report prices when it arrived within the
+            reservation; the reservation's admitted input count prices
+            when the report exceeded it or never arrived. `capture_method`
+            attests which arm priced; the raw report itself stays beside the
+            attempt row as telemetry and does not travel this feed. Null on
+            `released` and `expired`.
         provider_output_tokens:
           type: [integer, "null"]
           minimum: 0
           description: >-
-            The provider's own output-usage report as the gateway recorded it.
-            It prices a settlement only when the answer completed — a stream
-            that failed after commitment bills the delivered tokens, and the
-            provider's figure for the stream it never finished is telemetry
-            beside the settlement, not a customer bill (ADR 0004). Null when no
-            report arrived; null on `released` and `expired`.
+            The output figure the settlement priced — not the provider's raw
+            report. A completed answer prices the provider's report bounded by
+            the reservation's output basis, or the gateway's delivered count
+            under that bound when no report arrived. A stream that failed
+            after commitment prices the delivered tokens under the bound and
+            never the provider's figure — the provider's count for a stream it
+            never finished is the attempt row's telemetry, not a customer
+            bill (ADR 0004). `capture_method` attests which arm priced. Null
+            on `released` and `expired`.
         delivery_tokens:
           type: [integer, "null"]
           minimum: 0

@@ -15,6 +15,7 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/execution"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/identity"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/projection"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/persistence"
 )
 
 // The admission tests. Every one of them runs the real use case over the one
@@ -1137,7 +1138,11 @@ func TestAdmissionDuplicateHoldIsABugNotAnAnswer(t *testing.T) {
 // TestIsRetryableStoreFailure is the classifier's own table: the engine's
 // contention classes and the connection exceptions retry, everything else
 // fails on its merits, and a caller's cancelled context is never anyone's
-// retry.
+// retry. The two named sentinels sit beside the sqlstate rows on purpose:
+// the commit-ambiguity sentinel is a no-sqlstate failure whose whole meaning
+// is that the caller must retry and let the CAS re-judge — the one shape the
+// bare no-sqlstate row refuses — and the already-appended sentinel retries
+// so the ladder's next attempt reads the twin row as the done thing it is.
 func TestIsRetryableStoreFailure(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -1148,6 +1153,9 @@ func TestIsRetryableStoreFailure(t *testing.T) {
 		{name: "deadlock", err: fakePGError{code: "40P01"}, want: true},
 		{name: "connection exception", err: fakePGError{code: "08006"}, want: true},
 		{name: "connection exception, wrapped", err: fmt.Errorf("application: admit: %w", fakePGError{code: "08003"}), want: true},
+		{name: "the commit's outcome is unknown", err: persistence.ErrCommitOutcomeUnknown, want: true},
+		{name: "the commit's outcome is unknown, wrapped deep", err: fmt.Errorf("application: settle: append the settlement: %w", persistence.ErrCommitOutcomeUnknown), want: true},
+		{name: "the attempt is already appended", err: persistence.ErrAttemptAlreadyAppended, want: true},
 		{name: "unique violation", err: fakePGError{code: "23505"}},
 		{name: "check violation", err: fakePGError{code: "23514"}},
 		{name: "a failure with no sqlstate at all", err: errors.New("fake: the socket vanished")},

@@ -195,6 +195,81 @@ func TestReadUsageEventsDecodesAPage(t *testing.T) {
 	}
 }
 
+// TestReadUsageEventsDecodesAFullyPricedSettlement is the wire hop a real
+// settlement takes: every typed figure the producer writes non-null crosses
+// the seam non-null and equal — values AND null-fidelity together, the two
+// things a decode can lose. The all-null pages the neighbouring tests decode
+// pin the absence side; this pins the presence side, so a field that started
+// decoding to its zero value would fail here rather than settle for nothing.
+func TestReadUsageEventsDecodesAFullyPricedSettlement(t *testing.T) {
+	body := `{
+		"events": [
+			{
+				"append_seq": 87,
+				"request_id": "req-priced",
+				"kind": "settled",
+				"schema_version": 3,
+				"occurred_at": "2026-09-25T08:09:10Z",
+				"payload": {"allocations":[{"funding_bucket_id":"f0e0c8a0-0000-4000-8000-000000000001","amount":21,"ordinal":1}]},
+				"capture_method": "reservation_floor",
+				"committed_attempt_id": "att-priced",
+				"provider_input_tokens": 511,
+				"provider_output_tokens": 137,
+				"delivery_tokens": 12,
+				"price_revision_id": "rev-priced-9",
+				"input_unit_price": 1000000,
+				"output_unit_price": 2000000,
+				"settled_amount": 21
+			}
+		],
+		"next_cursor": "opaque-cursor-priced",
+		"has_more": false
+	}`
+
+	var seen *http.Request
+	client := New(capturingClient(&seen, jsonResponse(http.StatusOK, body)), baseURL, credential)
+
+	page, err := client.ReadUsageEvents(context.Background(), "", 100)
+	if err != nil {
+		t.Fatalf("ReadUsageEvents() error = %v, want nil", err)
+	}
+	if len(page.Events) != 1 {
+		t.Fatalf("len(Events) = %d, want 1", len(page.Events))
+	}
+	event := page.Events[0]
+
+	if event.CaptureMethod == nil || *event.CaptureMethod != "reservation_floor" {
+		t.Errorf("CaptureMethod = %v, want reservation_floor", event.CaptureMethod)
+	}
+	if event.CommittedAttemptID == nil || *event.CommittedAttemptID != "att-priced" {
+		t.Errorf("CommittedAttemptID = %v, want att-priced", event.CommittedAttemptID)
+	}
+	if event.ProviderInputTokens == nil || *event.ProviderInputTokens != 511 {
+		t.Errorf("ProviderInputTokens = %v, want 511 — a priced figure crosses as the number it was", event.ProviderInputTokens)
+	}
+	if event.ProviderOutputTokens == nil || *event.ProviderOutputTokens != 137 {
+		t.Errorf("ProviderOutputTokens = %v, want 137", event.ProviderOutputTokens)
+	}
+	if event.DeliveryTokens == nil || *event.DeliveryTokens != 12 {
+		t.Errorf("DeliveryTokens = %v, want 12", event.DeliveryTokens)
+	}
+	if event.PriceRevision == nil || *event.PriceRevision != "rev-priced-9" {
+		t.Errorf("PriceRevision = %v, want rev-priced-9", event.PriceRevision)
+	}
+	if event.InputUnitPrice == nil || *event.InputUnitPrice != 1_000_000 {
+		t.Errorf("InputUnitPrice = %v, want 1000000 — per-million prices keep their magnitude on the wire", event.InputUnitPrice)
+	}
+	if event.OutputUnitPrice == nil || *event.OutputUnitPrice != 2_000_000 {
+		t.Errorf("OutputUnitPrice = %v, want 2000000", event.OutputUnitPrice)
+	}
+	if event.SettledAmount == nil || *event.SettledAmount != 21 {
+		t.Errorf("SettledAmount = %v, want 21", event.SettledAmount)
+	}
+	if event.CorrectsAppendSeq != nil {
+		t.Errorf("CorrectsAppendSeq = %v, want nil — the correction path writes nothing in this build", event.CorrectsAppendSeq)
+	}
+}
+
 // TestReadUsageEventsRefusesAPageItCannotAdvanceFrom is the consumer boundary
 // the port's Page contract opens with: a page's position is the one value in
 // this flow that becomes durable state in another database, and a response that

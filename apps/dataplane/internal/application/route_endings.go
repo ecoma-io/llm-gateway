@@ -61,6 +61,55 @@ func endingContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), endingBudget)
 }
 
+// CloseObservation is the close's one structured record — the fields the
+// observability contract names for every finalization, and nothing more.
+// Nothing on it can carry a prompt, a credential or a provider response:
+// the usage figures are counts, the attribution is identity strings, and
+// the egress field is deliberately the one that can stay empty — the egress
+// layer is invisible below the executor by design (the egress port's own
+// law), so the runtime attests the backend it called and no egress identity
+// beyond it. UsageEventID is the feed position the ending's fact took; zero
+// on an observation whose fact was recorded by another writer (the orphan
+// tail's dedup skip).
+type CloseObservation struct {
+	RequestID      string
+	AttemptID      string
+	UsageEventID   int64
+	FinalStatus    string
+	Committed      bool
+	UsageState     string
+	InputTokens    *int64
+	OutputTokens   *int64
+	DeliveryTokens *int64
+	Provider       string
+	Backend        string
+	Candidate      int
+	Egress         string
+	CloseDuration  time.Duration
+}
+
+// The three usage states an ending can claim: the settlement priced its
+// figures, the release gave everything back, or the orphan tail observed
+// work it did not settle.
+const (
+	CloseUsageClaimed   = "claimed"
+	CloseUsageUnclaimed = "unclaimed"
+	CloseUsageObserved  = "observed_unsettled"
+)
+
+// CloseObserver receives one observation per stated ending, after the fact
+// that states it has committed. It runs on the ending's own path: an
+// observer that blocks delays the ending's caller, an observer that panics
+// is the operator's miswiring.
+type CloseObserver func(CloseObservation)
+
+// observeClose hands a stated ending to the wired observer, when one is.
+func (r *ChatRouting) observeClose(o CloseObservation) {
+	if r.ObserveClose != nil {
+		r.ObserveClose(o)
+	}
+}
+
 // release finalises an admitted request without settleable usage. Exactly one
 // of rejection and failure is set: a rejection is the no-candidate answer's
 // two shapes, a failure is a surfaced upstream refusal — and the pairing each
@@ -69,11 +118,25 @@ func endingContext(ctx context.Context) (context.Context, context.CancelFunc) {
 func (r *ChatRouting) release(ctx context.Context, in ChatInput, admitted *Admission, rejection execution.RejectionReason, failure execution.FailureReason) error {
 	ctx, cancel := endingContext(ctx)
 	defer cancel()
+	started := time.Now()
 	for attempt := 0; attempt < endingMaxAttempts; attempt++ {
 		// A unit that lost its CAS settled too — someone else owns the
 		// ending — and an error is the only thing left to retry.
-		_, err := r.releaseOnce(ctx, in, admitted, rejection, failure)
+		completed, seq, err := r.releaseOnce(ctx, in, admitted, rejection, failure)
 		if err == nil {
+			if completed {
+				status := string(execution.StatusRejected)
+				if failure != "" {
+					status = string(execution.StatusFailed)
+				}
+				r.observeClose(CloseObservation{
+					RequestID:     string(admitted.RuntimeRequestID),
+					UsageEventID:  seq,
+					FinalStatus:   status,
+					UsageState:    CloseUsageUnclaimed,
+					CloseDuration: time.Since(started),
+				})
+			}
 			return nil
 		}
 		if !isRetryableStoreFailure(err) {
@@ -94,8 +157,9 @@ func (r *ChatRouting) release(ctx context.Context, in ChatInput, admitted *Admis
 // by the one before it: the CAS decides who owns the hold's ending, and a
 // lost CAS ends the unit with nothing written — the winner's ending stands,
 // and this caller's answer is unchanged.
-func (r *ChatRouting) releaseOnce(ctx context.Context, in ChatInput, admitted *Admission, rejection execution.RejectionReason, failure execution.FailureReason) (bool, error) {
+func (r *ChatRouting) releaseOnce(ctx context.Context, in ChatInput, admitted *Admission, rejection execution.RejectionReason, failure execution.FailureReason) (bool, int64, error) {
 	var completed bool
+	var eventSeq int64
 	err := r.store.WithinTx(ctx, func(txCtx context.Context) error {
 		now, err := r.clock.TransactionTimestamp(txCtx)
 		if err != nil {
@@ -170,7 +234,8 @@ func (r *ChatRouting) releaseOnce(ctx context.Context, in ChatInput, admitted *A
 		// The append is the unit's LAST statement: the feed's row lock is
 		// held to the commit, so the order facts are allocated is the order
 		// they become visible, and this ending reads as one fact.
-		if _, err := r.facts.Append(txCtx, fact); err != nil {
+		seq, err := r.facts.Append(txCtx, fact)
+		if err != nil {
 			if errors.Is(err, persistence.ErrDuplicateFact) {
 				// The same named bug a settle's append would be: a second
 				// settlement-relevant fact behind a CAS this unit owns.
@@ -178,13 +243,14 @@ func (r *ChatRouting) releaseOnce(ctx context.Context, in ChatInput, admitted *A
 			}
 			return fmt.Errorf("application: release request %s: append the release: %w", admitted.RuntimeRequestID, err)
 		}
+		eventSeq = seq
 		completed = true
 		return nil
 	})
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
-	return completed, nil
+	return completed, eventSeq, nil
 }
 
 // finaliseIntake takes the replay record's terminal pointer for a release
@@ -206,13 +272,16 @@ func (r *ChatRouting) finaliseIntake(txCtx context.Context, in ChatInput, failur
 func (r *ChatRouting) settle(ctx context.Context, in ChatInput, admitted *Admission, attempt execution.Attempt, usage settleUsage, succeeded bool) error {
 	ctx, cancel := endingContext(ctx)
 	defer cancel()
+	started := time.Now()
 	orphaned := false
+	var eventSeq int64
 	err := fmt.Errorf("application: settle request %s: the settle unit did not settle after %d attempts", admitted.RuntimeRequestID, endingMaxAttempts)
 	for budget := 0; budget < endingMaxAttempts; budget++ {
-		lost, onceErr := r.settleOnce(ctx, in, admitted, attempt, usage, succeeded)
+		lost, seq, onceErr := r.settleOnce(ctx, in, admitted, attempt, usage, succeeded)
 		orphaned = orphaned || lost
 		if onceErr == nil {
 			err = nil
+			eventSeq = seq
 			break
 		}
 		err = onceErr
@@ -235,6 +304,25 @@ func (r *ChatRouting) settle(ctx context.Context, in ChatInput, admitted *Admiss
 		// compare-and-set of their own to keep a retry from double-appending.
 		return r.settleOrphanTail(ctx, in, admitted, attempt, usage)
 	}
+	status := execution.StatusSucceeded
+	if !succeeded {
+		status = execution.StatusFailed
+	}
+	r.observeClose(CloseObservation{
+		RequestID:      string(admitted.RuntimeRequestID),
+		AttemptID:      string(attempt.ID),
+		UsageEventID:   eventSeq,
+		FinalStatus:    string(status),
+		Committed:      true,
+		UsageState:     CloseUsageClaimed,
+		InputTokens:    usage.input,
+		OutputTokens:   usage.output,
+		DeliveryTokens: usage.delivery,
+		Provider:       attempt.ProviderModel,
+		Backend:        attempt.BackendID,
+		Candidate:      attempt.CandidatePosition,
+		CloseDuration:  time.Since(started),
+	})
 	return nil
 }
 
@@ -245,8 +333,9 @@ func (r *ChatRouting) settle(ctx context.Context, in ChatInput, admitted *Admiss
 // settled fact to learn what the spend became (data-implications.md). The
 // boolean answers whether the close lost its race: the unit wrote nothing,
 // and the caller owns what gets recorded about that.
-func (r *ChatRouting) settleOnce(ctx context.Context, in ChatInput, admitted *Admission, attempt execution.Attempt, usage settleUsage, succeeded bool) (bool, error) {
+func (r *ChatRouting) settleOnce(ctx context.Context, in ChatInput, admitted *Admission, attempt execution.Attempt, usage settleUsage, succeeded bool) (bool, int64, error) {
 	orphaned := false
+	var eventSeq int64
 	err := r.store.WithinTx(ctx, func(txCtx context.Context) error {
 		now, err := r.clock.TransactionTimestamp(txCtx)
 		if err != nil {
@@ -337,7 +426,8 @@ func (r *ChatRouting) settleOnce(ctx context.Context, in ChatInput, admitted *Ad
 		}
 		// The append is the unit's LAST statement, the same order law the
 		// release keeps.
-		if _, err := r.facts.Append(txCtx, fact); err != nil {
+		seq, err := r.facts.Append(txCtx, fact)
+		if err != nil {
 			if errors.Is(err, persistence.ErrDuplicateFact) {
 				// A second settlement-relevant fact for one request, while
 				// this unit holds the ending's CAS, is the feed's invariants
@@ -349,12 +439,13 @@ func (r *ChatRouting) settleOnce(ctx context.Context, in ChatInput, admitted *Ad
 			}
 			return fmt.Errorf("application: settle request %s: append the settlement: %w", admitted.RuntimeRequestID, err)
 		}
+		eventSeq = seq
 		return nil
 	})
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
-	return orphaned, nil
+	return orphaned, eventSeq, nil
 }
 
 // settleOrphanTail records what a settle owns when it does not own the
@@ -408,7 +499,8 @@ func (r *ChatRouting) settleOrphanTail(ctx context.Context, in ChatInput, admitt
 	// orphan. Both are true sentences about the request — usage was observed,
 	// and an ending priced it — and the feed carries both; the consumer's
 	// kind-classed idempotency is what makes that free.
-	return r.store.WithinTx(ctx, func(txCtx context.Context) error {
+	var orphanSeq int64
+	err = r.store.WithinTx(ctx, func(txCtx context.Context) error {
 		now, err := r.clock.TransactionTimestamp(txCtx)
 		if err != nil {
 			return err
@@ -418,7 +510,8 @@ func (r *ChatRouting) settleOrphanTail(ctx context.Context, in ChatInput, admitt
 		if err != nil {
 			return fmt.Errorf("application: settle request %s: form the orphaned fact: %w", admitted.RuntimeRequestID, err)
 		}
-		if _, err := r.facts.Append(txCtx, fact); err != nil {
+		seq, err := r.facts.Append(txCtx, fact)
+		if err != nil {
 			if errors.Is(err, persistence.ErrDuplicateFact) {
 				// The twin tail of the same lost race recorded the orphan
 				// first — two settles can both lose their CAS to one sweep,
@@ -431,8 +524,27 @@ func (r *ChatRouting) settleOrphanTail(ctx context.Context, in ChatInput, admitt
 			}
 			return fmt.Errorf("application: settle request %s: append the orphaned fact: %w", admitted.RuntimeRequestID, err)
 		}
+		orphanSeq = seq
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	r.observeClose(CloseObservation{
+		RequestID:      string(admitted.RuntimeRequestID),
+		AttemptID:      string(attempt.ID),
+		UsageEventID:   orphanSeq,
+		FinalStatus:    "orphaned",
+		Committed:      true,
+		UsageState:     CloseUsageObserved,
+		InputTokens:    usage.input,
+		OutputTokens:   usage.output,
+		DeliveryTokens: usage.delivery,
+		Provider:       attempt.ProviderModel,
+		Backend:        attempt.BackendID,
+		Candidate:      attempt.CandidatePosition,
+	})
+	return nil
 }
 
 // settleAmount prices the settlement: the hold formula — the one place the

@@ -201,11 +201,32 @@ func TestBuildSettleRefusesAnUnformedSettlement(t *testing.T) {
 	if _, err := BuildSettle(mustSettlementID(t), "", []Allocation{mustAllocation(t, mustBucketID(t), 10)}, NewLedgerEntryID, legNow); !errors.Is(err, ErrInvalidReference) {
 		t.Fatalf("blank request id = %v, want ErrInvalidReference", err)
 	}
-	if _, err := BuildSettle(mustSettlementID(t), "req-x", nil, NewLedgerEntryID, legNow); !errors.Is(err, ErrInvalidSettlement) {
-		t.Fatalf("no allocations = %v, want ErrInvalidSettlement", err)
-	}
 	if _, err := BuildSettle(mustSettlementID(t), "req-x", []Allocation{mustAllocation(t, mustBucketID(t), 10)}, nil, legNow); !errors.Is(err, ErrInvalidReference) {
 		t.Fatalf("nil minter = %v, want ErrInvalidReference", err)
+	}
+}
+
+// TestBuildSettleWritesAZeroPricedSettlementAsAHeaderAlone is the shape the
+// zero-priced request arrives in: its hold held nothing, so its fact carries
+// no legs and its settlement is the header alone — total zero, no entries.
+// Both nil and the empty slice are the same no-legs settlement; a settlement
+// with no legs cannot carry a nonzero total, because the total is derived
+// from the legs.
+func TestBuildSettleWritesAZeroPricedSettlementAsAHeaderAlone(t *testing.T) {
+	for name, allocations := range map[string][]Allocation{
+		"nil legs":   nil,
+		"empty legs": {},
+	} {
+		plan, err := BuildSettle(mustSettlementID(t), "req-x", allocations, NewLedgerEntryID, legNow)
+		if err != nil {
+			t.Fatalf("%s: build settle: %v", name, err)
+		}
+		if plan.Settlement.SettledTotal != 0 {
+			t.Fatalf("%s: settled total = %d, want 0 for a settlement with no legs", name, plan.Settlement.SettledTotal)
+		}
+		if len(plan.Entries) != 0 {
+			t.Fatalf("%s: plan legs = %v, want none", name, plan.Entries)
+		}
 	}
 }
 

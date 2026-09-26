@@ -59,6 +59,12 @@ type ChatRouting struct {
 	routed       ChatCompletion
 	clock        txClock
 	execution    ExecutionConfig
+	// ObserveClose receives one CloseObservation per stated ending — the
+	// close's structured record, wired by the composition root to whatever
+	// emits structured fields for operators. Nil is the wired-nothing
+	// default: the observation is the operator's instrument, not the
+	// ending's.
+	ObserveClose CloseObserver
 }
 
 // NewChatRouting builds the routing stage over the ports it needs and the
@@ -298,7 +304,16 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 			}
 			usage := settleBasis(admitted, deliveredBytes(reply), success.Usage.InputTokens, success.Usage.OutputTokens, false)
 			if err := r.settle(ctx, in, admitted, attempt, usage, true); err != nil {
-				return r.abandonWalk(ctx, in, admitted, err)
+				// The settle ladder exhausted over an answer the client is
+				// already reading, and its unit rolled back whole — the hold
+				// stands and nothing was recorded. A release here could win
+				// the close and publish "released, unused" over work the
+				// client provably received: the false clean ending the
+				// delivery boundary exists to prevent. The hold is left for
+				// the sweep, whose expiry states the loss instead of
+				// asserting a give-back, and bounds how long the stranded
+				// hold pins the projection's capacity.
+				return ChatOutcome{}, err
 			}
 			reply.ServeSucceeded()
 			trace.Committed = true
@@ -342,7 +357,11 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 			}
 			usage := settleBasis(admitted, deliveredBytes(reply), failure.Usage.InputTokens, failure.Usage.OutputTokens, true)
 			if err := r.settle(ctx, in, admitted, attempt, usage, false); err != nil {
-				return r.abandonWalk(ctx, in, admitted, err)
+				// The same strand as the success arm: the answer crossed its
+				// commitment, so the walk's ending can no longer honestly be
+				// a release, whatever the settle ladder just reported. The
+				// sweep owns the stranded hold.
+				return ChatOutcome{}, err
 			}
 			reply.ServeMidStreamFailure()
 			trace.Committed = true
@@ -431,20 +450,23 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 	}
 }
 
-// abandonWalk closes out a walk that failed on its own — a store read that
-// errored, an attempt row or ending unit that exhausted its ladder — before
-// the walk could state any ending of its own. The failure is this process's,
-// not a verdict about the request, so the hold's ending is the abandoned one:
-// the release runs on its own detached ending context (a caller gone missing
-// is no reason to strand the hold until the sweep), and its compare-and-set
-// referees against the ending whose unit actually committed despite the
-// error its ladder reported — a lost close writes nothing, and the cause is
-// what surfaces. The release's own failure supersedes the cause, the way the
-// pre-candidate abandonment's release error does: an ending that could not
-// be stated is the transport's to answer, and the sweep recovers the hold.
+// abandonWalk closes out a walk that failed before any answer crossed its
+// commitment — a store read that errored, an attempt row that could not even
+// be formed — and so has no delivered work a release would have to deny. The
+// failure is this process's, not a verdict about the request, so the hold's
+// ending is the abandoned one: the release runs on its own detached ending
+// context (a caller gone missing is no reason to strand the hold until the
+// sweep), and its compare-and-set referees against the ending whose unit
+// actually committed despite the error its ladder reported — a lost close
+// writes nothing. A settled walk never comes here: an ending unit that
+// exhausts its ladder after commitment strands the hold for the sweep rather
+// than hand it a release that could publish "unused" over delivered work.
+// When the release itself fails, its error travels beside the cause — both
+// survive errors.Is — because an operator reading the wire's one fixed cell
+// should not have to choose which fault they are diagnosing.
 func (r *ChatRouting) abandonWalk(ctx context.Context, in ChatInput, admitted *Admission, cause error) (ChatOutcome, error) {
 	if err := r.release(ctx, in, admitted, "", execution.FailedGatewayAbandoned); err != nil {
-		return ChatOutcome{}, err
+		return ChatOutcome{}, fmt.Errorf("%w: the abandonment's release also failed: %w", cause, err)
 	}
 	return ChatOutcome{}, cause
 }
@@ -570,14 +592,16 @@ type settleUsage struct {
 //     outcome, and the admitted count is the gateway's own observation of
 //     the same prompt;
 //   - output follows the delivery boundary. An answer that died after
-//     commitment prices its output at the delivered tokens and nothing
-//     else — the provider's usage figure for a stream it never finished is
+//     commitment prices its output at the delivered tokens, bounded by the
+//     output basis the hold was sized with, and nothing else — the
+//     provider's usage figure for a stream it never finished is
 //     the provider-cost telemetry the attempt row carries, never a customer
 //     bill for tokens the client stopped reading (ADR 0004: provider usage
 //     is recorded as telemetry, not silently substituted as customer usage).
 //     A completed answer prices the provider's report, bounded by the output
 //     basis the hold was sized with; a completed answer without a report
-//     prices the delivered tokens, the gateway's own observation of work the
+//     prices the delivered tokens under the same basis bound, the gateway's
+//     own observation of work the
 //     client provably received; and the basis itself answers only where
 //     neither arrived — unreachable after commitment, whose act is a
 //     content-bearing call — erring to the reserved basis should the sink's
@@ -617,9 +641,15 @@ func settleBasis(admitted *Admission, delivered []byte, reportedInput, reportedO
 	case streamFailed:
 		// The provider's output figure is telemetry on a stream it never
 		// finished: the delivered tokens are the only output the delivery
-		// boundary lets the gateway bill, whatever the provider counted.
-		count := deliveredCount
+		// boundary lets the gateway bill, whatever the provider counted —
+		// and even they bill no further than the basis the hold was sized
+		// with, because the reservation defends nothing it did not hold.
+		// Where the basis binds, its figure is what settles and the capture
+		// says so; the delivered count itself rides on undimmed as the
+		// delivery figure.
+		count := min(deliveredCount, int64(admitted.OutputBasis))
 		output = &count
+		floor = floor || count < deliveredCount
 	case reportedOutput != nil && *reportedOutput <= int64(admitted.OutputBasis):
 		output = reportedOutput
 	case reportedOutput != nil:
@@ -631,8 +661,12 @@ func settleBasis(admitted *Admission, delivered []byte, reportedInput, reportedO
 		output = &count
 		floor = true
 	case deliveredCount > 0:
-		count := deliveredCount
+		// The same bound on the completed answer that named no report: the
+		// gateway's own count prices, but only up to the basis — past it the
+		// reservation's own figure is what settles, and the label says so.
+		count := min(deliveredCount, int64(admitted.OutputBasis))
 		output = &count
+		floor = floor || count < deliveredCount
 	default:
 		count := int64(admitted.OutputBasis)
 		output = &count
