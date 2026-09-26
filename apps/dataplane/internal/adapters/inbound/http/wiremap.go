@@ -61,6 +61,7 @@ const (
 	codeInsufficientQuota   = "insufficient_quota"
 	codeIdempotencyConflict = "idempotency_conflict"
 	codeRequestInProgress   = "request_in_progress"
+	codeRequestAbandoned    = "request_abandoned"
 
 	// The surfaced refusals: the upstream faults a candidate's provider named
 	// that the endpoint answers as ordinary HTTP, because nothing was
@@ -90,6 +91,7 @@ const (
 	modelNotFoundMessage       = "the requested model does not exist"
 	conflictMessage            = "this Idempotency-Key was already used with a different request body"
 	inProgressMessage          = "a request with this Idempotency-Key is still in progress; retry the same request with the same key once it completes"
+	unansweredMessage          = "the request with this Idempotency-Key was abandoned before an answer was produced; send a new key with a retry"
 	quotaMessage               = "the account's quota is insufficient for this request"
 	noCandidateMessage         = "the runtime cannot serve this request right now"
 
@@ -254,6 +256,27 @@ func chatWireCell(outcome application.ChatOutcome) chatAnswer {
 			original:   outcome.Original,
 			reason:     string(outcome.Reason),
 		}
+	case application.OutcomeUnanswered:
+		// The key's original ended without an answer — the runtime abandoned
+		// its own walk before anything was committed or delivered — and the
+		// record is terminal, so no arrival under this key can ever be
+		// executed again. The honest cell says exactly that and advises the
+		// one thing that can still be true: a fresh key. No Retry-After —
+		// nothing about this condition clears with time — and no replay
+		// headers — there is no original answer here to have been re-served.
+		// The 409 status puts the cell beside the table's other key-state
+		// answers, which share its reading: the key cannot take this request.
+		return chatAnswer{
+			failure: wireFailure{
+				status: stdhttp.StatusConflict,
+				body: runtimeErrorBody{
+					Message: unansweredMessage,
+					Type:    typeInvalidRequest,
+					Code:    stringCode(codeRequestAbandoned),
+				},
+			},
+			reason: codeRequestAbandoned,
+		}
 	case application.OutcomeServed:
 		// The answer already travelled through the request's reply — the
 		// completed body or stream, or the stream that failed after
@@ -282,10 +305,12 @@ func chatWireCell(outcome application.ChatOutcome) chatAnswer {
 		// either of the two doors that end this way: the caller's context
 		// ended mid-walk and no channel is left to answer on, or the lease
 		// renewal reported the hold reaped and the call was cancelled before
-		// commitment — a live caller, answered by nothing, because the
-		// capacity that would have priced the answer is no longer defended.
-		// The outcome is the log's correlation fact and the reaper's, never
-		// the wire's.
+		// commitment — a live caller, whom the walk has already answered
+		// through the reply with the no-candidate cell, the one answer whose
+		// reading survives the news that the capacity behind the request is
+		// no longer defended. The outcome is the log's correlation fact and
+		// the reaper's; the table writes nothing, exactly as for the served
+		// and refused outcomes whose bytes the reply carried.
 		return chatAnswer{
 			silent:    true,
 			reason:    string(application.OutcomeAbandoned),

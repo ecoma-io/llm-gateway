@@ -16,7 +16,9 @@
 // same vocabulary the rejected request row stores — and, when the refusal is
 // about one field of the request, the detail naming that field. A replay
 // carries the original request's identity, because the answer is that
-// request's decision said again. Everything a later stage of the pipeline
+// request's decision said again; an unanswered decision says the original
+// this key names ended without producing an answer, and the key with it.
+// Everything a later stage of the pipeline
 // needs from an admitted request rides in Admission, and nothing in it is
 // interpreted here: admission's caller decides what an admission means.
 package application
@@ -232,6 +234,15 @@ const (
 	// marked as a replay. A replayed request that FAILED answers with its
 	// failure reason in Failure.
 	OutcomeReplay OutcomeKind = "replay"
+
+	// OutcomeUnanswered says this key and body match a request that ended
+	// without producing an answer — the runtime abandoned its own walk before
+	// any content existed, and nothing was ever delivered to re-serve. The
+	// key is spent: the record is terminal, so no arrival under it can ever
+	// be executed, and there is no answer to re-serve. The caller opens a
+	// fresh key; Original names the request whose abandonment is being
+	// accounted for.
+	OutcomeUnanswered OutcomeKind = "unanswered"
 
 	// OutcomeServed says the answer travelled to the client through the
 	// request's reply while the routing stage ran — a completed answer, or

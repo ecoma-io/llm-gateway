@@ -31,6 +31,7 @@ const (
 	modelNotFoundBody      = "{\"error\":{\"message\":\"the requested model does not exist\",\"type\":\"not_found_error\",\"param\":\"model\",\"code\":\"model_not_found\"}}\n"
 	conflictBody           = "{\"error\":{\"message\":\"this Idempotency-Key was already used with a different request body\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"idempotency_conflict\"}}\n"
 	inProgressBody         = "{\"error\":{\"message\":\"a request with this Idempotency-Key is still in progress; retry the same request with the same key once it completes\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"request_in_progress\"}}\n"
+	unansweredBody         = "{\"error\":{\"message\":\"the request with this Idempotency-Key was abandoned before an answer was produced; send a new key with a retry\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"request_abandoned\"}}\n"
 	quotaBody              = "{\"error\":{\"message\":\"the account's quota is insufficient for this request\",\"type\":\"insufficient_quota\",\"param\":null,\"code\":\"insufficient_quota\"}}\n"
 	noCandidateBody        = "{\"error\":{\"message\":\"the runtime cannot serve this request right now\",\"type\":\"overloaded_error\",\"param\":null,\"code\":null}}\n"
 
@@ -176,6 +177,19 @@ func TestEveryOutcomeKindHasItsWireCell(t *testing.T) {
 			wantBody:   conflictBody,
 		},
 		{
+			// The one terminal record with no answer to re-serve: the
+			// original was abandoned before anything existed, so the cell is
+			// the spent key's, with no replay headers — nothing was
+			// re-served — and no Retry-After — nothing will clear.
+			name: "a key whose original the runtime abandoned answers the spent key",
+			outcome: application.ChatOutcome{
+				Kind:     application.OutcomeUnanswered,
+				Original: original,
+			},
+			wantStatus: stdhttp.StatusConflict,
+			wantBody:   unansweredBody,
+		},
+		{
 			name: "a replayed rejection carries the original's cell and the replay headers",
 			outcome: application.ChatOutcome{
 				Kind:     application.OutcomeReplay,
@@ -319,16 +333,24 @@ func TestEveryOutcomeKindHasItsWireCell(t *testing.T) {
 	}
 }
 
-// TestTheConflictCellsDifferOnlyByCode guards the one pair of answers sharing
-// a status. Both 409s are invalid_request_error with a null param; what
-// separates them is the code and the Retry-After, and a caller must be able to
-// tell a waitable collision from a dead key without parsing prose.
+// TestTheConflictCellsDifferOnlyByCode guards the three answers sharing a
+// status. All 409s are invalid_request_error with a null param; what
+// separates them is the code and the Retry-After, and a caller must be able
+// to tell a waitable collision from a dead key without parsing prose.
 func TestTheConflictCellsDifferOnlyByCode(t *testing.T) {
 	inFlight := chatWireCell(application.ChatOutcome{Kind: application.OutcomeInFlight})
 	conflict := chatWireCell(application.ChatOutcome{Kind: application.OutcomeConflict})
+	unanswered := chatWireCell(application.ChatOutcome{Kind: application.OutcomeUnanswered})
 
-	if inFlight.failure.body.Code == conflict.failure.body.Code {
-		t.Errorf("both conflict cells carry code %v; a client cannot tell a waitable collision from a dead key", *conflict.failure.body.Code)
+	codes := map[string]bool{}
+	for _, answer := range []chatAnswer{inFlight, conflict, unanswered} {
+		if answer.failure.body.Code == nil {
+			t.Fatal("a conflict cell carries no code; a client cannot tell the three key-state answers apart")
+		}
+		codes[*answer.failure.body.Code] = true
+	}
+	if len(codes) != 3 {
+		t.Errorf("the three conflict cells carry codes %v; each must name its own key-state answer", codes)
 	}
 	if inFlight.retryAfter == "" {
 		t.Error("the in-flight cell carries no Retry-After; the contract tells the caller to retry the same request")
@@ -336,9 +358,15 @@ func TestTheConflictCellsDifferOnlyByCode(t *testing.T) {
 	if conflict.retryAfter != "" {
 		t.Errorf("the conflict cell carries Retry-After %q; a key with a different body must never be retried", conflict.retryAfter)
 	}
-	for _, answer := range []chatAnswer{inFlight, conflict} {
+	if unanswered.retryAfter != "" {
+		t.Errorf("the unanswered cell carries Retry-After %q; a spent key's answer cannot succeed however long the caller waits", unanswered.retryAfter)
+	}
+	if unanswered.replay {
+		t.Error("the unanswered cell claims to be a replay; there was no original answer to re-serve")
+	}
+	for _, answer := range []chatAnswer{inFlight, conflict, unanswered} {
 		if answer.failure.body.Param != nil {
-			t.Errorf("a conflict cell carries param %q; neither conflict is about a request field", *answer.failure.body.Param)
+			t.Errorf("a conflict cell carries param %q; no conflict is about a request field", *answer.failure.body.Param)
 		}
 	}
 }
@@ -424,8 +452,11 @@ func TestTheSurfacedRefusalCells(t *testing.T) {
 // refusal, the two no-candidate rejections were written through it by the
 // same ServeNoCandidate call that closed the released request — the exhausted
 // walk answering exactly the cell an empty walk does, so the caller's reading
-// never depends on how deep the walk went — and an abandoned request has no
-// channel left to answer on. Each arrives as a log line only, carrying the
+// never depends on how deep the walk went — and an abandoned walk's bytes
+// belong to the reply by whichever door it closed: the caller-gone door has
+// no channel left to write to, and the lost-lease door answered the live
+// caller with the no-candidate cell before the outcome ever reached this
+// table. Each arrives as a log line only, carrying the
 // routing trace and the runtime identity, and carrying no status, no body and
 // no headers.
 func TestTheRoutingOutcomesAreSilentAnswers(t *testing.T) {
