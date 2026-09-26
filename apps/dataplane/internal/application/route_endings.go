@@ -119,9 +119,22 @@ func (r *ChatRouting) releaseOnce(ctx context.Context, in ChatInput, admitted *A
 			return fmt.Errorf("application: release request %s: return the hold: %w", admitted.RuntimeRequestID, err)
 		}
 		request := execution.Request{ID: admitted.RuntimeRequestID, Status: execution.StatusExecuting}
-		if failure != "" {
+		switch {
+		case failure == execution.FailedGatewayAbandoned:
+			// The abandoned word names the request through its own door.
+			// FailBeforeCommitment refuses it — that refusal is the domain's
+			// law that a surfaced refusal and an abandonment are different
+			// shapes of ending — and FailAbandoned is the finalisation the
+			// vocabulary gives the word: no attempt named, because nothing
+			// was committed. The reaper reaches it for the process it cannot
+			// ask; the walk reaches it here, where the evidence is its own:
+			// the caller left before any candidate answered, so this process
+			// is the evidence, and the hold it opened comes back now instead
+			// of stranding until the sweep.
+			err = request.FailAbandoned(now)
+		case failure != "":
 			err = request.FailBeforeCommitment(failure, now)
-		} else {
+		default:
 			err = request.Reject(rejection, now)
 		}
 		if err != nil {
@@ -181,19 +194,25 @@ func (r *ChatRouting) finaliseIntake(txCtx context.Context, in ChatInput, failur
 
 // settle finalises an admitted request whose answer was committed. The unit
 // is detached on purpose — the provider call finished before it opens — and
-// when it ends with someone else owning the reservation's close, that is
-// settled too: the winner's ending stands, and this caller's answer already
-// left through the reply.
+// when it ends with someone else owning the reservation's close, the settle
+// does not simply walk away: the orphan tail records what this unit saw,
+// because a lost race is the one shape that would otherwise take the
+// stream's only telemetry with it.
 func (r *ChatRouting) settle(ctx context.Context, in ChatInput, admitted *Admission, attempt execution.Attempt, usage settleUsage, succeeded bool) error {
 	ctx, cancel := endingContext(ctx)
 	defer cancel()
+	orphaned := false
+	err := fmt.Errorf("application: settle request %s: the settle unit did not settle after %d attempts", admitted.RuntimeRequestID, endingMaxAttempts)
 	for budget := 0; budget < endingMaxAttempts; budget++ {
-		err := r.settleOnce(ctx, in, admitted, attempt, usage, succeeded)
-		if err == nil {
-			return nil
+		lost, onceErr := r.settleOnce(ctx, in, admitted, attempt, usage, succeeded)
+		orphaned = orphaned || lost
+		if onceErr == nil {
+			err = nil
+			break
 		}
-		if !isRetryableStoreFailure(err) {
-			return err
+		err = onceErr
+		if !isRetryableStoreFailure(onceErr) {
+			return onceErr
 		}
 		if budget+1 < endingMaxAttempts {
 			select {
@@ -203,16 +222,27 @@ func (r *ChatRouting) settle(ctx context.Context, in ChatInput, admitted *Admiss
 			}
 		}
 	}
-	return fmt.Errorf("application: settle request %s: the settle unit did not settle after %d attempts", admitted.RuntimeRequestID, endingMaxAttempts)
+	if err != nil {
+		return err
+	}
+	if orphaned {
+		// The tail runs once, after the ladder — its writes have no
+		// compare-and-set of their own to keep a retry from double-appending.
+		return r.settleOrphanTail(ctx, in, admitted, attempt, usage)
+	}
+	return nil
 }
 
 // settleOnce runs the settle unit once: the reservation closed settled, the
 // committed attempt appended, the request and the replay record finalised,
 // the settled fact last. There is deliberately no projection return here — a
 // settlement keeps the drawdown, and the Control Plane's derivation reads the
-// settled fact to learn what the spend became (data-implications.md).
-func (r *ChatRouting) settleOnce(ctx context.Context, in ChatInput, admitted *Admission, attempt execution.Attempt, usage settleUsage, succeeded bool) error {
-	return r.store.WithinTx(ctx, func(txCtx context.Context) error {
+// settled fact to learn what the spend became (data-implications.md). The
+// boolean answers whether the close lost its race: the unit wrote nothing,
+// and the caller owns what gets recorded about that.
+func (r *ChatRouting) settleOnce(ctx context.Context, in ChatInput, admitted *Admission, attempt execution.Attempt, usage settleUsage, succeeded bool) (bool, error) {
+	orphaned := false
+	err := r.store.WithinTx(ctx, func(txCtx context.Context) error {
 		now, err := r.clock.TransactionTimestamp(txCtx)
 		if err != nil {
 			return err
@@ -220,12 +250,13 @@ func (r *ChatRouting) settleOnce(ctx context.Context, in ChatInput, admitted *Ad
 		// The CAS is the whole claim to the ending, exactly as a release's
 		// is. A lost close settles the question of who owns the ending; the
 		// unit writes nothing and the winner's fact is the one the feed
-		// carries.
+		// carries — what this unit observed is the orphan tail's to record.
 		closed, err := r.reservations.Close(txCtx, admitted.ReservationID, accounting.StateSettled, now)
 		if err != nil {
 			return fmt.Errorf("application: settle request %s: close the hold: %w", admitted.RuntimeRequestID, err)
 		}
 		if !closed {
+			orphaned = true
 			return nil
 		}
 		// The committed attempt, appended inside the ending's own unit: no
@@ -288,6 +319,55 @@ func (r *ChatRouting) settleOnce(ctx context.Context, in ChatInput, admitted *Ad
 		// release keeps.
 		if _, err := r.facts.Append(txCtx, fact); err != nil {
 			return fmt.Errorf("application: settle request %s: append the settlement: %w", admitted.RuntimeRequestID, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return orphaned, nil
+}
+
+// settleOrphanTail records what a settle owns when it does not own the
+// ending: its close lost the race to another writer — the twin of itself
+// whose first attempt committed past a lost ack, or the lapsed-lease sweep
+// closing a hold whose lease died mid-stream — and without this tail the
+// race would take the stream's only telemetry with it. Three steps, each in
+// the shape its write has always had: the attempt row appended standalone,
+// exactly as a pre-commitment observation is, reading an already-persisted
+// twin as the done thing it is; then the replay record's verdict read, to
+// learn whether an ending was stated for the request — a settle that
+// finalised it already carried this usage into the feed through its own
+// settled fact, and the tail adds nothing the feed needs twice; and, when
+// the record still waits on an ending, the unbillable-orphaned fact, in one
+// unit of its own with the append as its last statement — the feed's word
+// that usage was observed on a named, committed attempt this process did
+// not settle. No terminal row is written and no money moves: the winner's
+// fact, settled or expired, stands beside this one, which is the
+// coexistence the fact kind was designed for.
+func (r *ChatRouting) settleOrphanTail(ctx context.Context, in ChatInput, admitted *Admission, attempt execution.Attempt, usage settleUsage) error {
+	if err := r.attempts.Insert(ctx, attempt); err != nil && !errors.Is(err, persistence.ErrAttemptAlreadyAppended) {
+		return fmt.Errorf("application: settle request %s: append the orphaned attempt: %w", admitted.RuntimeRequestID, err)
+	}
+	record, err := r.intakes.Find(ctx, in.AccountID, in.IdempotencyKey)
+	if err != nil {
+		return fmt.Errorf("application: settle request %s: read the replay record for the orphan tail: %w", admitted.RuntimeRequestID, err)
+	}
+	if record.FinalStatus != nil {
+		return nil
+	}
+	return r.store.WithinTx(ctx, func(txCtx context.Context) error {
+		now, err := r.clock.TransactionTimestamp(txCtx)
+		if err != nil {
+			return err
+		}
+		fact, err := accounting.NewUnbillableOrphaned(admitted.RuntimeRequestID, attempt.ID,
+			usage.capture, usage.input, usage.output, usage.delivery, factLegs(admitted.Legs), now)
+		if err != nil {
+			return fmt.Errorf("application: settle request %s: form the orphaned fact: %w", admitted.RuntimeRequestID, err)
+		}
+		if _, err := r.facts.Append(txCtx, fact); err != nil {
+			return fmt.Errorf("application: settle request %s: append the orphaned fact: %w", admitted.RuntimeRequestID, err)
 		}
 		return nil
 	})

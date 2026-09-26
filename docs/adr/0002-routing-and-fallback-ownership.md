@@ -1,8 +1,15 @@
 # ADR 0002: Routing model — who owns fallback, translation, and egress
 
-- Status: Accepted
+- Status: Accepted (amended 2026-09-26)
 - Date: 2026-09-23
 - Issue: [#5](https://github.com/ecoma-io/llm-gateway/issues/5)
+- Amended: provider retry is removed — an adapter makes exactly one upstream
+  call per candidate (issue
+  [#92](https://github.com/ecoma-io/llm-gateway/issues/92), B10). The sections
+  below state the amended decision; the original text assigned a bounded,
+  same-candidate retry to the adapter, which the landed executor port cannot
+  record: one pass through execution is one attempt row, so a retry inside the
+  call would be provider spend no row names and no walk observes.
 
 ## Context
 
@@ -29,7 +36,7 @@ logical model alias
         ↓
 ordered candidates          (ModelAlias's candidate list, one consistent snapshot)
         ↓
-candidate execution         (adapter translates; bounded provider retries)
+candidate execution         (adapter translates; one upstream call, no retry)
         ↓
 normalized result           (uniform success stream or typed failure)
         ↓
@@ -43,25 +50,30 @@ Ownership is split across three layers with hard boundaries:
 | Resolving alias → ordered candidates     | Router     | Pure lookup against the Catalog; no provider knowledge.                                                                            |
 | Cross-provider logical fallback          | Router     | **Only the router advances to the next candidate.** Adapters never fall back.                                                      |
 | Request/response/stream translation      | Adapter    | One adapter per provider protocol family; produces the normalized result contract below. No routing, billing, or alias knowledge.  |
-| Provider-specific retry                  | Adapter    | Bounded, same-candidate retry on retryable provider errors (e.g. 429/5xx/network). **Retry is not fallback** — see below.          |
+| Provider-specific retry                  | None       | An adapter makes **exactly one** upstream call per candidate and never retries it — see below.                                     |
 | Model-name and parameter mapping         | Adapter    | Candidate carries the provider-side model ID and per-candidate parameter overrides.                                                |
 | Outbound connection: proxy/egress choice | Egress     | Below adapters: adapters dial through an egress interface; egress config is referenced from the Backend, never from routing logic. |
 | Billing/quota consequences of attempts   | Accounting | Via the Execution record only — see ADR 0004; no layer below the router knows what an attempt costs.                               |
 
-### Provider retry is distinct from cross-provider fallback
+### One call per candidate; fallback is the walk's only retry-shaped move
 
-These are different mechanisms with different budgets, and conflating them is
-how double-billing and latency blowups happen:
+_(Amended 2026-09-26. The original text assigned a bounded, same-candidate
+retry to the adapter, with every original-or-retry call recorded as its own
+`RequestAttempt` row. The landed execution stage cannot honour that: one pass
+through execution appends one attempt row and the executor port returns one
+result per call, so a retry inside the adapter would be provider spend no row
+records — an answer the walk reads as the provider's first word. The retry is
+therefore removed rather than grown into the port.)_
 
-- **Retry (adapter-owned):** re-issuing the same request to the **same
-  candidate** after a retryable failure (429, 5xx, connect timeout), with
-  backoff, bounded per candidate. Every upstream HTTP call — original or
-  retry — is recorded as its own `RequestAttempt` row, so provider-side cost
-  of retries is visible without touching client billing.
+- **Retry (none):** an adapter re-issues nothing. A failure is classified and
+  handed back; what happens next is the routing stage's disposition of the
+  class, never the adapter's second attempt. The attempt schema's
+  `retry_sequence` column stays reserved for a design that records per-try
+  rows, which this one deliberately does not make.
 - **Fallback (router-owned):** abandoning the current **candidate** and moving
   to the next candidate in the alias's ordered list. Triggered when the
-  adapter reports a failure that is not recoverable by retry (or the retry
-  budget is exhausted), **and the response is not committed** (below).
+  adapter reports a fallback-eligible failure, **and the response is not
+  committed** (below).
 
 ### Commitment: the fallback gate
 
@@ -100,8 +112,10 @@ Every adapter, regardless of provider, yields exactly one of:
 - a **typed failure**: error class (`authentication`, `rate_limited`,
   `provider_unavailable`, `provider_rejected_request`, `context_too_large`,
   `invalid_upstream_response`, `upstream_error`,
-  `stream_failed_after_commitment`), provider error payload (preserved for
-  debugging), and whether the failure is retryable.
+  `stream_failed_after_commitment`) and provider error payload (preserved for
+  debugging). The class is the disposition's whole input — the original
+  contract's "whether the failure is retryable" flag went with the retry it
+  described.
 
 `provider_rejected_request` is the provider-side class for "the upstream
 refused this request" (invalid parameters for that model, unsupported
@@ -111,11 +125,11 @@ different failure kinds with one name is how an on-call engineer misroutes a
 page.
 
 `invalid_upstream_response` is the class for empty or malformed provider
-output before commitment — it is a provider fault, so it is retryable within
-the candidate and fallback-eligible after the retry budget is spent. It must
-never be presented to the client as an empty successful answer.
+output before commitment — it is a provider fault, so it is fallback-eligible:
+the walk tries the next candidate, never the same one again. It must never be
+presented to the client as an empty successful answer.
 
-The router's fallback policy is a pure function of `(error class, retryable,
+The router's fallback policy is a pure function of `(error class,
 committed?)` — it never parses provider payloads. Adapters normalize; the
 router decides. The success shape carries the usage report in the terminal
 chunk of a stream (OpenAI-compatible norm), so settlement has one place to
@@ -172,9 +186,8 @@ family are configuration (a new `Backend` + candidates), not code.
   family). Routing, fallback, and billing are untouched.
 - The OpenAPI contract exposes logical aliases only; provider model IDs never
   appear in it.
-- Attempt-level telemetry (per-candidate latency, retry counts, error classes)
-  falls out of the attempt rows and feeds analytics without new
-  instrumentation concepts.
+- Attempt-level telemetry (per-candidate latency, error classes) falls out of
+  the attempt rows and feeds analytics without new instrumentation concepts.
 - The commitment rule pins streaming behaviour: once bytes flow, the request's
   fate is bound to one provider. Clients that need cross-provider resilience
   get it only at request granularity, not mid-stream.
@@ -187,7 +200,10 @@ family are configuration (a new `Backend` + candidates), not code.
   live in N places.
 - **Global retry budget shared with fallback** (a single attempt counter):
   rejected — it makes "one flaky provider" indistinguishable from "alias
-  unavailable", and hides provider-side retry cost from analytics.
+  unavailable", and hides provider-side retry cost from analytics. (The
+  2026-09-26 amendment goes further and removes adapter retry outright; this
+  alternative stays rejected for the same reasons, and a recorded-retry design
+  would need to reopen the attempt schema first.)
 - **Fallback after commitment with stream rewind**: rejected — impossible to
   do correctly for SSE (client-visible corruption), and no major gateway does
   it; the commitment gate is the honest boundary.

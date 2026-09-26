@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -66,14 +67,35 @@ const (
 	// that a load-time fact instead of a per-deployment hope.
 	MaxReservationHoldWindow = 30 * 24 * time.Hour
 
-	// minReservationHorizon is the floor both reservation horizons share. A
-	// horizon this short cannot do the work it exists for: the reaper's
-	// reclaim test and the lease's fence both compare timestamps written by
-	// more than one process, and a window measured in milliseconds expires
-	// between the write of a stamp and the read of it. Below this, a
-	// deployment is not tuned, it is broken — so the loader refuses rather
-	// than runs.
-	minReservationHorizon = time.Second
+	// minHorizon is the floor the reservation horizons and the execution
+	// ceiling share. A horizon this short cannot do the work it exists for:
+	// the reaper's reclaim test and the lease's fence both compare
+	// timestamps written by more than one process, and a window measured in
+	// milliseconds expires between the write of a stamp and the read of it.
+	// A deployment tuned this low is not tuned, it is broken — so the loader
+	// refuses rather than runs.
+	minHorizon = time.Second
+
+	// DefaultExecutionMaxDuration is the ceiling on one provider call — the
+	// deadline the routing stage puts on the context every executor's call
+	// runs under. Four minutes sits strictly inside the default hold window:
+	// a call that used its whole budget plus its settlement endings still
+	// finishes inside the hold it was admitted under, which is the invariant
+	// that keeps settled usage priced by the reservation that defended it.
+	// Lease renewal keeps the process's CLAIM on the hold alive for the
+	// call's duration; it never extends the hold itself, and this ceiling is
+	// what stops one slow provider from turning the hold window into a
+	// formality. That "strictly below the hold window" is not the default's
+	// private property but the enforced chain — the process validates it at
+	// start (ADR 0004 as amended by ADR 0009).
+	DefaultExecutionMaxDuration = 4 * time.Minute
+
+	// DefaultExecutionRegistryRefresh is how often the composition root
+	// rebuilds the executor registry from the backend catalog. Ten seconds
+	// makes a catalog edit — a new backend, a re-pointed endpoint — live
+	// within one interval, and a refresh that fails changes nothing: the last
+	// good snapshot keeps serving until a refresh succeeds.
+	DefaultExecutionRegistryRefresh = 10 * time.Second
 
 	// ownedDatabase is the only database this application may be pointed at —
 	// the plane binding of ADR 0006 §7, checked in validatePostgresDSN and
@@ -130,6 +152,17 @@ const (
 // dials, and there is no setting here that would let it dial one. A runtime that
 // can be misconfigured towards a management endpoint is one step from depending
 // on it.
+//
+// The egress policies are the deliberate exception to "nothing outbound
+// beside the database", and they are the provider path's, not the Control
+// Plane's: the proxies a provider call may pass through on its way to the
+// upstream the request was admitted for. A route that pointed this process
+// at a management listener of its own repository would be a dependency on
+// it, but the setting that exists for is the dial the runtime exists to
+// make; the configuration cannot tell the two apart, so the separation stays
+// where ADR 0006 puts it — in what an operator is willing to configure,
+// backed by the architecture tests that no code path here reaches another
+// plane by import.
 type Config struct {
 	Addr              string
 	ShutdownTimeout   time.Duration
@@ -152,6 +185,21 @@ type Config struct {
 	// that outlives the hold it fences is a configuration the process refuses
 	// to start with, in validateReservationHorizons.
 	ReservationLeaseTTL time.Duration
+
+	// ExecutionMaxDuration is the deadline one provider call may run under —
+	// the context budget the routing stage hands every executor's attempt.
+	// It is an operational horizon like the two reservation ones above, and
+	// it is validated strictly below the hold window: renewal keeps the
+	// lease alive, never the hold, so a call allowed to run as long as its
+	// hold could outrun the reservation that prices it.
+	ExecutionMaxDuration time.Duration
+
+	// ExecutionRegistryRefresh is how often the composition root rebuilds the
+	// executor registry from the backend catalog. It must be positive; there
+	// is no "never refresh" spelling, because a registry that cannot learn a
+	// new backend is a process that must be restarted to be reconfigured,
+	// which is what the interval exists to avoid.
+	ExecutionRegistryRefresh time.Duration
 
 	// ManagementAddr is the private listener the Data Plane's management
 	// surface is served from. An empty value means this process serves no
@@ -179,6 +227,40 @@ type Config struct {
 	// that points it at its own database is what makes its hot path work when
 	// the Control Plane is unreachable.
 	Postgres Postgres
+
+	// Egress holds the named dial policies the provider path may pass
+	// through — ordered route lists of proxies and direct hops, below the
+	// adapter boundary (ADR 0002). A backend's egress reference names one of
+	// these policies or nothing at all: the empty reference, and the literal
+	// word `direct`, mean the plain dialer and are why no policy here may
+	// claim that name. Policies are read once at start-up; a route list that
+	// changed meaning behind a running process would be a conversation whose
+	// second half took a different road than its first.
+	Egress Egress
+}
+
+// Egress is the set of named dial policies. The map is empty in the default
+// configuration — a runtime with no egress configured dials directly, which
+// is the whole surface a deployment needs until its providers sit behind
+// proxies.
+type Egress struct {
+	Policies map[string]EgressPolicy
+}
+
+// EgressPolicy is one named, ordered route list. The order is the preference
+// the egress layer tries in: the first route that establishes a connection
+// carries the call.
+type EgressPolicy struct {
+	Routes []EgressRoute
+}
+
+// EgressRoute is one hop of a policy: how to dial it and where it lives.
+// Type is one of `direct`, `http-connect`, `socks5`, `socks5h`; an address
+// belongs to every type except `direct`, whose whole meaning is that there
+// is no hop in between.
+type EgressRoute struct {
+	Type string
+	Addr string
 }
 
 // Postgres holds the connection settings for this application's own plane's
@@ -202,6 +284,9 @@ func Defaults() Config {
 		ReadHeaderTimeout:     DefaultReadHeaderTimeout,
 		ReservationHoldWindow: DefaultReservationHoldWindow,
 		ReservationLeaseTTL:   DefaultReservationLeaseTTL,
+
+		ExecutionMaxDuration:     DefaultExecutionMaxDuration,
+		ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
 		Postgres: Postgres{
 			DSN:             DefaultPostgresDSN,
 			MaxOpenConns:    DefaultPostgresMaxOpenConns,
@@ -256,6 +341,35 @@ func Load(lookup LookupEnv) (Config, error) {
 			return Config{}, err
 		}
 		cfg.ReservationLeaseTTL = duration
+	}
+	if value, ok := lookup("DATAPLANE_EXECUTION_MAX_DURATION"); ok {
+		duration, err := parsePositiveDuration("DATAPLANE_EXECUTION_MAX_DURATION", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ExecutionMaxDuration = duration
+	}
+	if value, ok := lookup("DATAPLANE_EXECUTION_REGISTRY_REFRESH"); ok {
+		duration, err := parsePositiveDuration("DATAPLANE_EXECUTION_REGISTRY_REFRESH", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ExecutionRegistryRefresh = duration
+	}
+
+	if value, ok := lookup("DATAPLANE_EGRESS_POLICIES"); ok {
+		names, err := parseEgressPolicyNames("DATAPLANE_EGRESS_POLICIES", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Egress.Policies = map[string]EgressPolicy{}
+		for _, name := range names {
+			policy, err := parseEgressPolicy(name, lookup)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.Egress.Policies[name] = policy
+		}
 	}
 
 	if value, ok := lookup("DATAPLANE_MANAGEMENT_ADDR"); ok {
@@ -328,10 +442,150 @@ func Load(lookup LookupEnv) (Config, error) {
 	if err := validateReservationHorizons(cfg.ReservationHoldWindow, cfg.ReservationLeaseTTL); err != nil {
 		return Config{}, err
 	}
+	if err := validateExecutionBudgets(cfg.ReservationHoldWindow, cfg.ExecutionMaxDuration); err != nil {
+		return Config{}, err
+	}
+	if err := validateEgress(cfg.Egress); err != nil {
+		return Config{}, err
+	}
 	if err := validatePostgres(cfg.Postgres); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// reservedEgressDirectName is the word the backend egress reference spells
+// its "no hop in between" with, and for that reason no configured policy may
+// claim it: an operator writing `direct` into a reference must mean the
+// plain dialer, and a policy of the same name would make one spelling mean
+// two things.
+const reservedEgressDirectName = "direct"
+
+// egressRouteTypes is the vocabulary a route's type may spell. The socks5
+// and socks5h distinction is this configuration's own, not the SOCKS
+// library's: whether the destination's name is resolved here or at the
+// proxy is an operator's choice about which resolver to trust, and the
+// spelling follows the convention the ecosystem already uses.
+var egressRouteTypes = map[string]bool{
+	"direct":       true,
+	"http-connect": true,
+	"socks5":       true,
+	"socks5h":      true,
+}
+
+// parseEgressPolicyNames splits the policy list into its names. The list is
+// the whole declaration of which policies exist; every name on it must have
+// its own settings beside it, and a name that could not be spelled as an
+// environment variable is refused here rather than discovered missing.
+func parseEgressPolicyNames(name, value string) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, fmt.Errorf("%s must not be empty; omit the variable to configure no egress policies", name)
+	}
+	seen := map[string]bool{}
+	names := []string{}
+	for _, raw := range strings.Split(value, ",") {
+		policy := strings.TrimSpace(raw)
+		if policy == "" {
+			return nil, fmt.Errorf("%s must not carry an empty policy name", name)
+		}
+		if len(policy) > 64 {
+			return nil, fmt.Errorf("%s: policy name %q is longer than 64 characters; a name this long cannot be spelled as its own DATAPLANE_EGRESS_<NAME> variables", name, policy)
+		}
+		for _, r := range policy {
+			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' {
+				continue
+			}
+			return nil, fmt.Errorf("%s: policy name %q must be letters, digits and underscores, so the policy's own DATAPLANE_EGRESS_<NAME> variables can be spelled", name, policy)
+		}
+		if policy == reservedEgressDirectName {
+			return nil, fmt.Errorf("%s: %q is reserved — a backend egress reference already reads it as the plain dialer, and a policy of the same name would make one spelling mean two things", name, policy)
+		}
+		if seen[policy] {
+			return nil, fmt.Errorf("%s names policy %q twice", name, policy)
+		}
+		seen[policy] = true
+		names = append(names, policy)
+	}
+	return names, nil
+}
+
+// parseEgressPolicy reads one policy's routes: the type list is required,
+// the address list rides beside it and must have one address per non-direct
+// route. The two lists pair by position, so the order an operator writes is
+// the order the policy tries.
+func parseEgressPolicy(policy string, lookup LookupEnv) (EgressPolicy, error) {
+	typeVar := "DATAPLANE_EGRESS_" + strings.ToUpper(policy) + "_TYPE"
+	typeValue, ok := lookup(typeVar)
+	if !ok {
+		return EgressPolicy{}, fmt.Errorf("%s is missing: the policy list names %q, and a policy without its type list is a name nothing can dial", typeVar, policy)
+	}
+	if strings.TrimSpace(typeValue) == "" {
+		return EgressPolicy{}, fmt.Errorf("%s must not be empty; a policy needs at least one route", typeVar)
+	}
+	types := []string{}
+	for _, raw := range strings.Split(typeValue, ",") {
+		route := strings.TrimSpace(raw)
+		if route == "" {
+			return EgressPolicy{}, fmt.Errorf("%s must not carry an empty route type", typeVar)
+		}
+		types = append(types, route)
+	}
+
+	addrVar := "DATAPLANE_EGRESS_" + strings.ToUpper(policy) + "_ADDR"
+	addrs := make([]string, len(types))
+	if addrValue, ok := lookup(addrVar); ok {
+		split := strings.Split(addrValue, ",")
+		if len(split) != len(types) {
+			return EgressPolicy{}, fmt.Errorf(
+				"%s carries %d addresses for %d route types in %s; the lists pair by position and must have the same length",
+				addrVar, len(split), len(types), typeVar)
+		}
+		for i := range split {
+			addrs[i] = strings.TrimSpace(split[i])
+		}
+	}
+
+	routes := make([]EgressRoute, len(types))
+	for i, routeType := range types {
+		if !egressRouteTypes[routeType] {
+			return EgressPolicy{}, fmt.Errorf("%s: %q is not a route type; a route is direct, http-connect, socks5 or socks5h", typeVar, routeType)
+		}
+		if routeType == reservedEgressDirectName {
+			if addrs[i] != "" {
+				return EgressPolicy{}, fmt.Errorf("%s: the direct route at position %d must carry an empty address; direct is the absence of a hop, and there is no address for it", addrVar, i+1)
+			}
+			routes[i] = EgressRoute{Type: routeType}
+			continue
+		}
+		if addrs[i] == "" {
+			return EgressPolicy{}, fmt.Errorf("%s: the %s route at position %d needs its proxy address beside it", addrVar, routeType, i+1)
+		}
+		if _, _, err := net.SplitHostPort(addrs[i]); err != nil {
+			return EgressPolicy{}, fmt.Errorf("%s: the %s route at position %d must be a host:port address", addrVar, routeType, i+1)
+		}
+		routes[i] = EgressRoute{Type: routeType, Addr: addrs[i]}
+	}
+	return EgressPolicy{Routes: routes}, nil
+}
+
+// validateEgress re-checks the parsed policies as a set. Each policy was
+// validated where it was read — the types, the addresses, the pairing — and
+// what needs the whole set in hand is only the emptiness rule: a policy with
+// no route at all would be a name that dials nowhere, so the loader refuses
+// it before the server accepts traffic. Names are visited in sorted order so
+// the failure an operator sees is the same failure every run.
+func validateEgress(e Egress) error {
+	names := make([]string, 0, len(e.Policies))
+	for name := range e.Policies {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if len(e.Policies[name].Routes) == 0 {
+			return fmt.Errorf("DATAPLANE_EGRESS_%s_TYPE names no route; a policy needs at least one", strings.ToUpper(name))
+		}
+	}
+	return nil
 }
 
 func parsePositiveDuration(name, value string) (time.Duration, error) {
@@ -452,15 +706,15 @@ func validateReservationHorizons(hold, lease time.Duration) error {
 	// and a sub-second value there is not a tuning choice, it is a
 	// misreading: two processes would disagree about expiry by more than the
 	// horizon itself.
-	if hold < minReservationHorizon {
+	if hold < minHorizon {
 		return fmt.Errorf(
 			"DATAPLANE_RESERVATION_HOLD_WINDOW (%s) must not be shorter than %s",
-			hold, minReservationHorizon)
+			hold, minHorizon)
 	}
-	if lease < minReservationHorizon {
+	if lease < minHorizon {
 		return fmt.Errorf(
 			"DATAPLANE_RESERVATION_LEASE_TTL (%s) must not be shorter than %s",
-			lease, minReservationHorizon)
+			lease, minHorizon)
 	}
 	if hold > MaxReservationHoldWindow {
 		return fmt.Errorf(
@@ -471,6 +725,34 @@ func validateReservationHorizons(hold, lease time.Duration) error {
 		return fmt.Errorf(
 			"DATAPLANE_RESERVATION_LEASE_TTL (%s) must be strictly shorter than DATAPLANE_RESERVATION_HOLD_WINDOW (%s); a lease must never outlive the hold it fences",
 			lease, hold)
+	}
+	return nil
+}
+
+// validateExecutionBudgets decides the one cross-field fact the execution
+// ceiling carries: it must sit strictly below the hold window. Lease renewal
+// keeps the process's claim on a hold alive while a provider call runs; the
+// hold itself is never extended — its expiry is stamped once, at admission —
+// so an execution budget at or past the hold window would let a call outlive
+// the reservation that has to price it, and the settlement would be reading
+// a hold that the window's arithmetic has already let go of. Strictly below,
+// because the call's settlement endings run after the call and inside the
+// same window.
+func validateExecutionBudgets(hold, execution time.Duration) error {
+	// The ceiling carries the same one-second floor the two reservation
+	// horizons carry: it is the clock the walk's budget and the renewal
+	// chain's steps ride on, and a sub-second execution window is a
+	// misreading, not a tuning choice — a call shorter than the stamps that
+	// bound it is not a call this vocabulary can state.
+	if execution < minHorizon {
+		return fmt.Errorf(
+			"DATAPLANE_EXECUTION_MAX_DURATION (%s) must not be shorter than %s",
+			execution, minHorizon)
+	}
+	if execution >= hold {
+		return fmt.Errorf(
+			"DATAPLANE_EXECUTION_MAX_DURATION (%s) must be strictly shorter than DATAPLANE_RESERVATION_HOLD_WINDOW (%s); a provider call must end inside the hold it was admitted under",
+			execution, hold)
 	}
 	return nil
 }
@@ -505,4 +787,27 @@ func (p Postgres) LogValue() slog.Value {
 		slog.Duration("conn_max_lifetime", p.ConnMaxLifetime),
 		slog.Duration("conn_max_idle_time", p.ConnMaxIdleTime),
 	)
+}
+
+// LogValue renders the egress policies safe for logs: which policies exist
+// and where their routes point are operational facts, in the same register
+// as the database's own host and port. The loader's validation refuses any
+// route spelling that could carry userinfo, so there is no credential in
+// these values to redact — the structure below is the whole truth.
+func (e Egress) LogValue() slog.Value {
+	names := make([]string, 0, len(e.Policies))
+	for name := range e.Policies {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	values := make([]slog.Attr, 0, len(names))
+	for _, name := range names {
+		routes := e.Policies[name].Routes
+		spelled := make([]string, 0, len(routes))
+		for _, route := range routes {
+			spelled = append(spelled, route.Type+"@"+route.Addr)
+		}
+		values = append(values, slog.String(name, strings.Join(spelled, ", ")))
+	}
+	return slog.GroupValue(values...)
 }

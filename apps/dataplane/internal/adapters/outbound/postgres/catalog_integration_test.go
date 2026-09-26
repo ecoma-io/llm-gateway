@@ -256,6 +256,61 @@ func TestIntegrationBackendRoundTripCarriesOptionalRefs(t *testing.T) {
 	}
 }
 
+// TestIntegrationBackendListIsTheWholeCatalogInOrder: the snapshot read the
+// executor registry's refresh makes returns every row — references present
+// and absent alike, disabled beside active, no eligibility filter — in id
+// order, the determinism the snapshot signature's change detection leans
+// on. The rows the registry builds executors from are the rows this read
+// returns, so what a round trip loses here is what a snapshot silently
+// loses.
+func TestIntegrationBackendListIsTheWholeCatalogInOrder(t *testing.T) {
+	_, backends, _, _ := integrationCatalogRepos(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	first := catalogBackend(t, ctx, backends)
+	second := catalogBackend(t, ctx, backends)
+	withRefs := catalogBackend(t, ctx, backends)
+	if applied, err := backends.UpdateTarget(ctx, withRefs.ID, withRefs.Endpoint, "creds/listed", "egress/listed", time.Now()); err != nil || !applied {
+		t.Fatalf("UpdateTarget = %v, %v; want the move to land", applied, err)
+	}
+	disabled := catalogBackend(t, ctx, backends)
+	if applied, err := backends.TransitionState(ctx, disabled.ID, catalog.BackendActive, catalog.BackendDisabled, time.Now()); err != nil || !applied {
+		t.Fatalf("TransitionState = %v, %v; want the disable to land", applied, err)
+	}
+
+	rows, err := backends.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	got := make(map[catalog.BackendID]catalog.Backend, len(rows))
+	for _, row := range rows {
+		if _, seen := got[row.ID]; seen {
+			t.Fatalf("List returned backend %s twice", row.ID)
+		}
+		got[row.ID] = row
+	}
+	for _, id := range []catalog.BackendID{first.ID, second.ID} {
+		if _, ok := got[id]; !ok {
+			t.Fatalf("List is missing backend %s — the snapshot must be the whole catalog", id)
+		}
+	}
+	for i := 1; i < len(rows); i++ {
+		if rows[i-1].ID > rows[i].ID {
+			t.Fatalf("List is not ordered by id: %s before %s", rows[i-1].ID, rows[i].ID)
+		}
+	}
+	// What the registry's builder reads is this list: the references a
+	// snapshot resolves credentials and egress through, and the state the
+	// walk — never the snapshot — filters on, must both come back whole.
+	if listed := got[withRefs.ID]; listed.CredentialsRef != "creds/listed" || listed.EgressPolicyRef != "egress/listed" {
+		t.Errorf("refs = %q/%q, want the list to carry them whole for the snapshot builder", listed.CredentialsRef, listed.EgressPolicyRef)
+	}
+	if listed := got[disabled.ID]; listed.State != catalog.BackendDisabled {
+		t.Errorf("state = %s, want disabled — List returns rows, not eligibility", listed.State)
+	}
+}
+
 func TestIntegrationAliasAggregateRoundTripKeepsOrderAndOverrides(t *testing.T) {
 	store, backends, aliases, _ := integrationCatalogRepos(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)

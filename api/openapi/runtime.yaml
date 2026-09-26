@@ -244,6 +244,19 @@ paths:
           quantity is what was already forwarded.
 
 
+        - *A hold reclaimed mid-flight* — the reservation's execution lease
+          lost despite its renewals, by a process paused past its lease — ends
+          the call before commitment with no failure report either: the
+          capacity that would have priced the answer is no longer the
+          runtime's to defend. Nothing is written for it — no status of the
+          runtime's choosing, no error frame — so the client reads a bare
+          empty 200: for a streamed request, no event-stream at all rather
+          than an event-stream carrying an error, and for a body request, an
+          empty body. The ending is recorded as `gateway_abandoned` — the
+          request's failure reason and the intake record's word, the
+          operator's account of it, never the caller's answer.
+
+
         **The successful response.** A completion is answered 200 in the shape
         `stream` selects. `stream: false` answers one `application/json` body —
         the OpenAI-compatible chat.completion object. `stream: true` answers

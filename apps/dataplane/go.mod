@@ -32,7 +32,15 @@ go 1.26
 require (
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/valkey-io/valkey-go v1.0.78
+	golang.org/x/net v0.57.0
 )
+
+// golang.org/x/net provides the SOCKS5 client the egress adapter dials
+// through (golang.org/x/net/proxy, RFC 1928). The standard library has no
+// SOCKS5 dialer, and the maintained x/net implementation is required rather
+// than hand-rolling the handshake beside it. The version is the one the
+// module graph already resolved; this entry makes the direct use declared
+// rather than inherited.
 
 // golang-migrate is the schema-change tool deploy/postgres chose (its README
 // records why, and the pinned runner image is this exact version) — required

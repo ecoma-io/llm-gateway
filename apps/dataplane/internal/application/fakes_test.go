@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -243,6 +244,23 @@ func (f fakeBackends) UpdateTarget(ctx context.Context, id catalog.BackendID, en
 	return false, nil // the port reports the miss, and so does the fake
 }
 
+// List returns every backend row, ordered by id. It checks no unit of work
+// on purpose: the snapshot read is the composition root's, made outside any
+// unit of work — in production it is the executor registry's refresh reading
+// rows on the pool, not a step of a transaction.
+func (f fakeBackends) List(ctx context.Context) ([]catalog.Backend, error) {
+	ids := make([]catalog.BackendID, 0, len(f.world.backends))
+	for id := range f.world.backends {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	rows := make([]catalog.Backend, 0, len(ids))
+	for _, id := range ids {
+		rows = append(rows, *f.world.backends[id])
+	}
+	return rows, nil
+}
+
 // ---------------------------------------------------------------------------
 // aliases
 // ---------------------------------------------------------------------------
@@ -466,8 +484,11 @@ type admissionWorld struct {
 	reservationDuplicate bool
 	clockFailure         error
 	seamCloseLost        bool
+	renewalFailures      int    // the first N lease renewals error — the walk keeps its claim
+	renewalGone          int    // the first N lease renewals report the hold no longer open
 	requestFinaliseLost  bool   // the compensation's CAS won, but the request row did not finalise
 	attemptDuplicate     bool   // the attempt insert races a writer that already persisted the row
+	intakePreFinalised   bool   // the replay record is already terminal when the orphan tail reads it
 	intakeRace           int    // the first N intake inserts lose the unique race
 	intakeRaceWinner     string // "", "in_flight", or "rejected"
 
@@ -972,6 +993,13 @@ func (f fakeAdmissionIntakes) Insert(ctx context.Context, intake execution.Intak
 		}
 		return fmt.Errorf("fake: intake for %s: %w", key, persistence.ErrDuplicateIntake)
 	}
+	if f.world.intakePreFinalised {
+		// The winner of the ending's race finalised this record between the
+		// loser's lost close and the orphan tail's read — the skip branch's
+		// premise, staged where that read will find it.
+		final := execution.FinalSucceeded
+		intake.FinalStatus = &final
+	}
 	f.world.intakes[key] = cloneAdmissionIntake(intake)
 	return nil
 }
@@ -1043,6 +1071,33 @@ func (f fakeAdmissionReservations) Close(ctx context.Context, id identity.Reserv
 	}
 	reservation.State = state
 	reservation.ClosedAt = closedAt
+	f.world.reservations[id] = reservation
+	return true, nil
+}
+
+// RenewLease answers the walk's renewal with the port's CAS: the hold open
+// and the owner the admission stamped, or the claim is not this process's to
+// extend. It notes no event and counts no outside-tx violation on purpose —
+// a renewal is deliberately detached work, no unit of transaction, so it is
+// not part of the transactional story the event log tells. The knobs stage
+// the two answers the walk must survive: an error, which it rides out, and a
+// hold-no-longer-open, which stops the renewal and cancels the call.
+func (f fakeAdmissionReservations) RenewLease(ctx context.Context, id identity.ReservationID, owner string, leaseExpiresAt time.Time) (bool, error) {
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
+	if f.world.renewalFailures > 0 {
+		f.world.renewalFailures--
+		return false, fmt.Errorf("fake: lease renewal of %s failed", id)
+	}
+	if f.world.renewalGone > 0 {
+		f.world.renewalGone--
+		return false, nil
+	}
+	reservation, ok := f.world.reservations[id]
+	if !ok || reservation.State != accounting.StateOpen || reservation.LeaseOwner != owner {
+		return false, nil
+	}
+	reservation.LeaseExpiresAt = leaseExpiresAt
 	f.world.reservations[id] = reservation
 	return true, nil
 }

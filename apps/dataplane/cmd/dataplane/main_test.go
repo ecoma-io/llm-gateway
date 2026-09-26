@@ -117,7 +117,7 @@ func TestRunDrainsAnInFlightRequestBeforeReturning(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	runErr := serveForTest(t, ctx, cancel, server, listener, time.Second, pool)
+	runErr := serveForTest(t, ctx, cancel, server, listener, time.Second, time.Second, pool)
 	requestErr := requestForTest(t, listener)
 
 	waitForStart(t, started)
@@ -166,7 +166,7 @@ func TestRunDrainsEveryListenerItWasGiven(t *testing.T) {
 		runErr <- run(ctx, cancel, []service{
 			{name: "runtime", server: runtimeServer, listener: runtimeListener},
 			{name: "management", server: managementServer, listener: managementListener},
-		}, time.Second, pool)
+		}, time.Second, time.Second, pool)
 	}()
 
 	runtimeRequest := requestForTest(t, runtimeListener)
@@ -198,7 +198,16 @@ func TestRunDrainsEveryListenerItWasGiven(t *testing.T) {
 	}
 }
 
-func TestRunReportsAShutdownThatOverrunsItsTimeout(t *testing.T) {
+// TestRunExitsGreenAfterAnOverranDrain: the drain deadline ran out with a
+// request still in flight. Shutdown does not force that connection closed —
+// it reports the expiry and leaves it running — so run's policy is explicit:
+// the overrun is named, the sockets are closed, the in-flight endings are
+// given their bounded tail, and the process still exits green. The tail is
+// real: run returns no earlier than it. The request the shutdown severed
+// learns of it as the failed connection it now is — the caller was going to
+// be answered by a process that has been asked to leave, and the ending that
+// matters (the hold, the usage) runs detached from the socket.
+func TestRunExitsGreenAfterAnOverranDrain(t *testing.T) {
 	listener := listenForTest(t)
 	server, started, release := blockingServer(t)
 	defer release()
@@ -206,21 +215,24 @@ func TestRunReportsAShutdownThatOverrunsItsTimeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool := &recordingPool{}
-	// The drain timeout is far shorter than the request's own lifetime, so the
-	// shutdown is guaranteed to overrun it.
-	runErr := serveForTest(t, ctx, cancel, server, listener, 50*time.Millisecond, pool)
+	// The drain timeout is far shorter than the request's own lifetime, so
+	// the shutdown is guaranteed to overrun it; the tail is long enough to
+	// be measurable and far shorter than the test's patience.
+	drainTail := 150 * time.Millisecond
+	runErr := serveForTest(t, ctx, cancel, server, listener, 50*time.Millisecond, drainTail, pool)
 	requestErr := requestForTest(t, listener)
 
 	waitForStart(t, started)
+	stoppedAt := time.Now()
 	cancel()
 
 	select {
 	case err := <-runErr:
-		if err == nil {
-			t.Fatal("run() error = nil, want the overrun reported")
+		if err != nil {
+			t.Fatalf("run() error = %v, want nil — an overran drain is policy, not failure", err)
 		}
-		if !strings.Contains(err.Error(), "graceful shutdown") {
-			t.Errorf("run() error = %q, want it to name the graceful shutdown", err)
+		if elapsed := time.Since(stoppedAt); elapsed < drainTail {
+			t.Fatalf("run() returned %s after the stop, want at least the %s tail the endings were granted", elapsed, drainTail)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("run() never returned after the shutdown overran its timeout")
@@ -229,11 +241,11 @@ func TestRunReportsAShutdownThatOverrunsItsTimeout(t *testing.T) {
 		t.Error("run() left the pool open after returning — an overrun drain is still a return")
 	}
 
-	// The request the shutdown gave up on still has to be let go, or the
-	// connection it holds outlives the test.
-	release()
-	if err := <-requestErr; err != nil {
-		t.Fatalf("overrun request error = %v", err)
+	// The request the force-close severed: its connection died with the
+	// sockets, which is the policy — the caller of a process mid-exit does
+	// not get an answer, and the walk's ending ran on without the socket.
+	if err := <-requestErr; err == nil {
+		t.Fatal("the severed request error = nil, want the connection's failure")
 	}
 }
 
@@ -245,7 +257,7 @@ func TestRunReportsAListenerThatFailsOnItsOwn(t *testing.T) {
 	pool := &recordingPool{}
 
 	server := &stdhttp.Server{Handler: stdhttp.HandlerFunc(func(_ stdhttp.ResponseWriter, _ *stdhttp.Request) {})}
-	err := run(context.Background(), func() {}, []service{{name: "runtime", server: server, listener: listener}}, time.Second, pool)
+	err := run(context.Background(), func() {}, []service{{name: "runtime", server: server, listener: listener}}, time.Second, time.Second, pool)
 
 	if err == nil {
 		t.Fatal("run() error = nil, want the listener failure")
@@ -271,7 +283,7 @@ func TestRunReportsAPoolThatWillNotCloseCleanly(t *testing.T) {
 	ctx, stop := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, stop, []service{{name: "runtime", server: server, listener: listener}}, time.Second, pool)
+		done <- run(ctx, stop, []service{{name: "runtime", server: server, listener: listener}}, time.Second, time.Second, pool)
 	}()
 
 	stop()
@@ -317,11 +329,11 @@ func listenForTest(t *testing.T) net.Listener {
 // serveForTest starts run in the background against a single listener and
 // returns the channel its outcome arrives on. The tests that need two drive
 // run directly, because what they are checking is that one process serves both.
-func serveForTest(t *testing.T, ctx context.Context, stop context.CancelFunc, server *stdhttp.Server, listener net.Listener, timeout time.Duration, pool io.Closer) chan error {
+func serveForTest(t *testing.T, ctx context.Context, stop context.CancelFunc, server *stdhttp.Server, listener net.Listener, timeout, drainTail time.Duration, pool io.Closer) chan error {
 	t.Helper()
 	runErr := make(chan error, 1)
 	go func() {
-		runErr <- run(ctx, stop, []service{{name: "runtime", server: server, listener: listener}}, timeout, pool)
+		runErr <- run(ctx, stop, []service{{name: "runtime", server: server, listener: listener}}, timeout, drainTail, pool)
 	}()
 	return runErr
 }

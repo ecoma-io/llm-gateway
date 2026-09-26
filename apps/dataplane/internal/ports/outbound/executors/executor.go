@@ -39,11 +39,12 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/identity"
 )
 
-// Executor performs one upstream call for the routing stage: the whole call,
-// including whatever retrying that provider's own errors deserve — retrying
-// inside the call is the adapter's judgment about its provider, while moving
-// to another candidate is the routing stage's judgment about the alias. The
-// call's answer is delivered through the sink as it is produced; the returned
+// Executor performs one upstream call for the routing stage — exactly one:
+// an adapter re-issues nothing, because a retry inside the call would be
+// provider spend no attempt row records and no walk observes. Whether the
+// request is tried again is the routing stage's disposition of the failure's
+// class, and its only retry-shaped move is the next candidate. The call's
+// answer is delivered through the sink as it is produced; the returned
 // Result is the call's end, delivered once, after everything the sink
 // received.
 //

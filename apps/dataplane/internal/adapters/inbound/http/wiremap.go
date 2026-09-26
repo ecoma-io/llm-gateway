@@ -278,9 +278,14 @@ func chatWireCell(outcome application.ChatOutcome) chatAnswer {
 			routing:   outcome.Routing,
 		}
 	case application.OutcomeAbandoned:
-		// The caller's context ended mid-walk; there is no channel left to
-		// answer on and nothing was finalised. The outcome is the log's
-		// correlation fact and the reaper's, never the wire's.
+		// The hold is gone from the open set and nothing was committed, by
+		// either of the two doors that end this way: the caller's context
+		// ended mid-walk and no channel is left to answer on, or the lease
+		// renewal reported the hold reaped and the call was cancelled before
+		// commitment — a live caller, answered by nothing, because the
+		// capacity that would have priced the answer is no longer defended.
+		// The outcome is the log's correlation fact and the reaper's, never
+		// the wire's.
 		return chatAnswer{
 			silent:    true,
 			reason:    string(application.OutcomeAbandoned),

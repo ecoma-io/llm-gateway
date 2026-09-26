@@ -17,7 +17,7 @@ client: model = "<logical model alias>"
         │                       backend is disabled (see "Policy inputs" below)
         ▼
  ③ candidate execution          adapter translates the request for this backend's protocol;
-        │                       bounded provider retries (same candidate) happen inside this step
+        │                       one upstream call, no retries inside this step
         ▼
  ④ normalized result            success stream (+ usage report) or typed failure
         │
@@ -26,9 +26,11 @@ client: model = "<logical model alias>"
         └── success / committed ────────▶ ⑥ return to client
 ```
 
-Every pass through ③ is one `RequestAttempt` row; retries inside ③ append
-additional attempt rows against the **same** candidate. ⑤ never happens once
-a response is committed.
+Every pass through ③ is one `RequestAttempt` row, and one pass is one
+upstream call: an adapter never retries its provider
+([ADR 0002](../adr/0002-routing-and-fallback-ownership.md), as amended — a
+retry inside the call would be provider spend no row records). ⑤ never
+happens once a response is committed.
 
 **The pipeline starts where admission ends.** A request reaches step ① only
 after the runtime's admission transaction has committed — key authenticated,
@@ -56,9 +58,9 @@ down does not make a `/v1/*` request fail
 ┌───────────────────────────────────────────────────────────────┐
 │ Router        alias → candidates · selects · owns cross-provider logical fallback │
 ├───────────────────────────────────────────────────────────────┤
-│ Adapters      provider-protocol translation · normalized results · provider retry │
+│ Adapters      provider-protocol translation · normalized results · one call each │
 ├───────────────────────────────────────────────────────────────┤
-│ Egress        proxy pools, rotation, health; invisible above this line           │
+│ Egress        dial routes and establishment failover; invisible above this line  │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -83,31 +85,38 @@ Hard rules (ADR 0002):
   provider-specific code path exists for a provider that speaks an existing
   protocol family.
 
-## Retry vs fallback
+## Fallback
 
-|                          | Provider retry                                | Logical fallback                                 |
-| ------------------------ | --------------------------------------------- | ------------------------------------------------ |
-| Owner                    | Adapter                                       | Router                                           |
-| Target                   | Same candidate, same provider model           | Next candidate, possibly another provider        |
-| Triggers                 | Retryable error classes + connect timeouts    | Non-retryable failure, or retry budget exhausted |
-| Budget                   | Bounded per candidate (backoff)               | Bounded by the candidate list length             |
-| Allowed after commitment | No (nothing is re-sent to the client)         | **Never**                                        |
-| Recorded as              | Additional attempt rows on the same candidate | Attempt rows on the next candidate               |
-| Billing effect           | None for failed attempts (invariant 6)        | The committed attempt is the only billed subject |
+There is no provider retry to set against it: one pass through execution is
+one upstream call, and the adapter that made it re-issues nothing
+([ADR 0002](../adr/0002-routing-and-fallback-ownership.md), as amended). What
+the original design split across two mechanisms — retry the candidate, or
+move to the next — lives entirely in the walk's disposition now, and the
+disposition is a pure function of the failure's class:
+
+|                          | Logical fallback                                 |
+| ------------------------ | ------------------------------------------------ |
+| Owner                    | Router                                           |
+| Target                   | Next candidate, possibly another provider        |
+| Triggers                 | A fallback-eligible failure class                |
+| Budget                   | Bounded by the candidate list length             |
+| Allowed after commitment | **Never**                                        |
+| Recorded as              | Attempt rows on the next candidate               |
+| Billing effect           | The committed attempt is the only billed subject |
 
 Failure classes and their disposition (the router's decision table — the
 adapter only classifies):
 
-| Error class                                                       | Retryable? | Fallback?                                         |
-| ----------------------------------------------------------------- | ---------- | ------------------------------------------------- |
-| `rate_limited`                                                    | yes        | yes, if retry budget exhausted                    |
-| `provider_unavailable`                                            | yes        | yes, if retry budget exhausted                    |
-| `upstream_error` (5xx, unknown)                                   | yes        | yes, if retry budget exhausted                    |
-| `invalid_upstream_response` (empty/malformed body before content) | yes        | yes, if retry budget exhausted                    |
-| `provider_rejected_request` (upstream refused the request)        | no         | no — the client's request is at fault; surface it |
-| `context_too_large`                                               | no         | no — surfacing it beats silently truncating       |
-| `authentication` (our credentials)                                | no         | no — an operator problem, surfaced loudly         |
-| `stream_failed_after_commitment`                                  | no         | no — commitment gate (invariant 7)                |
+| Error class                                                       | Disposition                                       |
+| ----------------------------------------------------------------- | ------------------------------------------------- |
+| `rate_limited`                                                    | fall through to the next candidate                |
+| `provider_unavailable`                                            | fall through to the next candidate                |
+| `upstream_error` (5xx, unknown)                                   | fall through to the next candidate                |
+| `invalid_upstream_response` (empty/malformed body before content) | fall through to the next candidate                |
+| `provider_rejected_request` (upstream refused the request)        | no — the client's request is at fault; surface it |
+| `context_too_large`                                               | no — surfacing it beats silently truncating       |
+| `authentication` (our credentials)                                | no — an operator problem, surfaced loudly         |
+| `stream_failed_after_commitment`                                  | no — commitment gate (invariant 7)                |
 
 `provider_rejected_request` and `context_too_large` deliberately do **not**
 fall back: the same request against the next candidate would fail identically
@@ -153,14 +162,18 @@ answered through the request's reply. The reply is the transport's half of
 the same channel the executors write content into, which is what makes the
 commitment point real on the wire: the first content byte freezes the
 status line and the framing, and every ending after it knows which side of
-the gate it stands on. The candidate **execution** layer — the adapters that
-translate a request for a provider's protocol and call it — is deliberately
-absent: the registry the stage reads is empty until B10 lands the first
-executor, so today every admitted request is released as a no-candidate
-answer, byte-identical with the endpoint's behaviour before the stage
-existed. The walk, its dispositions, its endings and their transactions are
-landed and pinned by tests; B10 registers an executor and the walk starts
-trying candidates, and nothing above this paragraph changes when it does.
+the gate it stands on. The candidate **execution** layer stands behind the
+stage now ([ADR 0009](../adr/0009-provider-adapters-and-egress.md)): the
+registry the stage reads is a snapshot of the catalog's callable backends,
+built once by the composition root and refreshed on a timer — so the walk's
+lookup is a map read, never a catalog I/O — and the first adapter behind it
+speaks the OpenAI chat-completions wire. A lease renewer rides every call,
+extending the reservation's execution lease on the monotone chain admission
+opened, so a call that obeys its duration budget never loses its hold to the
+reaper mid-flight. The adapter rules are unchanged from the day they were
+written for an adapter that did not exist: one upstream call each, no
+retries, typed results only, and the reply's sink as the commitment point
+they write content into.
 
 ## Commitment
 
@@ -193,10 +206,14 @@ only — the hold is intact, the fallback restart is free to the account, and
 a release gives back exactly what was drawn. After commitment, usage settles
 on what was delivered against the hold admission secured
 ([commerce](commerce.md)): the hold is the ceiling the failure cannot exceed,
-and the lease renewed while the stream runs is what keeps the reaper from
-taking that ceiling back mid-flight. Admission sized the hold before any
-candidate ran precisely so that no routing outcome — fallback, exhaustion, or
-mid-stream death — ever needs to resize it.
+and the lease the walk renews while the call runs — stream or body alike —
+is what keeps the reaper from taking that ceiling back mid-flight. The
+renewal extends the lease only, never the hold window, so the bound that
+protects the call is the one the process validates at start: the execution
+duration sits strictly inside the hold window
+([ADR 0009](../adr/0009-provider-adapters-and-egress.md)). Admission sized
+the hold before any candidate ran precisely so that no routing outcome —
+fallback, exhaustion, or mid-stream death — ever needs to resize it.
 
 Consequence for clients: cross-provider resilience operates at request
 granularity. The gateway never splices two providers' output into one

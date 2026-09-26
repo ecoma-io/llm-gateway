@@ -147,11 +147,13 @@ step 10) and the settle (steps 11–12, delivery counted by the interim byte
 rule until B11's tokenizer) are whole transactions of the serving path, with
 the attempt row appended inside the settle unit and the usage fact appended
 **last** — so "settled" and "in the feed" are one fact, not two events to
-reconcile. What no serving path runs yet is the executor of step 9: the
-routing stage's registry carries no adapters until B10, so today's walk
-resolves no candidate for any alias and every admitted request is released as
-a no-candidate answer — the exact cell the endpoint answered before the stage
-existed. The attempt rows of step 9 are to be appended
+reconcile. Step 9's executor runs too
+([ADR 0009](../adr/0009-provider-adapters-and-egress.md)): the routing
+stage's registry is a snapshot of the catalog's callable backends, built by
+the composition root and refreshed on a timer, and an admitted request whose
+alias has a candidate on a callable backend reaches a real provider — one
+upstream call per attempt, typed result back, the reply's sink as the
+commitment point. The attempt rows of step 9 are appended
 **as each upstream call finishes, never while it is in flight**, so no
 transaction is ever open across a provider call and a crash mid-call leaves no
 row at all; the one sanctioned later write to an attempt row is the
@@ -231,9 +233,11 @@ assume them silently.
   a re-keying discipline, not a runtime guarantee.
 - **The reaper is not on the synchronous path, and nothing here promises a
   request safety from it.** An executing request keeps its hold alive by
-  renewing its lease, and the maximum accepted request/stream duration is
-  bounded strictly below the maximum lease — that is the whole protection. A
-  lease that is not renewed dies, and the reaper expires the reservation on
+  renewing its lease, and the bound that protects it is the one the process
+  validates at start: the execution duration sits strictly below the
+  reservation hold window — the horizon the reaper sweeps against, not the
+  lease, which renewal keeps alive for as long as the call runs. A lease
+  that is not renewed dies, and the reaper expires the reservation on
   the same terms as any other dead lease; no step above claims otherwise.
 - **The seed producer does not exist yet.** The quota projection's rows are
   consumed by admission, but the Control-Plane side that publishes them — the

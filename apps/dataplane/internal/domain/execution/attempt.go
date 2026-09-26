@@ -59,11 +59,15 @@ var ErrUnknownErrorClass = errors.New("execution: unknown attempt error class")
 // not a balance: there is no negative token.
 var ErrUsageNegative = errors.New("execution: provider usage must not be negative")
 
-// maxProviderErrorOctets is the serialised cap on the one sanctioned jsonb in
+// MaxProviderErrorOctets is the serialised cap on the one sanctioned jsonb in
 // the runtime schema. It is half of the database's own 65536-octet guard, for
 // the same reason the fact payload's writer cap is half of its: the legible
 // error belongs at the write site, the constraint is the wall behind it.
-const maxProviderErrorOctets = 32768
+// It is exported like MaxProviderRequestIDOctets because the executor adapter
+// that lifts a provider's error envelope off the wire is the first writer of
+// that telemetry — its cap keeps a verbose envelope from ever reaching the
+// row at all, and NewAttempt's refusal below stays the wall behind it.
+const MaxProviderErrorOctets = 32768
 
 // MaxProviderRequestIDOctets is the bound the schema's CHECK puts on the
 // provider's own correlation handle. It is exported because the handle is the
@@ -161,7 +165,7 @@ func (a *Attempt) SetProviderError(err json.RawMessage) error {
 	if !json.Valid(err) || json.RawMessage(err)[0] != '{' {
 		return errors.New("execution: provider error telemetry must be a json object")
 	}
-	if len(err) > maxProviderErrorOctets {
+	if len(err) > MaxProviderErrorOctets {
 		return errors.New("execution: provider error telemetry exceeds 32768 octets")
 	}
 	a.ProviderError = append(json.RawMessage(nil), err...)

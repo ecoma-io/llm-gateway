@@ -21,7 +21,8 @@ import (
 // mixes with neither. Admission's decision is final when it arrives here: the
 // hold is open, the request row is executing, the replay record is watching.
 // Execution's detail is invisible from here: a candidate is one Executor
-// call, whose retries are the adapter's own judgment about its provider.
+// call, and one call is all an executor ever makes (ADR 0002, as amended) —
+// what a failure earns next is this stage's disposition of its class.
 //
 // The walk is the whole policy. Eligibility keeps the catalog's order and
 // drops what cannot serve — a disabled backend, an unregistered executor — so
@@ -57,6 +58,7 @@ type ChatRouting struct {
 	registry     executors.Registry
 	routed       ChatCompletion
 	clock        txClock
+	execution    ExecutionConfig
 }
 
 // NewChatRouting builds the routing stage over the ports it needs and the
@@ -76,6 +78,7 @@ func NewChatRouting(
 	ledger persistence.QuotaProjectionRepository,
 	facts persistence.FactRepository,
 	registry executors.Registry,
+	execution ExecutionConfig,
 	routed ChatCompletion,
 ) *ChatRouting {
 	switch {
@@ -99,6 +102,10 @@ func NewChatRouting(
 		panic("application: NewChatRouting requires a fact repository")
 	case registry == nil:
 		panic("application: NewChatRouting requires an executor registry")
+	case execution.MaxDuration <= 0:
+		panic("application: NewChatRouting requires a positive execution max duration; the call's context needs its one budget")
+	case execution.LeaseTTL <= 0:
+		panic("application: NewChatRouting requires a positive lease ttl; the renewal ticks on its third")
 	case routed == nil:
 		panic("application: NewChatRouting requires the use case it routes for")
 	}
@@ -115,6 +122,7 @@ func NewChatRouting(
 		registry:     registry,
 		routed:       routed,
 		clock:        storeClock{store: store},
+		execution:    execution,
 	}
 }
 
@@ -204,12 +212,29 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 	// candidate gets to choose.
 	reply.Open(admitted.Stream)
 
+	// The renewal chain is the walk's, not one call's: it starts at the
+	// admission-stamped expiry and every call's renewer extends the deadline
+	// the previous call's renewer wrote. A fall-through to the next candidate
+	// therefore continues the lease from where the last call left it — a
+	// candidate that burned ten TTLs before failing does not hand the next
+	// one a lease that admission's stamp has long since lapsed.
+	leaseDeadline := admitted.LeaseExpiresAt
+
 	for step := 1; ; step++ {
 		if ctx.Err() != nil {
-			// The caller is gone before any candidate answered. Nothing is
-			// finalised and nothing can be written — there is no channel —
-			// so the request stays executing with its hold open, exactly the
-			// shape a dead process leaves, for the reaper to close.
+			// The caller is gone before any candidate answered. The walk's
+			// own ending is the abandoned one — nothing was delivered, the
+			// transport writes nothing — but the hold the request opened is
+			// real reserved capacity, and the ending that returns it has a
+			// channel of its own: the release runs on the detached ending
+			// context, naming gateway_abandoned as the failure, so the hold
+			// comes back to the projection instead of stranding open until
+			// the hold window expires. The outcome kind stays abandoned
+			// either way; the release is bookkeeping the caller will never
+			// see, not an answer.
+			if err := r.release(ctx, in, admitted, "", execution.FailedGatewayAbandoned); err != nil {
+				return ChatOutcome{}, err
+			}
 			return ChatOutcome{
 				Kind:             OutcomeAbandoned,
 				RuntimeRequestID: admitted.RuntimeRequestID,
@@ -237,7 +262,16 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 		executor, _ := r.registry.For(candidate.BackendID)
 		attemptID := identity.NewAttemptID()
 		started := time.Now().UTC()
-		result := executor.Execute(ctx, executors.AttemptSpec{
+		// The call runs under the renewal: its context carries the execution
+		// budget, and the lease-renewal goroutine lives exactly as long as
+		// the call does. The pairing below holds on the call's every exit —
+		// panics included, whose recovery the transport owns but whose
+		// unwinding would otherwise strand the renewer on a hold nobody will
+		// ever settle — and the stop waits for the renewer, so no renewal
+		// races the ending this attempt's finish writes. It reports whether
+		// the renewal was what ended the call, and the deadline the renewer
+		// last wrote becomes the next candidate's chain seed.
+		result, renewalLost := r.executeWithRenewal(ctx, admitted, &leaseDeadline, executor, executors.AttemptSpec{
 			RequestID:          admitted.RuntimeRequestID,
 			AttemptID:          attemptID,
 			BackendID:          string(candidate.BackendID),
@@ -337,6 +371,28 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 			return ChatOutcome{}, err
 		}
 
+		if renewalLost {
+			// The renewal stopped this call: the hold is gone from the open
+			// set — closed by a concurrent settlement, or swept — and no
+			// disposition applies, because every candidate after this one
+			// would be called on a hold nobody owns. The abandoned release
+			// returns what the ending still can: where the hold's close is
+			// already another writer's, the release's own CAS loses and
+			// writes nothing; the outcome is abandoned either way, and the
+			// transport writes nothing for a request whose hold died
+			// mid-walk. A renewal lost after commitment never reaches this
+			// branch — that ending is the settle's, whose CAS loses the
+			// same race and records the orphan tail.
+			if err := r.release(ctx, in, admitted, "", execution.FailedGatewayAbandoned); err != nil {
+				return ChatOutcome{}, err
+			}
+			return ChatOutcome{
+				Kind:             OutcomeAbandoned,
+				RuntimeRequestID: admitted.RuntimeRequestID,
+				Routing:          trace,
+			}, nil
+		}
+
 		if reason, surfaced := routing.SurfacedRefusal(class); surfaced {
 			// The caller's request is the thing at fault: the same request
 			// at another candidate fails identically or answers differently,
@@ -370,10 +426,10 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 
 // attemptRow forms one finished call's row. Candidate position counts from
 // zero on the row and from one in the catalog — the walk's first try is the
-// catalog's position 1 — and the retry sequence is always zero: retries
-// inside one candidate are the executor's judgment about its provider, and a
-// router retry of the same candidate would only repeat a failure the catalog
-// forbids listing twice.
+// catalog's position 1 — and the retry sequence is always zero: an executor
+// makes exactly one call per candidate (ADR 0002, as amended), so the column
+// is reserved, not merely unused — a recorded-retry design would have to
+// reopen the attempt schema first.
 func (r *ChatRouting) attemptRow(
 	admitted *Admission,
 	candidate catalog.Candidate,
@@ -475,45 +531,69 @@ type settleUsage struct {
 // rules in one place, so the success and the mid-stream failure settle by the
 // same arithmetic:
 //
-//   - delivery is always the gateway's own count of what left the process;
-//   - input is the provider's report when it gave one, otherwise the count
-//     admission priced the hold from — the gateway's own observation of the
-//     input side;
-//   - output is the provider's report when it gave one, otherwise the
-//     delivered count — which can only understate, because generation that
-//     was never forwarded is unknowable;
-//   - capture is reported when the provider reported both usage figures
-//     (input and output), gateway_observed otherwise. The label attests to
+//   - delivery is always the gateway's own count of what left the process,
+//     recorded beside the settlement but never priced by it — ADR 0003
+//     prices input and output only, and a byte-count heuristic is not a
+//     tokenizer;
+//   - input is the provider's report bounded by the count admission priced
+//     the hold from: a report above it is clamped down to it, and no report
+//     falls back to it;
+//   - output is the provider's report bounded by the output basis the hold
+//     was sized with, and the basis itself when no report arrived — never
+//     the delivered count, which would price a transport estimate the
+//     provider's tokenizer never agreed to and could claim above the hold;
+//   - capture is reported when the provider's own figures stand as given,
+//     gateway_observed when a figure is missing but nothing was clamped
+//     (the input side's fallback is the gateway's own count — the basis
+//     bullet above — so the observation label stays honest there), and
+//     reservation_floor whenever a settled figure is the reservation's own:
+//     a clamp that bound, or an output nobody reported. The label attests to
 //     the usage figures' provenance, and to nothing else: delivery is the
 //     gateway's own count by construction — the first bullet — reported or
 //     not, so it never decides the label.
 //
-// The reservation floor is deliberately out of reach on this path: a settled
-// ending always names a committed attempt, and a commitment means content
-// reached the client, so there is always a delivered count to stand on.
+// With both figures bounded by the counts the hold was derived from, the
+// settled amount cannot exceed the hold — the hold formula is increasing in
+// both — so the ending's first law, settled ≤ hold, holds by construction.
+// The provider's own claims are not lost by the clamping: the attempt row
+// records them as the telemetry they are, and the fact prices only what the
+// reservation defends.
 func settleBasis(admitted *Admission, delivered []byte, reportedInput, reportedOutput *int64) settleUsage {
-	observed := accounting.CountDeliveredTokens(delivered)
-	delivery := observed
+	delivery := accounting.CountDeliveredTokens(delivered)
+	floor := false
 
 	input := reportedInput
+	if input != nil && *input > int64(admitted.InputTokens) {
+		count := int64(admitted.InputTokens)
+		input = &count
+		floor = true
+	}
 	if input == nil {
 		count := int64(admitted.InputTokens)
 		input = &count
 	}
 	output := reportedOutput
-	if output == nil {
-		// The delivered count is copied, not aliased: the same octet count
-		// stands behind both the delivery figure and the output figure on
-		// purpose, but the fact's two pointers outlive this frame, and a
-		// shared variable is one future writer away from a fact whose output
-		// silently changed under it.
-		count := delivery
+	if output != nil && *output > int64(admitted.OutputBasis) {
+		count := int64(admitted.OutputBasis)
 		output = &count
+		floor = true
+	}
+	if output == nil {
+		// The basis is copied, not aliased: the count the hold was sized
+		// with stands behind the output figure, and the fact's pointer
+		// outlives this frame — a shared variable is one future writer away
+		// from a fact whose output silently changed under it.
+		count := int64(admitted.OutputBasis)
+		output = &count
+		floor = true
 	}
 
 	capture := accounting.CaptureGatewayObserved
 	if reportedInput != nil && reportedOutput != nil {
 		capture = accounting.CaptureReported
+	}
+	if floor {
+		capture = accounting.CaptureReservationFloor
 	}
 	return settleUsage{
 		capture:  capture,
