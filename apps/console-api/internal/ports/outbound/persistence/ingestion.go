@@ -14,7 +14,8 @@ import (
 //
 //   - the facts the Control Plane has derived from, at least in the form of the
 //     effects they produced. FactApplier is where those effects land, and it is
-//     idempotent by request_id, which is what makes redelivery free;
+//     idempotent per (request_id, kind class), which is what makes redelivery
+//     free;
 //   - the position in the feed it has applied *through*. IngestionCursor is
 //     that position, and it is the Control Plane's own: the Data Plane never
 //     learns it (shared/usage-facts.yaml, and ADR 0006 §5's no-acknowledgement
@@ -79,7 +80,10 @@ type IngestionCursor interface {
 	Position(ctx context.Context) (string, error)
 
 	// Advance records next as the applied-through position. It runs inside
-	// the caller's unit of work.
+	// the caller's unit of work, and an implementation must refuse a call
+	// that arrives without one — an advance is only meaningful in the same
+	// transaction as the work it claims to sit after, and outside that
+	// transaction it is the claim without the work.
 	//
 	// The obligation this signature cannot state, and which the caller carries:
 	// Advance is called after every fact the position covers has been applied,
@@ -106,10 +110,23 @@ type IngestionCursor interface {
 // forever. One class's effect may never cause the other's — a settlement
 // fact must never settle twice, an orphan must never consume or release twice
 // — and no fact of any kind may make money move twice.
+//
+// Idempotency has a fail-closed half. A fact the applier cannot interpret —
+// a kind or schema_version this build does not implement, a settled fact
+// whose figures do not cohere, a correction whose path it has not built —
+// must come back as an error, never as a nil it pretends was a replay.
+// The caller's whole-page rule turns that error into a stop the operator
+// sees; a silent no-op turns it into a fact that was in the feed, is past
+// the position, and was derived from by nothing. The contract fixes what
+// the feed may carry (shared/usage-facts.yaml); the applier is the only
+// code that knows what it implements, so the refusal belongs here and the
+// vocabulary it refuses is part of this port's meaning, not the wire's.
 type FactApplier interface {
 	// Apply records fact. Applying a fact whose (request_id, kind class) has
 	// already been applied must be a no-op, and it must never settle, consume
 	// or release twice within a class — while a different kind for the same
-	// request_id is a distinct fact with its own effect.
+	// request_id is a distinct fact with its own effect. A fact the applier
+	// cannot interpret is an error, not a replay: the refusal is what stops
+	// the page and holds the position for a human to resolve.
 	Apply(ctx context.Context, fact Fact) error
 }

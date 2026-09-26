@@ -144,17 +144,31 @@ components:
 
         Which fields are non-null is decided by `kind` and only by `kind`. In
         this feed's production vocabulary: a `settled` fact carries
-        `capture_method`, `committed_attempt_id`, `delivery_tokens`,
-        `price_revision_id`, `input_unit_price`, `output_unit_price` and
-        `settled_amount`, with the two `provider_*_tokens` fields non-null
-        exactly when the provider reported them; a `released` or `expired`
-        fact carries none of the settlement fields at all — no usage claim, no
-        price, no amount; an `unbillable_orphaned` fact carries
-        `capture_method`, `committed_attempt_id` and `delivery_tokens` with the
-        provider counts as reported or null, and never a price or an amount,
-        because no money moved. `corrects_append_seq` is null on every fact
-        this feed's producer writes; it is declared for the correction path a
-        later generation may add.
+        `capture_method`, `committed_attempt_id`, `settled_amount`,
+        `price_revision_id` and both unit prices, together with the three
+        token figures — and the two `provider_*_tokens` are the **priced**
+        figures under the substitution ladder their own field descriptions
+        state, not the provider's raw report: the provider's report prices
+        when it arrived within the reservation, and the reservation's own
+        basis prices when it did not, with `capture_method` attesting which
+        arm priced. A figure the runtime could not observe is never invented;
+        the engine permits null counts on a settled fact for exactly that
+        case, and a null count prices as zero in the settled amount — it is
+        never a reason to skip the re-derivation below. A `released` or
+        `expired` fact carries none of the settlement fields at all — no
+        usage claim, no price, no amount. An `unbillable_orphaned` fact
+        carries `capture_method`, `committed_attempt_id` and the token
+        figures on the same priced-figure terms as a `settled` fact's, and
+        never a price or an amount, because no money moved.
+
+
+        `corrects_append_seq` is null on every fact this feed's producer
+        writes; it is declared for the correction path a later generation
+        may add. A consumer that does not implement that path must **refuse**
+        any fact where it is non-null — loudly, as a state a human resolves —
+        and never treat it as a replay of the fact it names: the kind-classed
+        idempotency key would otherwise swallow the correction and leave the
+        wrong money standing.
       properties:
         append_seq:
           type: integer
@@ -238,6 +252,32 @@ components:
             the allocation and bucket identities and the immutable reservation
             figures needed to derive the consume legs, the release legs and the
             settled total (ADR 0006, amendments to ADR 0004).
+
+
+            Version 1 satisfies it with one object —
+            `{"allocations": [...]}` — whose entries are the reservation's
+            waterfall legs, each carrying `funding_bucket_id` (text),
+            `amount` (the held amount that leg booked, integer minor units,
+            at least 1) and `ordinal` (the leg's place in the waterfall,
+            integer, contiguous from 1 in drawdown order). The leg amounts
+            sum to the hold the fact closes out. On a settled fact a
+            positive `settled_amount` is carried by a non-empty allocation
+            list and a zero `settled_amount` by an empty one — the
+            zero-priced hold draws no legs, and a fact whose amount and tail
+            disagree is malformed, not priced.
+
+
+            The consumer's derivation over the tail is normative, so two
+            consumers derive identical legs: walk the legs in ascending
+            `ordinal` order, consume `min(remaining, amount)` per leg — the
+            settled total is consumed greedy from the waterfall's head, the
+            boundary leg may be partially consumed — and release each leg's
+            unconsumed remainder. `released` and `expired` facts release
+            every leg in full and derive no consume legs;
+            `unbillable_orphaned` derives no legs at all. A tail that cannot
+            absorb the settled total (its amounts sum to less than the
+            amount), or a settled total left with a remainder over a
+            exhausted tail, is refused — never converged around.
         capture_method:
           type: [string, "null"]
           enum:
@@ -316,8 +356,23 @@ components:
             the hold formula re-derived over this fact's own figures and
             prices, and that equality is the fact's binding: a consumer can
             re-derive the amount from the fact alone and must find this
-            number. Zero is a real settled amount (a free model, or a zero
-            report); null on every non-settled fact, because no money moved.
+            number. The formula, normatively, is one ceiling over the summed
+            raw product —
+
+
+            `settled_amount = ceil((input_tokens × input_unit_price +
+            output_tokens × output_unit_price) / 1_000_000)` —
+
+
+            with a null count pricing as zero, `delivery_tokens` never priced
+            (ADR 0003 prices input and output only), and the ceiling taken
+            once over the sum, never per leg: two ceilings would round each
+            leg up independently and overstate the amount by up to one minor
+            unit. A consumer re-deriving with per-leg ceilings or a
+            different rounding will refuse every remainder-bearing fact, so
+            the formula is stated here rather than left to be reinvented.
+            Zero is a real settled amount (a free model, or a zero report);
+            null on every non-settled fact, because no money moved.
         corrects_append_seq:
           type: [integer, "null"]
           minimum: 1

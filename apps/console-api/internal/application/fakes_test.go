@@ -34,10 +34,11 @@ type fakeWorld struct {
 	order []string
 
 	// position is the Control Plane's durable position, and effects is the
-	// applier's durable state (the request_ids whose effect was recorded, with
-	// the fact that produced it). Both are what a rollback restores.
+	// applier's durable state: one recorded effect per (request_id, kind
+	// class) pair, with the fact that produced it. Both are what a rollback
+	// restores.
 	position string
-	effects  map[string]persistence.Fact
+	effects  map[factKey]persistence.Fact
 
 	// outsideTx counts port calls that arrived without the transaction's
 	// context. It is the mechanical check that the applier and the cursor ran
@@ -58,10 +59,17 @@ type fakeWorld struct {
 
 func newWorld() *fakeWorld {
 	return &fakeWorld{
-		effects: map[string]persistence.Fact{},
+		effects: map[factKey]persistence.Fact{},
 		pages:   map[string]dataplane.Page{},
 		failOn:  map[string]error{},
 	}
+}
+
+// effect reads the recorded effect for one of a request's kind classes, so the
+// assertions name the identity idempotency actually turns on.
+func (w *fakeWorld) effect(requestID, kind string) (persistence.Fact, bool) {
+	fact, ok := w.effects[factKey{requestID: requestID, class: kindClass(kind)}]
+	return fact, ok
 }
 
 // newIngestion wires the use case over one world. Every test builds its fakes
@@ -135,10 +143,37 @@ func (c fakeCursor) Advance(ctx context.Context, next string) error {
 	return nil
 }
 
-// fakeApplier is an idempotent applier: the first delivery of a request_id
-// records the effect, and every later delivery of the same request_id is a
-// no-op that still records the attempt. It fails for the request_ids a test
-// names, and the failure is what the unit of work rolls back.
+// factKey is the identity a delivery deduplicates on. The fact contract makes
+// idempotency kind-classed: a request travels to exactly one terminal state,
+// so its settled, released and expired facts are one class — the first of them
+// to arrive books the effect and every later one is a replay of it — while an
+// unbillable orphan is separate bookkeeping a request may carry alongside its
+// settlement. Keying by request_id alone would fold the orphan into the
+// settlement and silently lose it.
+type factKey struct {
+	requestID string
+	class     string
+}
+
+// kindClass collapses a fact's kind onto its idempotency class. A kind this
+// mapping does not name falls outside both classes, so it can never be
+// mistaken for a replay of one — the fail-closed reading of a vocabulary the
+// contract fixes at four kinds.
+func kindClass(kind string) string {
+	switch kind {
+	case "settled", "released", "expired":
+		return "settlement"
+	case "unbillable_orphaned":
+		return "unbillable_orphaned"
+	default:
+		return "unclassifiable:" + kind
+	}
+}
+
+// fakeApplier is an idempotent applier: the first delivery of a fact class
+// records the effect, and every later delivery of the same class is a no-op
+// that still records the attempt. It fails for the request_ids a test names,
+// and the failure is what the unit of work rolls back.
 type fakeApplier struct {
 	world *fakeWorld
 }
@@ -151,13 +186,14 @@ func (a fakeApplier) Apply(ctx context.Context, fact persistence.Fact) error {
 	if err := a.world.failOn[fact.RequestID]; err != nil {
 		return err
 	}
-	if _, applied := a.world.effects[fact.RequestID]; applied {
-		// Already settled, consumed or released for this request_id. The
-		// second delivery changes nothing, which is the contract FactApplier
-		// states and the reason redelivery costs nothing.
+	key := factKey{requestID: fact.RequestID, class: kindClass(fact.Kind)}
+	if _, applied := a.world.effects[key]; applied {
+		// The request's class already carries its effect. The second delivery
+		// changes nothing, which is the contract FactApplier states and the
+		// reason redelivery costs nothing.
 		return nil
 	}
-	a.world.effects[fact.RequestID] = fact
+	a.world.effects[key] = fact
 	return nil
 }
 
@@ -175,9 +211,9 @@ func (s fakeStore) WithinTx(ctx context.Context, fn func(ctx context.Context) er
 	s.world.record("begin")
 
 	position := s.world.position
-	effects := make(map[string]persistence.Fact, len(s.world.effects))
-	for requestID, fact := range s.world.effects {
-		effects[requestID] = fact
+	effects := make(map[factKey]persistence.Fact, len(s.world.effects))
+	for key, fact := range s.world.effects {
+		effects[key] = fact
 	}
 
 	if err := fn(context.WithValue(ctx, txMarkerKey{}, true)); err != nil {
