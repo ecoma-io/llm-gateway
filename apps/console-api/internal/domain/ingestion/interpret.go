@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/accounting"
 )
@@ -203,6 +204,18 @@ func countOrZero(value *int64) int64 {
 // domain pins on the textual reference a consume leg carries.
 const maxPriceRevisionOctets = 256
 
+// requestIDForm is the canonical lowercase uuid shape — the whole grammar
+// this plane asserts on a reservation identity (the accounting domain's
+// own assertion, mirrored here). The contract types request_id as text but
+// also makes it the reservation's identity — the runtime mints exactly one
+// reservation per request — and the derived legs book against that
+// reservation through the accounting primitives, which validate the same
+// form. A request id outside it could not have been minted by the runtime
+// the feed belongs to, and a fact carrying one would stop the page at the
+// hold instead of at the grammar, so it is refused here, where the refusal
+// is a recorded disposition rather than a wedged feed.
+var requestIDForm = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
 // Interpret derives one fact's disposition: the outcome to apply, or the
 // refusal to record. It never touches a store and never moves money — the
 // applier does that from the outcome — so the whole grammar is testable
@@ -213,8 +226,8 @@ const maxPriceRevisionOctets = 256
 // the settled amount's re-derivation and the waterfall. A fact fails at the
 // first sentence it breaks, and the error says which.
 func Interpret(fact Fact) (Outcome, error) {
-	if fact.RequestID == "" || len(fact.RequestID) > maxRequestIDOctets {
-		return Outcome{}, fmt.Errorf("%w: request id must be 1..%d octets", ErrMalformedFact, maxRequestIDOctets)
+	if fact.RequestID == "" || len(fact.RequestID) > maxRequestIDOctets || !requestIDForm.MatchString(fact.RequestID) {
+		return Outcome{}, fmt.Errorf("%w: request id %q is not a canonical uuid — the identity the derived legs book the reservation against", ErrMalformedFact, fact.RequestID)
 	}
 	if fact.AppendSeq < 1 {
 		return Outcome{}, fmt.Errorf("%w: append seq %d is below 1", ErrMalformedFact, fact.AppendSeq)

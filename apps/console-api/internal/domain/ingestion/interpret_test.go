@@ -44,7 +44,7 @@ func settledFact(t *testing.T, legs ...wireLeg) Fact {
 	delivery := int64(4096)
 	return Fact{
 		AppendSeq:            7,
-		RequestID:            "req-1",
+		RequestID:            "d9000000-0000-7000-8000-0000000000d1",
 		Kind:                 KindSettled,
 		SchemaVersion:        SchemaVersion,
 		Payload:              envelope(t, legs...),
@@ -75,8 +75,8 @@ func TestASettledFactDerivesTheWaterfall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Interpret() error = %v, want nil", err)
 	}
-	if out.Class != ClassSettlement || out.Kind != KindSettled || out.RequestID != "req-1" {
-		t.Fatalf("Interpret() identity = (%s, %s, %s), want the settled settlement class for req-1", out.RequestID, out.Kind, out.Class)
+	if out.Class != ClassSettlement || out.Kind != KindSettled || out.RequestID != "d9000000-0000-7000-8000-0000000000d1" {
+		t.Fatalf("Interpret() identity = (%s, %s, %s), want the settled settlement class for d9000000-0000-7000-8000-0000000000d1", out.RequestID, out.Kind, out.Class)
 	}
 	if out.SettledAmount != 700 {
 		t.Errorf("SettledAmount = %d, want 700: one ceiling over 700_000_000 raw", out.SettledAmount)
@@ -134,7 +134,7 @@ func TestReleasedAndExpiredFactsReleaseEveryLegInFull(t *testing.T) {
 	for _, kind := range []string{KindReleased, KindExpired} {
 		fact := Fact{
 			AppendSeq:     8,
-			RequestID:     "req-2",
+			RequestID:     "d9000000-0000-7000-8000-0000000000d2",
 			Kind:          kind,
 			SchemaVersion: SchemaVersion,
 			Payload: envelope(t,
@@ -169,7 +169,7 @@ func TestAnOrphanDerivesNoLegsAtAll(t *testing.T) {
 	inTokens := int64(1234)
 	fact := Fact{
 		AppendSeq:           9,
-		RequestID:           "req-3",
+		RequestID:           "d9000000-0000-7000-8000-0000000000d3",
 		Kind:                KindUnbillableOrphaned,
 		SchemaVersion:       SchemaVersion,
 		Payload:             envelope(t, wireLeg{FundingBucketID: "bucket-a", Amount: 40, Ordinal: 1}),
@@ -233,6 +233,24 @@ func TestTheGrammarRefusesEveryMalformedFact(t *testing.T) {
 		fact.AppendSeq = 0
 		if _, err := Interpret(fact); !errors.Is(err, ErrMalformedFact) {
 			t.Fatalf("error = %v, want ErrMalformedFact", err)
+		}
+	})
+	t.Run("a request id outside the reservation grammar is malformed", func(t *testing.T) {
+		// The contract makes the request id the reservation's identity, and
+		// the derived legs book the reservation through primitives that
+		// validate the canonical uuid form. A fact carrying anything else
+		// was not written by the runtime this feed belongs to, and refusing
+		// it here is a recorded disposition rather than a hold that stops
+		// the page mid-derivation.
+		fact := settledFact(t)
+		fact.RequestID = "req-not-a-uuid"
+		if _, err := Interpret(fact); !errors.Is(err, ErrMalformedFact) || !Quarantinable(err) {
+			t.Fatalf("error = %v, want quarantinable ErrMalformedFact", err)
+		}
+		upper := settledFact(t)
+		upper.RequestID = "D9000000-0000-7000-8000-0000000000D1"
+		if _, err := Interpret(upper); !errors.Is(err, ErrMalformedFact) {
+			t.Fatalf("uppercase request id: error = %v, want ErrMalformedFact", err)
 		}
 	})
 }
@@ -340,7 +358,7 @@ func TestTheNoUsagePairingRules(t *testing.T) {
 		t.Helper()
 		fact := Fact{
 			AppendSeq:     11,
-			RequestID:     "req-4",
+			RequestID:     "d9000000-0000-7000-8000-0000000000d4",
 			Kind:          KindReleased,
 			SchemaVersion: SchemaVersion,
 			Payload:       envelope(t, wireLeg{FundingBucketID: "bucket-a", Amount: 40, Ordinal: 1}),
@@ -387,7 +405,7 @@ func TestTheOrphanPairingRules(t *testing.T) {
 		t.Helper()
 		return Fact{
 			AppendSeq:          12,
-			RequestID:          "req-5",
+			RequestID:          "d9000000-0000-7000-8000-0000000000d5",
 			Kind:               KindUnbillableOrphaned,
 			SchemaVersion:      SchemaVersion,
 			Payload:            envelope(t),

@@ -35,8 +35,8 @@ const FactPageSize = 100
 //     transaction open across a network call is how a slow management API
 //     becomes a database problem;
 //  3. every fact in the page is applied inside one unit of work, through the
-//     applier, whose idempotency by request_id is what makes a redelivered
-//     page free;
+//     applier, whose idempotency by (request_id, kind class) is what makes a
+//     redelivered page free;
 //  4. the cursor advances inside that same unit of work and only after the last
 //     fact has been applied. The position is a claim about work already done,
 //     so it must never move ahead of the work: if any apply fails, the
