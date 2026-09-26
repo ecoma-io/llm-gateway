@@ -378,14 +378,20 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 			// would be called on a hold nobody owns. The abandoned release
 			// returns what the ending still can: where the hold's close is
 			// already another writer's, the release's own CAS loses and
-			// writes nothing; the outcome is abandoned either way, and the
-			// transport writes nothing for a request whose hold died
-			// mid-walk. A renewal lost after commitment never reaches this
-			// branch — that ending is the settle's, whose CAS loses the
-			// same race and records the orphan tail.
+			// writes nothing. The caller, who may very well still be there —
+			// the lease died, not their connection — is answered through the
+			// reply with the no-candidate cell: the runtime cannot serve
+			// this request right now, which is the plain truth of a hold
+			// that died mid-walk, and the one reading a client can act on.
+			// Writing it is safe against a caller who has also gone — the
+			// reply discards what no channel will carry. A renewal lost
+			// after commitment never reaches this branch — that ending is
+			// the settle's, whose CAS loses the same race and records the
+			// orphan tail.
 			if err := r.release(ctx, in, admitted, "", execution.FailedGatewayAbandoned); err != nil {
 				return ChatOutcome{}, err
 			}
+			reply.ServeNoCandidate()
 			return ChatOutcome{
 				Kind:             OutcomeAbandoned,
 				RuntimeRequestID: admitted.RuntimeRequestID,

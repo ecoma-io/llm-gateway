@@ -227,14 +227,18 @@ components:
     Conflict:
       description: >-
         The request was not admitted because of its `Idempotency-Key`, under
-        one of two codes. `idempotency_conflict`: the key was already stored
+        one of three codes. `idempotency_conflict`: the key was already stored
         with a different body, so the runtime refuses rather than guessing
         which request the caller meant — the caller retries with a fresh key
         and never with the same one, so there is no Retry-After.
         `request_in_progress`: a request with this key and body is still being
         processed, and the caller retries the same request with the same key
         once it completes — the answer carries a short `Retry-After` hint
-        saying so.
+        saying so. `request_abandoned`: the key's original was abandoned by
+        the runtime before any answer existed, the record is terminal, and no
+        arrival under this key can ever be executed again — there is no
+        answer to re-serve and no Retry-After, because nothing about the
+        condition clears; the caller opens a fresh key.
       headers:
         X-Request-Id:
           $ref: "./probes.yaml#/components/headers/RequestId"
@@ -357,8 +361,9 @@ components:
             `model_not_found` (404, the requested alias does not exist — the
             one code a client resolves a name by); `invalid_request` (400,
             with `param` naming the field at fault);
-            `idempotency_conflict` and `request_in_progress` (409, the two
-            ways an idempotency key refuses a request);
+            `idempotency_conflict`, `request_in_progress` and
+            `request_abandoned` (409, the three ways an idempotency key
+            refuses a request);
             `insufficient_quota` (429, capacity matched and short);
             `provider_rejected_request` and `context_too_large` (400, the
             upstream refused the admitted request before any content was sent
