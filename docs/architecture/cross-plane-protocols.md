@@ -582,11 +582,13 @@ reader over it — the postgres adapter's `UsageFacts`
   use case belongs to the pull the schema PR builds, beside the table the cursor
   is stored in. What B6 did land is the side the loop will call: the
   settlement of record, its consume and release legs and the bucket moves they
-  name ([accounting](accounting.md)) — a primitive with no caller yet. What the
-  loop needs from the fact feed is the open defect of
-  [issue #63](https://github.com/ecoma-io/llm-gateway/issues/63) (the
-  settlement-relevant columns and price provenance the current contract does
-  not carry), so B12 is blocked on that rather than on the ledger.
+  name ([accounting](accounting.md)) — a primitive with no caller yet. The
+  settlement-relevant columns the loop prices from arrived with the typed fact
+  contract (B11) and the derivation it must reproduce is stated in the fact
+  contract itself, so B12 is no longer blocked on
+  [issue #63](https://github.com/ecoma-io/llm-gateway/issues/63); what remains
+  there is the accepted deferral — one settlement currency, provenance beyond
+  the revision id — tracked rather than blocking.
 - **mTLS or signed service credentials.** The mechanism today is a shared secret
   per hop, and either replacement proves the same identity cryptographically
   without changing application semantics (ADR 0006 §9).

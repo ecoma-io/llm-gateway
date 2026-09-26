@@ -150,8 +150,12 @@ here, and it is the half that observes what happened:
    freehand: the domain re-derives the hold formula over the fact's own
    counts at its own price snapshot and refuses to write a fact that
    disagrees with its own arithmetic. Zero is a value here as it is at
-   admission: a zero-priced model settles a header of record with no legs,
-   and the settlement derived from it is still a settlement of record.
+   admission, and which zero matters: a hold that prices out to zero — both
+   arms priced at zero, or both counts zero — settles a header of record
+   with no legs, and the settlement derived from it is still a settlement of
+   record. A model with one arm priced at zero is not this case: its hold
+   and its legs are real, and a consume leg may carry a zero unit price,
+   which the engine books (control migration 000007).
 
 Both statements are guarded twice over in the landed schema: the close is a
 `WHERE state = 'open'` update, and the fact's append sequence is allocated
@@ -168,9 +172,9 @@ position in it is the one the transaction commits behind.
 
 1. create the **Settlement** — unique by `request_id`; the exactly-once
    boundary. It carries `request_id`, a `settled_total` equal to the sum of
-   its consume legs — the one header with no legs being a zero-priced
-   settlement, whose total is zero and which is still of record — and
-   `created_at`. A competing acknowledgement of the
+   its consume legs — the one header with no legs being a settlement whose
+   hold prices out to zero, whose total is zero and which is still of
+   record — and `created_at`. A competing acknowledgement of the
    same request inserts nothing and reads the recorded settlement instead:
    the same total converges, and a different one is the conflict defect —
    one request cannot settle twice at two totals.
@@ -500,9 +504,12 @@ arrive later, and none is stubbed here:
   only — so this plane's `hold` legs wait for the terminal fact's allocation
   tail, as **Where ΣH comes from** above records.
 - **Usage → pricing → settlement wiring (B12)** — the consumer loop that
-  reads the fact feed and calls Settle; what that feed must carry is the
-  open defect of
-  [issue #63](https://github.com/ecoma-io/llm-gateway/issues/63).
+  reads the fact feed and calls Settle. The figures it prices from arrived
+  with the typed fact contract (B11) and the derivation the loop must
+  reproduce is stated in the fact contract itself; what remains of
+  [issue #63](https://github.com/ecoma-io/llm-gateway/issues/63) is the
+  accepted deferral — one settlement currency, provenance beyond the
+  revision id — not a blocker.
 - **Reconciliation worker (B13)** — the scheduled convergence between the
   Data Plane's quota projections and the ledger; `ReconcileBucket` is the
   verdict it will lean on.
