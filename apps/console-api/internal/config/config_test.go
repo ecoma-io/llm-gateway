@@ -39,6 +39,8 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					Credential:         testDataplaneCredential,
 					ProjectionInterval: DefaultProjectionInterval,
 					ProjectionTimeout:  DefaultProjectionTimeout,
+					IngestionInterval:  DefaultIngestionInterval,
+					IngestionTimeout:   DefaultIngestionTimeout,
 				},
 			},
 		},
@@ -65,6 +67,8 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					Credential:         testDataplaneCredential,
 					ProjectionInterval: DefaultProjectionInterval,
 					ProjectionTimeout:  DefaultProjectionTimeout,
+					IngestionInterval:  DefaultIngestionInterval,
+					IngestionTimeout:   DefaultIngestionTimeout,
 				},
 			},
 		},
@@ -93,6 +97,8 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					Credential:         testDataplaneCredential,
 					ProjectionInterval: DefaultProjectionInterval,
 					ProjectionTimeout:  DefaultProjectionTimeout,
+					IngestionInterval:  DefaultIngestionInterval,
+					IngestionTimeout:   DefaultIngestionTimeout,
 				},
 			},
 		},
@@ -103,6 +109,8 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				"CONSOLE_API_DATAPLANE_CREDENTIAL": "production-management-credential",
 				"CONSOLE_API_PROJECTION_INTERVAL":  "500ms",
 				"CONSOLE_API_PROJECTION_TIMEOUT":   "1m",
+				"CONSOLE_API_INGESTION_INTERVAL":   "2s",
+				"CONSOLE_API_INGESTION_TIMEOUT":    "45s",
 			}),
 			want: Config{
 				Addr:              DefaultAddr,
@@ -120,6 +128,8 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					Credential:         "production-management-credential",
 					ProjectionInterval: 500 * time.Millisecond,
 					ProjectionTimeout:  time.Minute,
+					IngestionInterval:  2 * time.Second,
+					IngestionTimeout:   45 * time.Second,
 				},
 			},
 		},
@@ -178,6 +188,20 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				"CONSOLE_API_PROJECTION_TIMEOUT": "soon",
 			}),
 			wantErr: "CONSOLE_API_PROJECTION_TIMEOUT must be a Go duration",
+		},
+		{
+			name: "rejects a zero ingestion interval",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_INGESTION_INTERVAL": "0s",
+			}),
+			wantErr: "CONSOLE_API_INGESTION_INTERVAL must be greater than zero",
+		},
+		{
+			name: "rejects a malformed ingestion timeout",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_INGESTION_TIMEOUT": "soon",
+			}),
+			wantErr: "CONSOLE_API_INGESTION_TIMEOUT must be a Go duration",
 		},
 		{
 			name: "rejects an explicitly empty address",
@@ -393,6 +417,8 @@ func TestDataPlaneLogValueRedactsTheCredential(t *testing.T) {
 		Credential:         testDataplaneCredential,
 		ProjectionInterval: DefaultProjectionInterval,
 		ProjectionTimeout:  DefaultProjectionTimeout,
+		IngestionInterval:  DefaultIngestionInterval,
+		IngestionTimeout:   DefaultIngestionTimeout,
 	}
 
 	value := dataPlane.LogValue().String()
@@ -402,7 +428,7 @@ func TestDataPlaneLogValueRedactsTheCredential(t *testing.T) {
 	if !strings.Contains(value, "[redacted]") {
 		t.Errorf("LogValue() = %q, want the redaction marker", value)
 	}
-	for _, want := range []string{testDataplaneURL, "projection_interval", "projection_timeout"} {
+	for _, want := range []string{testDataplaneURL, "projection_interval", "projection_timeout", "ingestion_interval", "ingestion_timeout"} {
 		if !strings.Contains(value, want) {
 			t.Errorf("LogValue() = %q, want it to name %s", value, want)
 		}

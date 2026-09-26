@@ -84,6 +84,25 @@ const (
 	// the bound fails the way any failed cycle does — logged, and retried by
 	// the next tick — instead of wedging the loop behind one hung call.
 	DefaultProjectionTimeout = 30 * time.Second
+
+	// DefaultIngestionInterval is how often the usage-fact consumer wakes to
+	// pull the feed (ADR 0006 §5's pull-with-replay model). The same cadence
+	// as the projection loop and for the same reason: the loop carries
+	// settlement work, not request-path answers, and the delivery model is
+	// replay — a slow tick costs freshness and never correctness. What it
+	// does cost, at this end, is the latency between a served request and its
+	// settlement landing in the ledger, so the day billing feels stale this
+	// is the dial an operator reaches for.
+	DefaultIngestionInterval = 5 * time.Second
+
+	// DefaultIngestionTimeout bounds one replay pass: the position read, the
+	// page fetch, and every fact applied inside it. The same shape as the
+	// projection bound for the same reason — a pass that hits it fails the
+	// way any failed pass does, logged and retried by the next tick, instead
+	// of wedging the loop behind one hung call. It bounds a pass that applies
+	// up to a full page of facts, each of them a handful of ledger writes,
+	// so it is the projection bound's equal and not its half.
+	DefaultIngestionTimeout = 30 * time.Second
 )
 
 // ownedDatabase is the only database this application may open — the plane
@@ -143,9 +162,16 @@ type DataPlane struct {
 
 	// ProjectionTimeout bounds one reconcile cycle. It must be positive.
 	ProjectionTimeout time.Duration
+
+	// IngestionInterval is how often the usage-fact consumer wakes to pull
+	// the feed. It must be positive.
+	IngestionInterval time.Duration
+
+	// IngestionTimeout bounds one replay pass. It must be positive.
+	IngestionTimeout time.Duration
 }
 
-// LogValue renders the settings safe for logs: the target and the two
+// LogValue renders the settings safe for logs: the target and the four
 // cadences are visible; the credential is not. DataPlane satisfies
 // slog.LogValuer for the same reason Postgres does — redaction by
 // construction, not by call-site discipline.
@@ -155,6 +181,8 @@ func (d DataPlane) LogValue() slog.Value {
 		slog.String("credential", "[redacted]"),
 		slog.Duration("projection_interval", d.ProjectionInterval),
 		slog.Duration("projection_timeout", d.ProjectionTimeout),
+		slog.Duration("ingestion_interval", d.IngestionInterval),
+		slog.Duration("ingestion_timeout", d.IngestionTimeout),
 	)
 }
 
@@ -256,16 +284,19 @@ func Load(lookup LookupEnv) (Config, error) {
 }
 
 // loadDataPlane reads where the Data Plane's management surface is and how
-// the projection loop paces itself. The URL and the credential are required
-// rather than defaulted — this process has no guess for where the other
-// plane is, and a default credential would be a credential printed in this
-// file — while the two cadences are durations with documented defaults,
+// the two loops pace themselves — the projection producer and the usage-fact
+// consumer, each with its interval and its bound. The URL and the credential
+// are required rather than defaulted — this process has no guess for where
+// the other plane is, and a default credential would be a credential printed
+// in this file — while the cadences are durations with documented defaults,
 // because a tick nobody tuned is survivable and a credential nobody set is
 // not.
 func loadDataPlane(lookup LookupEnv) (DataPlane, error) {
 	cfg := DataPlane{
 		ProjectionInterval: DefaultProjectionInterval,
 		ProjectionTimeout:  DefaultProjectionTimeout,
+		IngestionInterval:  DefaultIngestionInterval,
+		IngestionTimeout:   DefaultIngestionTimeout,
 	}
 
 	url, ok := lookup("CONSOLE_API_DATAPLANE_URL")
@@ -299,6 +330,20 @@ func loadDataPlane(lookup LookupEnv) (DataPlane, error) {
 			return DataPlane{}, err
 		}
 		cfg.ProjectionTimeout = duration
+	}
+	if value, ok := lookup("CONSOLE_API_INGESTION_INTERVAL"); ok {
+		duration, err := parsePositiveDuration("CONSOLE_API_INGESTION_INTERVAL", value)
+		if err != nil {
+			return DataPlane{}, err
+		}
+		cfg.IngestionInterval = duration
+	}
+	if value, ok := lookup("CONSOLE_API_INGESTION_TIMEOUT"); ok {
+		duration, err := parsePositiveDuration("CONSOLE_API_INGESTION_TIMEOUT", value)
+		if err != nil {
+			return DataPlane{}, err
+		}
+		cfg.IngestionTimeout = duration
 	}
 	return cfg, nil
 }

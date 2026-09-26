@@ -79,19 +79,29 @@ type IngestionCursor interface {
 	// anything.
 	Position(ctx context.Context) (string, error)
 
-	// Advance records next as the applied-through position. It runs inside
-	// the caller's unit of work, and an implementation must refuse a call
-	// that arrives without one — an advance is only meaningful in the same
-	// transaction as the work it claims to sit after, and outside that
-	// transaction it is the claim without the work.
+	// Advance records next as the applied-through position, replacing from —
+	// the position the caller read before it read the page it is advancing
+	// past. The replace is a compare-and-set: if the durable position is no
+	// longer from, another pass moved it while this one worked, and the
+	// implementation refuses rather than overwrite — the caller's unit of
+	// work rolls back with the refusal, and the page it applied re-applies
+	// idempotently from wherever the position now stands. An advance that
+	// ran blind could interleave two passes' effects under one position, and
+	// the position would then claim work that was ordered differently than
+	// it happened.
 	//
-	// The obligation this signature cannot state, and which the caller carries:
-	// Advance is called after every fact the position covers has been applied,
-	// never before. A position is a claim about work already done, and the
-	// store cannot check the claim — it can only record it in the same
-	// transaction as the work, which is what makes the claim true or false
-	// together with the effects it speaks for.
-	Advance(ctx context.Context, next string) error
+	// Advance runs inside the caller's unit of work, and an implementation
+	// must refuse a call that arrives without one — an advance is only
+	// meaningful in the same transaction as the work it claims to sit
+	// after, and outside that transaction it is the claim without the work.
+	//
+	// The obligation this signature cannot state, and which the caller
+	// carries: Advance is called after every fact the position covers has
+	// been applied, never before. A position is a claim about work already
+	// done, and the store cannot check the claim — it can only record it in
+	// the same transaction as the work, which is what makes the claim true
+	// or false together with the effects it speaks for.
+	Advance(ctx context.Context, from, next string) error
 }
 
 // FactApplier applies the facts the Control Plane derives from.
@@ -129,4 +139,121 @@ type FactApplier interface {
 	// cannot interpret is an error, not a replay: the refusal is what stops
 	// the page and holds the position for a human to resolve.
 	Apply(ctx context.Context, fact Fact) error
+}
+
+// AppliedFact is one row of the idempotency ledger: the record that a fact
+// of this (request_id, kind class) pair has been derived from, with the
+// lineage the derived effect itself cannot carry — the feed position it
+// arrived on, the amount and capture provenance it charged from, and the
+// settlement of record it produced. It is what a reconciliation pass (B13)
+// walks backwards from ledger to fact, and what the applier's read before
+// every write consults.
+type AppliedFact struct {
+	// RequestID and KindClass are the row's identity, and the fact's
+	// exactly-once boundary.
+	RequestID string
+	KindClass string
+
+	// Kind is which of the class's facts landed. Within the settlement
+	// class the first terminal fact to arrive decides this; an orphan's
+	// row is always its own kind.
+	Kind string
+
+	// AppendSeq is the feed position the fact arrived on — provenance,
+	// never an idempotency key.
+	AppendSeq int64
+
+	// SettledAmount is what the settled fact charged; nil on every other
+	// kind, the same shape statement the schema's CHECK pins.
+	SettledAmount *int64
+
+	// CaptureMethod is the usage claim's provenance, on the kinds that
+	// claim one (settled, unbillable_orphaned); nil on the rest.
+	CaptureMethod *string
+
+	// SettlementID is the settlement of record a settled fact produced,
+	// or "" on every other kind.
+	SettlementID string
+}
+
+// AppliedFacts is the idempotency ledger the applier reads before it writes.
+//
+// The read is not an optimisation. Convergence at the accounting layer would
+// absorb a replayed fact's movements one primitive at a time, but the
+// readable answer to "has this class been derived from" is what turns a
+// replay into a single no-op — one query against this ledger instead of a
+// walk through every primitive's convergence path — and it is what keeps a
+// second delivery from re-deriving anything at all.
+type AppliedFacts interface {
+	// Find returns the applied row for (requestID, kindClass), or nil when
+	// no fact of that class has been derived from. It may run inside or
+	// outside a unit of work; inside one, it sees that unit's own earlier
+	// writes.
+	Find(ctx context.Context, requestID, kindClass string) (*AppliedFact, error)
+
+	// Record inserts applied as a new row of the ledger. It runs inside the
+	// caller's unit of work and refuses a call that arrives without one —
+	// the row is the second half of the exactly-once boundary, and recording
+	// it outside the transaction that booked the effect would be a claim
+	// that outlives the work it speaks for. A row already present for the
+	// pair is a defect above this port: the applier's Find is the check that
+	// makes the insert unloseable, and the store's primary key is the
+	// arbiter of the one race Find cannot close (two workers deriving the
+	// same fact concurrently — the loser's whole page rolls back, and its
+	// retry finds the row).
+	Record(ctx context.Context, applied AppliedFact) error
+}
+
+// QuarantinedFact is one refused fact, recorded verbatim: every column the
+// feed delivered it with, beside the refusal reason. The record is the
+// explicit disposition for a fact the consumer cannot apply — the
+// operator-visible state and the reconciliation surface — and never a silent
+// skip: under-recording is the conservative direction, because a fact that
+// is never applied never charges.
+type QuarantinedFact struct {
+	RequestID string
+	AppendSeq int64
+	Kind      string
+	// SchemaVersion travels even when it is the reason for the refusal: an
+	// unknown version is exactly the fact a reconciliation pass needs to
+	// see whole.
+	SchemaVersion int
+	OccurredAt    time.Time
+	// Payload is the fact body verbatim, undecoded. Nothing downstream
+	// interprets it here; the record exists so nothing is lost by refusing.
+	Payload []byte
+
+	// The typed columns, verbatim, nil where the fact carried null.
+	CaptureMethod        *string
+	CommittedAttemptID   *string
+	ProviderInputTokens  *int64
+	ProviderOutputTokens *int64
+	DeliveryTokens       *int64
+	PriceRevision        *string
+	InputUnitPrice       *int64
+	OutputUnitPrice      *int64
+	SettledAmount        *int64
+	CorrectsAppendSeq    *int64
+
+	// Reason is the consumer's own refusal vocabulary — why this fact was
+	// not applied. It is a diagnostic written for the operator who resolves
+	// the quarantine, not a machine contract, and an implementation may
+	// bound its length to what the schema records.
+	Reason string
+}
+
+// QuarantinedFacts is where a refused fact is recorded.
+type QuarantinedFacts interface {
+	// Record records quarantined verbatim. It runs inside the caller's unit
+	// of work — the same transaction that advances the position past the
+	// fact, so the record and the advance stand or fall together — and
+	// refuses a call that arrives without one.
+	//
+	// Recording a fact whose (request_id, append_seq, kind) is already on
+	// file converges to a no-op: the refusal is already recorded, and the
+	// original record stands. The only path that re-delivers a quarantined
+	// fact is a position that moved backwards — a restored cursor replaying
+	// a range the feed already refused through — and a second refusal of
+	// the same fact is the same sentence about it, not a second fact.
+	Record(ctx context.Context, quarantined QuarantinedFact) error
 }

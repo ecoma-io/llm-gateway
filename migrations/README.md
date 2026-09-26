@@ -17,8 +17,8 @@ The split is the database split (ADR 0006 §7), not a filing convention:
 
 Both lanes exist. The Control Plane's lane opens with its ownership
 namespace — `000001_control_foundation` creates the `control` schema and
-nothing else, because ADR 0006 §5 writes the Control Plane's future position
-table as `control.usage_ingestion_cursor` — schema-qualified — so Control
+nothing else, because ADR 0006 §5 writes the Control Plane's position table
+schema-qualified — so Control
 Plane migrations keep their domain tables in the `control` schema, while the
 ADRs name the Data Plane's tables bare (`usage_events`, `request_intake`)
 and its lane stays on the default namespace. The namespace migrated first,

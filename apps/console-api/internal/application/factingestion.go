@@ -35,13 +35,16 @@ const FactPageSize = 100
 //     transaction open across a network call is how a slow management API
 //     becomes a database problem;
 //  3. every fact in the page is applied inside one unit of work, through the
-//     applier, whose idempotency by request_id is what makes a redelivered
-//     page free;
+//     applier, whose idempotency by (request_id, kind class) is what makes a
+//     redelivered page free;
 //  4. the cursor advances inside that same unit of work and only after the last
-//     fact has been applied. The position is a claim about work already done,
-//     so it must never move ahead of the work: if any apply fails, the
-//     transaction rolls back, the position stays where it was, and the next
-//     pass reads the same page again. That is the whole crash-safety story, and
+//     fact has been applied, as a compare-and-set on the position the pass
+//     read. The position is a claim about work already done, so it must never
+//     move ahead of the work: if any apply fails, the transaction rolls back,
+//     the position stays where it was, and the next pass reads the same page
+//     again; if another pass moved the position meanwhile, the set refuses and
+//     this pass's work rolls back whole rather than landing under a position
+//     that was never its own. That is the whole crash-safety story, and
 //     it is why the advance is the last statement in the transaction rather
 //     than its own write.
 //
@@ -49,12 +52,11 @@ const FactPageSize = 100
 // a position in an order only the Data Plane can name — and this use case
 // stores it verbatim.
 //
-// Nothing constructs this type yet, and nothing schedules it: there is no
-// worker loop, no ticker and no background goroutine, because the loop that
-// calls Replay belongs to the pull the schema PR builds, beside the table the
-// cursor is stored in. The postgres and valkey adapters sit unwired for the
-// same reason — their use case has not landed either — and a scheduler wired
-// ahead of its schema would be a process that polls a feed into nothing.
+// The process wiring is the loop's only home: cmd/console-api runs one Replay
+// pass per interval under its own deadline, and everything this type needs —
+// the position table, the applier's two effect tables, the accounting
+// primitives its derived effects book through — is composed there, beside the
+// pool those units of work resolve from.
 type FactIngestion struct {
 	facts   dataplane.UsageFacts
 	store   persistence.Store
@@ -93,10 +95,11 @@ type FactIngestionResult struct {
 	Applied int
 
 	// HasMore reports whether the Data Plane said the feed holds more facts
-	// after the page just applied. It is the stopping condition of the loop
-	// that does not exist yet, and it is deliberately not derived from Applied:
-	// a short page and a drained feed are different states, because a
-	// concurrent writer produces a short page too.
+	// after the page just applied. The loop takes it as an invitation to run
+	// again — a drained feed is answered by the next tick — and it is
+	// deliberately not derived from Applied: a short page and a drained feed
+	// are different states, because a concurrent writer produces a short page
+	// too.
 	HasMore bool
 }
 
@@ -182,7 +185,11 @@ func (ingestion *FactIngestion) Replay(ctx context.Context) (FactIngestionResult
 		// resolves its query surface from the context it is handed, and an
 		// advance written through the pool would commit on its own, outside
 		// the rollback that exists to keep position and work moving together.
-		return ingestion.cursor.Advance(txCtx, page.NextCursor)
+		// The advance is a compare-and-set on the position this pass read:
+		// a pass that raced another to the same page loses the set, and its
+		// whole unit of work rolls back rather than two passes' effects
+		// landing under one position.
+		return ingestion.cursor.Advance(txCtx, position, page.NextCursor)
 	}); err != nil {
 		return FactIngestionResult{}, fmt.Errorf("application: apply usage facts: %w", err)
 	}

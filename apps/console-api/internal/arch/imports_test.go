@@ -108,8 +108,8 @@ func rules(self string) []rule {
 			forbidden: []string{self + "/internal/application"},
 		},
 		{
-			why:       "the domain packages are the grammars — identity's ownership edges and, since the projection, the credential record whose one secret-bearing form is the digest. They are spoken by the use cases, by the ports that persist them and by the outbound adapters that translate them to storage and to the wire; an inbound surface that imported one would be handing aggregates and verification material to the transport instead of rendering its own response shapes",
-			allowed:   []string{"cmd", "internal/application", "internal/adapters/outbound", "internal/ports"},
+			why:       "the domain packages are the grammars — identity's ownership edges, the money grammar's ledger and settlements and, since the fact consumer, the feed grammar that derives from it. They are spoken by the use cases, by the ports that persist them and by the outbound adapters that translate them to storage and to the wire; an inbound surface that imported one would be handing aggregates and verification material to the transport instead of rendering its own response shapes. A grammar may also speak another: the feed grammar derives its effects from the money grammar's ids and formula, an inward layering the dependency rule has nothing against — what the rule guards is the arrow toward transport and infrastructure, and that stays shut",
+			allowed:   []string{"cmd", "internal/application", "internal/adapters/outbound", "internal/ports", "internal/domain"},
 			forbidden: []string{self + "/internal/domain"},
 		},
 	}
@@ -286,7 +286,7 @@ func TestTheRuleRosterIsTheDeclaredOne(t *testing.T) {
 		"<module>/internal/adapters/outbound/ <- cmd",
 		"<module>/internal/application <- cmd, internal/adapters/inbound",
 		"<module>/internal/config <- cmd",
-		"<module>/internal/domain <- cmd, internal/application, internal/adapters/outbound, internal/ports",
+		"<module>/internal/domain <- cmd, internal/application, internal/adapters/outbound, internal/ports, internal/domain",
 		"<module>/internal/ports <- cmd, internal/application, internal/adapters, internal/ports",
 		"database/sql <- cmd, internal/ports, internal/adapters/outbound",
 		"github.com/valkey-io/valkey-go <- internal/adapters/outbound/valkey",

@@ -210,7 +210,7 @@ final Request/Attempt state
         ↓
 immutable Usage Fact        appended LAST — "terminal" and "in the feed" are one fact
         ↓
-B12 Settlement              the Control Plane derives it from the fact; another plane, another milestone
+B12 Settlement              the Control Plane derives it from the fact — landed on the far side of the seam (ADR 0010)
 ```
 
 Each stage's contract, in the vocabulary the rest of this page already uses:
@@ -257,7 +257,8 @@ Each stage's contract, in the vocabulary the rest of this page already uses:
 - **Replay.** Both kinds are read-only answers: a client replay re-answers
   the original outcome from the intake record (step 4), and a feed replay
   re-delivers a fact the Control Plane has already applied — a no-op keyed
-  by `request_id`.
+  by the fact's `(request_id, kind class)`, the same key the applier settles
+  on ([accounting](accounting.md); [ADR 0010](../adr/0010-usage-fact-ingestion-and-settlement.md)).
 - **Attribution.** The single committed attempt is the billing subject; its
   figures are clamped to the bases the hold was priced from; failed attempts
   bill nothing and carry provider-side cost as telemetry only.
@@ -272,7 +273,9 @@ about the close eventually reaches for one of these words:
 > **The usage close is not billing** — nothing is owed, sent or collected;
 > the fact states usage, and the ledger prices it later. **It is not
 > settlement** — the `Settlement` of record is the Control Plane's
-> derivation from the fact, the B12 stage of the arc above. **It is not the
+> derivation from the fact, the stage of the arc above the B12 consumer
+> performs ([ADR 0010](../adr/0010-usage-fact-ingestion-and-settlement.md)).
+> **It is not the
 > ledger** — the runtime writes no ledger row at all. **And it is not
 > pricing** — the snapshot it prices with was copied at admission; the close
 > computes an amount with it and never selects, revises or re-quotes a

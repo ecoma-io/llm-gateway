@@ -40,9 +40,9 @@ worth stating before any table:
   is converged to the ledger by reconciliation (ADR 0006 §8;
   [accounting](accounting.md)).
 - **A financial record is derived, not observed.** It is written in the Control
-  Plane from the facts the Data Plane published, idempotently by `request_id`,
-  and it is the source of truth for money: the runtime's quota projection is not
-  a balance and never becomes one.
+  Plane from the facts the Data Plane published, idempotently by the fact's
+  `(request_id, kind class)`, and it is the source of truth for money: the
+  runtime's quota projection is not a balance and never becomes one.
 
 The facts reach the Control Plane as a durable pull rather than a push, with an
 opaque cursor and a consumer-owned position ([cross-plane
@@ -60,6 +60,7 @@ timescaledb (one cluster)
 │     plans (+ versions, grant definitions)   subscriptions   entitlements
 │     account_payg
 │     funding_buckets   settlements   ledger_entries
+│     applied_facts   quarantined_facts   ingestion_cursor
 │
 └── dataplane ← the runtime     the runtime's own rows
       model_aliases (+ candidates)   backends
@@ -86,6 +87,7 @@ Plane's (ADR 0006 §4, §7).
 | Catalog                       | `dataplane` | `model_aliases` (+ candidates), `backends`, `alias_group_versions`, `client_price_list_revisions` (+ entries) | Configured serving state; alias+candidates one transaction (ADR 0001, rule 3); activation is Catalog-local (ADR 0003). The runtime resolves the alias and prices the admission from these rows on every request, and the console's operator reaches them through `dataplane-api` (ADR 0006 §3, §5).                                                                                                                                                                                                                                                                                     |
 | Commerce                      | `control`   | `plans` (+ versions + grant definitions), `subscriptions`, `entitlements`, `account_payg`                     | Commercial lifecycle; the due-work lanes write here — the cycle-roll transaction among them — and the capacity a cycle grants reaches the runtime as a published projection (ADR 0006). `account_payg` is the PAYG enablement flag plus its write-once funding-bucket reference; the bucket row itself is the ledger family's. `plans` are unique by operator-facing name (`plans_name_key`) and immutable after creation: renaming is not defined, a new plan is created instead — a Commerce decision, not an ADR 0003 sentence, recorded here so the constraint is not an invention. |
 | Accounting ledger             | `control`   | `funding_buckets`, `settlements`, `ledger_entries`                                                            | One consistency unit — bucket capacity and its legs must be written together (invariants 3–4); the bucket is an Accounting aggregate (ADR 0001) and the ledger, with the settlement of record, is the Control Plane's (ADR 0006).                                                                                                                                                                                                                                                                                                                                                       |
+| Fact ingestion                | `control`   | `applied_facts`, `quarantined_facts`, `ingestion_cursor`                                                      | The consumer's side of the pull-with-replay seam (ADR 0006 §5, ADR 0010): the applied record is the idempotency key — the fact's `(request_id, kind class)` — that makes a replayed page free; the quarantine is a refusal kept verbatim for an operator; the cursor is the one thing about the feed the Data Plane never learns. Written in the same unit of work as the settlement effects they record and by nothing else.                                                                                                                                                           |
 | Runtime reservation and quota | `dataplane` | `reservations` (+ allocation legs), the quota projection                                                      | The runtime's own working set: admission writes the reservation and conditionally draws down the projection in one Data-Plane transaction (ADR 0006).                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | Intake                        | `dataplane` | `request_intake`                                                                                              | Permanent idempotency replay — decided inside the runtime's admission transaction from its own relational state alone, with the Control Plane switched off (ADR 0004, ADR 0006 §4).                                                                                                                                                                                                                                                                                                                                                                                                     |
 
@@ -242,12 +244,13 @@ Notes for the schema designer:
 
 ### Retention
 
-| Table                           | Database    | Retention                            | Because                                                                                                                     |
-| ------------------------------- | ----------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `ledger_entries`, `settlements` | `control`   | forever                              | Billing/audit history; corrections are compensating rows.                                                                   |
-| `usage_events`, `reservations`  | `dataplane` | forever                              | The facts the Control Plane settles from and the holds they came from — the same audit value, retained for the same reason. |
-| `requests`                      | `dataplane` | forever                              | One row per request — the anchor joining charges to usage and attempts; volume is already implied by the ledger.            |
-| `request_attempts`              | `dataplane` | archivable (aggregate, then age out) | Provider telemetry, not customer billing; nothing references it for accounting.                                             |
+| Table                                | Database    | Retention                            | Because                                                                                                                                                                              |
+| ------------------------------------ | ----------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ledger_entries`, `settlements`      | `control`   | forever                              | Billing/audit history; corrections are compensating rows.                                                                                                                            |
+| `applied_facts`, `quarantined_facts` | `control`   | forever                              | The idempotency ledger and its refusals: a replayed fact is answered from the applied row, and a quarantine is a record an operator resolves — neither is a state anything ages out. |
+| `usage_events`, `reservations`       | `dataplane` | forever                              | The facts the Control Plane settles from and the holds they came from — the same audit value, retained for the same reason.                                                          |
+| `requests`                           | `dataplane` | forever                              | One row per request — the anchor joining charges to usage and attempts; volume is already implied by the ledger.                                                                     |
+| `request_attempts`                   | `dataplane` | archivable (aggregate, then age out) | Provider telemetry, not customer billing; nothing references it for accounting.                                                                                                      |
 
 "Forever" is a statement about policy rather than a promise about every value a
 read can carry. Nothing in this design ages a fact out, and the ingestion cursor
@@ -274,7 +277,7 @@ through a distributed commit (ADR 0006 §5, §7).
 | ------------------------------------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
 | Admission                                               | Data Plane (local)    | `requests` (shell), `reservations` + allocation legs (insert), the quota projection (conditional drawdown), `request_intake` (insert **last**)                                                                                                                                                                                         | 3, 6, 10               |
 | Settlement — the runtime's close                        | Data Plane (local)    | `usage_events` (append), `reservations` (close, state-guarded), `request_attempts` (probe, then insert), `requests` (finalise), `request_intake` (terminal pointer)                                                                                                                                                                    | 1, 6, 7                |
-| Settlement — settlement from the fact                   | Control Plane (local) | `settlements` (insert), `ledger_entries` (`consume`/`release` legs), `funding_buckets` (projections)                                                                                                                                                                                                                                   | 2, 4, 8, 10            |
+| Settlement — settlement from the fact                   | Control Plane (local) | `applied_facts`/`quarantined_facts` (one row per fact — an interpretable fact records its application, a refusal quarantines verbatim), `settlements` (insert), `ledger_entries` (`hold`/`consume`/`release` legs), `funding_buckets` (projections), `ingestion_cursor` (advance **last**)                                             | 2, 4, 8, 10            |
 | Release (explicit compensation, or the reaper's expiry) | Data Plane (local)    | `reservations` (close, state-guarded), the quota projection (capacity returned, leg by leg), `requests` (finalise with failure reason), `request_intake` (terminal pointer), `usage_events` (append, the `released`/`expired` fact — **last**)                                                                                         | 3, 6                   |
 | Cycle roll                                              | Control Plane (local) | `entitlements` (create) + `subscriptions` (cycle fields) — keyed `(subscription, cycle)`; `funding_buckets` (create) and the `ledger_entries` `grant` legs join the same unit of work at settlement (B6) — the commerce foundation ships the Commerce half. The new capacity then reaches the runtime's projection as a published fact | 3 (grant exactly once) |
 
@@ -294,7 +297,10 @@ The two settlement rows are one logical settlement split by the plane that
 owns each row, not one transaction failing: the runtime closes its reservation
 and writes the usage fact in the Data Plane, and the Control Plane reads that
 fact and writes the settlement, its ledger legs and its bucket projections
-from it, idempotently by `request_id`. The window between the two is a named,
+from it — together with the applied record that makes a redelivery a no-op,
+keyed by the fact's `(request_id, kind class)` — while the cursor's advance
+is the same unit's last write, so the position never claims work that did not
+commit (ADR 0010). The window between the two is a named,
 bounded property, and the unique settlement per request is unchanged — the
 customer is charged exactly once (ADR 0006). Admission and release are
 Data-Plane transactions for the same reason, and their `hold` and `release`
