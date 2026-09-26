@@ -97,6 +97,37 @@ const (
 	// good snapshot keeps serving until a refresh succeeds.
 	DefaultExecutionRegistryRefresh = 10 * time.Second
 
+	// DefaultReaperInterval is how often the reaper's drain cycle runs. Five
+	// seconds bounds the extra time a dead process's capacity stays drawn by
+	// one cycle's span plus whatever the loop's own deadline allows on top: a
+	// hold is reclaimable once BOTH its clocks have passed, and both of them
+	// are already measured in minutes and seconds, so a cadence far above the
+	// lease TTL would be adding a recovery delay the horizons do not already
+	// carry. It is the loop's idle cost — a cycle over an empty sweep is one
+	// indexed statement — and it is the dial that sets how long a backlog
+	// waits between cycles, which is the only place reaping throughput is
+	// traded against the latency of live settlements.
+	DefaultReaperInterval = 5 * time.Second
+
+	// DefaultReaperTimeout bounds one drain cycle: the whole batch, under one
+	// deadline, the first cycle immediate. It is the loop's answer to a store
+	// that has stopped answering — without it a cycle's units would sit on a
+	// connection that is never coming back until the next signal arrived, and
+	// a reaper that cannot answer must not be the reason a process cannot
+	// stop. It sits above the interval deliberately: a cycle that outlived its
+	// own cadence would be two cycles overlapping in one goroutine, which is
+	// not a shape this loop has.
+	DefaultReaperTimeout = 10 * time.Second
+
+	// DefaultReaperBatchSize bounds how many holds one cycle may take. Fifty
+	// is not a tuned number: each victim is a whole unit of work whose last
+	// statement takes the fact feed's stream row lock, so a large batch does
+	// not drain faster — it holds that one global serialisation point longer
+	// and stalls every live settle in the process behind it. The bound is
+	// there to cap a backlog's per-cycle work, and the loop's interval caps
+	// the rest.
+	DefaultReaperBatchSize = 50
+
 	// ownedDatabase is the only database this application may be pointed at —
 	// the plane binding of ADR 0006 §7, checked in validatePostgresDSN and
 	// again by the persistence adapter (which carries a constant of the same
@@ -201,6 +232,38 @@ type Config struct {
 	// which is what the interval exists to avoid.
 	ExecutionRegistryRefresh time.Duration
 
+	// ReaperEnabled says whether this process runs the reaper's drain loop at
+	// all. It defaults to true, and the default is the decision: the reaper
+	// is the thing that stops a hold from leaking capacity for as long as its
+	// hold window runs, and a runtime that shipped without it would strand
+	// every hold its process ever died on. The setting exists for the
+	// operator who is running a second process beside this one to sweep the
+	// same table — two reapers are correct but redundant — and for the
+	// operator who wants a database fixture with no background writes in it.
+	// It is a boolean and not a zero interval, so "off" is one honest word
+	// rather than a value the duration checks below would have to refuse.
+	ReaperEnabled bool
+
+	// ReaperInterval is how often the reaper's drain cycle runs — the
+	// composed loop's own ticker, beside the executor registry's. It is an
+	// operational cadence like the horizons above: nothing a caller ever sees
+	// states it, and retuning it changes only how quickly stranded capacity
+	// comes back, never what a reclaim means. It must be positive, and it
+	// must not be stretched past ReaperTimeout, because a cycle that
+	// outlived its own cadence would be two cycles running at once.
+	ReaperInterval time.Duration
+
+	// ReaperTimeout bounds one drain cycle under its own deadline. It must be
+	// positive, so a store that has stopped answering costs a cycle its
+	// budget rather than the process its shutdown.
+	ReaperTimeout time.Duration
+
+	// ReaperBatchSize bounds how many holds one cycle may reclaim. It must be
+	// at least one: a cycle that can close nothing is not a drain, and a
+	// batch of zero would read as a reaper that ran and found nothing rather
+	// than one that never ran.
+	ReaperBatchSize int
+
 	// ManagementAddr is the private listener the Data Plane's management
 	// surface is served from. An empty value means this process serves no
 	// management surface at all, which is the default: a runtime that has not
@@ -287,6 +350,12 @@ func Defaults() Config {
 
 		ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 		ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+
+		ReaperEnabled:   true,
+		ReaperInterval:  DefaultReaperInterval,
+		ReaperTimeout:   DefaultReaperTimeout,
+		ReaperBatchSize: DefaultReaperBatchSize,
+
 		Postgres: Postgres{
 			DSN:             DefaultPostgresDSN,
 			MaxOpenConns:    DefaultPostgresMaxOpenConns,
@@ -355,6 +424,39 @@ func Load(lookup LookupEnv) (Config, error) {
 			return Config{}, err
 		}
 		cfg.ExecutionRegistryRefresh = duration
+	}
+	// The reaper's switch is read as a boolean and the three bounds beside it
+	// as the values they are. The switch is default-on and says so with a
+	// value only it spells: an operator who wants the reaper off writes
+	// DATAPLANE_REAPER_ENABLED=false, and an operator who says nothing gets a
+	// runtime that reclaims.
+	if value, ok := lookup("DATAPLANE_REAPER_ENABLED"); ok {
+		enabled, err := parseBool("DATAPLANE_REAPER_ENABLED", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ReaperEnabled = enabled
+	}
+	if value, ok := lookup("DATAPLANE_REAPER_INTERVAL"); ok {
+		duration, err := parsePositiveDuration("DATAPLANE_REAPER_INTERVAL", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ReaperInterval = duration
+	}
+	if value, ok := lookup("DATAPLANE_REAPER_TIMEOUT"); ok {
+		duration, err := parsePositiveDuration("DATAPLANE_REAPER_TIMEOUT", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ReaperTimeout = duration
+	}
+	if value, ok := lookup("DATAPLANE_REAPER_BATCH_SIZE"); ok {
+		size, err := parseInt("DATAPLANE_REAPER_BATCH_SIZE", value)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ReaperBatchSize = size
 	}
 
 	if value, ok := lookup("DATAPLANE_EGRESS_POLICIES"); ok {
@@ -443,6 +545,9 @@ func Load(lookup LookupEnv) (Config, error) {
 		return Config{}, err
 	}
 	if err := validateExecutionBudgets(cfg.ReservationHoldWindow, cfg.ExecutionMaxDuration); err != nil {
+		return Config{}, err
+	}
+	if err := validateReaper(cfg); err != nil {
 		return Config{}, err
 	}
 	if err := validateEgress(cfg.Egress); err != nil {
@@ -617,6 +722,23 @@ func parseInt(name, value string) (int, error) {
 	return number, nil
 }
 
+// parseBool parses the one switch this configuration reads, and the spelling
+// is deliberately narrow: Go's own truth-value vocabulary (1, t, TRUE, True)
+// and nothing else. A deployment that writes "yes" or "on" gets an error
+// naming the two words this reads, because a switch whose spelling a
+// deployment has to guess is a switch that will be read as the wrong value
+// rather than refused — and a reaper that is silently off is the failure mode
+// this whole setting exists to be visible about.
+func parseBool(name, value string) (bool, error) {
+	switch value {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	}
+	return false, fmt.Errorf("%s must be either true or false, got %q", name, value)
+}
+
 // validatePostgres checks the pool settings as a set: each count against its
 // own bound, the idle bound against the open bound, and the DSN against both
 // its shape and the plane it may name. The variable names are spelled here
@@ -753,6 +875,46 @@ func validateExecutionBudgets(hold, execution time.Duration) error {
 		return fmt.Errorf(
 			"DATAPLANE_EXECUTION_MAX_DURATION (%s) must be strictly shorter than DATAPLANE_RESERVATION_HOLD_WINDOW (%s); a provider call must end inside the hold it was admitted under",
 			execution, hold)
+	}
+	return nil
+}
+
+// validateReaper checks the reaper's own settings as a set. The per-variable
+// rules — a Go duration at all, greater than zero, an integer at all — are
+// applied where each variable is read, by parsePositiveDuration and parseInt
+// like every other value this file reads. What needs all four in hand lives
+// here, and it is the relationship between them rather than any one of them:
+//
+//   - a batch below one is a cycle that can close nothing, which reads as a
+//     reaper that runs and reclaims nothing rather than as a broken one;
+//   - a cycle budget below the interval is a loop whose own deadline fires
+//     before its next tick is even due, so every cycle is cut short and the
+//     one bound the operator set to protect the process becomes the thing
+//     stopping the reaping.
+//
+// The horizon relationship the reaper's cadence could imply is deliberately
+// NOT checked: an interval longer than the lease TTL would not be wrong. The
+// TTL is a claim's lifetime, not a recovery schedule, and the cost of a slow
+// cadence is a few more seconds of drawn capacity on a hold that is already
+// dead — which is an operational dial, not an invariant. The two relations
+// above are different: each of them is a reaper that cannot do the job it
+// was configured to do.
+//
+// A disabled reaper is validated like any other configuration, not skipped.
+// The values are still read, still bounded, and still reported when wrong:
+// a process with the reaper off and a zero batch is a deployment that will
+// turn the reaper on and find it refused, and finding that out at the edit
+// is better than finding it out at the restart.
+func validateReaper(cfg Config) error {
+	if cfg.ReaperBatchSize < 1 {
+		return fmt.Errorf(
+			"DATAPLANE_REAPER_BATCH_SIZE (%d) must be at least one; a cycle that can close nothing is not a drain",
+			cfg.ReaperBatchSize)
+	}
+	if cfg.ReaperInterval >= cfg.ReaperTimeout {
+		return fmt.Errorf(
+			"DATAPLANE_REAPER_INTERVAL (%s) must be shorter than DATAPLANE_REAPER_TIMEOUT (%s); a cycle that outlives its own cadence would be two cycles running at once",
+			cfg.ReaperInterval, cfg.ReaperTimeout)
 	}
 	return nil
 }
