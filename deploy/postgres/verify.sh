@@ -1745,7 +1745,11 @@ SELECT (SELECT count(*) FROM control.ingestion_cursor) || '|' ||
 
 expect_constraint_failure "an applied fact of an unknown kind class is refused" applied_facts_kind_class_valid "
 INSERT INTO control.applied_facts (request_id, kind_class, kind, append_seq)
-VALUES ('verify probe request', 'expired_settlement', 'expired', 7)"
+VALUES ('verify probe request', 'expired_settlement', 'corrected', 7)"
+# The kind above is deliberately outside the vocabulary: the pairing
+# constraint is derivable for any kind — an unknown kind with an unknown
+# class passes it — so an unknown kind is what lets this probe isolate the
+# class-valid constraint instead of tripping the pairing one first.
 
 expect_constraint_failure "an applied released fact carrying a settled amount is refused" applied_facts_settled_shape "
 INSERT INTO control.applied_facts (request_id, kind_class, kind, append_seq, settled_amount)
