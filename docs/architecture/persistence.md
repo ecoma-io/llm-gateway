@@ -70,8 +70,10 @@ exercised end to end — applied, re-applied, rolled back
 One namespace decision is already made, and a future migration is the place it
 would be quietly lost, so it is written here. Within the Control Plane's
 database, tables keep to the `control` schema — the namespace
-[ADR 0006](../adr/0006-control-plane-and-data-plane.md) §5 already spells in
-`control.usage_ingestion_cursor`. The Data Plane's database stays on the
+[ADR 0006](../adr/0006-control-plane-and-data-plane.md) §5 spells, and every
+table since has kept to, most recently the fact-ingestion trio B12 landed as
+`control.applied_facts`, `control.quarantined_facts` and
+`control.ingestion_cursor`. The Data Plane's database stays on the
 default namespace, which is where its bootstrap pair puts the extension and
 where the verify suite asserts that lane's applied history lands
 (`deploy/postgres/verify.sh`).

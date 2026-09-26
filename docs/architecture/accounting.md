@@ -296,13 +296,18 @@ tail, whose per-bucket `amount` is the held amount that reservation booked
 booked here from that tail — before the `release`/`consume` legs it funds:
 required outright for a `release`, which names a reservation that has a `hold`
 leg on file, and in effect for a `consume`, which draws against `held`.
-Idempotency runs through the fact: the applier keys on `request_id`, and a
-replayed leg collides on its own uniqueness rather than moving money twice —
-for a `hold` leg, `(reservation_id, funding_bucket_id, kind)`. B12's applier
-is the caller that will do it — B6 shipped the primitive and no caller, and no
-other channel exists: the feed is the only path by which a `dataplane` row
-becomes a `control` row ([data implications](data-implications.md)), and the
-management surface contracts no read of live reservations.
+Idempotency runs through the fact: the applier keys on the fact's
+`(request_id, kind class)` — `settled`, `released` and `expired` share the one
+class, `unbillable_orphaned` stands alone — so a replayed fact is answered
+from the applied record before any leg is written, and each leg's own
+uniqueness stands behind that — for a `hold` leg,
+`(reservation_id, funding_bucket_id, kind)`. The caller has landed: B12's
+applier (`application.FactApplier`, driven by the replay loop in
+`cmd/console-api`, [ADR 0010](../adr/0010-usage-fact-ingestion-and-settlement.md))
+is the caller B6 shipped the primitive for, and no other channel exists: the
+feed is the only path by which a `dataplane` row becomes a `control` row
+([data implications](data-implications.md)), and the management surface
+contracts no read of live reservations.
 
 The consequence for the projection above is exact: a bucket's cached `held`
 is algebra over holds whose terminal fact has already been applied, never the
@@ -503,18 +508,26 @@ arrive later, and none is stubbed here:
   projection; admission writes no fact — the feed carries terminal outcomes
   only — so this plane's `hold` legs wait for the terminal fact's allocation
   tail, as **Where ΣH comes from** above records.
-- **Usage → pricing → settlement wiring (B12)** — the consumer loop that
-  reads the fact feed and calls Settle. The figures it prices from arrived
-  with the typed fact contract (B11) and the derivation the loop must
-  reproduce is stated in the fact contract itself; what remains of
-  [issue #63](https://github.com/ecoma-io/llm-gateway/issues/63) is the
-  accepted deferral — one settlement currency, provenance beyond the
-  revision id — not a blocker.
 - **Reconciliation worker (B13)** — the scheduled convergence between the
   Data Plane's quota projections and the ledger; `ReconcileBucket` is the
   verdict it will lean on.
 - **Payment processor (B15)** — the provider whose webhooks land as topups;
   an operator's keyed topup is the same door it will use.
+
+One flow the list above was written to wait for has since landed, and has
+left the list for it: **B12's consumer**. The replay loop in
+`cmd/console-api` reads the fact feed on a configurable interval and books
+each page's effects through the flows above — the `hold` legs from the fact's
+allocation tail, then the `consume`/`release` legs through Settle —
+idempotent by `(request_id, kind class)`, whole-page atomic with the
+position's advance, refusals quarantined rather than skipped
+([ADR 0010](../adr/0010-usage-fact-ingestion-and-settlement.md),
+[cross-plane protocols](cross-plane-protocols.md)). The figures it prices
+from arrived with the typed fact contract (B11), and the derivation it
+reproduces is the fact contract's own; what remains of
+[issue #63](https://github.com/ecoma-io/llm-gateway/issues/63) is the
+accepted deferral — one settlement currency, provenance beyond the revision
+id — not a blocker.
 
 ## Concurrency and time
 

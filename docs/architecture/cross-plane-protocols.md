@@ -566,29 +566,31 @@ reader over it — the postgres adapter's `UsageFacts`
 ([ports and adapters](ports.md)) — rather than a promise
 (ADR 0006 §5; [data implications](data-implications.md)).
 
+### The fact consumer, decided and landed
+
+The other half of the seam has landed the same way, and the pair of "future
+tables" ADR 0006 §5 named is now two landed ones. The Control Plane's
+position lives in `control.ingestion_cursor` (B12's
+`migrations/control/000008_fact_ingestion`) — a singleton row holding one
+opaque string, written verbatim from the page's `next_cursor` and read by
+nothing outside the consumer module — behind the repository-level port that
+predates the table ([ports and adapters](ports.md)). The consumer that drives
+it is the replay use case and the process loop that calls it: one page per
+pass, fetched outside any transaction, applied whole — every fact, then the
+position's advance in the same unit of work, last. Duplicate delivery is
+answered by the applier's `(request_id, kind class)` idempotency rather than
+by any protocol acknowledgement; a fact the consumer refuses to interpret is
+recorded verbatim in the quarantine and the page still advances; a fact the
+plane cannot apply — an accounting refusal, a payload past the column's
+bound — stops the page where it stands, so the position never claims work
+that did not commit ([accounting](accounting.md);
+[data implications](data-implications.md)). What remains of
+[issue #63](https://github.com/ecoma-io/llm-gateway/issues/63) is the
+accepted deferral it arrived with — one settlement currency, provenance
+beyond the revision id — tracked rather than blocking.
+
 ## What this page does not decide
 
-- **The ingestion-cursor schema.** `control.usage_ingestion_cursor` is the
-  future table the Control Plane stores its position in. Today the position is a
-  repository-level port in `apps/console-api/internal/ports/outbound/persistence`
-  with the future table documented beside it and test fakes behind it; a
-  production implementation arrives with the schema rather than before it. The
-  Data Plane's side of the same seam has no such gap — its production fact
-  reader is landed ([above](#the-fact-source-decided-and-landed)) — so what
-  remains undecided here is the Control Plane's table and the loop that drives
-  it.
-- **The settlement consumer loop.** Nothing schedules the replay: there is no
-  worker, no ticker and no background process. The loop that calls the ingestion
-  use case belongs to the pull the schema PR builds, beside the table the cursor
-  is stored in. What B6 did land is the side the loop will call: the
-  settlement of record, its consume and release legs and the bucket moves they
-  name ([accounting](accounting.md)) — a primitive with no caller yet. The
-  settlement-relevant columns the loop prices from arrived with the typed fact
-  contract (B11) and the derivation it must reproduce is stated in the fact
-  contract itself, so B12 is no longer blocked on
-  [issue #63](https://github.com/ecoma-io/llm-gateway/issues/63); what remains
-  there is the accepted deferral — one settlement currency, provenance beyond
-  the revision id — tracked rather than blocking.
 - **mTLS or signed service credentials.** The mechanism today is a shared secret
   per hop, and either replacement proves the same identity cryptographically
   without changing application semantics (ADR 0006 §9).
@@ -618,5 +620,7 @@ reader over it — the postgres adapter's `UsageFacts`
   envelope is the façade's own and does not identify the request in the
   listener's logs. Spanning the hops is a small change with a real question
   attached, since a caller-supplied string would then cross a second trust
-  boundary, and it belongs with the consumer loop that will have a request worth
-  correlating.
+  boundary, and it belongs with the consumer loop. That loop has landed and
+  does not send the header either — its passes are already the boundary-crossing
+  calls the question is about — so the change remains owed, still small, and
+  still recorded rather than made.
