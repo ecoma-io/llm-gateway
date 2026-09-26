@@ -30,7 +30,6 @@ package credentials
 
 import (
 	"errors"
-	"fmt"
 	"strings"
 )
 
@@ -53,19 +52,25 @@ type Ref struct {
 // snapshot later — an executor built over a reference nobody can resolve is
 // a backend that fails every call forever, and that is a boot-time fact, not
 // a runtime one.
+//
+// Every refusal names the grammar and never the value. A reference field is
+// exactly where credential material ends up when an operator wiring a
+// backend pastes it into the wrong column, and these errors are the ones the
+// registry's skip-and-log prints — so the refusal must not turn one bad row
+// into the material sitting in a log line.
 func ParseRef(raw string) (Ref, error) {
 	scheme, name, found := strings.Cut(raw, ":")
 	if !found {
-		return Ref{}, fmt.Errorf("credentials: reference %q names no scheme; the grammar is env:NAME", raw)
+		return Ref{}, errors.New("credentials: a reference must name its scheme; the grammar is env:NAME")
 	}
 	if scheme != envScheme {
-		return Ref{}, fmt.Errorf("credentials: reference scheme %q is not one this runtime resolves; the grammar is env:NAME", scheme)
+		return Ref{}, errors.New("credentials: the reference's scheme is not one this runtime resolves; the grammar is env:NAME")
 	}
 	if name == "" {
 		return Ref{}, errors.New("credentials: an env reference must name its variable; the grammar is env:NAME")
 	}
 	if !validEnvName(name) {
-		return Ref{}, fmt.Errorf("credentials: env reference %q must name a variable spelled with letters, digits and underscores, not starting with a digit", name)
+		return Ref{}, errors.New("credentials: an env reference must name a variable spelled with letters, digits and underscores, not starting with a digit")
 	}
 	return Ref{name: name}, nil
 }

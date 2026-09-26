@@ -23,12 +23,12 @@ func TestParseRefReadsTheEnvGrammar(t *testing.T) {
 		{
 			name:    "a schemeless reference names nothing resolvable",
 			raw:     "creds/main",
-			refusal: `reference "creds/main" names no scheme; the grammar is env:NAME`,
+			refusal: "a reference must name its scheme; the grammar is env:NAME",
 		},
 		{
 			name:    "a foreign scheme is not one this runtime resolves",
 			raw:     "vault:secret/provider",
-			refusal: `reference scheme "vault" is not one this runtime resolves; the grammar is env:NAME`,
+			refusal: "the reference's scheme is not one this runtime resolves; the grammar is env:NAME",
 		},
 		{
 			name:    "an env reference must name its variable",
@@ -65,6 +65,29 @@ func TestParseRefReadsTheEnvGrammar(t *testing.T) {
 				t.Errorf("EnvName() = %q, want %q", ref.EnvName(), test.want)
 			}
 		})
+	}
+}
+
+// TestParseRefRefusalsNeverEchoTheReference: a reference field is exactly
+// where credential material ends up when an operator pastes it into the
+// wrong column, and ParseRef's errors are the ones the executor registry's
+// skip-and-log prints — so no refusal may carry a fragment of the value it
+// refused. The grammar is named; the value never is.
+func TestParseRefRefusalsNeverEchoTheReference(t *testing.T) {
+	materialShaped := []string{
+		"pasted-material-0001",       // raw material pasted whole: no scheme at all
+		"env:pasted-material-0001",   // material behind the env scheme: a bad variable name
+		"vault:pasted-material-0001", // a foreign scheme carrying material
+		"pasted-material:0001",       // material whose first colon makes a bogus scheme
+	}
+	for _, raw := range materialShaped {
+		_, err := ParseRef(raw)
+		if err == nil {
+			t.Fatalf("ParseRef accepted %q, want refusal", raw)
+		}
+		if got := err.Error(); strings.Contains(got, "pasted-material") {
+			t.Errorf("ParseRef refusal %q echoes the refused value — the grammar is named, never the value", got)
+		}
 	}
 }
 

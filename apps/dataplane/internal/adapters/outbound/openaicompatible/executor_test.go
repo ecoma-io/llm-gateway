@@ -446,6 +446,26 @@ func TestExecuteStreamUsageNilWhenUnreported(t *testing.T) {
 	}
 }
 
+// TestExecuteNegativeUsageIsAbsentNotNegative: a negative count is a
+// malformed figure, not a report. Rendered through, it would let the
+// settlement's arithmetic price negative tokens — a credit; rendered
+// absent, the settle basis does what it does for any report that never
+// came — it settles on the reservation's own basis.
+func TestExecuteNegativeUsageIsAbsentNotNegative(t *testing.T) {
+	negativeChunk := `{"choices":[],"usage":{"prompt_tokens":-3,"completion_tokens":-5}}`
+	_, endpoint := startProvider(t, func(seq int, request recordedRequest) fakeResponse {
+		return fakeResponse{status: stdhttp.StatusOK, body: sse(textChunkOne, finishChunk, negativeChunk)}
+	})
+	executor := newTestExecutor(t, endpoint)
+
+	result := executor.Execute(t.Context(), testSpec(true), newFakeSink())
+	success := assertSuccess(t, result)
+
+	if success.Usage.InputTokens != nil || success.Usage.OutputTokens != nil {
+		t.Errorf("usage = %+v, want nil fields — a negative count is not a report, it is absence", success.Usage)
+	}
+}
+
 // TestExecuteClassifiesRefusals walks the status table: each class the
 // vocabulary holds earns the status the convention gives it.
 func TestExecuteClassifiesRefusals(t *testing.T) {

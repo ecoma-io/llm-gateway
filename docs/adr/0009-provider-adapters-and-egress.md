@@ -56,10 +56,13 @@ port's contract:
   next egress route, second attempt on a stalled stream — belongs to the
   layers that own it. A 3xx is refused where it stands, not followed.
 - **The sink is the commitment point.** An adapter writes only
-  content-bearing bytes into the sink; the first `Content` call the reply
-  accepts is commitment (the one-way gate, ADR 0002). Protocol lifecycle
-  frames are consumed or buffered per the routing rules, never forwarded as
-  content.
+  content-bearing bytes into the sink, and the first `Content` call the
+  reply accepts is commitment (the one-way gate, ADR 0002). The preamble —
+  the lifecycle frames a stream answers with before its first content — is
+  read bounded and held by the adapter, then flushed into the sink ahead of
+  the first content; if the preamble reaches its cap, the flush itself is
+  the commitment, because bytes a caller can already read are content
+  whatever named them. Lifecycle frames never reach the sink on their own.
 - **No I/O beside the one call.** No catalog reads, no configuration reads,
   no store access inside `Execute`. Everything an adapter needs arrives
   frozen at construction — which is what makes a snapshot of them safe to
@@ -84,12 +87,15 @@ The usage report is required, not hoped for.
 
 ### The registry is a snapshot, and the composition root builds it
 
-The routing stage reads the catalog's shape but must never read the catalog:
-a provider call that opens a database transaction per request would hold a
-connection across a call that can outlive minutes. The registry is therefore
-a **snapshot** — one frozen executor per callable backend row, built by the
-composition root from one whole read of the catalog, swapped whole behind an
-atomic pointer. Its laws:
+The law's subject is the **executor**: an adapter must never read the
+catalog, because a provider call that opens a database read would hold a
+connection across a call that can outlive minutes. The routing stage still
+reads the catalog, on purpose — the walk's eligibility leg is a per-request
+read of the alias's candidates and their backends, each read its own short
+unit that closes before any call runs. What the snapshot buys is that the
+call itself needs no catalog: the registry is one frozen executor per
+callable backend row, built by the composition root from one whole read of
+the catalog, swapped whole behind an atomic pointer. Its laws:
 
 - The walk's lookup is a map read: I/O-free, identical between refreshes, so
   an attempt row's meaning never shifts under a request in flight.
@@ -149,11 +155,15 @@ that the **routing stage's walk** runs the renewal, around the executor call,
 because the renewal is the hold's business and no adapter's. One renewer per
 call:
 
-- The **deadline chain is monotone and admission-anchored**: the first
+- The **deadline chain is monotone and anchored at admission**: the first
   renewal extends the admission-stamped expiry by the lease TTL, and every
-  later renewal extends the previous deadline by the TTL. No node clock
-  enters the arithmetic, so skew never shortens what the previous renewal
-  bought, and a deadline never shrinks.
+  later renewal extends the previous deadline by the TTL. The chain belongs
+  to the **walk**, not to one call — a candidate that fails after burning
+  several lease lifetimes leaves the chain where its renewer left it, and
+  the next candidate's renewer continues from there instead of restarting
+  from the admission stamp, which a long first call has already left
+  behind. No node clock enters the arithmetic, so skew never shortens what
+  the previous renewal bought, and a deadline never shrinks.
 - The **first renewal is immediate** — the walk starts after admission's
   stamp, and part of the TTL may already be spent — then ticks at a third of
   the TTL: two renewal chances inside one lease lifetime.
@@ -191,9 +201,12 @@ the same fact, the hold is gone from the open set, and neither is a refusal
 anyone surfaced. The intake side needed no change: its failure vocabulary
 already knew the word.
 
-The composition stays ADR 0006's: one unit of work releases the hold, and
-the `gateway_abandoned` fact is the last word in it, the same shape every
-other release uses.
+The composition stays ADR 0006's: one unit of work releases the hold, in
+the same shape every other release uses. One precision the intake's
+vocabulary already knew: the `gateway_abandoned` **word** travels on the
+request row's failure reason and the intake record — the fact feed carries
+a plain `released` usage fact, because a fact prices nothing and names no
+failure; the ending's word is the request's, not the feed's.
 
 ### The enforceable bound is the hold window
 

@@ -76,15 +76,19 @@ func Connect(proxyAddr string) egress.DialFunc {
 // The proxy library's dialer must be used through its context-aware
 // interface — the context-blind shape keeps dialling in a goroutine after
 // the caller has gone, and an abandoned request must not leave a dial
-// running behind it. The library's dialer has had the context form since it
-// grew context support; if that ever stops being true, the constructor
-// refuses here rather than wiring a dialer that leaks.
+// running behind it. On the x/net version this build pins, the constructor
+// returns a nil error unconditionally for the socks5 scheme — the two guards
+// below are insurance against a dependency whose contract changes, not a
+// live path: an error here becomes a boot-time panic rather than a dialer
+// wired wrong, and a dialer that lost its context interface is refused rather
+// than one that leaks goroutines on cancellation.
 func SOCKS5(proxyAddr string, remoteDNS bool) egress.DialFunc {
 	inner, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
 	if err != nil {
-		// The library's constructor fails on an unusable proxy address, which
-		// configuration validation has already refused. Reaching this is a
-		// wiring mistake at the composition root, not a runtime condition.
+		// Not reachable on the pinned x/net: the socks5 constructor cannot
+		// fail for these arguments. The guard is what turns a future
+		// dependency change into a boot failure instead of a silently wrong
+		// dialer.
 		panic(fmt.Sprintf("egress: build the socks5 dialer for %s: %v", proxyAddr, err))
 	}
 	contextDialer, ok := inner.(proxy.ContextDialer)

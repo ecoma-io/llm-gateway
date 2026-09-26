@@ -212,6 +212,14 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 	// candidate gets to choose.
 	reply.Open(admitted.Stream)
 
+	// The renewal chain is the walk's, not one call's: it starts at the
+	// admission-stamped expiry and every call's renewer extends the deadline
+	// the previous call's renewer wrote. A fall-through to the next candidate
+	// therefore continues the lease from where the last call left it — a
+	// candidate that burned ten TTLs before failing does not hand the next
+	// one a lease that admission's stamp has long since lapsed.
+	leaseDeadline := admitted.LeaseExpiresAt
+
 	for step := 1; ; step++ {
 		if ctx.Err() != nil {
 			// The caller is gone before any candidate answered. The walk's
@@ -256,11 +264,14 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 		started := time.Now().UTC()
 		// The call runs under the renewal: its context carries the execution
 		// budget, and the lease-renewal goroutine lives exactly as long as
-		// the call does. The stop waits for the renewer — no renewal races
-		// the ending this attempt's finish writes — and reports whether the
-		// renewal was what ended the call.
-		callCtx, stopRenewing := r.executionContext(ctx, admitted)
-		result := executor.Execute(callCtx, executors.AttemptSpec{
+		// the call does. The pairing below holds on the call's every exit —
+		// panics included, whose recovery the transport owns but whose
+		// unwinding would otherwise strand the renewer on a hold nobody will
+		// ever settle — and the stop waits for the renewer, so no renewal
+		// races the ending this attempt's finish writes. It reports whether
+		// the renewal was what ended the call, and the deadline the renewer
+		// last wrote becomes the next candidate's chain seed.
+		result, renewalLost := r.executeWithRenewal(ctx, admitted, &leaseDeadline, executor, executors.AttemptSpec{
 			RequestID:          admitted.RuntimeRequestID,
 			AttemptID:          attemptID,
 			BackendID:          string(candidate.BackendID),
@@ -269,7 +280,6 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 			Stream:             admitted.Stream,
 			Body:               admitted.RawBody,
 		}, reply)
-		renewalLost := stopRenewing()
 		finished := time.Now().UTC()
 		trace.Attempts++
 		trace.LastPosition = candidate.Position

@@ -97,12 +97,30 @@ type providerUsage struct {
 	CompletionTokens *int64 `json:"completion_tokens"`
 }
 
-// asPort renders the report in the port's own vocabulary.
+// asPort renders the report in the port's own vocabulary. A negative count
+// is not a report: it is a malformed figure, and passing it through would
+// let the settlement's arithmetic price negative tokens — a credit. The
+// settlement reads an absent field as "fall back to the reservation's own
+// basis", which is the honest settle for a figure nobody can defend, so a
+// negative count is rendered absent here, at the boundary where the
+// provider's words become the port's.
 func (u *providerUsage) asPort() executors.Usage {
 	if u == nil {
 		return executors.Usage{}
 	}
-	return executors.Usage{InputTokens: u.PromptTokens, OutputTokens: u.CompletionTokens}
+	return executors.Usage{
+		InputTokens:  nonNegative(u.PromptTokens),
+		OutputTokens: nonNegative(u.CompletionTokens),
+	}
+}
+
+// nonNegative nils a count that claims to be negative — absence, as far as
+// the settlement is concerned.
+func nonNegative(v *int64) *int64 {
+	if v == nil || *v < 0 {
+		return nil
+	}
+	return v
 }
 
 // parseChunk reads one data-line payload as a chunk.

@@ -1,10 +1,11 @@
 # ADR 0004: Accounting — reserve, execute, settle
 
-- Status: Accepted
+- Status: Accepted (amended 2026-09-26)
 - Date: 2026-09-23
 - Issue: [#5](https://github.com/ecoma-io/llm-gateway/issues/5)
 - Amended by: [ADR 0006](0006-control-plane-and-data-plane.md) — the transactions below are plane-scoped, and settlement is split across the plane boundary
 - Amended by: B6, the accounting foundation (2026-09-25) — the guards this record states as discipline are schema CHECKs, indexes and triggers now, and there is no negative-settled path any more (see the amendment under “Formal balance projections”)
+- Amended by: [ADR 0009](0009-provider-adapters-and-egress.md) — the enforceable bound on a live call is the hold window, validated at process start, not “the maximum lease” (see the amendment under “Expiry, leases, and crashes”)
 
 ## Context
 
@@ -269,6 +270,15 @@ only `open` reservations with a dead/expired lease. The reaper returns the
 capacity to the runtime's projection and changes state to `expired` atomically;
 its release legs are written in the Control Plane from that state change
 (ADR 0006 — the reaper is the runtime, and the ledger is not its to write).
+
+> **Amended by [ADR 0009](0009-provider-adapters-and-egress.md): the
+> enforceable bound is the hold window, not "the maximum lease".**
+> `expires_at` is the hold window's stamp — fixed at admission, never
+> extended — and renewal keeps the lease alive, never the window; what
+> actually protects a live call is the chain the process validates at start:
+> the execution duration sits strictly below the hold window. The sentence
+> above states that chain in its earlier phrasing; it holds because the
+> composition validates it at boot, not because the runtime hopes for it.
 
 After an expiry, customer settlement is intentionally **forbidden**: the
 reservation's capacity has been released for future customers, so consuming it

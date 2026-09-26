@@ -67,11 +67,15 @@ const (
 	// that a load-time fact instead of a per-deployment hope.
 	MaxReservationHoldWindow = 30 * 24 * time.Hour
 
-	// minReservationHorizon is the floor both reservation horizons share. A
-	// horizon this short cannot do the work it exists for: the reaper's
-	// reclaim test and the lease's fence both compare timestamps written by
-	// more than one process, and a window measured in milliseconds expires
-	// between the write of a stamp and the read of it. Below this, a
+	// minHorizon is the floor the reservation horizons and the execution
+	// ceiling share. A horizon this short cannot do the work it exists for:
+	// the reaper's reclaim test and the lease's fence both compare
+	// timestamps written by more than one process, and a window measured in
+	// milliseconds expires between the write of a stamp and the read of it.
+	// A deployment tuned this low is not tuned, it is broken — so the loader
+	// refuses rather than runs.
+	minHorizon = time.Second
+
 	// DefaultExecutionMaxDuration is the ceiling on one provider call — the
 	// deadline the routing stage puts on the context every executor's call
 	// runs under. Four minutes sits strictly inside the default hold window:
@@ -81,7 +85,9 @@ const (
 	// Lease renewal keeps the process's CLAIM on the hold alive for the
 	// call's duration; it never extends the hold itself, and this ceiling is
 	// what stops one slow provider from turning the hold window into a
-	// formality.
+	// formality. That "strictly below the hold window" is not the default's
+	// private property but the enforced chain — the process validates it at
+	// start (ADR 0004 as amended by ADR 0009).
 	DefaultExecutionMaxDuration = 4 * time.Minute
 
 	// DefaultExecutionRegistryRefresh is how often the composition root
@@ -90,10 +96,6 @@ const (
 	// within one interval, and a refresh that fails changes nothing: the last
 	// good snapshot keeps serving until a refresh succeeds.
 	DefaultExecutionRegistryRefresh = 10 * time.Second
-
-	// deployment is not tuned, it is broken — so the loader refuses rather
-	// than runs.
-	minReservationHorizon = time.Second
 
 	// ownedDatabase is the only database this application may be pointed at —
 	// the plane binding of ADR 0006 §7, checked in validatePostgresDSN and
@@ -704,15 +706,15 @@ func validateReservationHorizons(hold, lease time.Duration) error {
 	// and a sub-second value there is not a tuning choice, it is a
 	// misreading: two processes would disagree about expiry by more than the
 	// horizon itself.
-	if hold < minReservationHorizon {
+	if hold < minHorizon {
 		return fmt.Errorf(
 			"DATAPLANE_RESERVATION_HOLD_WINDOW (%s) must not be shorter than %s",
-			hold, minReservationHorizon)
+			hold, minHorizon)
 	}
-	if lease < minReservationHorizon {
+	if lease < minHorizon {
 		return fmt.Errorf(
 			"DATAPLANE_RESERVATION_LEASE_TTL (%s) must not be shorter than %s",
-			lease, minReservationHorizon)
+			lease, minHorizon)
 	}
 	if hold > MaxReservationHoldWindow {
 		return fmt.Errorf(
@@ -737,6 +739,16 @@ func validateReservationHorizons(hold, lease time.Duration) error {
 // because the call's settlement endings run after the call and inside the
 // same window.
 func validateExecutionBudgets(hold, execution time.Duration) error {
+	// The ceiling carries the same one-second floor the two reservation
+	// horizons carry: it is the clock the walk's budget and the renewal
+	// chain's steps ride on, and a sub-second execution window is a
+	// misreading, not a tuning choice — a call shorter than the stamps that
+	// bound it is not a call this vocabulary can state.
+	if execution < minHorizon {
+		return fmt.Errorf(
+			"DATAPLANE_EXECUTION_MAX_DURATION (%s) must not be shorter than %s",
+			execution, minHorizon)
+	}
 	if execution >= hold {
 		return fmt.Errorf(
 			"DATAPLANE_EXECUTION_MAX_DURATION (%s) must be strictly shorter than DATAPLANE_RESERVATION_HOLD_WINDOW (%s); a provider call must end inside the hold it was admitted under",

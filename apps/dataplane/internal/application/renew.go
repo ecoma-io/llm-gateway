@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync/atomic"
 	"time"
+
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/executors"
 )
 
 // The routing stage's lease renewal: the thing that keeps a live hold from
@@ -56,20 +58,27 @@ type ExecutionConfig struct {
 
 // executionContext wraps one executor call's context: the call's own deadline
 // on top of the walk's context, and the renewal goroutine whose life is
-// exactly the call's. The returned stop ends the renewal and waits for it —
-// no renewal may race the ending the walk is about to write — and it must be
-// called, because the goroutine holds the call's cancel. It reports whether
-// the renewal ended the call itself: a renewal that found the hold gone from
-// the open set cancelled the context, and the walk owes that call the
-// abandoned ending, not a disposition.
+// exactly the call's. The leaseDeadline argument is the walk's chain — the
+// last expiry a renewer of this walk wrote, the admission's stamp for the
+// first call — and the returned stop ends the renewal, waits for it, and
+// reports both of the walk's facts: whether the renewal ended the call (a
+// renewal that found the hold gone from the open set cancelled the context,
+// and the walk owes that call the abandoned ending, not a disposition), and
+// the deadline the renewer last wrote, which is the next candidate's chain
+// seed. The stop must be called on the call's every exit — it holds the
+// call's cancel, and a renewer left running would renew a hold nobody will
+// ever settle or release.
 //
 // The renewal's deadline chain never reads this process's clock for expiry:
-// the first renewal extends the lease to the admission-stamped expiry plus
-// the TTL, and every later one extends the previous deadline by the TTL. The
-// chain is therefore monotone by construction — a renewal can never write an
-// earlier expiry than the one before it — and clock skew between this
-// process and the store's stamp never enters the arithmetic, because the
-// store's own stamp is the only instant the chain starts from.
+// the first renewal extends the lease to the chain's seed plus the TTL, and
+// every later one extends the previous deadline by the TTL. The chain is
+// therefore monotone by construction — a renewal can never write an earlier
+// expiry than the one before it, and a fall-through to the next candidate
+// continues from where the last call's renewer left off instead of restarting
+// from the admission stamp, which a long first call would already have left
+// behind — and clock skew between this process and the store's stamp never
+// enters the arithmetic, because the store's own stamp is the only instant
+// the chain starts from.
 //
 // A renewal that reports the hold no longer open — closed by a concurrent
 // settlement, or swept — cancels the call's context at once: the provider
@@ -78,13 +87,13 @@ type ExecutionConfig struct {
 // not that: the deadline on the reservation row is whatever the last
 // successful renewal wrote, the next tick re-asks, and an outage shorter
 // than the remaining hold window survives.
-func (r *ChatRouting) executionContext(ctx context.Context, admitted *Admission) (context.Context, func() bool) {
+func (r *ChatRouting) executionContext(ctx context.Context, admitted *Admission, leaseDeadline time.Time) (context.Context, func() (bool, time.Time)) {
 	callCtx, cancel := context.WithDeadline(ctx, time.Now().UTC().Add(r.execution.MaxDuration))
 	stopRenewing := make(chan struct{})
 	doneRenewing := make(chan struct{})
 	var lost atomic.Bool
 
-	deadline := admitted.LeaseExpiresAt.Add(r.execution.LeaseTTL)
+	deadline := leaseDeadline.Add(r.execution.LeaseTTL)
 	go func() {
 		defer close(doneRenewing)
 		ticker := time.NewTicker(r.execution.LeaseTTL / 3)
@@ -110,12 +119,31 @@ func (r *ChatRouting) executionContext(ctx context.Context, admitted *Admission)
 		}
 	}()
 
-	return callCtx, func() bool {
+	return callCtx, func() (bool, time.Time) {
 		close(stopRenewing)
 		<-doneRenewing
 		cancel()
-		return lost.Load()
+		// Reading deadline here is race-free: the goroutine has finished —
+		// doneRenewing's close is the handoff — so no renewal can be
+		// writing it while the walk carries it to the next candidate.
+		return lost.Load(), deadline
 	}
+}
+
+// executeWithRenewal pairs the renewer's stop with the call's every exit,
+// panics included. An adapter panic does not end the process — the transport's
+// handler recovers it — but it would end this call's straight-line flow, and
+// a renewer whose stop never ran would keep renewing the hold forever: a
+// goroutine leak, a reservation that never leaves the open set, and a
+// permanent defeat of the sweep. The deferred stop runs on the panic's way
+// out, so the pairing holds on the paths the walk cannot name.
+func (r *ChatRouting) executeWithRenewal(ctx context.Context, admitted *Admission, leaseDeadline *time.Time, executor executors.Executor, spec executors.AttemptSpec, reply Reply) (result executors.Result, renewalLost bool) {
+	callCtx, stop := r.executionContext(ctx, admitted, *leaseDeadline)
+	defer func() {
+		renewalLost, *leaseDeadline = stop()
+	}()
+	result = executor.Execute(callCtx, spec, reply)
+	return
 }
 
 // renewLeaseOnce runs one renewal as its own short unit: detached from the

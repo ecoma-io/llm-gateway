@@ -308,13 +308,18 @@ func bind(ctx context.Context, cfg config.Config, pool *sql.DB) ([]service, erro
 	)
 
 	// The executor snapshot: one whole read of the backend catalog, resolved
-	// into frozen executors, before any listener serves. A snapshot that
-	// cannot be read fails the boot — a runtime that reported ready with no
-	// idea which backends it could call would be serving readiness for
-	// nothing — and the refresher keeps it current afterwards, the last good
-	// snapshot standing on a failed read.
+	// into frozen executors, before any listener serves. The read carries the
+	// same bound the pool open does — a database that cannot answer one small
+	// read inside the boot budget is one an orchestrator should restart on,
+	// not one this process waits inside. A snapshot that cannot be read fails
+	// the boot — a runtime that reported ready with no idea which backends it
+	// could call would be serving readiness for nothing — and the refresher
+	// keeps it current afterwards, the last good snapshot standing on a failed
+	// read.
 	backendRepo := postgres.NewBackends(catalogStore)
-	rows, err := backendRepo.List(ctx)
+	listCtx, cancelList := context.WithTimeout(ctx, postgresOpenTimeout)
+	rows, err := backendRepo.List(listCtx)
+	cancelList()
 	if err != nil {
 		return nil, fmt.Errorf("executor registry: %w", err)
 	}
@@ -368,10 +373,12 @@ func bind(ctx context.Context, cfg config.Config, pool *sql.DB) ([]service, erro
 
 	// The refresher rides the process's signal context from here on and
 	// stops when the process stops; the registry needs no close, a snapshot
-	// being data rather than a resource. It starts beside the first listener
-	// it serves — a bind that still fails past this point fails the process,
-	// and the goroutine dies with it.
-	go refreshExecutors(ctx, backendRepo, registry, cfg)
+	// being data rather than a resource. It is seeded with the boot
+	// snapshot's signature, so its first comparison runs against what is
+	// already serving rather than against nothing. It starts beside the first
+	// listener it serves — a bind that still fails past this point fails the
+	// process, and the goroutine dies with it.
+	go refreshExecutors(ctx, backendRepo, registry, cfg, snapshotSignature(rows))
 
 	if cfg.ManagementAddr == "" {
 		return services, nil
@@ -466,8 +473,12 @@ func newServer(handler stdhttp.Handler, cfg config.Config) *stdhttp.Server {
 // The database pool is closed when run returns, which orders it correctly on
 // every path: after the servers have drained on the stop path — and after the
 // overrun tail, which is exactly what the tail is for — so no request still
-// in flight loses its database mid-query, and immediately on the
-// listener-failed path, where nothing is being served at all. It arrives as
+// in flight loses its database mid-query. On the listener-failed path the
+// close is immediate, and that is the fail-fast policy named plainly: one
+// listener dying on its own ends the process, and the other listener's
+// in-flight walks lose their database mid-flight — the ending a walk cannot
+// write strands its hold until the hold window expires, because the reaper
+// that would reclaim it early is not wired yet (debt #80). It arrives as
 // io.Closer because closing is the whole of what run does with it. A close
 // that fails is reported rather than buried: it is joined onto whatever run
 // is already returning, so the process exits non-zero even when the drain
@@ -499,11 +510,16 @@ func run(ctx context.Context, stop context.CancelFunc, services []service, shutd
 		var overran bool
 		serveErr, overran = shutdown(services, shutdownTimeout)
 		if overran {
-			// The tail is bounded and one-shot: long enough for the endings
-			// of the walks the force-close interrupted to write their
-			// releases and settlements, short enough that an operator
-			// waiting on the process sees it leave. It is not interruptible
-			// — granted once, on the way out.
+			// The sleep below is the tail: bounded, and granted once on the
+			// way out — an operator's second signal does not wait for it,
+			// because stop() has already restored the default handling and
+			// the next signal kills the process outright. What the tail
+			// actually protects is the endings already writing: the endings'
+			// queries are started against the pool, and pool.Close below
+			// waits for started queries rather than severing them, so an
+			// ending that began inside the tail finishes; one that never
+			// started strands its hold until the hold window expires (the
+			// reaper that would reclaim it early is still debt #80).
 			log.Printf("dataplane drain overran %s with requests in flight; closing their sockets and giving the in-flight endings a %s tail before exit", shutdownTimeout, drainTail)
 			time.Sleep(drainTail)
 		}

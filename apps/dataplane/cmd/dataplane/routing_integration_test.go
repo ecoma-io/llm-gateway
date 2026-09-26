@@ -325,6 +325,10 @@ func TestIntegrationRoutingServesThroughARegistryBuiltFromTheCatalog(t *testing.
 			return
 		}
 		sawModel.Store(translated["model"])
+		// The raw value is stored, not a coerced one: an absent key decodes
+		// as untyped nil, and the assertion below reads the difference
+		// between "false" and "not stated" — the stream switch is one of the
+		// two fields the gateway owns on the wire, so it must be stated.
 		sawStream.Store(translated["stream"])
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(providerAnswer)
@@ -379,8 +383,8 @@ VALUES ($1, 'openai-compatible', $2, $3, 'active', transaction_timestamp(), tran
 	if model, _ := sawModel.Load().(string); model != providerModel {
 		t.Errorf("the provider was asked for model %v, want the candidate's provider model %s", model, providerModel)
 	}
-	if stream, _ := sawStream.Load().(bool); stream {
-		t.Error("the translated request asked to stream, want the gateway's own switch at the body's preference")
+	if stream, ok := sawStream.Load().(bool); !ok || stream {
+		t.Errorf("the translated request carried stream = %v (stated: %t), want the gateway's own switch, stated and false", sawStream.Load(), ok)
 	}
 	if !reply.committed || string(reply.buf) != string(providerAnswer) {
 		t.Errorf("reply = committed:%t body:%q, want the provider's answer delivered verbatim and committed", reply.committed, reply.buf)

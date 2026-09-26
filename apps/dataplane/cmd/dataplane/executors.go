@@ -24,6 +24,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -121,6 +122,9 @@ func buildExecutors(rows []catalog.Backend, cfg config.Config) map[catalog.Backe
 // the call's context. A header timeout here would be a second, smaller clock
 // whose expiry the vocabulary would read as a stalled provider.
 func resolveTarget(row catalog.Backend, cfg config.Config) (openaicompatible.Target, error) {
+	if err := validateEndpoint(row.Endpoint); err != nil {
+		return openaicompatible.Target{}, err
+	}
 	dial, err := resolveDial(row.EgressPolicyRef, cfg)
 	if err != nil {
 		return openaicompatible.Target{}, err
@@ -139,6 +143,23 @@ func resolveTarget(row catalog.Backend, cfg config.Config) (openaicompatible.Tar
 		Dial:          dial,
 		HeaderTimeout: 0, // see above: the call's context carries the one budget
 	}, nil
+}
+
+// validateEndpoint applies the endpoint rule the adapter enforces by panic: a
+// usable provider URL names http or https, carries a host, and carries no
+// userinfo. The catalog's schema CHECK accepts a wider grammar — any
+// `https?://` prefix — so a row the store happily holds can still fail here,
+// and the rule lives in both places on purpose: the adapter's check is the
+// contract's backstop for every builder that ever exists, while this one is
+// the reading that turns a schema-legal row the build cannot call into a
+// skip-and-log — the snapshot's law for an unresolvable row — instead of a
+// panic in the goroutine that builds the snapshot.
+func validateEndpoint(endpoint string) error {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" || parsed.User != nil {
+		return fmt.Errorf("endpoint %q is not a usable provider URL (scheme, host, no userinfo)", endpoint)
+	}
+	return nil
 }
 
 // resolveCredential turns a backend row's credential reference into the
@@ -233,32 +254,47 @@ func snapshotSignature(rows []catalog.Backend) string {
 
 // refreshExecutors keeps the registry's snapshot current for the life of the
 // context it is given: one whole read of the backend catalog per interval, a
-// swap only when the catalog actually changed. A read that fails is logged
-// and survived — the last good snapshot keeps serving. The loop exits when
-// the context does, which is the process stopping; the registry needs no
-// close, because a snapshot is data, not a resource.
-func refreshExecutors(ctx context.Context, backends persistence.Backends, registry *executorRegistry, cfg config.Config) {
+// swap only when the catalog actually changed. The signature argument is the
+// boot snapshot's, so the first comparison runs against what is actually
+// serving — a first refresh over an unchanged catalog swaps nothing, and a
+// first refresh over a genuinely emptied catalog still performs the one swap
+// it owes. The loop exits when the context does, which is the process
+// stopping; the registry needs no close, because a snapshot is data, not a
+// resource.
+func refreshExecutors(ctx context.Context, backends persistence.Backends, registry *executorRegistry, cfg config.Config, signature string) {
 	ticker := time.NewTicker(cfg.ExecutionRegistryRefresh)
 	defer ticker.Stop()
-	signature := ""
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			signature = refreshOnce(ctx, backends, registry, cfg, signature)
 		}
-		rows, err := backends.List(ctx)
-		if err != nil {
-			log.Printf("dataplane executor registry: refresh read failed, the last good snapshot keeps serving: %v", err)
-			continue
-		}
-		if next := snapshotSignature(rows); next == signature {
-			continue
-		} else {
-			signature = next
-		}
-		entries := buildExecutors(rows, cfg)
-		registry.store(entries)
-		log.Printf("dataplane executor registry: snapshot refreshed, %d callable backend(s) of %d row(s)", len(entries), len(rows))
 	}
+}
+
+// refreshOnce is one tick's whole work: one bounded read, one swap when the
+// rows changed, and the signature the next tick compares against — the last
+// good one when the read failed, the given one when the rows read the same,
+// the new one when a snapshot was built. The read carries its own budget of
+// one refresh interval, so a database that cannot answer cannot stack reads
+// or hold the loop past its own cadence.
+func refreshOnce(ctx context.Context, backends persistence.Backends, registry *executorRegistry, cfg config.Config, signature string) string {
+	readCtx, cancel := context.WithTimeout(ctx, cfg.ExecutionRegistryRefresh)
+	defer cancel()
+	rows, err := backends.List(readCtx)
+	if err != nil {
+		log.Printf("dataplane executor registry: refresh read failed, the last good snapshot keeps serving: %v", err)
+		return signature
+	}
+	if next := snapshotSignature(rows); next == signature {
+		return signature
+	} else {
+		signature = next
+	}
+	entries := buildExecutors(rows, cfg)
+	registry.store(entries)
+	log.Printf("dataplane executor registry: snapshot refreshed, %d callable backend(s) of %d row(s)", len(entries), len(rows))
+	return signature
 }
