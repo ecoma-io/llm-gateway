@@ -15,6 +15,7 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/execution"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/identity"
 	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/domain/projection"
+	"github.com/ecoma-io/llm-gateway/apps/dataplane/internal/ports/outbound/persistence"
 )
 
 // The admission tests. Every one of them runs the real use case over the one
@@ -70,7 +71,9 @@ func statePtr(state string) *string { return &state }
 // admissionFixture builds the smallest world that admits: one verified key
 // with its active account, one alias, one price snapshot, one eligible grant.
 // The prices are minor units per 1M tokens, so the hold a default body draws
-// is ceil((5·1_000_000 + 16·2_000_000) / 1_000_000) = 37 minor units.
+// is ceil((71·1_000_000 + 16·2_000_000) / 1_000_000) = 103 minor units — 71
+// being the whole body's byte length, the canonical v1 input count, not the
+// content's 5.
 func admissionFixture(t *testing.T) (*ChatAdmission, *admissionWorld) {
 	t.Helper()
 	world := newAdmissionWorld()
@@ -589,7 +592,7 @@ func TestAdmissionHandsAnAdmittedRequestToTheRoutingStage(t *testing.T) {
 	if outcome.Kind != OutcomeAdmitted || outcome.Admitted == nil {
 		t.Fatalf("outcome = %s, want admitted with a payload", outcome.Kind)
 	}
-	if outcome.Admitted.Alias != "test-model" || outcome.Admitted.InputTokens != 5 {
+	if outcome.Admitted.Alias != "test-model" || outcome.Admitted.InputTokens != 71 {
 		t.Fatalf("the admission payload lost its alias or its input count")
 	}
 
@@ -597,11 +600,11 @@ func TestAdmissionHandsAnAdmittedRequestToTheRoutingStage(t *testing.T) {
 		"begin", "ledger.drawdown", "request.insert", "reservation.insert", "intake.insert", "commit",
 	})
 
-	// The hold: drawn at 37, still open — no ending has been stated, and
+	// The hold: drawn at 103, still open — no ending has been stated, and
 	// stating one is the routing stage's job now.
 	reservation := admissionReservationRow(t, world)
-	if reservation.ReservedAmount != 37 {
-		t.Fatalf("the hold = %d, want 37", reservation.ReservedAmount)
+	if reservation.ReservedAmount != 103 {
+		t.Fatalf("the hold = %d, want 103", reservation.ReservedAmount)
 	}
 	if reservation.State != accounting.StateOpen {
 		t.Fatalf("the hold is %s, want open — admission writes no ending", reservation.State)
@@ -616,8 +619,8 @@ func TestAdmissionHandsAnAdmittedRequestToTheRoutingStage(t *testing.T) {
 		t.Fatalf("lease owner = %q, want the configured owner", reservation.LeaseOwner)
 	}
 	if len(reservation.Allocations) != 1 || reservation.Allocations[0].FundingBucketID != "bucket-1" ||
-		reservation.Allocations[0].Amount != 37 || reservation.Allocations[0].Ordinal != 1 {
-		t.Fatalf("the hold's split does not name bucket-1 for all 37 at ordinal 1")
+		reservation.Allocations[0].Amount != 103 || reservation.Allocations[0].Ordinal != 1 {
+		t.Fatalf("the hold's split does not name bucket-1 for all 103 at ordinal 1")
 	}
 
 	// The request row: born executing, carrying the price basis and the
@@ -626,7 +629,7 @@ func TestAdmissionHandsAnAdmittedRequestToTheRoutingStage(t *testing.T) {
 	if row.Status != execution.StatusExecuting {
 		t.Fatalf("the request is %s, want executing", row.Status)
 	}
-	if row.Alias != "test-model" || row.InputTokens != 5 || row.MaxOutputTokens != 16 {
+	if row.Alias != "test-model" || row.InputTokens != 71 || row.MaxOutputTokens != 16 {
 		t.Fatalf("the request row's bounds drifted from the body and the alias")
 	}
 	if row.Price.RevisionID != "rev-1" {
@@ -648,8 +651,29 @@ func TestAdmissionHandsAnAdmittedRequestToTheRoutingStage(t *testing.T) {
 	if outcome.Admitted.ReservationID != reservation.ID || len(outcome.Admitted.Legs) != 1 {
 		t.Fatalf("the admission payload does not name the hold it opened")
 	}
-	if outcome.Admitted.Price.RevisionID != "rev-1" || outcome.Admitted.Hold != 37 {
+	if outcome.Admitted.Price.RevisionID != "rev-1" || outcome.Admitted.Hold != 103 {
 		t.Fatalf("the admission payload's pricing drifted from the unit's decision")
+	}
+}
+
+// TestAdmissionAdmitsContentThatCarriesNoBytes pins the refusal boundary's
+// move to the message list: the emptiness that refuses a body is a
+// conversation with no messages, not content with no bytes. An empty content
+// string is a message the API contract allows, the body it travels in still
+// prices a whole-body hold, and no rejection pair is written for it.
+func TestAdmissionAdmitsContentThatCarriesNoBytes(t *testing.T) {
+	useCase, _ := admissionFixture(t)
+	body := []byte(`{"model":"test-model","max_tokens":16,"messages":[{"content":""}]}`)
+
+	outcome, err := useCase.Serve(context.Background(), admissionInput(body))
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if outcome.Kind != OutcomeAdmitted || outcome.Admitted == nil {
+		t.Fatalf("outcome = %s, want admitted — an empty message list refuses a body, empty content does not", outcome.Kind)
+	}
+	if outcome.Admitted.InputTokens != len(body) {
+		t.Fatalf("input tokens = %d, want the body's %d bytes — the hold prices the whole body", outcome.Admitted.InputTokens, len(body))
 	}
 }
 
@@ -792,12 +816,6 @@ func TestAdmissionRefusalsInsideTheUnitWriteThePairAndCommit(t *testing.T) {
 			wantDetail: DetailNone,
 		},
 		{
-			name:       "content that carries no bytes",
-			body:       []byte(`{"model":"test-model","max_tokens":16,"messages":[{"content":""}]}`),
-			wantReason: execution.RejectedInvalidRequest,
-			wantDetail: DetailNone,
-		},
-		{
 			name:       "a hold the arithmetic refuses",
 			body:       admissionBody("test-model"),
 			setup:      hugePrice,
@@ -921,7 +939,7 @@ func TestAdmissionRefusesTheHoldBeforeTheWaterfall(t *testing.T) {
 // hold, and a hold AT the cap is admissible — the boundary is inclusive.
 func TestAdmissionAcceptsAHoldAtExactlyTheCap(t *testing.T) {
 	useCase, world := admissionFixture(t)
-	world.seedAlias("test-model", 4096, 37) // the default body draws exactly 37
+	world.seedAlias("test-model", 4096, 103) // the default body draws exactly 103
 
 	outcome, err := useCase.Serve(context.Background(), admissionInput(admissionBody("test-model")))
 	if err != nil {
@@ -1120,7 +1138,11 @@ func TestAdmissionDuplicateHoldIsABugNotAnAnswer(t *testing.T) {
 // TestIsRetryableStoreFailure is the classifier's own table: the engine's
 // contention classes and the connection exceptions retry, everything else
 // fails on its merits, and a caller's cancelled context is never anyone's
-// retry.
+// retry. The two named sentinels sit beside the sqlstate rows on purpose:
+// the commit-ambiguity sentinel is a no-sqlstate failure whose whole meaning
+// is that the caller must retry and let the CAS re-judge — the one shape the
+// bare no-sqlstate row refuses — and the already-appended sentinel retries
+// so the ladder's next attempt reads the twin row as the done thing it is.
 func TestIsRetryableStoreFailure(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -1131,6 +1153,9 @@ func TestIsRetryableStoreFailure(t *testing.T) {
 		{name: "deadlock", err: fakePGError{code: "40P01"}, want: true},
 		{name: "connection exception", err: fakePGError{code: "08006"}, want: true},
 		{name: "connection exception, wrapped", err: fmt.Errorf("application: admit: %w", fakePGError{code: "08003"}), want: true},
+		{name: "the commit's outcome is unknown", err: persistence.ErrCommitOutcomeUnknown, want: true},
+		{name: "the commit's outcome is unknown, wrapped deep", err: fmt.Errorf("application: settle: append the settlement: %w", persistence.ErrCommitOutcomeUnknown), want: true},
+		{name: "the attempt is already appended", err: persistence.ErrAttemptAlreadyAppended, want: true},
 		{name: "unique violation", err: fakePGError{code: "23505"}},
 		{name: "check violation", err: fakePGError{code: "23514"}},
 		{name: "a failure with no sqlstate at all", err: errors.New("fake: the socket vanished")},
@@ -1394,13 +1419,15 @@ func newAdmissionWithHorizons(t *testing.T, hold, lease time.Duration) *ChatAdmi
 }
 
 // ---------------------------------------------------------------------------
-// the interim tokenizer seam
+// the canonical v1 count, at admission
 // ---------------------------------------------------------------------------
 
-// TestParseCountsContentInBytes: the input count prices the hold, and the
-// seam it comes from counts bytes, not runes — a multibyte message holds
-// against its real wire size.
-func TestParseCountsContentInBytes(t *testing.T) {
+// TestParseCountsTheWholeBodyInBytes: the input count prices the hold, and
+// the canonical v1 rule counts the WHOLE admitted body in bytes — not runes,
+// and not the message strings alone. A body whose envelope dwarfs its
+// content holds against the request the provider will actually tokenize, and
+// a multibyte script holds against its real wire size.
+func TestParseCountsTheWholeBodyInBytes(t *testing.T) {
 	raw := []byte(`{"model":"test-model","max_tokens":16,"messages":[` +
 		`{"content":"hello"},` +
 		`{"content":"你好世界"},` +
@@ -1411,9 +1438,39 @@ func TestParseCountsContentInBytes(t *testing.T) {
 	if refusal != nil {
 		t.Fatalf("a well-formed body refused: %s", refusal.reason)
 	}
-	// "hello" is 5 bytes; "你好世界" is 12 bytes (4 runes × 3), not 4; the
-	// content-less message contributes nothing, and so does the empty one.
-	if parsed.inputTokens != 17 {
-		t.Fatalf("input tokens = %d, want 17 — the count is bytes, not runes", parsed.inputTokens)
+	// The count is the body's own byte length. The content strings inside it
+	// are only 17 of those bytes — "hello" is 5, "你好世界" is 12 (4 runes ×
+	// 3), not 4 — so a count that landed at or below 17 would be reading the
+	// message strings alone, the exact undercount the whole-body rule
+	// replaced, and a rune count would halve the multibyte part outright.
+	if parsed.inputTokens != int64(len(raw)) {
+		t.Fatalf("input tokens = %d, want the body's %d bytes — the count is the whole body, in bytes", parsed.inputTokens, len(raw))
+	}
+	if parsed.inputTokens <= 17 {
+		t.Fatalf("input tokens = %d, at or below the content strings' 17 bytes; the envelope must be counted", parsed.inputTokens)
+	}
+}
+
+// TestParseCountsTheToolsTheProviderBills pins the scope's reason: tools and
+// their schemas are input a provider tokenizes and bills, and the body that
+// carries them must price a bigger hold than the same conversation without
+// them. The count that read only the messages would size both holds alike
+// and under-cover the second.
+func TestParseCountsTheToolsTheProviderBills(t *testing.T) {
+	plain := []byte(`{"model":"test-model","max_tokens":16,"messages":[{"content":"hi"}]}`)
+	withTools := []byte(`{"model":"test-model","max_tokens":16,"messages":[{"content":"hi"}],` +
+		`"tools":[{"type":"function","function":{"name":"search","description":"search the web",` +
+		`"parameters":{"type":"object","properties":{"query":{"type":"string"}}}}}]}`)
+
+	bareParsed, refusal := parseChatRequest(plain)
+	if refusal != nil {
+		t.Fatalf("the plain body refused: %s", refusal.reason)
+	}
+	tooledParsed, refusal := parseChatRequest(withTools)
+	if refusal != nil {
+		t.Fatalf("the tools-bearing body refused: %s", refusal.reason)
+	}
+	if tooledParsed.inputTokens <= bareParsed.inputTokens {
+		t.Fatalf("input tokens = %d with tools and %d without; the envelope the provider bills must be counted", tooledParsed.inputTokens, bareParsed.inputTokens)
 	}
 }

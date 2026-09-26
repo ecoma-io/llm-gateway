@@ -229,14 +229,14 @@ func TestRoutingFallsThroughToTheNextCandidateAndSettles(t *testing.T) {
 	if len(world.returned) != 0 {
 		t.Fatalf("the settlement returned %d legs, want none — a settle keeps its drawdown", len(world.returned))
 	}
-	if got := world.available("bucket-1"); got != 10_000-37 {
-		t.Fatalf("the grant holds %d, want 9963 — the hold became cost", got)
+	if got := world.available("bucket-1"); got != 10_000-103 {
+		t.Fatalf("the grant holds %d, want 9897 — the hold became cost", got)
 	}
 
 	// The fact: the provider reported 101 input and 55 output — both beyond
-	// the counts the hold was derived from (5 input, 16 output basis) — so
+	// the counts the hold was derived from (71 input, 16 output basis) — so
 	// both figures clamp to the reservation's own and the capture attests the
-	// floor: 5·1 + 16·2 = 37, the hold to the token. The provider's claims
+	// floor: 71·1 + 16·2 = 103, the hold to the token. The provider's claims
 	// are not erased by the clamping; they stand on the attempt row as the
 	// telemetry they are.
 	fact := world.facts[len(world.facts)-1]
@@ -245,16 +245,16 @@ func TestRoutingFallsThroughToTheNextCandidateAndSettles(t *testing.T) {
 		t.Fatalf("the settled fact reads %s/%s on %s, want a reservation-floor settlement on the committed attempt",
 			fact.Kind, fact.CaptureMethod, fact.CommittedAttemptID)
 	}
-	if fact.ProviderInputTokens == nil || *fact.ProviderInputTokens != 5 ||
+	if fact.ProviderInputTokens == nil || *fact.ProviderInputTokens != 71 ||
 		fact.ProviderOutputTokens == nil || *fact.ProviderOutputTokens != 16 {
-		t.Fatalf("the settled fact's provider counts drifted: %v/%v, want the hold's own counts (5, 16)",
+		t.Fatalf("the settled fact's provider counts drifted: %v/%v, want the hold's own counts (71, 16)",
 			fact.ProviderInputTokens, fact.ProviderOutputTokens)
 	}
 	if fact.DeliveryTokens == nil || *fact.DeliveryTokens != 15 {
 		t.Fatalf("the settled fact's delivery = %v, want the 15 bytes the sink recorded", fact.DeliveryTokens)
 	}
-	if fact.SettledAmount == nil || *fact.SettledAmount != 37 {
-		t.Fatalf("the settled amount = %v, want 37 — the hold, which is what the clamped figures re-derive", fact.SettledAmount)
+	if fact.SettledAmount == nil || *fact.SettledAmount != 103 {
+		t.Fatalf("the settled amount = %v, want 103 — the hold, which is what the clamped figures re-derive", fact.SettledAmount)
 	}
 
 	// The intake closed succeeded; the reply closed the answer it delivered.
@@ -427,27 +427,29 @@ func TestRoutingSettlesAMidStreamFailure(t *testing.T) {
 			row.Status, row.FailureReason, row.CommittedAttemptID)
 	}
 
-	// The provider reported 77 output — beyond the 16-token basis the hold
-	// was sized with — so the output figure clamps to the basis and, no input
-	// figure arriving, the settled pair is the reservation's own: capture
-	// reservation_floor, amount 5·1 + 16·2 = 37, the hold exactly. The
-	// 13 delivered bytes ride beside the settlement as the delivery figure,
-	// recorded and never priced.
+	// The provider reported 77 output — about a stream it never finished —
+	// and that report is the attempt row's telemetry, never the bill. The
+	// delivery boundary prices the stream's output at the 13 delivered bytes
+	// and nothing else; no input figure arrived, so input is the count
+	// admission priced the hold from. Capture gateway_observed — the priced
+	// pair is the gateway's own — and the amount re-derives:
+	// 71·1 + 13·2 = 97, under the 103 hold. The 13 delivered bytes ride
+	// beside the settlement as the delivery figure, recorded and never priced.
 	fact := world.facts[len(world.facts)-1]
-	if fact.Kind != accounting.KindSettled || fact.CaptureMethod != accounting.CaptureReservationFloor {
-		t.Fatalf("the settled fact reads %s/%s, want a reservation-floor settlement", fact.Kind, fact.CaptureMethod)
+	if fact.Kind != accounting.KindSettled || fact.CaptureMethod != accounting.CaptureGatewayObserved {
+		t.Fatalf("the settled fact reads %s/%s, want a gateway-observed settlement", fact.Kind, fact.CaptureMethod)
 	}
-	if fact.ProviderInputTokens == nil || *fact.ProviderInputTokens != 5 {
+	if fact.ProviderInputTokens == nil || *fact.ProviderInputTokens != 71 {
 		t.Fatalf("the settled fact's input = %v, want the count admission priced the hold from", fact.ProviderInputTokens)
 	}
-	if fact.ProviderOutputTokens == nil || *fact.ProviderOutputTokens != 16 {
-		t.Fatalf("the settled fact's output = %v, want the basis the hold was sized with", fact.ProviderOutputTokens)
+	if fact.ProviderOutputTokens == nil || *fact.ProviderOutputTokens != 13 {
+		t.Fatalf("the settled fact's output = %v, want the 13 delivered bytes — a failed stream bills what reached the client, never the basis", fact.ProviderOutputTokens)
 	}
 	if fact.DeliveryTokens == nil || *fact.DeliveryTokens != 13 {
 		t.Fatalf("the settled fact's delivery = %v, want the 13 bytes that left", fact.DeliveryTokens)
 	}
-	if fact.SettledAmount == nil || *fact.SettledAmount != 37 {
-		t.Fatalf("the settled amount = %v, want 37 — the hold, which is what the clamped figures re-derive", fact.SettledAmount)
+	if fact.SettledAmount == nil || *fact.SettledAmount != 97 {
+		t.Fatalf("the settled amount = %v, want 97 — what the delivered pair re-derives, under the 103 hold", fact.SettledAmount)
 	}
 
 	if intake := admissionIntakeRow(t, world, admissionAccount, "replay-key-1"); intake.FinalStatus == nil ||
@@ -700,10 +702,12 @@ func TestRoutingDoesNotSettleASuccessTheSinkNeverCommitted(t *testing.T) {
 
 // TestRoutingFailsTheRequestWhenTheCatalogCannotAnswer: a backend read that
 // FAILED is not a catalog with nothing in it — answering it as no_candidate
-// would write a permanent rejection over a transient fault, and the honest
-// ending for a walk that never reached a decision is the error: the request
-// stays executing for the reaper, exactly as an admission that could not
-// read its catalog leaves it. Only the admission's unit is in the story.
+// would write a permanent rejection over a transient fault. The honest
+// ending is the error to the caller, and the walk still states its own
+// ending on the way out: the hold it holds is released as gateway_abandoned,
+// so no client reservation waits on the reaper for a fault the walk watched
+// happen. The caller's error and the gateway's ending are different
+// sentences about the same fault, and both get said.
 func TestRoutingFailsTheRequestWhenTheCatalogCannotAnswer(t *testing.T) {
 	routing, world, _, in := routingFixture(t)
 	world.seedCandidates("test-model",
@@ -724,15 +728,16 @@ func TestRoutingFailsTheRequestWhenTheCatalogCannotAnswer(t *testing.T) {
 	}
 	wantEvents(t, world, []string{
 		"begin", "ledger.drawdown", "request.insert", "reservation.insert", "intake.insert", "commit",
+		"begin", "reservation.close", "ledger.return", "request.finalise", "intake.finalise", "fact.append", "commit",
 	})
-	if reservation := admissionReservationRow(t, world); reservation.State != accounting.StateOpen {
-		t.Fatalf("the hold is %s, want open — no ending was decided", reservation.State)
+	if reservation := admissionReservationRow(t, world); reservation.State != accounting.StateReleased {
+		t.Fatalf("the hold is %s, want released — the abandoned walk gave the hold back", reservation.State)
 	}
-	if row := admissionRequestRow(t, world); row.Status != execution.StatusExecuting {
-		t.Fatalf("the request is %s, want executing — the reaper's to reclaim", row.Status)
+	if row := admissionRequestRow(t, world); row.Status != execution.StatusFailed {
+		t.Fatalf("the request is %s, want failed — the walk's ending is stated even though the call never happened", row.Status)
 	}
-	if len(world.facts) != 0 {
-		t.Fatalf("the undecided walk appended %d facts, want none", len(world.facts))
+	if len(world.facts) != 1 || world.facts[0].Kind != accounting.KindReleased {
+		t.Fatalf("the feed holds %v, want the one released fact the abandoned walk stated", world.facts)
 	}
 }
 
@@ -834,8 +839,159 @@ func TestRoutingStrandsTheHoldWhenTheEndingExhaustsItsBudget(t *testing.T) {
 	if len(world.facts) != 0 {
 		t.Fatalf("the stranded ending appended a fact, want none")
 	}
-	if got := world.available("bucket-1"); got != 10_000-37 {
-		t.Fatalf("the grant holds %d, want 9963 — the drawdown committed and the hold is out", got)
+	if got := world.available("bucket-1"); got != 10_000-103 {
+		t.Fatalf("the grant holds %d, want 9897 — the drawdown committed and the hold is out", got)
+	}
+}
+
+// TestRoutingStrandsTheHoldWhenTheSettleLadderExhausts: a settle unit that
+// fails after commitment never falls through to a release — a release whose
+// compare-and-set then wins would publish "released, unused" over an answer
+// the client is already reading, and the feed's last word would be a
+// falsehood. The hold stands for the sweep instead: the walk fails as an
+// internal error, nothing is appended, and nothing is given back.
+func TestRoutingStrandsTheHoldWhenTheSettleLadderExhausts(t *testing.T) {
+	routing, world, _, in := routingFixture(t)
+	world.seedCandidates("test-model",
+		catalog.Candidate{ID: "cand-a", BackendID: "backend-a", ProviderModel: "model-a", Position: 1})
+	world.seedBackend("backend-a", catalog.BackendActive)
+	exec := &fakeExecutor{}
+	exec.act = func(sink executors.Sink) { _ = sink.Content([]byte(`{"answer":true}`)) }
+	exec.results = []executors.Result{okExec(20, 8)}
+	routing.registry = executors.NewRegistry(map[catalog.BackendID]executors.Executor{"backend-a": exec})
+	// The fault bites the ending's attempt insert — a step only the settle
+	// unit takes — for the whole ladder, while every step a release unit
+	// would take stays healthy: exactly the sequence where the old shape
+	// converted the exhaustion into a release.
+	world.attemptFailure = fakePGError{code: "40001"}
+	world.attemptFailures = 3
+
+	_, err := routing.Serve(context.Background(), in)
+	if err == nil {
+		t.Fatalf("Serve answered an ending whose settle ladder never landed, want the internal failure")
+	}
+	if closes := world.count("reservation.close"); closes != 3 {
+		t.Fatalf("the ending attempted %d closes, want the settle ladder's 3 and no release's fourth", closes)
+	}
+	if returns := world.count("ledger.return"); returns != 0 {
+		t.Fatalf("the stranded ending gave capacity back %d times, want none — a release never ran", returns)
+	}
+	if world.commitCount() != 1 {
+		t.Fatalf("the world committed %d units, want only admission's", world.commitCount())
+	}
+	if reservation := admissionReservationRow(t, world); reservation.State != accounting.StateOpen {
+		t.Fatalf("the hold is %s, want open — stranded, the reaper's to reclaim", reservation.State)
+	}
+	if row := admissionRequestRow(t, world); row.Status != execution.StatusExecuting {
+		t.Fatalf("the request is %s, want executing — no ending was ever stated", row.Status)
+	}
+	if intake := admissionIntakeRow(t, world, admissionAccount, "replay-key-1"); intake.FinalStatus != nil {
+		t.Fatalf("the replay record is terminal, want it still waiting on the stranded walk")
+	}
+	if len(world.facts) != 0 {
+		t.Fatalf("the stranded ending appended a fact, want none")
+	}
+}
+
+// TestRoutingSettleRefusesADuplicateSettlementFactAsABug: a second
+// settlement-relevant fact behind a CAS the unit owns is the feed's
+// invariants broken — the append refuses through the dedup unique's
+// sentinel, the unit rolls back whole, and the refusal is not retried,
+// because a retry cannot improve a broken invariant.
+func TestRoutingSettleRefusesADuplicateSettlementFactAsABug(t *testing.T) {
+	routing, world, _, in := routingFixture(t)
+	world.seedCandidates("test-model",
+		catalog.Candidate{ID: "cand-a", BackendID: "backend-a", ProviderModel: "model-a", Position: 1})
+	world.seedBackend("backend-a", catalog.BackendActive)
+	exec := &fakeExecutor{}
+	exec.act = func(sink executors.Sink) { _ = sink.Content([]byte(`{"answer":true}`)) }
+	exec.results = []executors.Result{okExec(20, 8)}
+	routing.registry = executors.NewRegistry(map[catalog.BackendID]executors.Executor{"backend-a": exec})
+	world.factDuplicate = true
+
+	if _, err := routing.Serve(context.Background(), in); err == nil {
+		t.Fatalf("Serve answered a settlement whose fact the dedup unique refused, want the internal failure")
+	}
+	if closes := world.count("reservation.close"); closes != 1 {
+		t.Fatalf("the ending attempted %d closes, want 1 — the refusal is a bug, not contention to retry", closes)
+	}
+	if world.rollbackCount() != 1 || world.commitCount() != 1 {
+		t.Fatalf("the ending committed %d and rolled back %d beyond admission's commit, want the ending rolled back whole", world.commitCount()-1, world.rollbackCount())
+	}
+	if reservation := admissionReservationRow(t, world); reservation.State != accounting.StateOpen {
+		t.Fatalf("the hold is %s, want open — the rolled-back unit left it standing", reservation.State)
+	}
+	if len(world.facts) != 0 {
+		t.Fatalf("the refused settlement left a fact behind, want none")
+	}
+}
+
+// TestRoutingObservesTheClose: every stated ending hands a wired observer
+// its structured record — the observability contract's fields, filled from
+// what the ending proved, and nothing on the shape that could carry a
+// prompt, a credential or a provider response. A nil observer is the
+// wired-nothing default, which is why every other test in this file runs
+// without one and passes.
+func TestRoutingObservesTheClose(t *testing.T) {
+	routing, world, _, in := routingFixture(t)
+	first, second := twoCandidateWorld(world)
+	first.results = []executors.Result{failExec(execution.ErrorRateLimited)}
+	second.act = func(sink executors.Sink) { _ = sink.Content([]byte(`{"answer":true}`)) }
+	second.results = []executors.Result{okExec(101, 55)}
+	routing.registry = executors.NewRegistry(map[catalog.BackendID]executors.Executor{
+		"backend-a": first,
+		"backend-b": second,
+	})
+	var observed []CloseObservation
+	routing.ObserveClose = func(o CloseObservation) { observed = append(observed, o) }
+
+	if _, err := routing.Serve(context.Background(), in); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("the walk observed %d closings, want the one settlement", len(observed))
+	}
+	o := observed[0]
+	committed := world.attempts[1]
+	fact := world.facts[len(world.facts)-1]
+	if o.FinalStatus != string(execution.StatusSucceeded) || !o.Committed || o.UsageState != CloseUsageClaimed {
+		t.Fatalf("the observation reads %s/%v/%s, want a committed, claimed success", o.FinalStatus, o.Committed, o.UsageState)
+	}
+	if o.RequestID != string(committed.RequestID) || o.AttemptID != string(committed.ID) {
+		t.Fatalf("the observation names %s/%s, want the committed walk's request and attempt", o.RequestID, o.AttemptID)
+	}
+	if o.UsageEventID != fact.AppendSeq {
+		t.Fatalf("the observation's event id = %d, want the settled fact's feed position %d", o.UsageEventID, fact.AppendSeq)
+	}
+	if o.Provider != "model-b" || o.Backend != "backend-b" || o.Candidate != 1 {
+		t.Fatalf("the observation's attribution reads %s/%s/%d, want the second candidate", o.Provider, o.Backend, o.Candidate)
+	}
+	if o.InputTokens == nil || *o.InputTokens != 71 || o.OutputTokens == nil || *o.OutputTokens != 16 || o.DeliveryTokens == nil || *o.DeliveryTokens != 15 {
+		t.Fatalf("the observation's counts read %v/%v/%v, want the clamped pair and the delivery", o.InputTokens, o.OutputTokens, o.DeliveryTokens)
+	}
+}
+
+// TestRoutingObservesTheRelease: the release's observation states an ending
+// that claimed nothing — no attempt named, commitment false, and the feed
+// position of the released fact.
+func TestRoutingObservesTheRelease(t *testing.T) {
+	routing, world, _, in := routeFixture(t) // the empty registry walks to no_candidate
+	var observed []CloseObservation
+	routing.ObserveClose = func(o CloseObservation) { observed = append(observed, o) }
+
+	if _, err := routing.Serve(context.Background(), in); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if len(observed) != 1 {
+		t.Fatalf("the walk observed %d closings, want the one release", len(observed))
+	}
+	o := observed[0]
+	fact := world.facts[len(world.facts)-1]
+	if o.FinalStatus != string(execution.StatusRejected) || o.Committed || o.UsageState != CloseUsageUnclaimed {
+		t.Fatalf("the observation reads %s/%v/%s, want an unclaimed, uncommitted rejection", o.FinalStatus, o.Committed, o.UsageState)
+	}
+	if o.AttemptID != "" || o.UsageEventID != fact.AppendSeq {
+		t.Fatalf("the release observation names attempt %q at event %d, want no attempt and the released fact's position", o.AttemptID, o.UsageEventID)
 	}
 }
 
@@ -962,33 +1118,57 @@ func clampedPtr(v int64) *int64 { return &v }
 // TestSettleBasisCases is the settlement arithmetic's whole table: what the
 // provider reported, against the counts the hold was derived from (5 input,
 // 16 output basis — the fixture's own), decides the settled pair and the
-// capture label that attests where each figure came from. Every case's pair
-// prices at or below the hold — the invariant the clamping exists to keep.
+// capture label that attests where each figure came from, under both arms of
+// the delivery boundary — the completed answer and the stream that failed
+// after commitment. Every case's pair prices at or below the hold — the
+// invariant the clamping exists to keep.
 func TestSettleBasisCases(t *testing.T) {
-	admitted := &Admission{InputTokens: 5, OutputBasis: 16, Hold: 37}
+	// The prices make the hold guard below bite: at a minor unit per token,
+	// Hold(5, 16, 1M, 2M) = 37, the hold the fixture carries, so every row's
+	// amount is a real number the guard actually compares — not a zero
+	// priced against a ceiling.
+	admitted := &Admission{
+		InputTokens: 5, OutputBasis: 16, Hold: 37,
+		Price: catalog.PriceSnapshot{InputUnitPrice: 1_000_000, OutputUnitPrice: 2_000_000},
+	}
 	delivered := []byte(`{"answer":true}`) // 15 bytes, the delivery figure on every row
 
 	cases := []struct {
 		name          string
+		streamFailed  bool
 		reportedInput *int64
 		reportedOut   *int64
 		wantCapture   accounting.CaptureMethod
 		wantInput     int64
 		wantOutput    int64
 	}{
-		{"both reported within the bounds", clampedPtr(4), clampedPtr(15), accounting.CaptureReported, 4, 15},
-		{"both reported at the bounds", clampedPtr(5), clampedPtr(16), accounting.CaptureReported, 5, 16},
-		{"output beyond the basis clamps to it", clampedPtr(4), clampedPtr(77), accounting.CaptureReservationFloor, 4, 16},
-		{"input beyond the count clamps to it", clampedPtr(9), clampedPtr(15), accounting.CaptureReservationFloor, 5, 15},
-		{"both beyond clamp both", clampedPtr(9), clampedPtr(77), accounting.CaptureReservationFloor, 5, 16},
-		{"output unreported falls to the basis", clampedPtr(4), nil, accounting.CaptureReservationFloor, 4, 16},
-		{"input unreported falls to the count", nil, clampedPtr(15), accounting.CaptureGatewayObserved, 5, 15},
-		{"nothing reported falls to the hold's pair", nil, nil, accounting.CaptureReservationFloor, 5, 16},
+		// The completed answer: the provider's report prices where it stands
+		// within the counts the hold priced, clamps where it does not, and the
+		// delivered tokens take over where no output report arrived — the
+		// gateway's own observation of work the client provably received,
+		// which is why the label is gateway_observed and not the floor.
+		{"completed: both reported within the bounds", false, clampedPtr(4), clampedPtr(15), accounting.CaptureReported, 4, 15},
+		{"completed: both reported at the bounds", false, clampedPtr(5), clampedPtr(16), accounting.CaptureReported, 5, 16},
+		{"completed: output beyond the basis clamps to it", false, clampedPtr(4), clampedPtr(77), accounting.CaptureReservationFloor, 4, 16},
+		{"completed: input beyond the count clamps to it", false, clampedPtr(9), clampedPtr(15), accounting.CaptureReservationFloor, 5, 15},
+		{"completed: both beyond clamp both", false, clampedPtr(9), clampedPtr(77), accounting.CaptureReservationFloor, 5, 16},
+		{"completed: output unreported falls to the delivered tokens", false, clampedPtr(4), nil, accounting.CaptureGatewayObserved, 4, 15},
+		{"completed: input unreported falls to the count", false, nil, clampedPtr(15), accounting.CaptureGatewayObserved, 5, 15},
+		{"completed: nothing reported prices the gateway's own pair", false, nil, nil, accounting.CaptureGatewayObserved, 5, 15},
+		// The stream that failed after commitment: the delivered tokens are
+		// the only output that can bill, whatever the provider counted about
+		// the stream it never finished, and the label never claims reported —
+		// the priced figures are not the provider's pair even when the
+		// provider named one.
+		{"failed: an output report as given is still the delivered tokens", true, clampedPtr(4), clampedPtr(9), accounting.CaptureGatewayObserved, 4, 15},
+		{"failed: an output report beyond the basis is still the delivered tokens", true, clampedPtr(4), clampedPtr(77), accounting.CaptureGatewayObserved, 4, 15},
+		{"failed: input beyond the count still clamps", true, clampedPtr(9), clampedPtr(9), accounting.CaptureReservationFloor, 5, 15},
+		{"failed: nothing reported prices the count and the delivery", true, nil, nil, accounting.CaptureGatewayObserved, 5, 15},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			usage := settleBasis(admitted, delivered, tc.reportedInput, tc.reportedOut)
+			usage := settleBasis(admitted, delivered, tc.reportedInput, tc.reportedOut, tc.streamFailed)
 			if usage.capture != tc.wantCapture {
 				t.Fatalf("capture = %s, want %s", usage.capture, tc.wantCapture)
 			}
@@ -1009,6 +1189,84 @@ func TestSettleBasisCases(t *testing.T) {
 				t.Fatalf("the settled amount = %d, above the hold %d — the bound the arithmetic exists to keep", amount, admitted.Hold)
 			}
 		})
+	}
+}
+
+// TestSettleBasisDeliveredBeyondTheBasis is the regime the first table's
+// fixture cannot reach: a delivered count the basis cannot cover. The clamp
+// binds, the reservation's own figure is what settles, and the capture
+// attests the floor — while the delivery column still carries the full count
+// the client provably received. Without the clamp these pairs price above
+// the hold: delivered bytes are wire bytes and the basis is the token
+// ceiling the hold was sized with, so the unclamped arms breached the
+// ending's first law in ordinary traffic.
+func TestSettleBasisDeliveredBeyondTheBasis(t *testing.T) {
+	admitted := &Admission{
+		InputTokens: 5, OutputBasis: 8, Hold: 21,
+		Price: catalog.PriceSnapshot{InputUnitPrice: 1_000_000, OutputUnitPrice: 2_000_000},
+	}
+	delivered := []byte(`{"answer":true}`) // 15 delivered bytes against an 8 basis
+
+	cases := []struct {
+		name         string
+		streamFailed bool
+		reportedIn   *int64
+		reportedOut  *int64
+		wantCapture  accounting.CaptureMethod
+		wantInput    int64
+		wantOutput   int64
+	}{
+		{"failed: the delivered bytes clamp to the basis", true, nil, nil, accounting.CaptureReservationFloor, 5, 8},
+		{"failed: clamped past a report that named less", true, nil, clampedPtr(3), accounting.CaptureReservationFloor, 5, 8},
+		{"completed: the unreported delivery clamps to the basis", false, nil, nil, accounting.CaptureReservationFloor, 5, 8},
+		{"completed: input unreported, output clamped", false, nil, clampedPtr(77), accounting.CaptureReservationFloor, 5, 8},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			usage := settleBasis(admitted, delivered, tc.reportedIn, tc.reportedOut, tc.streamFailed)
+			if usage.capture != tc.wantCapture {
+				t.Fatalf("capture = %s, want %s — the clamp that bound is the reservation's own figure settling", usage.capture, tc.wantCapture)
+			}
+			if usage.input == nil || *usage.input != tc.wantInput {
+				t.Fatalf("input = %v, want %d", usage.input, tc.wantInput)
+			}
+			if usage.output == nil || *usage.output != tc.wantOutput {
+				t.Fatalf("output = %v, want the %d basis the delivered count was clamped to", usage.output, tc.wantOutput)
+			}
+			if usage.delivery == nil || *usage.delivery != 15 {
+				t.Fatalf("delivery = %v, want the 15 bytes delivered — the clamp bounds the priced figure, never the recorded one", usage.delivery)
+			}
+			amount, err := settleAmount(usage, admitted.Price)
+			if err != nil {
+				t.Fatalf("settleAmount: %v", err)
+			}
+			if amount != admitted.Hold {
+				t.Fatalf("the settled amount = %d, want %d — the clamped pair prices exactly at the hold", amount, admitted.Hold)
+			}
+		})
+	}
+}
+
+// TestAStreamFailureWithNoDeliveryPricesARealZero pins the failed arm's nil
+// vs zero doctrine: a stream that died before a byte reached the client
+// prices its output at a present zero — the delivered tokens, of which there
+// were none — and never at the basis the hold reserved. The zero is a real
+// figure about real work (a prompt was read, nothing was answered), and nil
+// would claim nobody knows, which is false: the gateway watched every byte
+// that did not arrive.
+func TestAStreamFailureWithNoDeliveryPricesARealZero(t *testing.T) {
+	admitted := &Admission{InputTokens: 5, OutputBasis: 16, Hold: 37}
+
+	usage := settleBasis(admitted, nil, clampedPtr(4), clampedPtr(9), true)
+	if usage.output == nil || *usage.output != 0 {
+		t.Fatalf("output = %v, want a present zero — the delivery boundary prices what was delivered, and nothing was", usage.output)
+	}
+	if usage.capture != accounting.CaptureGatewayObserved {
+		t.Errorf("capture = %s, want gateway_observed — the zero is the gateway's own observation", usage.capture)
+	}
+	if usage.input == nil || *usage.input != 4 {
+		t.Errorf("input = %v, want the report's 4 — the delivery boundary does not touch input", usage.input)
 	}
 }
 
@@ -1033,7 +1291,7 @@ func TestRoutingSettleLosesTheCloseAndRecordsTheOrphanTail(t *testing.T) {
 	routing.registry = executors.NewRegistry(map[catalog.BackendID]executors.Executor{
 		"backend-a": &fakeExecutor{
 			act:     func(sink executors.Sink) { _ = sink.Content([]byte(`{"answer":true}`)) },
-			results: []executors.Result{okExec(9, 9)},
+			results: []executors.Result{okExec(999, 999)},
 		},
 	})
 
@@ -1145,6 +1403,15 @@ func TestRoutingSettleSkipsTheOrphanFactWhenTheEndingWasOwned(t *testing.T) {
 // way this test is meant to be read.
 func TestRoutingServesManyRequestsConcurrently(t *testing.T) {
 	routing, world, _, in := routingFixture(t)
+	// A hundred concurrent admissions each draw the whole 103 hold before any
+	// settlement returns its remainder, so the grant must cover the peak:
+	// 100 × 103 against 10 000 would starve the tail of the burst for a
+	// reason this test is not about. The subject is the walk's concurrency,
+	// not the waterfall's capacity. The fixture's bucket is replaced, not
+	// re-seeded — a second leg naming the same bucket id is a hold the
+	// domain refuses to form.
+	world.buckets = nil
+	world.seedBucket(admissionAccount, "bucket-1", 1_000_000, true)
 	world.seedCandidates("test-model",
 		catalog.Candidate{ID: "cand-a", BackendID: "backend-a", ProviderModel: "model-a", Position: 1},
 	)
@@ -1188,18 +1455,19 @@ func TestRoutingServesManyRequestsConcurrently(t *testing.T) {
 		t.Fatalf("the feed holds %d facts, want %d settled", got, requests)
 	}
 	for _, fact := range world.facts {
-		// The scripted report (20, 30) sits beyond the hold's counts (5, 16),
-		// so every settlement clamps to the reservation floor — and every
-		// request's fact reads it identically.
+		// The scripted report reads 20 input — inside the 71 the hold priced —
+		// and 30 output, beyond the 16 basis, so the output clamps and the
+		// capture attests the floor; the input crosses as reported. Every
+		// request's fact reads the settlement identically.
 		if fact.Kind != accounting.KindSettled || fact.CaptureMethod != accounting.CaptureReservationFloor {
 			t.Fatalf("a fact reads %s/%s, want a reservation-floor settlement", fact.Kind, fact.CaptureMethod)
 		}
-		if fact.ProviderInputTokens == nil || *fact.ProviderInputTokens != 5 ||
+		if fact.ProviderInputTokens == nil || *fact.ProviderInputTokens != 20 ||
 			fact.ProviderOutputTokens == nil || *fact.ProviderOutputTokens != 16 {
-			t.Fatalf("a fact settles %v/%v, want the hold's own counts (5, 16)", fact.ProviderInputTokens, fact.ProviderOutputTokens)
+			t.Fatalf("a fact settles %v/%v, want the report's 20 and the basis's 16", fact.ProviderInputTokens, fact.ProviderOutputTokens)
 		}
 	}
-	if got := world.available("bucket-1"); got != 10_000-37*requests {
-		t.Fatalf("the grant holds %d, want %d — every hold became cost", got, 10_000-37*requests)
+	if got := world.available("bucket-1"); got != 1_000_000-103*requests {
+		t.Fatalf("the grant holds %d, want %d — every hold became cost", got, 1_000_000-103*requests)
 	}
 }

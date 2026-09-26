@@ -258,11 +258,14 @@ func writeChatAnswer(w stdhttp.ResponseWriter, r *stdhttp.Request, requestID str
 // and the log line is what finds it.
 //
 // The reply travels with the error for the one ending that outranks the
-// internal failure: an answer that already committed has frozen its status
-// line, and a second status written over it is not an answer but garbage
-// appended to one. There the transport's own failure frame is what the
-// client can still read, and the log line — still the internal failure — is
-// what says the caller never saw it as a status.
+// internal failure: an answer whose bytes have left the process has frozen
+// its status line, and a second status written over it is not an answer but
+// garbage appended to one. There the transport's own failure frame is what
+// the client can still read, and the log line — still the internal failure —
+// is what says the caller never saw it as a status. The key is answered,
+// not committed: a buffered body holds content no wire carries, and an
+// ending that failed behind the buffer is answered whole — status, cell and
+// all — with the buffer discarded.
 func writeChatError(w stdhttp.ResponseWriter, r *stdhttp.Request, reply *chatReply, requestID string, err error, runtimeID identity.RequestID) {
 	var refusal unauthenticatedRequest
 	if errors.As(err, &refusal) {
@@ -270,7 +273,7 @@ func writeChatError(w stdhttp.ResponseWriter, r *stdhttp.Request, reply *chatRep
 		return
 	}
 	answer := chatAnswer{failure: errorResponse(err), runtimeID: runtimeID}
-	if reply != nil && reply.Committed() {
+	if reply != nil && reply.Answered() {
 		answer.silent = true
 		writeChatAnswer(w, r, requestID, answer)
 		reply.ServeMidStreamFailure()

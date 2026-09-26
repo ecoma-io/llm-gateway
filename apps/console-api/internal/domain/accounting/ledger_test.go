@@ -188,9 +188,11 @@ func TestEveryKindRefusesAnUnformedLeg(t *testing.T) {
 	if _, err := NewConsumeEntry(mustEntryID(t), bucket, mustAmount(t, 1), "", snapshotPrice(), legNow); !errors.Is(err, ErrInvalidReference) {
 		t.Fatalf("settlementless consume = %v, want ErrInvalidReference", err)
 	}
-	priceless := PriceSnapshot{RevisionID: "rev", InputUnitPrice: 3, OutputUnitPrice: 0}
-	if _, err := NewConsumeEntry(mustEntryID(t), bucket, mustAmount(t, 1), SettlementID(validV7), priceless, legNow); !errors.Is(err, ErrInvalidAmount) {
-		t.Fatalf("consume priced at zero on one side = %v, want ErrInvalidAmount", err)
+	// A zero price is a real price — the free model — so the refusal that
+	// survives is the negative one.
+	negative := PriceSnapshot{RevisionID: "rev", InputUnitPrice: 3, OutputUnitPrice: -1}
+	if _, err := NewConsumeEntry(mustEntryID(t), bucket, mustAmount(t, 1), SettlementID(validV7), negative, legNow); !errors.Is(err, ErrInvalidAmount) {
+		t.Fatalf("consume priced below zero on one side = %v, want ErrInvalidAmount", err)
 	}
 }
 

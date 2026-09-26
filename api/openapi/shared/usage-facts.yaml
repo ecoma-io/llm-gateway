@@ -107,22 +107,89 @@ components:
     UsageEvent:
       type: object
       required:
+        - append_seq
         - request_id
         - kind
         - schema_version
         - occurred_at
         - payload
+        - capture_method
+        - committed_attempt_id
+        - provider_input_tokens
+        - provider_output_tokens
+        - delivery_tokens
+        - price_revision_id
+        - input_unit_price
+        - output_unit_price
+        - settled_amount
+        - corrects_append_seq
+      description: >-
+        One immutable fact the runtime recorded about a request it handled, and
+        everything a settlement is derived from. The settlement figures travel
+        beside the payload as typed fields on purpose: a Control Plane
+        settlement has to be derivable from the fact alone, with no synchronous
+        call back into the Data Plane, and a consumer that had to parse this
+        table's payload shape to price anything would be coupled to a schema
+        this envelope exists to keep versioned. The payload still travels whole
+        beside them — it is the allocation tail's shape, versioned by
+        `schema_version`.
+
+
+        Every field below is carried by every fact. A nullable field's null is
+        the claim that this fact makes no such claim — a different sentence
+        from a stored zero, which is why nullability crosses the wire exactly:
+        a free model settles at a real zero amount, and an absent usage report
+        is an absence, not a zero.
+
+
+        Which fields are non-null is decided by `kind` and only by `kind`. In
+        this feed's production vocabulary: a `settled` fact carries
+        `capture_method`, `committed_attempt_id`, `delivery_tokens`,
+        `price_revision_id`, `input_unit_price`, `output_unit_price` and
+        `settled_amount`, with the two `provider_*_tokens` fields non-null
+        exactly when the provider reported them; a `released` or `expired`
+        fact carries none of the settlement fields at all — no usage claim, no
+        price, no amount; an `unbillable_orphaned` fact carries
+        `capture_method`, `committed_attempt_id` and `delivery_tokens` with the
+        provider counts as reported or null, and never a price or an amount,
+        because no money moved. `corrects_append_seq` is null on every fact
+        this feed's producer writes; it is declared for the correction path a
+        later generation may add.
       properties:
+        append_seq:
+          type: integer
+          minimum: 1
+          description: >-
+            The fact's position in the Data Plane's single monotonic append
+            order — the identity of this fact on the wire. Two facts of one
+            request never share one, and a correction, when the day comes,
+            names the fact it amends through it. It is deliberately **not** the
+            consumer's idempotency key: deduplication keys on `request_id` and
+            the kind's class, and a consumer that deduplicated by position
+            would treat a replayed page as fresh facts.
         request_id:
           type: string
           description: >-
             The runtime request this fact is about, and the logical idempotency
-            key for everything derived from it: a settlement, a consume leg and
-            a release leg are each created at most once per `request_id`,
-            however many times this fact is delivered. It is the fact's
-            immutable business identity and is **not** the HTTP
-            `X-Request-Id`, which correlates a call and means nothing across a
-            retry.
+            key for everything derived from it — keyed by kind class, never
+            alone: at most one settlement-relevant fact (`settled`, `released`
+            or `expired` — the three are mutually exclusive) and at most one
+            `unbillable_orphaned` fact exist per `request_id`, and the orphan
+            may coexist with any of the three by design. A settlement, a
+            consume leg and a release leg are each created at most once per
+            `request_id` and kind class, however many times the fact is
+            delivered. It is the fact's immutable business identity and is
+            **not** the HTTP `X-Request-Id`, which correlates a call and means
+            nothing across a retry.
+
+
+            One substitution a consumer of the legs should know: on this feed
+            the `request_id` is also the reservation's identity. The runtime
+            mints exactly one reservation per request — uniqueness on
+            `request_id` is total — so a consume or release leg derived from
+            this fact names the reservation through the request id, and no
+            separate reservation field exists because there is no second value
+            to carry.
         kind:
           type: string
           enum:
@@ -131,13 +198,19 @@ components:
             - expired
             - unbillable_orphaned
           description: >-
-            The terminal outcome the fact records, and what a consumer derives
-            from it: a settlement with consume and release legs for `settled`,
-            release legs alone for `released` and `expired`, and no customer
-            charge at all for `unbillable_orphaned`. The vocabulary is terminal
-            on purpose — a hold is Data-Plane reservation state, not a fact of
-            its own, so no kind delivers one; what a consumer learns of a hold
-            rides in each fact's allocation tail.
+            The terminal outcome the fact records — and, normatively, the only
+            input to which derivation a consumer performs: the kind and nothing
+            else decides which legs a fact produces. A `settled` fact is the
+            only kind from which consume legs are derived, together with the
+            settled total; `released` and `expired` derive release legs alone;
+            `unbillable_orphaned` derives no legs and no charge at all. A
+            consumer that inferred the split from a fact's figures rather than
+            from its kind would price an orphan or release a settlement, and
+            the coexistence rule on `request_id` above is what makes the
+            inference wrong rather than merely unusual. The vocabulary is
+            terminal on purpose — a hold is Data-Plane reservation state, not a
+            fact of its own, so no kind delivers one; what a consumer learns of
+            a hold rides in each fact's allocation tail.
         schema_version:
           type: integer
           minimum: 1
@@ -165,6 +238,93 @@ components:
             the allocation and bucket identities and the immutable reservation
             figures needed to derive the consume legs, the release legs and the
             settled total (ADR 0006, amendments to ADR 0004).
+        capture_method:
+          type: [string, "null"]
+          enum:
+            - reported
+            - gateway_observed
+            - reservation_floor
+            - null
+          description: >-
+            How the fact's usage figures were known — `reported` when the
+            provider's own figures priced as given, `gateway_observed` when a
+            priced figure is the gateway's own count, `reservation_floor` when
+            a settled figure is the reservation's own bound. Null on the facts
+            that carry no usage claim: `released` and `expired`.
+        committed_attempt_id:
+          type: [string, "null"]
+          description: >-
+            The upstream call the usage belongs to. Null on every fact that
+            names no attempt: `released` and `expired`.
+        provider_input_tokens:
+          type: [integer, "null"]
+          minimum: 0
+          description: >-
+            The input figure the settlement priced — not the provider's raw
+            report. The provider's report prices when it arrived within the
+            reservation; the reservation's admitted input count prices
+            when the report exceeded it or never arrived. `capture_method`
+            attests which arm priced; the raw report itself stays beside the
+            attempt row as telemetry and does not travel this feed. Null on
+            `released` and `expired`.
+        provider_output_tokens:
+          type: [integer, "null"]
+          minimum: 0
+          description: >-
+            The output figure the settlement priced — not the provider's raw
+            report. A completed answer prices the provider's report bounded by
+            the reservation's output basis, or the gateway's delivered count
+            under that bound when no report arrived. A stream that failed
+            after commitment prices the delivered tokens under the bound and
+            never the provider's figure — the provider's count for a stream it
+            never finished is the attempt row's telemetry, not a customer
+            bill (ADR 0004). `capture_method` attests which arm priced. Null
+            on `released` and `expired`.
+        delivery_tokens:
+          type: [integer, "null"]
+          minimum: 0
+          description: >-
+            The gateway's own count of the answer bytes that left the process —
+            the canonical v1 byte rule, recorded beside every settlement and
+            every orphan as the delivery side. It is never priced by this
+            feed's arithmetic (ADR 0003 prices input and output only); it is
+            the figure a consumer can audit a settlement's output figure
+            against. Null on `released` and `expired`.
+        price_revision_id:
+          type: [string, "null"]
+          description: >-
+            The price revision the settlement was priced at, present together
+            with the two unit prices or not at all. A later price change never
+            rewrites it. Null on every non-settled fact.
+        input_unit_price:
+          type: [integer, "null"]
+          minimum: 0
+          description: >-
+            The input price, in integer minor units per 1M tokens, copied from
+            the revision named above. Null on every non-settled fact.
+        output_unit_price:
+          type: [integer, "null"]
+          minimum: 0
+          description: >-
+            The output price, in integer minor units per 1M tokens, copied from
+            the revision named above. Null on every non-settled fact.
+        settled_amount:
+          type: [integer, "null"]
+          minimum: 0
+          description: >-
+            What the request cost, in integer minor units — on a settled fact,
+            the hold formula re-derived over this fact's own figures and
+            prices, and that equality is the fact's binding: a consumer can
+            re-derive the amount from the fact alone and must find this
+            number. Zero is a real settled amount (a free model, or a zero
+            report); null on every non-settled fact, because no money moved.
+        corrects_append_seq:
+          type: [integer, "null"]
+          minimum: 1
+          description: >-
+            Reserved for the correction path: a later fact naming the
+            `append_seq` of the one it amends. Null on every fact this feed's
+            producer writes today.
     UsageFactPage:
       type: object
       required:
@@ -176,9 +336,27 @@ components:
           type: array
           description: >-
             The facts, in ascending append order, strictly after the requested
-            position. At most one settlement-relevant fact per `request_id`
-            appears in the feed, which is what makes `request_id` sufficient as
-            the consumer's idempotency key.
+            position. At most one settlement-relevant fact (`settled`,
+            `released` or `expired`) and at most one `unbillable_orphaned`
+            fact exist per `request_id`, and an orphan may coexist with a
+            settlement-relevant fact for the same request — usage observed on
+            a request whose ending another writer stated is exactly the
+            telemetry the orphan exists to carry. The idempotency key is
+            therefore `request_id` **and kind class**, never `request_id`
+            alone: a consumer that deduplicated by `request_id` alone would
+            drop the second fact it saw — losing a settlement because an
+            orphan arrived first, or losing the orphan because a settlement
+            did.
+
+
+            A page is served whole and must be applied whole: a fact a
+            consumer cannot decode or apply stops the consumer at that fact,
+            and no page may be skipped past. This contract deliberately gives
+            a consumer no way to advance around a fact it could not handle —
+            the alternative is a position that silently skips a fact, and the
+            gap would surface later as money that cannot be accounted for. A
+            fact that stops the feed is a state a human resolves, not a
+            position a consumer rounds forward.
           items:
             $ref: "#/components/schemas/UsageEvent"
         next_cursor:

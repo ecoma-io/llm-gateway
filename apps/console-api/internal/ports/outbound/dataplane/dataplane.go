@@ -157,12 +157,62 @@ type CatalogReader interface {
 // goes stale; the applier is what decides whether it recognizes one. Payload is
 // the fact's body: the contract fixes that a settlement must be derivable from
 // the fact alone, and leaves its columns to the schema the facts are stored in.
+//
+// The typed settlement figures travel beside the payload on the contract's
+// say-so (shared/usage-facts.yaml): a settlement must be derivable from the
+// fact alone, and the figures a settlement prices with are the envelope's, not
+// the payload's. Every one is required on the wire and nullable in meaning —
+// null is the claim that the fact makes no such claim, and a stored zero is a
+// different sentence about money — so they cross as pointers: nil for the
+// absence, a pointer for the figure, including a zero. Which fields a given
+// kind makes non-null is the producer's vocabulary, and this port carries them
+// without an opinion; AppendSeq is the one exception, required and non-null,
+// because a page that cannot say where its facts stand is a page this seam
+// refuses rather than delivers.
 type Event struct {
-	RequestID     string
-	Kind          string
+	// AppendSeq is the fact's position in the Data Plane's append order and
+	// its identity on the wire. It is not the consumer's idempotency key —
+	// that is RequestID and the kind's class — but it is the only value that
+	// names which fact a question is about.
+	AppendSeq int64
+	RequestID string
+	Kind      string
+	// SchemaVersion is the version of the payload shape the fact was written
+	// with, carried through so a consumer that does not know a version can
+	// refuse the fact rather than guess at settlement.
 	SchemaVersion int
-	OccurredAt    time.Time
-	Payload       json.RawMessage
+	// OccurredAt is when the runtime observed the outcome. Informational: the
+	// ordering key is the Data Plane's append sequence, which the cursor names.
+	OccurredAt time.Time
+	// Payload is the fact's body, carried as the bytes the Data Plane wrote.
+	Payload json.RawMessage
+
+	// CaptureMethod names how the fact's usage figures were known. Nil where
+	// the fact claims no usage.
+	CaptureMethod *string
+	// CommittedAttemptID names the upstream call the usage belongs to. Nil
+	// where the fact names no attempt.
+	CommittedAttemptID *string
+	// ProviderInputTokens and ProviderOutputTokens are the output figures
+	// the settlement priced, under the substitution ladder the producing
+	// runtime applies (capture_method attests which arm priced); the
+	// provider's raw report stays behind the attempt row as telemetry. Nil
+	// on the facts that carry no usage.
+	ProviderInputTokens  *int64
+	ProviderOutputTokens *int64
+	// DeliveryTokens is the gateway's own count of what reached the client.
+	DeliveryTokens *int64
+	// PriceRevision and the two unit prices are the settlement's pricing
+	// basis, present together or not at all.
+	PriceRevision   *string
+	InputUnitPrice  *int64
+	OutputUnitPrice *int64
+	// SettledAmount is what the request cost. Nil on every fact where no
+	// money moved; zero is a real amount.
+	SettledAmount *int64
+	// CorrectsAppendSeq is reserved for the correction path. Nil on every
+	// fact this generation's producer writes.
+	CorrectsAppendSeq *int64
 }
 
 // Page is one replayable slice of the fact feed.

@@ -258,11 +258,14 @@ const (
 	// names the refusal; the cell it answers with is the transport's table.
 	OutcomeRefused OutcomeKind = "refused"
 
-	// OutcomeAbandoned says the routing walk stopped because the caller's
-	// context ended before any candidate produced an outcome. Nothing is
-	// finalised and nothing can be written — there is no channel left — so
-	// the request stays executing for the reaper, the same shape a dead
-	// process leaves, and the transport writes nothing.
+	// OutcomeAbandoned says the routing walk stopped without an answer: the
+	// caller's context ended before any candidate produced an outcome, or
+	// the walk's lease lapsed and the hold died underneath it. The ending is
+	// still stated — the hold is released as gateway_abandoned through the
+	// release's own unit, the request row and the replay record finalise
+	// with it, and the released fact is the feed's word. What never existed
+	// is the answer: there is no channel left to carry one, so the transport
+	// writes nothing.
 	OutcomeAbandoned OutcomeKind = "abandoned"
 )
 

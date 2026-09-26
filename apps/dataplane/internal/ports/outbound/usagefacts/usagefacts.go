@@ -54,16 +54,52 @@ import (
 // makes replay safe and what makes the consumer's position meaningful — a
 // history that can change under a reader is not a history a cursor can point
 // into.
+//
+// The typed fields below travel beside the payload on purpose. The payload is
+// the fact's own schema — the allocation tail, versioned by SchemaVersion —
+// while these columns are the feed's envelope: the figures and identities a
+// settlement is derived from, carried as typed values so a consumer can
+// settle from the fact alone without parsing the payload's shape. A
+// settlement-relevant fact carries them whole: a settled fact names its
+// attempt, its capture method, its usage counts, its price basis and its
+// amount; a released or expired fact carries none of them. The pointer types
+// are the null fidelity the settlement needs — zero is a real figure (a free
+// model settles at zero), and NULL is a different claim entirely.
 type Event struct {
-	// RequestID is the fact's business identity and the consumer's idempotency
-	// key. Applying the same RequestID twice must settle, consume or release
-	// exactly once (ADR 0006 §5).
+	// AppendSeq is the store-allocated position in the feed's single
+	// monotonic order — the same number the cursor is a position in — and it
+	// is the fact's identity on the wire. Two facts of one request never
+	// share one, and a correction, when the day comes, names the fact it
+	// amends through it. It is never the consumer's dedup key (RequestID and
+	// the kind's class are), but without it a consumer cannot state which
+	// fact a question is about.
+	AppendSeq int64
+
+	// RequestID is the fact's business identity and the consumer's
+	// idempotency key — keyed by kind class, not alone. The runtime mints one
+	// settlement-relevant fact per request at most (a settled, released or
+	// expired fact: the three are mutually exclusive, the ending's CAS
+	// referees them), and one unbillable_orphaned fact at most, which is not
+	// settlement-relevant and may coexist with any of the three by design.
+	// A consumer that deduplicated by RequestID alone would drop the second
+	// fact it saw — losing a settlement because an orphan arrived first, or
+	// the telemetry because a settlement did — so the rule the idempotency
+	// promise actually makes is: at most one settlement-relevant fact per
+	// RequestID, and applying the same RequestID twice must settle, consume
+	// or release exactly once (ADR 0006 §5).
 	//
 	// It is deliberately not the HTTP correlation identifier. `X-Request-Id` is
 	// a transport handle for tracing one client request through logs; it may be
 	// absent, invented by a caller, or reused across unrelated requests. A fact
 	// needs an identity the Data Plane minted and owns, because settlement
 	// hangs off it.
+	//
+	// One more substitution it is worth naming where a consumer meets it: on
+	// this seam the RequestID is also the reservation's identity. The runtime
+	// mints exactly one reservation per request — uniqueness on request_id is
+	// total — so a Control Plane leg derived from this fact names the
+	// reservation through the request id, and the fact carries no separate
+	// reservation field because there is no second value to carry.
 	RequestID string
 
 	// Kind names what happened, in the closed vocabulary the fact contract
@@ -75,6 +111,45 @@ type Event struct {
 	// predates the payload it is reading needs to be able to say so rather than
 	// guess.
 	SchemaVersion int
+
+	// CaptureMethod names how the fact's usage figures were known — the
+	// contract's three-value vocabulary as a plain string. Nil on the facts
+	// that carry no usage claim (released, expired); present on every
+	// settled and unbillable_orphaned fact.
+	CaptureMethod *string
+
+	// CommittedAttemptID names the upstream call the usage belongs to. Nil on
+	// the facts that name no attempt.
+	CommittedAttemptID *string
+
+	// ProviderInputTokens and ProviderOutputTokens are the provider's own
+	// usage report as the gateway recorded it, bounded or not. Nil where no
+	// report arrived.
+	ProviderInputTokens  *int64
+	ProviderOutputTokens *int64
+
+	// DeliveryTokens is the gateway's own count of what reached the client —
+	// the canonical v1 byte rule, recorded beside every settlement.
+	DeliveryTokens *int64
+
+	// PriceRevision and the two unit prices are the settled fact's pricing
+	// basis, present together or not at all. The prices are integer minor
+	// units per 1M tokens, copied from the revision the hold was priced at —
+	// a later price change never rewrites them.
+	PriceRevision   *string
+	InputUnitPrice  *int64
+	OutputUnitPrice *int64
+
+	// SettledAmount is what the request cost, in integer minor units. Nil on
+	// every non-settled fact; zero is a real settled amount, and the amount
+	// equals the hold formula re-derived over the fact's own figures and
+	// prices — that equality is the fact's binding.
+	SettledAmount *int64
+
+	// CorrectsAppendSeq is reserved for the correction path: a later fact
+	// naming the AppendSeq of the one it amends. Nil on every fact this build
+	// writes.
+	CorrectsAppendSeq *int64
 
 	// OccurredAt is when the fact happened, for a consumer that wants to
 	// reason about time. It is not the ordering key — see the package comment

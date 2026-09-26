@@ -242,15 +242,19 @@ func NewAdjustmentEntry(id LedgerEntryID, bucketID FundingBucketID, settledDelta
 }
 
 // validatePriceSnapshot pins the consume leg's price provenance: all three
-// parts present, every price a positive magnitude.
+// parts present, every price a magnitude of at least zero. A zero is a real
+// price — a model the deployment gives away is priced at nothing, and the
+// settlement that proves a nothing-charge still names the revision it was
+// free under. What is refused is a price below zero: no movement of money
+// runs backwards.
 func validatePriceSnapshot(price PriceSnapshot) error {
 	if err := validatePriceRevisionID(price.RevisionID); err != nil {
 		return err
 	}
-	if _, err := NewAmount(price.InputUnitPrice.Int64()); err != nil {
+	if err := validateAmountAtOrAboveZero(price.InputUnitPrice.Int64()); err != nil {
 		return fmt.Errorf("input unit price: %w", err)
 	}
-	if _, err := NewAmount(price.OutputUnitPrice.Int64()); err != nil {
+	if err := validateAmountAtOrAboveZero(price.OutputUnitPrice.Int64()); err != nil {
 		return fmt.Errorf("output unit price: %w", err)
 	}
 	return nil

@@ -47,6 +47,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	stdhttp "net/http"
 	"net/url"
@@ -359,6 +360,31 @@ func bind(ctx context.Context, cfg config.Config, pool *sql.DB) ([]service, erro
 		},
 		admission,
 	)
+	// The close's structured record, one JSON line per stated ending on the
+	// runtime's standard log. The observation is the contract's twelve
+	// fields and nothing else — counts, identity strings and durations — so
+	// the redaction law holds by construction: no prompt, no credential and
+	// no provider response can travel on it.
+	closeLog := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	routing.ObserveClose = func(o application.CloseObservation) {
+		attrs := []any{
+			"request_id", o.RequestID,
+			"attempt_id", o.AttemptID,
+			"usage_event_id", o.UsageEventID,
+			"final_status", o.FinalStatus,
+			"commitment", o.Committed,
+			"usage_state", o.UsageState,
+			"input_tokens", o.InputTokens,
+			"output_tokens", o.OutputTokens,
+			"delivery_tokens", o.DeliveryTokens,
+			"provider", o.Provider,
+			"backend", o.Backend,
+			"candidate", o.Candidate,
+			"egress", o.Egress,
+			"close_duration_ms", o.CloseDuration.Milliseconds(),
+		}
+		closeLog.Info("usage close", attrs...)
+	}
 
 	runtimeListener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {

@@ -404,6 +404,58 @@ func TestExecuteStreamClassifiesAPostContentCut(t *testing.T) {
 	}
 }
 
+// oversizeFrame is one data line past the reader's frame-size wall — the
+// scanner refuses to hold it, and the refusal surfaces as the unreadable
+// stream the loop classifies where it stands.
+func oversizeFrame() string {
+	return `{"choices":[{"delta":{"content":""}}],"padding":"` + strings.Repeat("p", (1<<20)+64) + `"}`
+}
+
+// TestExecuteStreamWallBeforeCommitmentFallsBack: the frame-size wall broke
+// the stream before any content was forwarded. The answer is unreadable, so
+// the class is the fallback-eligible one — the walk may still try the next
+// candidate — and the sink never saw a byte.
+func TestExecuteStreamWallBeforeCommitmentFallsBack(t *testing.T) {
+	_, endpoint := startProvider(t, func(seq int, request recordedRequest) fakeResponse {
+		return fakeResponse{status: stdhttp.StatusOK, body: "data: " + roleChunk + "\n\ndata: " + oversizeFrame() + "\n\n"}
+	})
+	executor := newTestExecutor(t, endpoint)
+	sink := newFakeSink()
+
+	result := executor.Execute(t.Context(), testSpec(true), sink)
+	assertClass(t, result, execution.ErrorInvalidUpstreamResponse)
+
+	if delivered := sink.recordings(); len(delivered) != 0 {
+		t.Errorf("Content calls = %v, want none — the wall held before commitment", delivered)
+	}
+	if sink.Committed() {
+		t.Error("sink committed = true, want false — the answer never reached the client")
+	}
+}
+
+// TestExecuteStreamWallAfterCommitmentSettlesOnDelivered: the same wall,
+// met after content flowed. The answer is already out — the class is the
+// stream's own post-commitment failure, the settled usage (if the provider
+// reported any before the wall) rides it as telemetry, and the delivered
+// bytes stand for the ending to price.
+func TestExecuteStreamWallAfterCommitmentSettlesOnDelivered(t *testing.T) {
+	_, endpoint := startProvider(t, func(seq int, request recordedRequest) fakeResponse {
+		return fakeResponse{status: stdhttp.StatusOK, body: "data: " + textChunkOne + "\n\ndata: " + usageChunk + "\n\ndata: " + oversizeFrame() + "\n\n"}
+	})
+	executor := newTestExecutor(t, endpoint)
+	sink := newFakeSink()
+
+	result := executor.Execute(t.Context(), testSpec(true), sink)
+	failure := assertClass(t, result, execution.ErrorStreamAfterCommitment)
+
+	if !sink.Committed() {
+		t.Error("sink committed = false, want true — content left the process before the wall")
+	}
+	if failure.Usage.InputTokens == nil || *failure.Usage.InputTokens != 5 {
+		t.Errorf("failure usage input tokens = %v, want 5 — the report before the wall is the telemetry that survives", failure.Usage.InputTokens)
+	}
+}
+
 // TestExecuteStreamStopsAtASinkError: the caller is gone, the executor
 // returns at once, and the class is the one the contract assigns a sink
 // stop — the walk's abandoned check owns the ending.

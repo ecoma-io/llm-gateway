@@ -48,6 +48,20 @@ import (
 // with context.
 var ErrNotFound = errors.New("persistence: not found")
 
+// ErrCommitOutcomeUnknown reports that a unit of work's COMMIT failed without
+// the engine ever stating a verdict — the connection dropped, the client
+// context died mid-commit, the driver lost the answer — so the unit's fate is
+// genuinely unknown: committed and unacknowledged, or rolled back with the
+// connection. It is distinct from a statement failure inside the unit, which
+// the engine answers and rolls back with certainty, and the difference decides
+// what a caller may do: a unit whose outcome is unknown may be retried only
+// when re-running it is safe against its own committed twin. The ending units
+// are — their CAS re-judges who owns the hold, and every row they write is
+// keyed against a second copy — which is why this sentinel is classified
+// retryable by the ladders that run them. A caller whose unit has no such
+// referee must not borrow the classification.
+var ErrCommitOutcomeUnknown = errors.New("persistence: the unit of work's commit outcome is unknown")
+
 // Pinger reports whether the backing store is answering right now. Readiness
 // is what it is for: /readyz gates on this, through the application, and
 // nothing else should treat a successful ping as evidence that a particular

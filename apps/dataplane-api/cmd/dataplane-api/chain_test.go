@@ -55,10 +55,18 @@ const (
 const chainCursor = "cur:9f2 &=<not-a-number>/+=="
 
 // chainUpstreamPage is the Data Plane's answer as the upstream sends it —
-// compact, which is what makes the byte comparison below meaningful: the
-// façade's own encoder, not the upstream's formatting, decides what the caller
-// receives.
-const chainUpstreamPage = `{"events":[{"request_id":"req_01HZ","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{"allocation_id":"alloc-1","note":"a<b & c>d"}}],"next_cursor":"` + chainCursor + `","has_more":true}`
+// compact, omitting the ten meaning-nullable fields the caller's contract
+// requires, which is the spelling absence is allowed on the private hop.
+// The comparison below is against what this façade's own encoder writes from
+// it, not against these bytes: the façade re-encodes the page it decoded, and
+// absence arrives at the caller as the contract's explicit null.
+const chainUpstreamPage = `{"events":[{"append_seq":1,"request_id":"req_01HZ","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{"allocation_id":"alloc-1","note":"a<b & c>d"}}],"next_cursor":"` + chainCursor + `","has_more":true}`
+
+// chainServedPage is the page above as the façade serves it: every fact
+// carried across untouched — append_seq, the identity, the payload's bytes —
+// with the ten meaning fields the served contract requires written as the
+// nulls their absence means.
+const chainServedPage = `{"events":[{"append_seq":1,"request_id":"req_01HZ","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{"allocation_id":"alloc-1","note":"a<b & c>d"},"capture_method":null,"committed_attempt_id":null,"provider_input_tokens":null,"provider_output_tokens":null,"delivery_tokens":null,"price_revision_id":null,"input_unit_price":null,"output_unit_price":null,"settled_amount":null,"corrects_append_seq":null}],"next_cursor":"` + chainCursor + `","has_more":true}`
 
 // chainUpstream starts a server standing in for the Data Plane's private
 // listener, counting the calls it receives. The counter is what the refusal
@@ -126,8 +134,8 @@ func TestTheChainCarriesThePageFromTheDataPlaneToTheCaller(t *testing.T) {
 	if rec.Code != stdhttp.StatusOK {
 		t.Fatalf("GET /internal/usage-events status = %d, want %d (body %q)", rec.Code, stdhttp.StatusOK, rec.Body.String())
 	}
-	if got, want := rec.Body.String(), chainUpstreamPage+"\n"; got != want {
-		t.Errorf("the page did not cross unchanged:\n got %q\nwant %q", got, want)
+	if got, want := rec.Body.String(), chainServedPage+"\n"; got != want {
+		t.Errorf("the page did not cross as the contract writes it:\n got %q\nwant %q", got, want)
 	}
 	if got := rec.Header().Get("Content-Type"); got != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", got)

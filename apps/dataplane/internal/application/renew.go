@@ -99,7 +99,8 @@ func (r *ChatRouting) executionContext(ctx context.Context, admitted *Admission,
 		ticker := time.NewTicker(r.execution.LeaseTTL / 3)
 		defer ticker.Stop()
 		for {
-			if !r.renewLeaseOnce(ctx, admitted, deadline) {
+			extended, live := r.renewLeaseOnce(ctx, admitted, deadline)
+			if !live {
 				// The hold is gone from the open set: cancel the call now,
 				// so the walk learns of it from the call's own ending
 				// instead of spending the rest of its budget on a provider
@@ -108,13 +109,23 @@ func (r *ChatRouting) executionContext(ctx context.Context, admitted *Admission,
 				cancel()
 				return
 			}
+			if extended {
+				// The chain advances only through a renewal the store
+				// answered: it is the row's expiry stated forward, and
+				// advancing it on a renewal that errored would write the
+				// next expiry from an instant no row ever carried — a
+				// chain that has quietly left the reservation behind.
+				// An errored renewal leaves the deadline where it is, and
+				// the next tick asks the store for the same value it never
+				// recorded.
+				deadline = deadline.Add(r.execution.LeaseTTL)
+			}
 			select {
 			case <-stopRenewing:
 				return
 			case <-callCtx.Done():
 				return
 			case <-ticker.C:
-				deadline = deadline.Add(r.execution.LeaseTTL)
 			}
 		}
 	}()
@@ -149,16 +160,19 @@ func (r *ChatRouting) executeWithRenewal(ctx context.Context, admitted *Admissio
 // renewLeaseOnce runs one renewal as its own short unit: detached from the
 // caller's cancellation — a caller walking away is no reason to leave the
 // claim lapsed while the store still answers — and bounded by its own
-// timeout. True means the lease stands; false means the hold is no longer
-// this process's to renew, and the caller must stop. An error is neither:
-// the claim stands until a renewal says otherwise, and the next tick asks
-// again.
-func (r *ChatRouting) renewLeaseOnce(ctx context.Context, admitted *Admission, leaseExpiresAt time.Time) bool {
+// timeout. It reports two verdicts. live is the hold's: false means the hold
+// is no longer this process's to renew, and the caller must stop. extended
+// is this renewal's: true only when the store answered and wrote the expiry,
+// which is the only fact the deadline chain may advance on. An error is
+// neither a lost hold nor a written one — the claim stands until a renewal
+// says otherwise, the next tick asks again, and the chain stays where the
+// last answered renewal left it.
+func (r *ChatRouting) renewLeaseOnce(ctx context.Context, admitted *Admission, leaseExpiresAt time.Time) (extended, live bool) {
 	renewCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaseRenewalTimeout)
 	defer cancel()
 	extended, err := r.reservations.RenewLease(renewCtx, admitted.ReservationID, admitted.LeaseOwner, leaseExpiresAt)
 	if err != nil {
-		return true
+		return false, true
 	}
-	return extended
+	return extended, extended
 }

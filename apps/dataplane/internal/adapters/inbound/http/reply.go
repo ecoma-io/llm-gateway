@@ -15,10 +15,19 @@ import (
 // response this runtime writes (the register() doctrine). The routing stage
 // holds both halves of it: it hands the reply to each executor as the sink
 // content is written into, and it calls the ending methods when the walk
-// reaches its decision. That ordering is what makes the commitment point
-// real on this transport — the first Content call is the moment the status
-// line and content type leave the process, and every method after it knows
-// the difference between an answer it can still shape and one it cannot.
+// reaches its decision.
+//
+// Two facts live here, and the difference between them is the settlement's
+// guarantee to the client. Committed is the application's: answer content
+// exists, crossed by the first Content call — the line past which the walk
+// stops trying candidates. Answered is the transport's: at least one byte,
+// status line included, has left the process. For a stream the two are the
+// same instant — the first frame writes the status — and for a body they
+// part: the body buffers whole, because a body answer is one JSON document,
+// and a client that holds half of one holds garbage. The buffered bytes
+// leave only when the ending states itself — ServeSucceeded after the
+// settlement has committed, or the failure cell when it has not — so a
+// client never reads success the runtime cannot account for.
 //
 // The bytes themselves are the wire map's, not this file's inventions: the
 // stream's framing is `data: ` + payload + blank line, the terminal frame is
@@ -35,14 +44,21 @@ type chatReply struct {
 	// JSON body. Set by Open before the first byte is chosen.
 	stream bool
 
-	// committed is the transport's commitment fact: a status line and at
-	// least one content-bearing byte left the process. The routing stage
-	// trusts this over any executor's claim, and no ending after it may
-	// write a status.
+	// committed is the application's commitment fact: answer content exists.
+	// The routing stage trusts this over any executor's claim, and no walk
+	// after it tries another candidate.
 	committed bool
 
-	// body is what the client received, kept because the settlement counts
-	// it — the gateway's own observation of the delivery side.
+	// answered is the transport's own fact: a byte has left the process on
+	// this connection. The transport's silence is keyed on this — an answer
+	// that left may not be written over, and an answer that has not is still
+	// the transport's to shape, whatever its content buffers hold.
+	answered bool
+
+	// body is the answer's content: for a stream, the chunks that went out
+	// frame by frame; for a body, the buffered whole awaiting its ending.
+	// Either way it is the settlement's delivery side, counted by the
+	// application, never parsed here.
 	body bytes.Buffer
 }
 
@@ -52,25 +68,24 @@ func newChatReply(w stdhttp.ResponseWriter) *chatReply {
 	return &chatReply{w: w, flusher: flusher}
 }
 
-// Content writes one chunk of the answer, arming the response on its first
-// call — the commitment point. The content type is the framing's, decided by
-// Open, and the status is 200: bytes are arriving. For a stream the chunk
-// becomes one `data:` frame and is flushed, because a stream that arrives in
-// batches is not a stream; for a body it is the body itself. A write error is
+// Content writes one chunk of the answer. The first call crosses the
+// commitment point; for a stream it is also the answered one — status line,
+// content type and the first frame leave together, and the chunk becomes one
+// `data:` frame and is flushed, because a stream that arrives in batches is
+// not a stream. For a body the chunk joins the buffer and nothing leaves:
+// the body travels whole, at its ending, or not at all. A write error is
 // returned to the executor — the client is gone, and the executor is the one
-// that knows what its provider call should do about that.
+// that knows what its provider call should do about that; a buffered body
+// cannot fail.
 func (c *chatReply) Content(chunk []byte) error {
-	if !c.committed {
-		if c.stream {
+	c.committed = true
+	if c.stream {
+		if !c.answered {
 			c.w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 			c.w.Header().Set("Cache-Control", "no-cache")
-		} else {
-			c.w.Header().Set("Content-Type", "application/json")
+			c.w.WriteHeader(stdhttp.StatusOK)
+			c.answered = true
 		}
-		c.w.WriteHeader(stdhttp.StatusOK)
-		c.committed = true
-	}
-	if c.stream {
 		frame := make([]byte, 0, len(chunk)+8)
 		frame = append(frame, "data: "...)
 		frame = append(frame, chunk...)
@@ -82,18 +97,21 @@ func (c *chatReply) Content(chunk []byte) error {
 		c.flush()
 		return nil
 	}
-	if _, err := c.w.Write(chunk); err != nil {
-		return err
-	}
 	c.body.Write(chunk)
 	return nil
 }
 
-// Committed reports whether the answer crossed its commitment point.
+// Committed reports whether the answer crossed its commitment point —
+// content exists, whether or not it has left the process.
 func (c *chatReply) Committed() bool { return c.committed }
 
-// Delivered is the bytes the client received — the settlement's delivery
-// side, counted by the application, never parsed here.
+// Answered reports whether a byte has left the process on this connection —
+// the fact the transport's silence keys on.
+func (c *chatReply) Answered() bool { return c.answered }
+
+// Delivered is the answer's content bytes — for a stream, what was written
+// frame by frame; for a body, the buffered whole its ending writes. The
+// settlement's delivery side, counted by the application, never parsed here.
 func (c *chatReply) Delivered() []byte { return c.body.Bytes() }
 
 // Open arms the reply's framing before the first candidate runs: the answer's
@@ -102,28 +120,40 @@ func (c *chatReply) Delivered() []byte { return c.body.Bytes() }
 func (c *chatReply) Open(stream bool) { c.stream = stream }
 
 // ServeSucceeded closes a delivered answer. For a stream that is the terminal
-// frame; for a body the body was the whole answer and there is nothing to
-// add.
+// frame; for a body it is the moment the buffered answer is allowed to exist
+// — the settlement behind it has committed, so the status line and the body
+// whole leave together.
 func (c *chatReply) ServeSucceeded() {
-	if !c.stream {
+	if c.stream {
+		_, _ = c.w.Write(streamDoneFrame)
+		c.flush()
 		return
 	}
-	_, _ = c.w.Write(streamDoneFrame)
+	c.w.Header().Set("Content-Type", "application/json")
+	c.w.WriteHeader(stdhttp.StatusOK)
+	c.answered = true
+	_, _ = c.w.Write(c.body.Bytes())
 	c.flush()
 }
 
-// ServeMidStreamFailure writes a post-commitment failure into the stream it
-// belongs to: the failure frame carrying the one body the internal failure
-// carries — nothing about the cause, which by now is nobody's to parse — then
-// the terminal frame, then close. It has no meaning for a body answer, which
-// is written once and complete.
+// ServeMidStreamFailure writes a post-commitment failure into the answer it
+// belongs to. For a stream that is the failure frame carrying the one body
+// the internal failure carries — nothing about the cause, which by now is
+// nobody's to parse — then the terminal frame, then close. For a body the
+// wire is still silent, so the failure is an ordinary answer: the buffer is
+// discarded whole, and the failure cell is the only thing the client reads —
+// never a truncated document that could pass for success.
 func (c *chatReply) ServeMidStreamFailure() {
-	if !c.stream {
+	if c.stream {
+		_, _ = c.w.Write(eventFrame(internalFailure().body))
+		_, _ = c.w.Write(streamDoneFrame)
+		c.flush()
 		return
 	}
-	_, _ = c.w.Write(eventFrame(internalFailure().body))
-	_, _ = c.w.Write(streamDoneFrame)
-	c.flush()
+	c.body.Reset()
+	cell := internalFailure()
+	writeJSON(c.w, cell.status, runtimeErrorResponse{Error: cell.body})
+	c.answered = true
 }
 
 // ServeSurfaced answers a pre-commitment surfaced refusal: nothing has been

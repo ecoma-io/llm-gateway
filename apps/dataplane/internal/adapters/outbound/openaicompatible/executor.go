@@ -230,7 +230,15 @@ func (e *Executor) deliverBody(response *stdhttp.Response, requestID string, sin
 		return executors.Failure{Class: execution.ErrorInvalidUpstreamResponse, ProviderRequestID: requestID}
 	}
 	if err := sink.Content(raw); err != nil {
-		return executors.Failure{Class: execution.ErrorInvalidUpstreamResponse, ProviderRequestID: requestID}
+		// The write failed, but the usage report was read before it was
+		// attempted and is telemetry whether or not the answer was
+		// delivered — the failure carries it, the way a stream's own
+		// sink-stop does.
+		return executors.Failure{
+			Class:             execution.ErrorInvalidUpstreamResponse,
+			ProviderRequestID: requestID,
+			Usage:             probe.Usage.asPort(),
+		}
 	}
 	return executors.Success{
 		Usage:             probe.Usage.asPort(),

@@ -98,8 +98,8 @@ func TestIntegrationEngineRefusesAUsageEventRewrite(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `SELECT kind, settled_amount FROM public.usage_events WHERE append_seq = $1`, seq).Scan(&kind, &settledAmount); err != nil {
 		t.Fatalf("reading back the refused fact: %v", err)
 	}
-	if kind != "settled" || settledAmount != 375 {
-		t.Errorf("fact after the refused rewrites = (%s, %d), want (settled, 375) — a refusal leaves the row as the settlement wrote it", kind, settledAmount)
+	if kind != "settled" || settledAmount != integrationSettledAmount() {
+		t.Errorf("fact after the refused rewrites = (%s, %d), want (settled, %d) — a refusal leaves the row as the settlement wrote it", kind, settledAmount, integrationSettledAmount())
 	}
 	if stored := string(integrationStoredPayload(t, db, requestID)); !strings.Contains(stored, bucket) {
 		t.Errorf("payload after the refused rewrites = %s, want the settlement's own leg for %s still on file", stored, bucket)

@@ -33,13 +33,30 @@ import (
 // rule the whole Control Plane keeps, not a rule about the wire alone.
 
 // Fact is one usage fact as the Control Plane's store records it. It is this
-// port's own vocabulary, translated from the seam's by the application.
+// port's own vocabulary, translated from the seam's by the application, and it
+// carries the envelope whole — the typed settlement figures beside the payload,
+// because the contract fixes that a settlement must be derivable from the fact
+// alone. How they are stored is the schema PR's business; the pointers here
+// carry the fact's own claim about absence, so an applier can tell "no such
+// claim" (nil) from a stored zero without re-reading the payload.
 type Fact struct {
+	AppendSeq     int64
 	RequestID     string
 	Kind          string
 	SchemaVersion int
 	OccurredAt    time.Time
 	Payload       []byte
+
+	CaptureMethod        *string
+	CommittedAttemptID   *string
+	ProviderInputTokens  *int64
+	ProviderOutputTokens *int64
+	DeliveryTokens       *int64
+	PriceRevision        *string
+	InputUnitPrice       *int64
+	OutputUnitPrice      *int64
+	SettledAmount        *int64
+	CorrectsAppendSeq    *int64
 }
 
 // IngestionCursor is the Control Plane's own position in the fact feed.
@@ -77,12 +94,22 @@ type IngestionCursor interface {
 //
 // It takes this port's Fact rather than the seam's Event so the derivation
 // lives behind the port, where the schema that gives a payload its meaning is.
-// The obligation the signature cannot state is idempotency: the same fact is
-// expected to arrive more than once — replay is normal, not exceptional, and
-// the same range may be read any number of times — and applying it twice must
-// leave exactly one settlement, one consume leg and one release leg behind.
+// The obligation the signature cannot state is idempotency, and the contract
+// is kind-classed rather than by request_id alone: the same fact is expected
+// to arrive more than once — replay is normal, not exceptional, and the same
+// range may be read any number of times — and applying a fact whose
+// (request_id, kind class) has been applied must leave exactly one settlement,
+// one consume leg and one release leg behind. A different kind for the same
+// request_id is not a duplicate: the feed can carry a request's settlement
+// fact and an orphan fact beside it (shared/usage-facts.yaml), each with its
+// own effect, and a request_id-keyed refusal would drop the second one
+// forever. One class's effect may never cause the other's — a settlement
+// fact must never settle twice, an orphan must never consume or release twice
+// — and no fact of any kind may make money move twice.
 type FactApplier interface {
-	// Apply records fact. Applying the same request_id twice must be a no-op,
-	// and it must never settle, consume or release twice.
+	// Apply records fact. Applying a fact whose (request_id, kind class) has
+	// already been applied must be a no-op, and it must never settle, consume
+	// or release twice within a class — while a different kind for the same
+	// request_id is a distinct fact with its own effect.
 	Apply(ctx context.Context, fact Fact) error
 }

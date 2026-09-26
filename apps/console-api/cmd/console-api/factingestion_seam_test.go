@@ -36,10 +36,10 @@ const seamCredential = "management-credential-e2e-44b1"
 // carries a position to advance to and a fact whose request_id is null. Zero-
 // value decoding turned the null into "" and the page crossed as well-formed;
 // the cursor then advanced across a fact no applier ever saw.
-const malformedPageBody = `{"events":[{"request_id":null,"kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`
+const malformedPageBody = `{"events":[{"append_seq":7,"request_id":null,"kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`
 
 // validPageBody answers the same range with the fact the malformed page hid.
-const validPageBody = `{"events":[{"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":false}`
+const validPageBody = `{"events":[{"append_seq":7,"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":false}`
 
 // feedServer stands in for dataplane-api: it answers every read with the body
 // the test last set, and records what it was asked for. The fields are guarded

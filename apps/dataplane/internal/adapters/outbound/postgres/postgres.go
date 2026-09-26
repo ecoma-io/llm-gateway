@@ -239,14 +239,15 @@ func (s *store) InUnitOfWork(ctx context.Context) bool {
 // port member: a pool answers a ping all day while the migration that creates
 // its tables has not run, and a process that discovers that on its first real
 // query turns a one-line deployment mistake into per-request failures. The
-// probe asks for the ten objects whose absence breaks the very first
-// statement of each repository — the feed's ordering authority, the request
-// family, the quota family, the projection foundation's mirror and position,
-// the client price list, and the catalog's two tables, whose absence the
-// executor registry's snapshot read would otherwise discover per refresh
-// after a boot that reported ready — and the error
-// names the missing object and nothing else: no SQL, no driver prose, the
-// same discipline the repositories' own failures follow.
+// probe asks for the sixteen objects whose absence breaks the very first
+// statement of each repository — the feed's ordering authority and the feed
+// itself, the request family (shell, replay record, attempts, reservation and
+// its allocation legs), the quota family and its refills, the projection
+// foundation's mirror and position, the client price list, and the catalog's
+// two tables, whose absence the executor registry's snapshot read would
+// otherwise discover per refresh after a boot that reported ready — and the
+// error names the missing object and nothing else: no SQL, no driver prose,
+// the same discipline the repositories' own failures follow.
 func ValidateSchema(ctx context.Context, db *sql.DB) error {
 	if db == nil {
 		panic("postgres: ValidateSchema requires a non-nil *sql.DB — open the pool before validating")
@@ -254,8 +255,14 @@ func ValidateSchema(ctx context.Context, db *sql.DB) error {
 	const probe = `SELECT to_regclass($1)`
 	for _, required := range []struct{ object, why string }{
 		{"public.usage_events_stream", "the usage fact feed has no ordering authority"},
+		{"public.usage_events", "the usage fact feed has no table"},
 		{"public.requests", "the request family is missing"},
+		{"public.request_intake", "the replay records are missing"},
+		{"public.request_attempts", "the attempt telemetry is missing"},
+		{"public.reservations", "the holds are missing"},
+		{"public.reservation_allocations", "the holds' allocation legs are missing"},
 		{"public.quota_projections", "the quota projections are missing"},
+		{"public.quota_refills", "the quota projections have no refill history"},
 		{"public.api_key_credentials", "the credential mirror is missing"},
 		{"public.account_states", "the account mirror is missing"},
 		{"public.projection_state", "the projection position is missing"},
@@ -344,6 +351,20 @@ func (s *store) WithinTx(ctx context.Context, fn func(context.Context) error) er
 		return err
 	}
 	if err := tx.Commit(); err != nil {
+		// A commit failure that carries no SQLSTATE is the one failure whose
+		// verdict the engine never stated: the connection dropped, the context
+		// died mid-commit, the driver lost the answer — the unit may be
+		// committed and unacknowledged, or rolled back with its connection. A
+		// commit failure WITH a SQLSTATE (a deferred trigger's refusal, a
+		// serialization) is the engine judging: the unit rolled back, and the
+		// error travels as itself. The sentinel matters because the caller's
+		// next act depends on it — a unit whose outcome is unknown may be
+		// retried only where re-running it is safe against its own committed
+		// twin, which the ending ladders' CAS makes true for theirs and no
+		// caller may assume for its own.
+		if code(err) == "" {
+			return fmt.Errorf("postgres: commit transaction: %w: %w", persistence.ErrCommitOutcomeUnknown, err)
+		}
 		return fmt.Errorf("postgres: commit transaction: %w", err)
 	}
 	return nil

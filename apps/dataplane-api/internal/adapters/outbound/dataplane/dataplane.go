@@ -405,12 +405,24 @@ func (b pageBody) page() (dataplane.Page, error) {
 }
 
 // event translates one fact into the port's vocabulary, refusing it when any
-// of the five fields the contract marks required is absent or null. Presence
+// of the required non-nullable fields is absent or null. Presence
 // is the only judgement: an empty request_id, a schema_version this build does
 // not know and a payload whose shape this build does not interpret all cross —
 // which of them can settle is the consumer's decision, made below the port.
+//
+// The typed settlement figures cross as the pointers they are. The contract
+// requires them — every fact carries every field — and makes them nullable,
+// and encoding/json cannot distinguish a field that is absent from one that is
+// null, so this hop admits both spellings as the nil that means "this fact
+// makes no such claim". Their null fidelity is the whole point: a stored zero
+// and an absence are different sentences about money, and the pointer is what
+// keeps the two from merging on the way through.
 func (e eventBody) event() (dataplane.Event, error) {
 	switch {
+	case e.AppendSeq == nil:
+		return dataplane.Event{}, fmt.Errorf("%w: the data plane answered with a fact carrying no append_seq, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
+	case *e.AppendSeq < 1:
+		return dataplane.Event{}, fmt.Errorf("%w: the data plane answered with a fact whose append_seq is %d, below the 1 this surface contracts", dataplane.ErrUpstreamUnavailable, *e.AppendSeq)
 	case e.RequestID == nil:
 		return dataplane.Event{}, fmt.Errorf("%w: the data plane answered with a fact carrying no request_id, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
 	case e.Kind == nil:
@@ -423,11 +435,22 @@ func (e eventBody) event() (dataplane.Event, error) {
 		return dataplane.Event{}, fmt.Errorf("%w: the data plane answered with a fact carrying no payload, which this surface contracts as required", dataplane.ErrUpstreamUnavailable)
 	}
 	return dataplane.Event{
-		RequestID:     *e.RequestID,
-		Kind:          *e.Kind,
-		SchemaVersion: *e.SchemaVersion,
-		OccurredAt:    *e.OccurredAt,
-		Payload:       *e.Payload,
+		AppendSeq:            *e.AppendSeq,
+		RequestID:            *e.RequestID,
+		Kind:                 *e.Kind,
+		SchemaVersion:        *e.SchemaVersion,
+		OccurredAt:           *e.OccurredAt,
+		Payload:              *e.Payload,
+		CaptureMethod:        e.CaptureMethod,
+		CommittedAttemptID:   e.CommittedAttemptID,
+		ProviderInputTokens:  e.ProviderInputTokens,
+		ProviderOutputTokens: e.ProviderOutputTokens,
+		DeliveryTokens:       e.DeliveryTokens,
+		PriceRevision:        e.PriceRevisionID,
+		InputUnitPrice:       e.InputUnitPrice,
+		OutputUnitPrice:      e.OutputUnitPrice,
+		SettledAmount:        e.SettledAmount,
+		CorrectsAppendSeq:    e.CorrectsAppendSeq,
 	}, nil
 }
 
@@ -465,11 +488,31 @@ type pageBody struct {
 }
 
 type eventBody struct {
+	AppendSeq     *int64           `json:"append_seq"`
 	RequestID     *string          `json:"request_id"`
 	Kind          *string          `json:"kind"`
 	SchemaVersion *int             `json:"schema_version"`
 	OccurredAt    *time.Time       `json:"occurred_at"`
 	Payload       *json.RawMessage `json:"payload"`
+
+	// The settlement figures are pointers for the same fidelity reason the
+	// envelope fields are, with one turn of the screw: null here is a claim
+	// — "this fact makes no such claim" — that a stored zero is not, and the
+	// pointer is what keeps the two apart. The contract requires these
+	// fields and makes them nullable; encoding/json cannot distinguish an
+	// absent field from an explicit null, this decoder admits both spellings
+	// as the nil that means the absence, and refusing either spelling would
+	// demand a distinction JSON cannot carry.
+	CaptureMethod        *string `json:"capture_method"`
+	CommittedAttemptID   *string `json:"committed_attempt_id"`
+	ProviderInputTokens  *int64  `json:"provider_input_tokens"`
+	ProviderOutputTokens *int64  `json:"provider_output_tokens"`
+	DeliveryTokens       *int64  `json:"delivery_tokens"`
+	PriceRevisionID      *string `json:"price_revision_id"`
+	InputUnitPrice       *int64  `json:"input_unit_price"`
+	OutputUnitPrice      *int64  `json:"output_unit_price"`
+	SettledAmount        *int64  `json:"settled_amount"`
+	CorrectsAppendSeq    *int64  `json:"corrects_append_seq"`
 }
 
 // currentGroupVersionBody is the wire shape of the private listener's catalog

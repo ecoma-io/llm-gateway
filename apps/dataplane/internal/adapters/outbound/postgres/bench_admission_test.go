@@ -130,19 +130,22 @@ func BenchmarkHoldOverflowAdjacent(b *testing.B) {
 	}
 }
 
-// BenchmarkCountInputTokens costs the interim byte counter on a request body
-// the suite's shapes produce: three content parts, one of them multibyte, so
-// the byte (not rune) walk is what is measured.
+// BenchmarkCountInputTokens costs the canonical v1 tokenizer on an admitted
+// body: one JSON envelope with three messages, one of them multibyte, and a
+// tools array beside them. Canonical v1 counts the WHOLE body in bytes — the
+// envelope and its tools included, not just the messages — so the benchmark
+// doubles as its own validity check: the count may never disagree with
+// len(body).
 func BenchmarkCountInputTokens(b *testing.B) {
-	contents := []string{
-		"You are a helpful assistant.",
-		"Summarise the following contract in five bullet points.",
-		"Здесь многоязычный текст, считаемый байтами, не рунами.",
-	}
+	body := []byte(`{"model":"bench-model","messages":[` +
+		`{"role":"system","content":"You are a helpful assistant."},` +
+		`{"role":"user","content":"Summarise the following contract in five bullet points."},` +
+		`{"role":"user","content":"Здесь многоязычный текст, считаемый байтами, не рунами."}],` +
+		`"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if count := catalog.CountInputTokens(contents); count <= 0 {
-			b.Fatalf("CountInputTokens = %d, want the parts' byte sum", count)
+		if count := catalog.CountInputTokens(body); count != int64(len(body)) {
+			b.Fatalf("CountInputTokens = %d, want the body's own %d bytes — canonical v1 counts the envelope", count, len(body))
 		}
 	}
 }

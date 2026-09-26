@@ -161,9 +161,11 @@ func TestARenewalReportingTheHoldGoneCancelsTheCall(t *testing.T) {
 
 // TestARenewingErrorKeepsTheClaimAndTheCall: a renewal that merely ERRORS is
 // not evidence the hold is gone — the row's deadline is the last successful
-// renewal's, the next tick asks again, and an outage shorter than the
-// remaining hold window survives. The call runs on; the chain, when answers
-// return, is exactly as continuous as it ever was.
+// renewal's, the next tick asks the store for the SAME value it never
+// recorded, and an outage shorter than the remaining hold window survives.
+// The chain never advances on an error, because advancing would write the
+// next expiry from an instant no row ever carried; from the first answer it
+// climbs by the lease again, as continuous as it ever was.
 func TestARenewingErrorKeepsTheClaimAndTheCall(t *testing.T) {
 	routing, world, _, in := routingFixture(t)
 	world.seedCandidates("test-model",
@@ -196,9 +198,21 @@ func TestARenewingErrorKeepsTheClaimAndTheCall(t *testing.T) {
 	if len(renewals.asked) < 4 {
 		t.Fatalf("the renewer asked %d times, want at least 4 — two errors then the chain continued", len(renewals.asked))
 	}
-	for i := 1; i < len(renewals.asked); i++ {
+	// The two errored renewals leave the chain exactly where it was: the
+	// store never recorded the expiry they asked for, so the next tick asks
+	// for that same value rather than writing a new one from an instant no
+	// row carried. Three identical asks — the two errors and the successful
+	// retry of the same deadline — are the doctrine on the wire.
+	for i := 1; i <= 2; i++ {
+		if got := renewals.asked[i].Sub(renewals.asked[i-1]); got != 0 {
+			t.Fatalf("renewal %d asked %s after its predecessor, want the same unrecorded deadline — an errored renewal never advances the chain", i, got)
+		}
+	}
+	// From the first answer the climb resumes: one lease per ask, as
+	// continuous as it ever was.
+	for i := 3; i < len(renewals.asked); i++ {
 		if got := renewals.asked[i].Sub(renewals.asked[i-1]); got != cfg.LeaseTTL {
-			t.Fatalf("renewal %d asked %s after its predecessor, want exactly the lease %s — the chain does not stutter for an error", i, got, cfg.LeaseTTL)
+			t.Fatalf("renewal %d asked %s after its predecessor, want exactly the lease %s — the chain climbs by the lease once answers return", i, got, cfg.LeaseTTL)
 		}
 	}
 	if reservation := admissionReservationRow(t, world); !reservation.LeaseExpiresAt.Equal(renewals.asked[len(renewals.asked)-1]) {

@@ -150,11 +150,22 @@ func (ingestion *FactIngestion) Replay(ctx context.Context) (FactIngestionResult
 			// version, rather than guessing at it, is that side's decision to
 			// make: it is the only side that knows which shapes it can settle.
 			fact := persistence.Fact{
-				RequestID:     event.RequestID,
-				Kind:          event.Kind,
-				SchemaVersion: event.SchemaVersion,
-				OccurredAt:    event.OccurredAt,
-				Payload:       []byte(event.Payload),
+				AppendSeq:            event.AppendSeq,
+				RequestID:            event.RequestID,
+				Kind:                 event.Kind,
+				SchemaVersion:        event.SchemaVersion,
+				OccurredAt:           event.OccurredAt,
+				Payload:              []byte(event.Payload),
+				CaptureMethod:        event.CaptureMethod,
+				CommittedAttemptID:   event.CommittedAttemptID,
+				ProviderInputTokens:  event.ProviderInputTokens,
+				ProviderOutputTokens: event.ProviderOutputTokens,
+				DeliveryTokens:       event.DeliveryTokens,
+				PriceRevision:        event.PriceRevision,
+				InputUnitPrice:       event.InputUnitPrice,
+				OutputUnitPrice:      event.OutputUnitPrice,
+				SettledAmount:        event.SettledAmount,
+				CorrectsAppendSeq:    event.CorrectsAppendSeq,
 			}
 			if err := ingestion.applier.Apply(txCtx, fact); err != nil {
 				// Returning here ends the unit of work, so the effects of the

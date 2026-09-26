@@ -50,13 +50,21 @@ func NewUsageFacts(db *sql.DB) *UsageFacts {
 }
 
 // pageQuery selects exactly the columns the port's Event carries, no more.
-// The settlement figures — capture method, tokens, prices, amount — stay in
-// the row: they are the payload's provenance and the Control Plane derives
-// from the payload, not from columns this port never promised to carry. The
-// order by is the table's append sequence, the one monotonic order the store
-// allocates at commit; ordering by occurred_at would be trusting clocks that
-// disagree, and the port exists so nobody has to.
-const pageQuery = `SELECT append_seq, request_id::text, kind, schema_version, occurred_at, payload
+// The typed settlement figures cross with the envelope on purpose: a Control
+// Plane settlement has to be derivable from the fact alone — the feed's own
+// contract — and a page that carried only the payload would leave the
+// consumer parsing this table's jsonb shape to price anything, which is the
+// coupling the typed columns exist to prevent. The payload still travels
+// whole beside them: it is the allocation tail's schema, versioned by
+// schema_version, and it is not this reader's to interpret. The order by is
+// the table's append sequence, the one monotonic order the store allocates
+// at commit; ordering by occurred_at would be trusting clocks that disagree,
+// and the port exists so nobody has to.
+const pageQuery = `SELECT append_seq, request_id::text, kind, schema_version,
+       capture_method, committed_attempt_id::text,
+       provider_input_tokens, provider_output_tokens, delivery_tokens,
+       price_revision_id, input_unit_price, output_unit_price, settled_amount,
+       corrects_append_seq, occurred_at, payload
 FROM public.usage_events
 WHERE append_seq > $1
 ORDER BY append_seq ASC
@@ -178,15 +186,26 @@ func (reader *UsageFacts) Read(ctx context.Context, after string, limit int) (us
 // consumer reads are the bytes that were stored, and an event that aliased a
 // reused buffer would satisfy every test and corrupt the first consumer that
 // held two pages at once.
+//
+// The nullable columns scan into the Event's pointers, so a column's NULL and
+// a stored zero stay distinct across the whole feed — the distinction a
+// zero-priced settlement is built on. A row whose decode fails fails the page
+// (Read's fail-closed rule): a fact this build cannot decode stops the
+// consumer, it is never skipped.
 func scanEvent(rows *sql.Rows) (usagefacts.Event, int64, error) {
 	var (
 		event   usagefacts.Event
 		seq     int64
 		payload []byte
 	)
-	if err := rows.Scan(&seq, &event.RequestID, &event.Kind, &event.SchemaVersion, &event.OccurredAt, &payload); err != nil {
+	if err := rows.Scan(&seq, &event.RequestID, &event.Kind, &event.SchemaVersion,
+		&event.CaptureMethod, &event.CommittedAttemptID,
+		&event.ProviderInputTokens, &event.ProviderOutputTokens, &event.DeliveryTokens,
+		&event.PriceRevision, &event.InputUnitPrice, &event.OutputUnitPrice, &event.SettledAmount,
+		&event.CorrectsAppendSeq, &event.OccurredAt, &payload); err != nil {
 		return usagefacts.Event{}, 0, err
 	}
+	event.AppendSeq = seq
 	if !json.Valid(payload) {
 		return usagefacts.Event{}, 0, fmt.Errorf("payload is not valid json")
 	}

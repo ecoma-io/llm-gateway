@@ -203,11 +203,28 @@ type usageEventsResponse struct {
 }
 
 type usageEventResponse struct {
+	AppendSeq     int64           `json:"append_seq"`
 	RequestID     string          `json:"request_id"`
 	Kind          string          `json:"kind"`
 	SchemaVersion int             `json:"schema_version"`
 	OccurredAt    string          `json:"occurred_at"`
 	Payload       json.RawMessage `json:"payload"`
+
+	// The settlement figures are pointers so a fact's absence claims render
+	// as the contract's nulls: the contract requires every field and makes
+	// these nullable, and a nil pointer marshals to exactly that null. A
+	// stored zero marshals as a real zero, which is the distinction the
+	// nullability exists to carry.
+	CaptureMethod        *string `json:"capture_method"`
+	CommittedAttemptID   *string `json:"committed_attempt_id"`
+	ProviderInputTokens  *int64  `json:"provider_input_tokens"`
+	ProviderOutputTokens *int64  `json:"provider_output_tokens"`
+	DeliveryTokens       *int64  `json:"delivery_tokens"`
+	PriceRevisionID      *string `json:"price_revision_id"`
+	InputUnitPrice       *int64  `json:"input_unit_price"`
+	OutputUnitPrice      *int64  `json:"output_unit_price"`
+	SettledAmount        *int64  `json:"settled_amount"`
+	CorrectsAppendSeq    *int64  `json:"corrects_append_seq"`
 }
 
 // newUsageEventsResponse renders a page. Every value crosses unchanged: the
@@ -224,6 +241,7 @@ func newUsageEventsResponse(page dataplane.Page) usageEventsResponse {
 	events := make([]usageEventResponse, 0, len(page.Events))
 	for _, event := range page.Events {
 		events = append(events, usageEventResponse{
+			AppendSeq:     event.AppendSeq,
 			RequestID:     event.RequestID,
 			Kind:          event.Kind,
 			SchemaVersion: event.SchemaVersion,
@@ -235,6 +253,17 @@ func newUsageEventsResponse(page dataplane.Page) usageEventsResponse {
 			// difference.
 			OccurredAt: event.OccurredAt.Format(time.RFC3339Nano),
 			Payload:    event.Payload,
+
+			CaptureMethod:        event.CaptureMethod,
+			CommittedAttemptID:   event.CommittedAttemptID,
+			ProviderInputTokens:  event.ProviderInputTokens,
+			ProviderOutputTokens: event.ProviderOutputTokens,
+			DeliveryTokens:       event.DeliveryTokens,
+			PriceRevisionID:      event.PriceRevision,
+			InputUnitPrice:       event.InputUnitPrice,
+			OutputUnitPrice:      event.OutputUnitPrice,
+			SettledAmount:        event.SettledAmount,
+			CorrectsAppendSeq:    event.CorrectsAppendSeq,
 		})
 	}
 	return usageEventsResponse{Events: events, NextCursor: page.NextCursor, HasMore: page.HasMore}

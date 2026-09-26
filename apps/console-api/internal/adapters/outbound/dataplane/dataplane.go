@@ -286,12 +286,32 @@ type pageResponse struct {
 // that never carried the field is a nil rather than an instant that looks like
 // the beginning of time. Payload stays raw: its columns belong to the schema
 // that wrote the fact.
+//
+// The settlement figures are pointers for the null fidelity the contract
+// requires: null is the claim that the fact makes no such claim, and a stored
+// zero is a different sentence about money. The contract requires these
+// fields and makes them nullable; encoding/json cannot distinguish an absent
+// field from an explicit null, both decode to the nil that means the absence,
+// and neither is refused — which of a fact's figures can be null is the
+// kind's decision, and presence-shape is the only judgement this hop makes.
 type eventResponse struct {
+	AppendSeq     *int64           `json:"append_seq"`
 	RequestID     *string          `json:"request_id"`
 	Kind          *string          `json:"kind"`
 	SchemaVersion *int             `json:"schema_version"`
 	OccurredAt    *time.Time       `json:"occurred_at"`
 	Payload       *json.RawMessage `json:"payload"`
+
+	CaptureMethod        *string `json:"capture_method"`
+	CommittedAttemptID   *string `json:"committed_attempt_id"`
+	ProviderInputTokens  *int64  `json:"provider_input_tokens"`
+	ProviderOutputTokens *int64  `json:"provider_output_tokens"`
+	DeliveryTokens       *int64  `json:"delivery_tokens"`
+	PriceRevisionID      *string `json:"price_revision_id"`
+	InputUnitPrice       *int64  `json:"input_unit_price"`
+	OutputUnitPrice      *int64  `json:"output_unit_price"`
+	SettledAmount        *int64  `json:"settled_amount"`
+	CorrectsAppendSeq    *int64  `json:"corrects_append_seq"`
 }
 
 // page translates the wire shape into the port's, one field at a time so a
@@ -333,12 +353,18 @@ func (r pageResponse) page() (port.Page, error) {
 }
 
 // event translates one fact into the port's vocabulary, refusing it when any
-// of the five fields the contract marks required is absent or null. Presence
+// of the required non-nullable fields is absent or null. Presence
 // is the only judgement: an empty request_id, a kind this build has never
 // heard of and a schema_version it does not know all cross — deciding which of
-// them can settle is the applier's, below the port.
+// them can settle is the applier's, below the port. The nullable settlement
+// figures cross as the nils they decode to, their absence a claim the port's
+// pointers carry whole.
 func (r eventResponse) event() (port.Event, error) {
 	switch {
+	case r.AppendSeq == nil:
+		return port.Event{}, fmt.Errorf("%w: the page carries a fact with no append_seq, which the contract requires", port.ErrMalformedPage)
+	case *r.AppendSeq < 1:
+		return port.Event{}, fmt.Errorf("%w: the page carries a fact whose append_seq is %d, below the 1 the contract allows", port.ErrMalformedPage, *r.AppendSeq)
 	case r.RequestID == nil:
 		return port.Event{}, fmt.Errorf("%w: the page carries a fact with no request_id, which the contract requires", port.ErrMalformedPage)
 	case r.Kind == nil:
@@ -351,11 +377,22 @@ func (r eventResponse) event() (port.Event, error) {
 		return port.Event{}, fmt.Errorf("%w: the page carries a fact with no payload, which the contract requires", port.ErrMalformedPage)
 	}
 	return port.Event{
-		RequestID:     *r.RequestID,
-		Kind:          *r.Kind,
-		SchemaVersion: *r.SchemaVersion,
-		OccurredAt:    *r.OccurredAt,
-		Payload:       *r.Payload,
+		AppendSeq:            *r.AppendSeq,
+		RequestID:            *r.RequestID,
+		Kind:                 *r.Kind,
+		SchemaVersion:        *r.SchemaVersion,
+		OccurredAt:           *r.OccurredAt,
+		Payload:              *r.Payload,
+		CaptureMethod:        r.CaptureMethod,
+		CommittedAttemptID:   r.CommittedAttemptID,
+		ProviderInputTokens:  r.ProviderInputTokens,
+		ProviderOutputTokens: r.ProviderOutputTokens,
+		DeliveryTokens:       r.DeliveryTokens,
+		PriceRevision:        r.PriceRevisionID,
+		InputUnitPrice:       r.InputUnitPrice,
+		OutputUnitPrice:      r.OutputUnitPrice,
+		SettledAmount:        r.SettledAmount,
+		CorrectsAppendSeq:    r.CorrectsAppendSeq,
 	}, nil
 }
 

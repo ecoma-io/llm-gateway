@@ -42,10 +42,25 @@ import (
 )
 
 // Event is one immutable fact the runtime recorded, as the Data Plane reports
-// it. The five fields are the envelope the wire contract fixes
+// it. The envelope fields are the wire contract's
 // (api/openapi/shared/usage-facts.yaml); what is inside Payload is the fact
 // schema's business and not this application's.
+//
+// The typed settlement figures travel beside the payload on the contract's
+// say-so: a settlement must be derivable from the fact alone, and the figures
+// a settlement prices with are the envelope's, not the payload's. This
+// application carries them without an opinion — which fields a given kind
+// makes non-null is the producer's vocabulary, and this transport's only
+// obligation to them is fidelity: a null crosses as nil, a stored zero as a
+// pointer to zero.
 type Event struct {
+	// AppendSeq is the fact's position in the Data Plane's append order and
+	// its identity on the wire. It is not the consumer's idempotency key —
+	// that is RequestID and the kind's class — but it is the only value that
+	// names which fact a question is about, and this surface requires it:
+	// a page that cannot say where its facts stand is a page this
+	// application cannot answer from.
+	AppendSeq int64
 	// RequestID is the runtime request this fact is about, and the logical
 	// idempotency key for everything derived from it. It is not the HTTP
 	// X-Request-Id: one correlates a call, the other identifies the business
@@ -67,6 +82,30 @@ type Event struct {
 	// is raw rather than decoded because decoding it here would be a second
 	// definition of a shape this application never reads.
 	Payload json.RawMessage
+
+	// CaptureMethod names how the fact's usage figures were known. Nil where
+	// the fact claims no usage.
+	CaptureMethod *string
+	// CommittedAttemptID names the upstream call the usage belongs to. Nil
+	// where the fact names no attempt.
+	CommittedAttemptID *string
+	// ProviderInputTokens and ProviderOutputTokens are the provider's own
+	// report as the gateway recorded it. Nil where no report arrived.
+	ProviderInputTokens  *int64
+	ProviderOutputTokens *int64
+	// DeliveryTokens is the gateway's own count of what reached the client.
+	DeliveryTokens *int64
+	// PriceRevision and the two unit prices are the settlement's pricing
+	// basis, present together or not at all.
+	PriceRevision   *string
+	InputUnitPrice  *int64
+	OutputUnitPrice *int64
+	// SettledAmount is what the request cost. Nil on every fact where no
+	// money moved; zero is a real amount.
+	SettledAmount *int64
+	// CorrectsAppendSeq is reserved for the correction path. Nil on every
+	// fact this generation's producer writes.
+	CorrectsAppendSeq *int64
 }
 
 // Page is one replayable slice of the feed: the facts, the position of the last

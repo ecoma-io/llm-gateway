@@ -159,6 +159,20 @@ func NewSettled(requestID identity.RequestID, attempt identity.AttemptID, captur
 	if err := checkUsage(input, output, delivery); err != nil {
 		return Fact{}, err
 	}
+	// The amount is bound to the figures, not trusted from the caller: the
+	// hold formula is the one place the arithmetic lives, and a settled fact
+	// whose amount disagrees with what that formula prices the fact's own
+	// counts at is a settlement no auditor could re-derive — the exact
+	// property the amount exists to keep. The binding holds at zero too: a
+	// free model's counts price to zero, and zero is what the fact must
+	// carry.
+	derived, err := Hold(int(countOrZero(input)), int(countOrZero(output)), inputUnitPrice, outputUnitPrice)
+	if err != nil {
+		return Fact{}, fmt.Errorf("%w: the settled amount cannot be re-derived over the fact's figures: %w", ErrFactShape, err)
+	}
+	if derived != settledAmount {
+		return Fact{}, fmt.Errorf("%w: settled amount %d disagrees with the %d the hold formula prices the fact's own figures at", ErrFactShape, settledAmount, derived)
+	}
 	pricedIn := inputUnitPrice
 	pricedOut := outputUnitPrice
 	amount := settledAmount
@@ -283,4 +297,14 @@ func captureKnown(capture CaptureMethod) bool {
 		return true
 	}
 	return false
+}
+
+// countOrZero reads a nullable count as the number it prices at: nobody-knows
+// and zero both contribute nothing to a derivation, while the fact keeps the
+// distinction between them.
+func countOrZero(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }

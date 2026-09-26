@@ -636,10 +636,25 @@ func integrationSeedProjection(t testing.TB, ctx context.Context, repos integrat
 // integrationPrice is the one price snapshot every suite request is priced
 // under. Nothing here needs it to vary: the settlement re-derives its amount
 // from the row's own snapshot, and one constant keeps every fact's arithmetic
-// checkable by eye — 120 input tokens at 2 and 45 output tokens at 3 is 375
-// minor units, the settled amount every helper writes.
+// checkable by eye — 120 input tokens at 2 and 45 output tokens at 3
+// raw-cost 375, and the 1M price scale is the ceiling's to apply.
 func integrationPrice() execution.PriceSnapshot {
 	return execution.PriceSnapshot{RevisionID: "b7it-price-revision-1", InputUnitPrice: 2, OutputUnitPrice: 3}
+}
+
+// integrationSettledAmount is the hold formula's verdict for the suite's own
+// counts at the suite's own prices — the settled amount every helper writes.
+// It is derived through accounting.Hold rather than restated as a literal
+// because that derivation is exactly the binding the settled fact keeps: a
+// figure stated beside its inputs can drift from them, a figure computed
+// from them cannot.
+func integrationSettledAmount() int64 {
+	price := integrationPrice()
+	amount, err := accounting.Hold(120, 45, price.InputUnitPrice, price.OutputUnitPrice)
+	if err != nil {
+		panic(fmt.Sprintf("integrationSettledAmount: %v", err))
+	}
+	return amount
 }
 
 // int64Ptr is the suite's spelling of "a known count": a pointer, because the
@@ -727,7 +742,7 @@ func integrationSettlement(t testing.TB, ctx context.Context, repos integrationR
 		}
 		fact, err = accounting.NewSettled(request.ID, attempt.ID, accounting.CaptureReported,
 			int64Ptr(120), int64Ptr(45), int64Ptr(45),
-			price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice, 375,
+			price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice, integrationSettledAmount(),
 			integrationFactLegs(reservation.Allocations), now)
 		if err != nil {
 			return err
@@ -762,7 +777,7 @@ func integrationFormSettled(t testing.TB, account string, legs []accounting.Allo
 	}
 	fact, err := accounting.NewSettled(request.ID, attempt.ID, accounting.CaptureReported,
 		int64Ptr(120), int64Ptr(45), int64Ptr(45),
-		price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice, 375,
+		price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice, integrationSettledAmount(),
 		legs, occurredAt)
 	if err != nil {
 		t.Fatalf("building a settled fact: %v", err)
@@ -1844,7 +1859,7 @@ func TestIntegrationSettlementUnitIsAllOrNothing(t *testing.T) {
 		}
 		fact, err := accounting.NewSettled(request.ID, attempt.ID, accounting.CaptureReported,
 			int64Ptr(120), int64Ptr(45), int64Ptr(45),
-			price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice, 375,
+			price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice, integrationSettledAmount(),
 			integrationFactLegs(drawn), now)
 		if err != nil {
 			return err
@@ -3749,13 +3764,19 @@ func TestIntegrationSurfacedRefusalVocabularyWritesAndRefuses(t *testing.T) {
 }
 
 // TestIntegrationAttemptAppendCollisionReadsAsAlreadyAppended pins the
-// engine half of append idempotency: a second insert of an attempt the row
-// already carries — by id, or by the (request, candidate position, retry
-// sequence) business key — is the persistence sentinel, not a raw driver
-// error, because an append whose commit acknowledgement was lost must read
-// "already done" from the one writer that knows. A genuinely new attempt on
-// the same request (the next retry sequence) still inserts cleanly, proving
-// the sentinel is the collision's answer and not a swallowed failure.
+// engine half of append idempotency. A second insert of an attempt the row
+// already carries, by its own id, is the persistence sentinel, not a raw
+// driver error, because an append whose commit acknowledgement was lost must
+// read "already done" from the one writer that knows — and the Exists probe
+// is what reads it first inside a unit of work, answering the race while the
+// ending's transaction can still act instead of on an engine the 23505 has
+// already aborted. The business key's refusal is a different verdict on
+// purpose: a second attempt at one (request, candidate position, retry
+// sequence) carries a different id by construction, so its 23505 is a caller
+// bug, not a raced append, and surfaces as the engine's own error — never
+// dressed as a sentinel that would tell the caller its row was written. A
+// genuinely new attempt on the same request (the next retry sequence) still
+// inserts cleanly, proving neither answer is a swallowed failure.
 func TestIntegrationAttemptAppendCollisionReadsAsAlreadyAppended(t *testing.T) {
 	db, store := integrationPool(t)
 	repos := integrationRepos(t, store)
@@ -3781,14 +3802,35 @@ func TestIntegrationAttemptAppendCollisionReadsAsAlreadyAppended(t *testing.T) {
 		t.Fatalf("re-inserting the same attempt = %v, want ErrAttemptAlreadyAppended", err)
 	}
 
+	// What a unit of work reads instead of racing the insert: the probe that
+	// precedes it. The appended attempt is present to the probe — and an id
+	// nothing appended is absent from it — which is the one tolerance an
+	// ending needs: it acts on "already done" while its transaction can
+	// still act, rather than reading the answer off an engine the duplicate
+	// has already poisoned.
+	appended, err := repos.attempts.Exists(ctx, attempt.ID)
+	if err != nil {
+		t.Fatalf("probing the appended attempt: %v", err)
+	}
+	if !appended {
+		t.Fatal("Exists() = false for an attempt the insert's sentinel just named as present")
+	}
+	if absent, err := repos.attempts.Exists(ctx, identity.NewAttemptID()); err != nil || absent {
+		t.Fatalf("Exists() = (%t, %v) for an id nothing appended, want (false, nil)", absent, err)
+	}
+
 	// The same business identity under a fresh id: the (request, candidate
-	// position, retry sequence) key refuses it with the same answer.
+	// position, retry sequence) key refuses it too, but as the engine's own
+	// error. A twin at one position is a caller bug, not a raced append, and
+	// the already-appended sentinel would tell the caller its row was written
+	// when what happened was that its attempt was illegitimate.
 	twin, err := execution.NewAttempt(identity.NewAttemptID(), request.ID, attempt.CandidatePosition, attempt.RetrySequence, attempt.BackendID, attempt.ProviderModel, attempt.Outcome, "", attempt.StartedAt, attempt.FinishedAt)
 	if err != nil {
 		t.Fatalf("building the twin attempt: %v", err)
 	}
-	if err := repos.attempts.Insert(ctx, twin); !errors.Is(err, persistence.ErrAttemptAlreadyAppended) {
-		t.Fatalf("inserting a twin under the business key = %v, want ErrAttemptAlreadyAppended", err)
+	twinErr := repos.attempts.Insert(ctx, twin)
+	if twinErr == nil || errors.Is(twinErr, persistence.ErrAttemptAlreadyAppended) {
+		t.Fatalf("inserting a twin under the business key = %v, want the engine's own 23505, never the already-appended sentinel", twinErr)
 	}
 
 	// A different retry sequence is a different call of the same request on

@@ -74,11 +74,16 @@ func legsTotalling(t *testing.T, target int) []AllocationLeg {
 }
 
 // settledFact builds the fixture every settled-shape test starts from: a
-// reported settle of the whole hold under the standard snapshot.
+// reported settle of the whole hold under the standard snapshot. The amount
+// is the hold formula's own answer for the report below —
+// ceil((511·15 + 137·60)/1_000_000) = ceil(15 885/1 000 000) = 1 — because
+// the constructor binds the amount to the figures and refuses anything else;
+// the binding itself is TestNewSettledBindsTheAmountToTheHoldFormula's
+// subject.
 func settledFact(t *testing.T, legs []AllocationLeg) Fact {
 	t.Helper()
 	input, output, delivery := usageReport()
-	fact, err := NewSettled("req-0001", "att-0001", CaptureReported, input, output, delivery, "rev-2026-09", 15, 60, 2295, legs, occurredAt)
+	fact, err := NewSettled("req-0001", "att-0001", CaptureReported, input, output, delivery, "rev-2026-09", 15, 60, 1, legs, occurredAt)
 	if err != nil {
 		t.Fatalf("NewSettled() error = %v", err)
 	}
@@ -118,8 +123,8 @@ func TestNewSettledProducesTheV1EnvelopeAndThePricingPointers(t *testing.T) {
 	if fact.InputUnitPrice == nil || fact.OutputUnitPrice == nil || fact.SettledAmount == nil {
 		t.Fatalf("pricing pointers = (%v, %v, %v), want all three present — a settled fact carries its pricing basis whole", fact.InputUnitPrice, fact.OutputUnitPrice, fact.SettledAmount)
 	}
-	if *fact.InputUnitPrice != 15 || *fact.OutputUnitPrice != 60 || *fact.SettledAmount != 2295 {
-		t.Errorf("pricing = (%d, %d, %d), want (15, 60, 2295)", *fact.InputUnitPrice, *fact.OutputUnitPrice, *fact.SettledAmount)
+	if *fact.InputUnitPrice != 15 || *fact.OutputUnitPrice != 60 || *fact.SettledAmount != 1 {
+		t.Errorf("pricing = (%d, %d, %d), want (15, 60, 1) — the amount the hold formula derives from the report", *fact.InputUnitPrice, *fact.OutputUnitPrice, *fact.SettledAmount)
 	}
 	if fact.PriceRevision != "rev-2026-09" {
 		t.Errorf("PriceRevision = %q, want rev-2026-09", fact.PriceRevision)
@@ -192,6 +197,97 @@ func TestANewSettledFactCanPriceAtZero(t *testing.T) {
 	}
 }
 
+// TestNewSettledBindsTheAmountToTheHoldFormula pins the amount's binding to
+// the figures the fact itself carries: the hold formula is the one place the
+// arithmetic lives, so a settled amount the formula does not re-derive from
+// the fact's own counts and prices is refused — an auditor must be able to
+// take the row alone and reach the same number. The cases cover the non-zero
+// ceiling (a fractional derivation rounds up), an exact derivation, the
+// absent-count case that prices at zero, and the refusal naming both the
+// amount offered and the amount derived.
+func TestNewSettledBindsTheAmountToTheHoldFormula(t *testing.T) {
+	tests := []struct {
+		name              string
+		input, output     *int64
+		delivery          *int64
+		inPrice, outPrice int64
+		amount            int64
+		want              int64 // the amount the formula derives and the fact must carry
+		wantErr           bool  // the offered amount disagrees with the derivation
+	}{
+		{
+			name:  "a fractional derivation rounds up",
+			input: ptrInt64(40000), output: ptrInt64(20000),
+			inPrice: 15, outPrice: 60,
+			amount: 2, // ceil((40000·15 + 20000·60)/1_000_000) = ceil(1.8) = 2
+			want:   2,
+		},
+		{
+			name:  "the rounded-up amount one below is refused",
+			input: ptrInt64(40000), output: ptrInt64(20000),
+			inPrice: 15, outPrice: 60,
+			amount:  1, // the formula says 2
+			wantErr: true,
+		},
+		{
+			name:  "an exact derivation needs no rounding",
+			input: ptrInt64(40000), output: ptrInt64(20000),
+			inPrice: 100, outPrice: 100,
+			amount: 6, // (40000·100 + 20000·100)/1_000_000 = 6 exactly
+			want:   6,
+		},
+		{
+			name:  "an over-charged exact derivation is refused",
+			input: ptrInt64(40000), output: ptrInt64(20000),
+			inPrice: 100, outPrice: 100,
+			amount:  7, // the formula says 6
+			wantErr: true,
+		},
+		{
+			name:  "absent counts price at zero and bind at zero",
+			input: nil, output: nil,
+			inPrice: 15, outPrice: 60,
+			amount: 0,
+			want:   0,
+		},
+		{
+			name:  "absent counts with a claimed amount are refused",
+			input: nil, output: nil,
+			inPrice: 15, outPrice: 60,
+			amount:  1, // the formula prices nothing at 0
+			wantErr: true,
+		},
+		{
+			name:  "delivery tokens never participate in the pricing",
+			input: ptrInt64(0), output: ptrInt64(0), delivery: ptrInt64(999999),
+			inPrice: 15, outPrice: 60,
+			amount: 0, // the counts price to zero whatever was delivered
+			want:   0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			delivery := tt.delivery
+			if tt.input == nil && tt.output == nil && delivery == nil {
+				_, _, delivery = usageReport()
+			}
+			fact, err := NewSettled("req-0001", "att-0001", CaptureReported, tt.input, tt.output, delivery, "rev-2026-09", tt.inPrice, tt.outPrice, tt.amount, factWaterfall(), occurredAt)
+			if tt.wantErr {
+				if !errors.Is(err, ErrFactShape) || !strings.Contains(err.Error(), "disagrees") {
+					t.Fatalf("NewSettled() error = %v, want the ErrFactShape disagreement naming both amounts", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewSettled() error = %v", err)
+			}
+			if fact.SettledAmount == nil || *fact.SettledAmount != tt.want {
+				t.Errorf("SettledAmount = %v, want %d", fact.SettledAmount, tt.want)
+			}
+		})
+	}
+}
+
 // TestNewSettledRefusesFiguresItCannotSettle pins every shape refusal the
 // settled constructor makes, all of them wrapped in ErrFactShape: an unnamed
 // attempt (usage with no attempt is a claim nothing traces), an unknown
@@ -201,7 +297,7 @@ func TestANewSettledFactCanPriceAtZero(t *testing.T) {
 func TestNewSettledRefusesFiguresItCannotSettle(t *testing.T) {
 	valid := func() (identity.AttemptID, CaptureMethod, string, int64, int64, int64, *int64, *int64, *int64) {
 		input, output, delivery := usageReport()
-		return "att-0001", CaptureReported, "rev-2026-09", 15, 60, 2295, input, output, delivery
+		return "att-0001", CaptureReported, "rev-2026-09", 15, 60, 1, input, output, delivery
 	}
 	type settledArgs struct {
 		attempt  identity.AttemptID
@@ -260,7 +356,7 @@ func TestNewSettledRefusesFiguresItCannotSettle(t *testing.T) {
 func TestNewSettledEnforcesThePayloadCapAt16384Octets(t *testing.T) {
 	input, output, delivery := usageReport()
 
-	atCap, err := NewSettled("req-0001", "att-0001", CaptureReported, input, output, delivery, "rev-2026-09", 15, 60, 2295, legsTotalling(t, maxPayloadOctets), occurredAt)
+	atCap, err := NewSettled("req-0001", "att-0001", CaptureReported, input, output, delivery, "rev-2026-09", 15, 60, 1, legsTotalling(t, maxPayloadOctets), occurredAt)
 	if err != nil {
 		t.Fatalf("NewSettled() at exactly %d octets error = %v", maxPayloadOctets, err)
 	}
@@ -268,7 +364,7 @@ func TestNewSettledEnforcesThePayloadCapAt16384Octets(t *testing.T) {
 		t.Errorf("payload = %d octets, want exactly %d on the accepted side of the boundary", len(atCap.Payload), maxPayloadOctets)
 	}
 
-	_, err = NewSettled("req-0001", "att-0001", CaptureReported, input, output, delivery, "rev-2026-09", 15, 60, 2295, legsTotalling(t, maxPayloadOctets+1), occurredAt)
+	_, err = NewSettled("req-0001", "att-0001", CaptureReported, input, output, delivery, "rev-2026-09", 15, 60, 1, legsTotalling(t, maxPayloadOctets+1), occurredAt)
 	if err == nil {
 		t.Fatal("NewSettled() one octet over the cap succeeded, want a refusal")
 	}

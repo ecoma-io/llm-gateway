@@ -59,6 +59,12 @@ type ChatRouting struct {
 	routed       ChatCompletion
 	clock        txClock
 	execution    ExecutionConfig
+	// ObserveClose receives one CloseObservation per stated ending — the
+	// close's structured record, wired by the composition root to whatever
+	// emits structured fields for operators. Nil is the wired-nothing
+	// default: the observation is the operator's instrument, not the
+	// ending's.
+	ObserveClose CloseObserver
 }
 
 // NewChatRouting builds the routing stage over the ports it needs and the
@@ -158,7 +164,7 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 
 	alias, err := r.aliases.ByName(ctx, admitted.Alias)
 	if err != nil && !errors.Is(err, persistence.ErrNotFound) {
-		return ChatOutcome{}, fmt.Errorf("application: route request %s: read the alias: %w", admitted.RuntimeRequestID, err)
+		return r.abandonWalk(ctx, in, admitted, fmt.Errorf("application: route request %s: read the alias: %w", admitted.RuntimeRequestID, err))
 	}
 	servable := func(id catalog.BackendID) (bool, error) {
 		backend, err := r.backends.ByID(ctx, id)
@@ -184,7 +190,7 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 	if err == nil && alias.State == catalog.AliasActive {
 		eligible, err = routing.Eligible(alias.Candidates, servable, callable)
 		if err != nil {
-			return ChatOutcome{}, fmt.Errorf("application: route request %s: %w", admitted.RuntimeRequestID, err)
+			return r.abandonWalk(ctx, in, admitted, fmt.Errorf("application: route request %s: %w", admitted.RuntimeRequestID, err))
 		}
 	}
 	walk := routing.NewSelection(eligible)
@@ -294,10 +300,19 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 				execution.OutcomeSucceeded, "", success.ProviderRequestID, nil,
 				success.Usage.InputTokens, success.Usage.OutputTokens, deliveredTokens(reply))
 			if err != nil {
-				return ChatOutcome{}, err
+				return r.abandonWalk(ctx, in, admitted, err)
 			}
-			usage := settleBasis(admitted, deliveredBytes(reply), success.Usage.InputTokens, success.Usage.OutputTokens)
+			usage := settleBasis(admitted, deliveredBytes(reply), success.Usage.InputTokens, success.Usage.OutputTokens, false)
 			if err := r.settle(ctx, in, admitted, attempt, usage, true); err != nil {
+				// The settle ladder exhausted over an answer the client is
+				// already reading, and its unit rolled back whole — the hold
+				// stands and nothing was recorded. A release here could win
+				// the close and publish "released, unused" over work the
+				// client provably received: the false clean ending the
+				// delivery boundary exists to prevent. The hold is left for
+				// the sweep, whose expiry states the loss instead of
+				// asserting a give-back, and bounds how long the stranded
+				// hold pins the projection's capacity.
 				return ChatOutcome{}, err
 			}
 			reply.ServeSucceeded()
@@ -338,10 +353,14 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 				failure.ProviderRequestID, failure.ProviderError,
 				failure.Usage.InputTokens, failure.Usage.OutputTokens, deliveredTokens(reply))
 			if err != nil {
-				return ChatOutcome{}, err
+				return r.abandonWalk(ctx, in, admitted, err)
 			}
-			usage := settleBasis(admitted, deliveredBytes(reply), failure.Usage.InputTokens, failure.Usage.OutputTokens)
+			usage := settleBasis(admitted, deliveredBytes(reply), failure.Usage.InputTokens, failure.Usage.OutputTokens, true)
 			if err := r.settle(ctx, in, admitted, attempt, usage, false); err != nil {
+				// The same strand as the success arm: the answer crossed its
+				// commitment, so the walk's ending can no longer honestly be
+				// a release, whatever the settle ladder just reported. The
+				// sweep owns the stranded hold.
 				return ChatOutcome{}, err
 			}
 			reply.ServeMidStreamFailure()
@@ -363,12 +382,13 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 		// happened whatever the walk does next.
 		attempt, err := r.attemptRow(admitted, candidate, attemptID, started, finished,
 			execution.OutcomeFailedBeforeCommitment, class,
-			failure.ProviderRequestID, failure.ProviderError, nil, nil, nil)
+			failure.ProviderRequestID, failure.ProviderError,
+			failure.Usage.InputTokens, failure.Usage.OutputTokens, nil)
 		if err != nil {
-			return ChatOutcome{}, err
+			return r.abandonWalk(ctx, in, admitted, err)
 		}
 		if err := r.appendAttempt(ctx, attempt); err != nil {
-			return ChatOutcome{}, err
+			return r.abandonWalk(ctx, in, admitted, err)
 		}
 
 		if renewalLost {
@@ -428,6 +448,27 @@ func (r *ChatRouting) route(ctx context.Context, in ChatInput, admitted *Admissi
 		// channel — the caller sees at most one error however deep the walk
 		// went.
 	}
+}
+
+// abandonWalk closes out a walk that failed before any answer crossed its
+// commitment — a store read that errored, an attempt row that could not even
+// be formed — and so has no delivered work a release would have to deny. The
+// failure is this process's, not a verdict about the request, so the hold's
+// ending is the abandoned one: the release runs on its own detached ending
+// context (a caller gone missing is no reason to strand the hold until the
+// sweep), and its compare-and-set referees against the ending whose unit
+// actually committed despite the error its ladder reported — a lost close
+// writes nothing. A settled walk never comes here: an ending unit that
+// exhausts its ladder after commitment strands the hold for the sweep rather
+// than hand it a release that could publish "unused" over delivered work.
+// When the release itself fails, its error travels beside the cause — both
+// survive errors.Is — because an operator reading the wire's one fixed cell
+// should not have to choose which fault they are diagnosing.
+func (r *ChatRouting) abandonWalk(ctx context.Context, in ChatInput, admitted *Admission, cause error) (ChatOutcome, error) {
+	if err := r.release(ctx, in, admitted, "", execution.FailedGatewayAbandoned); err != nil {
+		return ChatOutcome{}, fmt.Errorf("%w: the abandonment's release also failed: %w", cause, err)
+	}
+	return ChatOutcome{}, cause
 }
 
 // attemptRow forms one finished call's row. Candidate position counts from
@@ -534,38 +575,54 @@ type settleUsage struct {
 }
 
 // settleBasis derives what the gateway claims for a settled ending — the
-// rules in one place, so the success and the mid-stream failure settle by the
-// same arithmetic:
+// delivery-boundary rules in one place, so the success and the mid-stream
+// failure settle by the same arithmetic. The provider's tokenizer is the
+// pricing authority where its answer completed; the gateway's own observation
+// takes over where it did not; and the reservation bounds both:
 //
 //   - delivery is always the gateway's own count of what left the process,
 //     recorded beside the settlement but never priced by it — ADR 0003
 //     prices input and output only, and a byte-count heuristic is not a
 //     tokenizer;
 //   - input is the provider's report bounded by the count admission priced
-//     the hold from: a report above it is clamped down to it, and no report
-//     falls back to it;
-//   - output is the provider's report bounded by the output basis the hold
-//     was sized with, and the basis itself when no report arrived — never
-//     the delivered count, which would price a transport estimate the
-//     provider's tokenizer never agreed to and could claim above the hold;
-//   - capture is reported when the provider's own figures stand as given,
-//     gateway_observed when a figure is missing but nothing was clamped
-//     (the input side's fallback is the gateway's own count — the basis
-//     bullet above — so the observation label stays honest there), and
-//     reservation_floor whenever a settled figure is the reservation's own:
-//     a clamp that bound, or an output nobody reported. The label attests to
-//     the usage figures' provenance, and to nothing else: delivery is the
-//     gateway's own count by construction — the first bullet — reported or
-//     not, so it never decides the label.
+//     the hold from — a report above it is clamped down to it — and the
+//     admitted count itself when no report arrived. The delivery boundary
+//     does not touch input: the provider read the whole prompt before it
+//     produced anything, so its report prices finished work in either
+//     outcome, and the admitted count is the gateway's own observation of
+//     the same prompt;
+//   - output follows the delivery boundary. An answer that died after
+//     commitment prices its output at the delivered tokens, bounded by the
+//     output basis the hold was sized with, and nothing else — the
+//     provider's usage figure for a stream it never finished is
+//     the provider-cost telemetry the attempt row carries, never a customer
+//     bill for tokens the client stopped reading (ADR 0004: provider usage
+//     is recorded as telemetry, not silently substituted as customer usage).
+//     A completed answer prices the provider's report, bounded by the output
+//     basis the hold was sized with; a completed answer without a report
+//     prices the delivered tokens under the same basis bound, the gateway's
+//     own observation of work the
+//     client provably received; and the basis itself answers only where
+//     neither arrived — unreachable after commitment, whose act is a
+//     content-bearing call — erring to the reserved basis should the sink's
+//     contract ever break;
+//   - capture attests to the priced figures' provenance and nothing else:
+//     reported when the provider's own figures priced as given,
+//     gateway_observed when a priced figure is the gateway's own count, and
+//     reservation_floor whenever a settled figure is the reservation's own —
+//     a clamp that bound, or the basis fall-through above. Delivery is the
+//     gateway's own count by construction — the first bullet — so it never
+//     decides the label.
 //
 // With both figures bounded by the counts the hold was derived from, the
 // settled amount cannot exceed the hold — the hold formula is increasing in
 // both — so the ending's first law, settled ≤ hold, holds by construction.
-// The provider's own claims are not lost by the clamping: the attempt row
-// records them as the telemetry they are, and the fact prices only what the
-// reservation defends.
-func settleBasis(admitted *Admission, delivered []byte, reportedInput, reportedOutput *int64) settleUsage {
-	delivery := accounting.CountDeliveredTokens(delivered)
+// The provider's own claims are not lost to the clamping or the boundary:
+// the attempt row records them as the telemetry they are, and the fact
+// prices only what the gateway observed or the reservation defends.
+func settleBasis(admitted *Admission, delivered []byte, reportedInput, reportedOutput *int64, streamFailed bool) settleUsage {
+	deliveredCount := accounting.CountDeliveredTokens(delivered)
+	delivery := &deliveredCount
 	floor := false
 
 	input := reportedInput
@@ -578,13 +635,24 @@ func settleBasis(admitted *Admission, delivered []byte, reportedInput, reportedO
 		count := int64(admitted.InputTokens)
 		input = &count
 	}
-	output := reportedOutput
-	if output != nil && *output > int64(admitted.OutputBasis) {
-		count := int64(admitted.OutputBasis)
+
+	var output *int64
+	switch {
+	case streamFailed:
+		// The provider's output figure is telemetry on a stream it never
+		// finished: the delivered tokens are the only output the delivery
+		// boundary lets the gateway bill, whatever the provider counted —
+		// and even they bill no further than the basis the hold was sized
+		// with, because the reservation defends nothing it did not hold.
+		// Where the basis binds, its figure is what settles and the capture
+		// says so; the delivered count itself rides on undimmed as the
+		// delivery figure.
+		count := min(deliveredCount, int64(admitted.OutputBasis))
 		output = &count
-		floor = true
-	}
-	if output == nil {
+		floor = floor || count < deliveredCount
+	case reportedOutput != nil && *reportedOutput <= int64(admitted.OutputBasis):
+		output = reportedOutput
+	case reportedOutput != nil:
 		// The basis is copied, not aliased: the count the hold was sized
 		// with stands behind the output figure, and the fact's pointer
 		// outlives this frame — a shared variable is one future writer away
@@ -592,10 +660,21 @@ func settleBasis(admitted *Admission, delivered []byte, reportedInput, reportedO
 		count := int64(admitted.OutputBasis)
 		output = &count
 		floor = true
+	case deliveredCount > 0:
+		// The same bound on the completed answer that named no report: the
+		// gateway's own count prices, but only up to the basis — past it the
+		// reservation's own figure is what settles, and the label says so.
+		count := min(deliveredCount, int64(admitted.OutputBasis))
+		output = &count
+		floor = floor || count < deliveredCount
+	default:
+		count := int64(admitted.OutputBasis)
+		output = &count
+		floor = true
 	}
 
 	capture := accounting.CaptureGatewayObserved
-	if reportedInput != nil && reportedOutput != nil {
+	if !streamFailed && !floor && reportedInput != nil && reportedOutput != nil {
 		capture = accounting.CaptureReported
 	}
 	if floor {
@@ -605,6 +684,6 @@ func settleBasis(admitted *Admission, delivered []byte, reportedInput, reportedO
 		capture:  capture,
 		input:    input,
 		output:   output,
-		delivery: &delivery,
+		delivery: delivery,
 	}
 }

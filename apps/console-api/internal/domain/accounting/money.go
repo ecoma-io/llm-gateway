@@ -43,6 +43,19 @@ func NewAmount(raw int64) (Amount, error) {
 	return Amount(raw), nil
 }
 
+// validateAmountAtOrAboveZero accepts a magnitude of zero where zero is a
+// value and not the absence of one: a zero-priced model books a hold of
+// nothing, settles for nothing, and is still a settlement of record. Every
+// leg that moves money keeps NewAmount's strictly-positive rule — money that
+// moves is money that exists — while the figures that describe a price or a
+// slice of a hold may legitimately be nothing at all.
+func validateAmountAtOrAboveZero(raw int64) error {
+	if raw < 0 {
+		return fmt.Errorf("accounting: %w: %d is not a minor-unit amount", ErrInvalidAmount, raw)
+	}
+	return nil
+}
+
 // Int64 returns the amount as the plain integer the database stores.
 func (a Amount) Int64() int64 { return int64(a) }
 

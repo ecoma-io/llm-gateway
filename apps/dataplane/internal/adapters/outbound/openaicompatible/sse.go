@@ -29,6 +29,10 @@ type sseReader struct {
 // completion frame carries.
 const maxSSELineOctets = 1 << 20
 
+// doneSentinel is the terminal frame's payload, as the SSE convention spells
+// it. It is matched whitespace-blind — see next.
+const doneSentinel = "[DONE]"
+
 func newSSEReader(r io.Reader) *sseReader {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxSSELineOctets)
@@ -38,6 +42,12 @@ func newSSEReader(r io.Reader) *sseReader {
 // next returns the next data line's payload. done is the [DONE] sentinel;
 // io.EOF is the stream's end as the provider left it; any other error is a
 // stream that can no longer be read, the oversized frame included.
+//
+// Emptiness and the sentinel are read whitespace-blind: a whitespace-only
+// data line, or a trailing space or tab after the sentinel, is the
+// provider's typography, not a frame — and mistyping the sentinel breaks the
+// stream at its own terminal, the one failure a completed answer must never
+// take. The payload itself travels as the line carries it.
 func (r *sseReader) next() (payload []byte, done bool, err error) {
 	for r.scanner.Scan() {
 		line := r.scanner.Text()
@@ -47,14 +57,14 @@ func (r *sseReader) next() (payload []byte, done bool, err error) {
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		trimmed := strings.TrimLeft(strings.TrimPrefix(line, "data:"), " ")
-		if trimmed == "" {
+		payloadText := strings.TrimLeft(strings.TrimPrefix(line, "data:"), " ")
+		switch strings.TrimSpace(payloadText) {
+		case "":
 			continue
-		}
-		if trimmed == "[DONE]" {
+		case doneSentinel:
 			return nil, true, nil
 		}
-		return []byte(trimmed), false, nil
+		return []byte(payloadText), false, nil
 	}
 	if err := r.scanner.Err(); err != nil {
 		return nil, false, err
@@ -100,8 +110,9 @@ type providerUsage struct {
 // asPort renders the report in the port's own vocabulary. A negative count
 // is not a report: it is a malformed figure, and passing it through would
 // let the settlement's arithmetic price negative tokens — a credit. The
-// settlement reads an absent field as "fall back to the reservation's own
-// basis", which is the honest settle for a figure nobody can defend, so a
+// settlement reads an absent field as "the gateway prices its own
+// observation" — the admitted count for input, the delivered tokens for
+// output — which is the honest settle for a figure nobody can defend, so a
 // negative count is rendered absent here, at the boundary where the
 // provider's words become the port's.
 func (u *providerUsage) asPort() executors.Usage {

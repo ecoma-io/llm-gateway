@@ -282,7 +282,7 @@ func BenchmarkReservationCloseAndFactAppend(b *testing.B) {
 		// measure.
 		fact, err := accounting.NewSettled(request.ID, attempt.ID, accounting.CaptureReported,
 			int64Ptr(120), int64Ptr(45), int64Ptr(45),
-			price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice, 375,
+			price.RevisionID, price.InputUnitPrice, price.OutputUnitPrice, integrationSettledAmount(),
 			[]accounting.AllocationLeg{{FundingBucketID: account + "-bench-bucket", Amount: 250, Ordinal: 1}},
 			time.Now().UTC())
 		if err != nil {

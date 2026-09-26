@@ -488,6 +488,9 @@ type admissionWorld struct {
 	renewalGone          int    // the first N lease renewals report the hold no longer open
 	requestFinaliseLost  bool   // the compensation's CAS won, but the request row did not finalise
 	attemptDuplicate     bool   // the attempt insert races a writer that already persisted the row
+	attemptFailure       error  // the fault the first N attempt inserts fail with
+	attemptFailures      int    // the countdown behind attemptFailure
+	factDuplicate        bool   // the fact append refuses behind the dedup unique
 	intakePreFinalised   bool   // the replay record is already terminal when the orphan tail reads it
 	intakeRace           int    // the first N intake inserts lose the unique race
 	intakeRaceWinner     string // "", "in_flight", or "rejected"
@@ -1182,6 +1185,15 @@ func (f fakeAdmissionLedger) Return(ctx context.Context, legs []accounting.Alloc
 type fakeAdmissionFacts struct{ world *admissionWorld }
 
 func (f fakeAdmissionFacts) Append(ctx context.Context, fact accounting.Fact) (int64, error) {
+	f.world.mu.Lock()
+	duplicate := f.world.factDuplicate
+	f.world.mu.Unlock()
+	if duplicate {
+		// The dedup unique refused: a settlement-relevant fact already
+		// stands for this request. The engine's own law, staged for the
+		// tests that pin the named-bug refusal.
+		return 0, fmt.Errorf("fake: fact for request %s: %w", fact.RequestID, persistence.ErrDuplicateFact)
+	}
 	if !inAdmissionTx(ctx) {
 		f.world.outsideTx++
 	}
@@ -1213,6 +1225,13 @@ func (f fakeAdmissionAttempts) Insert(ctx context.Context, attempt execution.Att
 	f.world.note("attempt.insert")
 	f.world.mu.Lock()
 	defer f.world.mu.Unlock()
+	if f.world.attemptFailures > 0 {
+		// The countdown fault: the ending's insert fails on its merits for
+		// the first N calls, so a settle ladder can be watched exhausting
+		// while a release unit's own steps would have succeeded.
+		f.world.attemptFailures--
+		return f.world.attemptFailure
+	}
 	if f.world.attemptDuplicate {
 		// The row is already on disk — the lost-commit-ack shape whose
 		// sentinel reads as done.
@@ -1220,6 +1239,27 @@ func (f fakeAdmissionAttempts) Insert(ctx context.Context, attempt execution.Att
 	}
 	f.world.attempts = append(f.world.attempts, attempt)
 	return nil
+}
+
+// Exists is the probe the settle unit runs before its insert, and the fake
+// answers it from the same two places the real store's unique key would: a
+// row this fake appended, and the attemptDuplicate shape whose row "is on
+// disk" by construction — that flag's whole meaning is that an insert would
+// collide, which is presence. Without the second source the probe would read
+// a miss where the insert is about to refuse, and the settle unit would
+// poison itself exactly the way the probe exists to prevent.
+func (f fakeAdmissionAttempts) Exists(ctx context.Context, attemptID identity.AttemptID) (bool, error) {
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
+	if f.world.attemptDuplicate {
+		return true, nil
+	}
+	for _, attempt := range f.world.attempts {
+		if attempt.ID == attemptID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // fakeRoutingBackends is the backend half of the servable closure. Only ByID

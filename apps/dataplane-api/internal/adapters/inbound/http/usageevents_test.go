@@ -591,6 +591,7 @@ func TestAServedPageIsExactlyWhatTheDataPlaneAnswered(t *testing.T) {
 	occurredAt := time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC)
 	usage := &fakeUsageFacts{page: dataplane.Page{
 		Events: []dataplane.Event{{
+			AppendSeq:     7,
 			RequestID:     "req_01HZ",
 			Kind:          "unbillable_orphaned",
 			SchemaVersion: 3,
@@ -607,7 +608,11 @@ func TestAServedPageIsExactlyWhatTheDataPlaneAnswered(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+testCredential)
 	handler.ServeHTTP(rec, req)
 
-	want := `{"events":[{"request_id":"req_01HZ","kind":"unbillable_orphaned","schema_version":3,"occurred_at":"2026-09-23T10:00:00Z","payload":{"allocation_id":"alloc-1","reason":"a<b"}}],"next_cursor":"` + cursor + `","has_more":true}` + "\n"
+	// The served fact carries append_seq and the ten meaning-nullable fields:
+	// the contract marks them all required on the wire, so a fact this process
+	// knows nothing about is written with each absent meaning as an explicit
+	// null — and the stored zero of append_seq as its own number.
+	want := `{"events":[{"append_seq":7,"request_id":"req_01HZ","kind":"unbillable_orphaned","schema_version":3,"occurred_at":"2026-09-23T10:00:00Z","payload":{"allocation_id":"alloc-1","reason":"a<b"},"capture_method":null,"committed_attempt_id":null,"provider_input_tokens":null,"provider_output_tokens":null,"delivery_tokens":null,"price_revision_id":null,"input_unit_price":null,"output_unit_price":null,"settled_amount":null,"corrects_append_seq":null}],"next_cursor":"` + cursor + `","has_more":true}` + "\n"
 	if got := rec.Body.String(); got != want {
 		t.Errorf("body = %q, want %q", got, want)
 	}
