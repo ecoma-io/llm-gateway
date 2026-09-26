@@ -36,8 +36,51 @@ func TestAllocationValidation(t *testing.T) {
 	if _, err := NewAllocation(mustBucketID(t), "not-a-uuid", mustAmount(t, 10)); !errors.Is(err, ErrInvalidReference) {
 		t.Fatalf("malformed reservation allocation = %v, want ErrInvalidReference", err)
 	}
-	if _, err := NewAllocation(mustBucketID(t), ReservationID(validV4), Amount(0)); !errors.Is(err, ErrInvalidAmount) {
-		t.Fatalf("zero-held allocation = %v, want ErrInvalidAmount: an allocation books a hold that exists", err)
+	// Zero is a value: a model priced at nothing books a hold of nothing, and
+	// the allocation is still an allocation. Below zero is not — no slice of
+	// a hold runs backwards.
+	if _, err := NewAllocation(mustBucketID(t), ReservationID(validV4), Amount(0)); err != nil {
+		t.Fatalf("zero-held allocation = %v, want nil: a zero-priced model books a hold of nothing", err)
+	}
+	if _, err := NewAllocation(mustBucketID(t), ReservationID(validV4), Amount(-1)); !errors.Is(err, ErrInvalidAmount) {
+		t.Fatalf("negative-held allocation = %v, want ErrInvalidAmount", err)
+	}
+}
+
+// TestAZeroPricedSettlementIsStillASettlement is the zero-price story end to
+// end: a model priced at nothing books a hold of nothing, consumes nothing,
+// and settles for nothing — a header of record with no legs, because no
+// money moved. The refusal that survives is the once-only one: a settled-
+// zero allocation is settled, and a second SettleConsumed is a defect even
+// though its amounts are indistinguishable from the first's.
+func TestAZeroPricedSettlementIsStillASettlement(t *testing.T) {
+	a, err := NewAllocation(mustBucketID(t), ReservationID(validV4), Amount(0))
+	if err != nil {
+		t.Fatalf("new zero-held allocation: %v", err)
+	}
+
+	freePrice := PriceSnapshot{RevisionID: "rev-free", InputUnitPrice: 0, OutputUnitPrice: 0}
+	settled, err := a.SettleConsumed(Amount(0), freePrice)
+	if err != nil {
+		t.Fatalf("settle nothing for nothing: %v", err)
+	}
+	if settled.Consumed != Amount(0) {
+		t.Fatalf("consumed = %d, want 0", settled.Consumed)
+	}
+
+	if _, err := settled.SettleConsumed(Amount(0), freePrice); !errors.Is(err, ErrInvalidSettlement) {
+		t.Fatalf("a second zero SettleConsumed = %v, want ErrInvalidSettlement — the allocation settled once, at zero", err)
+	}
+
+	plan, err := BuildSettle(mustSettlementID(t), "req-zero-priced", []Allocation{settled}, NewLedgerEntryID, legNow)
+	if err != nil {
+		t.Fatalf("build settle of a zero-priced allocation: %v", err)
+	}
+	if plan.Settlement.SettledTotal != Amount(0) {
+		t.Fatalf("settled total = %d, want 0 — nothing was spent", plan.Settlement.SettledTotal)
+	}
+	if len(plan.Entries) != 0 {
+		t.Fatalf("the plan writes %d legs, want none — a settlement of nothing moves no money", len(plan.Entries))
 	}
 }
 
@@ -64,9 +107,14 @@ func TestSettleConsumedRefusesOverspendAndBadPrices(t *testing.T) {
 	if _, err := a.SettleConsumed(mustAmount(t, 50), snapshotPrice()); !errors.Is(err, ErrInvalidSettlement) {
 		t.Fatalf("consume 50 of held 40 = %v, want ErrInvalidSettlement", err)
 	}
-	zeroPrice := PriceSnapshot{RevisionID: "rev", InputUnitPrice: 3, OutputUnitPrice: 0}
-	if _, err := a.SettleConsumed(mustAmount(t, 10), zeroPrice); !errors.Is(err, ErrInvalidAmount) {
-		t.Fatalf("consume priced at zero on one side = %v, want ErrInvalidAmount", err)
+	// A zero price is a real price — the free model — so the refusal that
+	// survives is the negative one.
+	negativePrice := PriceSnapshot{RevisionID: "rev", InputUnitPrice: 3, OutputUnitPrice: -1}
+	if _, err := a.SettleConsumed(mustAmount(t, 10), negativePrice); !errors.Is(err, ErrInvalidAmount) {
+		t.Fatalf("consume priced below zero on one side = %v, want ErrInvalidAmount", err)
+	}
+	if _, err := a.SettleConsumed(mustAmount(t, 10), PriceSnapshot{RevisionID: "rev", InputUnitPrice: 0, OutputUnitPrice: 3}); err != nil {
+		t.Fatalf("consume priced at zero on one side = %v, want nil — a zero price is a price", err)
 	}
 }
 

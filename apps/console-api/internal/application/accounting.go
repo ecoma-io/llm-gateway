@@ -331,7 +331,9 @@ type SettlementResult struct {
 // release leg for the unconsumed tail, in the caller's waterfall order, all
 // in one unit of work. A header without its legs cannot commit and legs that
 // lose their guards leave no header — the atomicity the ledger's word
-// depends on.
+// depends on. The one header that legitimately carries no legs is a
+// zero-priced settlement: nothing moved, and the request is still recorded
+// as settled rather than left for the feed to deliver forever.
 //
 // An already-settled request is the exactly-once bargain: the recorded
 // settlement's total is the one total that request can have. The same total

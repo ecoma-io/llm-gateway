@@ -116,13 +116,21 @@ func authed(t *testing.T, target string) *stdhttp.Request {
 }
 
 func TestTheFactFeedReturnsThePageThePortGave(t *testing.T) {
+	zeroAmount := int64(0)
 	facts := &stubFacts{page: usagefacts.Page{
 		Events: []usagefacts.Event{{
+			AppendSeq:     7,
 			RequestID:     "req_1",
 			Kind:          "settled",
 			SchemaVersion: 1,
 			OccurredAt:    time.Date(2026, 9, 24, 10, 0, 0, 0, time.UTC),
 			Payload:       json.RawMessage(`{"tokens":7}`),
+			// SettledAmount at a real zero pins the nullability's whole point
+			// on this wire: the stored zero marshals as 0, and every figure
+			// the fact claims nothing about marshals as the contract's null —
+			// nil would not be distinguishable from zero if the pointers
+			// became values.
+			SettledAmount: &zeroAmount,
 		}},
 		NextCursor: "position-7",
 		HasMore:    true,
@@ -133,9 +141,12 @@ func TestTheFactFeedReturnsThePageThePortGave(t *testing.T) {
 	// The body is pinned as bytes rather than decoded and inspected: this
 	// surface is a contract, and a test that decoded the response would pass
 	// just as happily against a field renamed to something no consumer expects.
-	want := `{"events":[{"request_id":"req_1","kind":"settled","schema_version":1,` +
-		`"occurred_at":"2026-09-24T10:00:00Z","payload":{"tokens":7}}],` +
-		`"next_cursor":"position-7","has_more":true}` + "\n"
+	want := `{"events":[{"append_seq":7,"request_id":"req_1","kind":"settled","schema_version":1,` +
+		`"occurred_at":"2026-09-24T10:00:00Z","payload":{"tokens":7},` +
+		`"capture_method":null,"committed_attempt_id":null,"provider_input_tokens":null,` +
+		`"provider_output_tokens":null,"delivery_tokens":null,"price_revision_id":null,` +
+		`"input_unit_price":null,"output_unit_price":null,"settled_amount":0,` +
+		`"corrects_append_seq":null}],"next_cursor":"position-7","has_more":true}` + "\n"
 	if got := rec.Body.String(); got != want {
 		t.Errorf("body = %s, want %s", got, want)
 	}
@@ -354,6 +365,7 @@ func TestTheFeedWritesAmpersandsAndAngleBracketsLiterally(t *testing.T) {
 	// of content this surface will be the head of.
 	facts := &stubFacts{page: usagefacts.Page{
 		Events: []usagefacts.Event{{
+			AppendSeq:     1,
 			RequestID:     "req_amp",
 			Kind:          "settled",
 			SchemaVersion: 1,
@@ -366,9 +378,12 @@ func TestTheFeedWritesAmpersandsAndAngleBracketsLiterally(t *testing.T) {
 
 	rec := serve(t, facts, authed(t, "/internal/usage-events"))
 
-	want := `{"events":[{"request_id":"req_amp","kind":"settled","schema_version":1,` +
-		`"occurred_at":"2026-09-24T10:00:00Z","payload":{"reason":"a<b & c"}}],` +
-		`"next_cursor":"cur:9f2&=<","has_more":true}` + "\n"
+	want := `{"events":[{"append_seq":1,"request_id":"req_amp","kind":"settled","schema_version":1,` +
+		`"occurred_at":"2026-09-24T10:00:00Z","payload":{"reason":"a<b & c"},` +
+		`"capture_method":null,"committed_attempt_id":null,"provider_input_tokens":null,` +
+		`"provider_output_tokens":null,"delivery_tokens":null,"price_revision_id":null,` +
+		`"input_unit_price":null,"output_unit_price":null,"settled_amount":null,` +
+		`"corrects_append_seq":null}],"next_cursor":"cur:9f2&=<","has_more":true}` + "\n"
 	if got := rec.Body.String(); got != want {
 		t.Errorf("body = %s\nwant %s\nthe write must not HTML-escape the cursor or the payload", got, want)
 	}

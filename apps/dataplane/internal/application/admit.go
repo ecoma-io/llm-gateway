@@ -657,7 +657,13 @@ type chatRequest struct {
 	maxTokens     json.RawMessage
 	maxCompletion json.RawMessage
 	stream        bool
-	inputTokens   int64
+	// messages is the parsed message count — the emptiness the bounds
+	// refusal names, checked directly rather than inferred from a token
+	// count: the canonical v1 count covers the whole body, so it is never
+	// zero for a body that parsed, and an empty conversation would pass
+	// unnoticed if the old inference stayed.
+	messages    int
+	inputTokens int64
 }
 
 // chatRefusal is a body-level refusal already in admission's vocabulary: the
@@ -698,14 +704,19 @@ func parseChatRequest(raw []byte) (*chatRequest, *chatRefusal) {
 		maxTokens:     body.MaxTokens,
 		maxCompletion: body.MaxCompletion,
 		stream:        body.Stream != nil && *body.Stream,
+		messages:      len(body.Messages),
 	}
-	contents := make([]string, 0, len(body.Messages))
-	for _, message := range body.Messages {
-		if message.Content != nil {
-			contents = append(contents, *message.Content)
-		}
-	}
-	parsed.inputTokens = catalog.CountInputTokens(contents)
+	// The input count is the whole admitted body's byte length — the
+	// canonical v1 rule the counter states in full. Tools, response formats
+	// and parameter passthrough are input a provider tokenizes and bills,
+	// and a counter that read only the message strings would understate
+	// exactly the requests that carry them; the envelope's structural keys
+	// are noise next to that exposure, and the byte rule's worst case
+	// overstates the hold, never understates it. The content strings are
+	// still parsed above only for the shape their refusal keeps: a message
+	// whose content is neither string nor null is a malformed request, not a
+	// cheap one.
+	parsed.inputTokens = catalog.CountInputTokens(raw)
 	return parsed, nil
 }
 
@@ -755,10 +766,17 @@ func (p *chatRequest) bounds(alias *catalog.ModelAlias) (ceiling int, inputToken
 	if ceiling > int(alias.MaxOutputTokens) {
 		return refuse(ceilingDetail)
 	}
-	if p.inputTokens == 0 {
-		// No content anywhere in the request: nothing this build could count,
-		// so nothing it could price. The fault is the body's whole shape, and
-		// no one field is named.
+	if p.messages == 0 {
+		// No messages anywhere in the request: a chat completion is a
+		// conversation, and a body without one has nothing to serve. The
+		// fault is the body's whole shape, and no one field is named. The
+		// check is the message list itself, not the input count it once was
+		// inferred from — the canonical v1 count covers the whole body, so a
+		// body that parsed is never countless, and the refusal has to move
+		// to the emptiness it actually meant. Content that is present but
+		// null — an assistant tool-call message, say — is admitted: it is a
+		// shape the API contract allows, and the hold prices the whole body
+		// it travels in.
 		return 0, 0, &chatRefusal{reason: execution.RejectedInvalidRequest}
 	}
 	return ceiling, p.inputTokens, nil
@@ -851,17 +869,40 @@ type sqlStateReporter interface {
 }
 
 // isRetryableStoreFailure reports whether a failed unit may be retried whole:
-// the engine aborted it for contention (serialization failure, deadlock) or
-// the connection died before any commit could be in question. A unit that
-// failed for any other reason failed on its merits, and a retry would only
-// repeat it. A caller's cancelled context is never retried — the caller is
-// gone, and the budget belongs to the request.
+// the engine aborted it for contention (serialization failure, deadlock), the
+// connection died before any commit could be in question, or the unit's fate
+// is one of the two unknown-or-done outcomes whose sentinels name. A unit
+// that failed for any other reason failed on its merits, and a retry would
+// only repeat it. A caller's cancelled context is never retried — the caller
+// is gone, and the budget belongs to the request.
+//
+// The two sentinels are in this set because the ladders that consult it run
+// units re-running is safe against their own committed twin: the ending
+// units' CAS re-judges who owns the hold, every row they write is keyed
+// against a second copy, and an attempt append probes before it inserts. The
+// classification is a property of those callers as much as of the errors — a
+// unit without such a referee must not borrow it.
 func isRetryableStoreFailure(err error) bool {
 	if err == nil {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
+	}
+	if errors.Is(err, persistence.ErrCommitOutcomeUnknown) {
+		// The commit's outcome is unknown — committed and unacknowledged, or
+		// rolled back with its connection. A fresh unit is safe: if the twin
+		// committed, the CAS loses and the unit walks away knowing it; if it
+		// did not, the fresh unit runs whole.
+		return true
+	}
+	if errors.Is(err, persistence.ErrAttemptAlreadyAppended) {
+		// Reachable inside a unit only as the poisoned-unit race: the probe
+		// missed, a standalone writer (the orphan tail of a lost ending race)
+		// landed the row before the insert, and the engine aborted the unit
+		// on its unique key. The retry's probe finds the row and reads the
+		// append as the done thing it is.
+		return true
 	}
 	var reporter sqlStateReporter
 	if !errors.As(err, &reporter) {

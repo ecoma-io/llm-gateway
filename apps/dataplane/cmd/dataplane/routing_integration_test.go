@@ -568,14 +568,15 @@ func TestIntegrationRoutingFallsThroughToTheSecondCandidateAndSettles(t *testing
 
 	kind, capture, providerInput, providerOutput, delivery, amount := f.latestFact(t, requestID)
 	// The report's input (101) ran past the count the hold was priced from —
-	// the admission's four, len("b8c3") — so the settlement clamps it to the
-	// basis and labels the fact reservation_floor. The report's output (55)
-	// sat inside the output basis (routeServe's max_tokens of 64), so the
-	// report stands as given.
+	// the whole body's byte length under the canonical tokenizer, the
+	// envelope included — so the settlement clamps it to that basis and
+	// labels the fact reservation_floor. The report's output (55) sat inside
+	// the output basis (routeServe's max_tokens of 64), so the report stands
+	// as given.
 	if kind.String != "settled" || capture.String != "reservation_floor" {
 		t.Errorf("fact = %s/%s, want settled/reservation_floor", kind.String, capture.String)
 	}
-	if providerInput.Int64 != int64(len("b8c3")) {
+	if providerInput.Int64 != int64(len(admissionBody(t, routingFixtureAliasName, 64, "b8c3"))) {
 		t.Errorf("provider input = %d, want the basis the hold was priced from — the clamp, not the report", providerInput.Int64)
 	}
 	if providerOutput.Int64 != 55 {
@@ -689,19 +690,24 @@ func TestIntegrationRoutingSettlesAMidStreamFailure(t *testing.T) {
 	}
 
 	kind, capture, providerInput, providerOutput, delivery, amount := f.latestFact(t, requestID)
-	// The dying provider reported nothing, so both settled figures fall back
-	// to the counts the hold was sized with — the admission's input count and
-	// routeServe's output basis of 64 — and the label is reservation_floor:
-	// every settled figure here is the reservation's own. Delivery stays the
-	// gateway's own record of what left the process, priced by nothing.
-	if kind.String != "settled" || capture.String != "reservation_floor" {
-		t.Errorf("fact = %s/%s, want settled/reservation_floor", kind.String, capture.String)
+	// The dying provider reported nothing, so the settlement prices what the
+	// delivery boundary can stand behind: input falls back to the count the
+	// hold was priced from — the whole body's byte length, because the
+	// provider read the whole prompt either way — and output, on a stream
+	// that died after commitment, is the delivered tokens and nothing else;
+	// the provider's figure for work the client never read is attempt
+	// telemetry, never a bill. Both settled figures are the gateway's own
+	// counts and the reservation defends neither, so the label is
+	// gateway_observed. Delivery is that same delivered count, priced by
+	// nothing.
+	if kind.String != "settled" || capture.String != "gateway_observed" {
+		t.Errorf("fact = %s/%s, want settled/gateway_observed", kind.String, capture.String)
 	}
-	if !providerInput.Valid || providerInput.Int64 != int64(len("b8c3")) { // the admission count
+	if !providerInput.Valid || providerInput.Int64 != int64(len(admissionBody(t, routingFixtureAliasName, 64, "b8c3"))) { // the admission count
 		t.Errorf("provider input = %v, want the admission count the settlement fell back to", providerInput)
 	}
-	if providerOutput.Int64 != 64 {
-		t.Errorf("provider output = %d, want the output basis the hold was sized with, not the delivered bytes' count", providerOutput.Int64)
+	if providerOutput.Int64 != int64(len("data: partial")) {
+		t.Errorf("provider output = %d, want the delivered tokens the delivery boundary bills — the hold's output basis bounds them, never replaces them", providerOutput.Int64)
 	}
 	if delivery.Int64 != int64(len("data: partial")) {
 		t.Errorf("delivery = %d, want what the client received", delivery.Int64)

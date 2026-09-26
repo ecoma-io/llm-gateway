@@ -118,14 +118,18 @@ reserved = price(revision_at_admission, canonical input tokens
 ```
 
 `max_output_tokens` is a required, validated client field (ADR 0003); input
-tokens are counted with the gateway's canonical tokenizer, the reservation is
-priced once, at the admission-time price revision, and copied immutably onto
-the reservation. A computed hold above the alias's **reservation cap** (a
+tokens are counted with the gateway's canonical tokenizer — B11's canonical
+counting, the whole request body's byte length — the reservation is priced
+once, at the admission-time price revision, and copied immutably onto the
+reservation. A computed hold above the alias's **reservation cap** (a
 maximum hold in minor units) rejects `invalid_request` before any capacity is
 taken. Adapters enforce the output bound, so billable usage never exceeds the
-hold — it can only come in under it. At settlement, provider-**reported**
-usage is priced when present; otherwise delivered content is re-counted
-canonically (the capture method records which).
+hold — it can only come in under it. At settlement the close prices figures
+the delivery boundary picks: the provider's report where the answer completed
+and the report fits inside the hold's bases, the gateway's own counts
+otherwise, the reservation's own figures as the floor — the capture method
+attests which provenance priced each figure
+([request lifecycle](request-lifecycle.md)).
 
 ## Settlement
 
@@ -142,7 +146,12 @@ here, and it is the half that observes what happened:
 2. append the `UsageEvent` (immutable fact: committed attempt, normalized
    token counts, price revision snapshot, capture method) as the unit of
    work's **last** statement. The fact is the **authority the charge is
-   derived from**, not a side effect of it.
+   derived from**, not a side effect of it — and its `settled_amount` is not
+   freehand: the domain re-derives the hold formula over the fact's own
+   counts at its own price snapshot and refuses to write a fact that
+   disagrees with its own arithmetic. Zero is a value here as it is at
+   admission: a zero-priced model settles a header of record with no legs,
+   and the settlement derived from it is still a settlement of record.
 
 Both statements are guarded twice over in the landed schema: the close is a
 `WHERE state = 'open'` update, and the fact's append sequence is allocated
@@ -159,7 +168,9 @@ position in it is the one the transaction commits behind.
 
 1. create the **Settlement** — unique by `request_id`; the exactly-once
    boundary. It carries `request_id`, a `settled_total` equal to the sum of
-   its consume legs, and `created_at`. A competing acknowledgement of the
+   its consume legs — the one header with no legs being a zero-priced
+   settlement, whose total is zero and which is still of record — and
+   `created_at`. A competing acknowledgement of the
    same request inserts nothing and reads the recorded settlement instead:
    the same total converges, and a different one is the conflict defect —
    one request cannot settle twice at two totals.
@@ -180,6 +191,17 @@ atomicity between the charge and the fact it derives from is gone,
 deliberately: what replaces it is a fact that already exists, a retry that is
 safe, and a convergence property that is named (ADR 0006).
 
+**What the runtime's half is not.** The close the runtime runs answers to none
+of the money words it sounds like, and the distinction is worth stating where
+those words live: it is not **billing** — nothing is owed, sent or collected;
+the fact states usage, and the ledger prices it later. It is not
+**settlement** — the `Settlement` of record is this plane's derivation from
+the fact. It is not **the ledger** — the runtime writes no ledger row at all.
+And it is not **pricing** — the snapshot it prices with was copied at
+admission; the close computes an amount with it and never selects, revises or
+re-quotes a price. The usage close ends the reservation and states the usage;
+every money word after that is this plane's.
+
 Concretely, a hold split S1: 20 + S2: 40 (S1 expires sooner) settling at 30
 writes: `Settlement S` → consume S1: 20, consume S2: 10, release S2: 30 —
 three settlement legs, plus the two `hold` legs the same fact's allocation
@@ -199,11 +221,29 @@ captures what was already delivered. Provider-reported usage that arrives
 after a disconnect or post-commitment failure is provider-cost telemetry on
 the attempt record; it is never silently substituted as customer usage.
 
-| Capture method      | When it is used                                                                                      |
-| ------------------- | ---------------------------------------------------------------------------------------------------- |
-| `reported`          | The provider's terminal usage is present and the delivery is complete.                               |
-| `gateway_observed`  | Delivery was partial (disconnect / post-commitment failure); the gateway counts forwarded deltas.    |
-| `reservation_floor` | No reliable count exists for a committed attempt; the already-held amount is charged conservatively. |
+| Capture method      | When it is used                                                                                                                                                                                                                                            |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `reported`          | The provider's own figures priced the settlement as given — both present, neither clamped to a bound the hold was priced from, on an answer that completed.                                                                                                |
+| `gateway_observed`  | At least one priced figure is the gateway's own count: the delivered-token output of an answer that died or was left mid-delivery, or a completed answer whose report never arrived (output from delivered tokens, input from the count admission priced). |
+| `reservation_floor` | At least one settled figure is the reservation's own: a report clamped down to the bound the hold was priced from, or the basis fall-through where neither a report nor delivered content answered.                                                        |
+
+The method attests the **provenance of the priced figures, nothing more**, and
+it is the weakest provenance in the priced set: a settlement whose input
+arrived by report and whose output fell to the floor is a `reservation_floor`
+settlement. Delivery never decides the label — it is always the gateway's own
+count of what left the process, recorded on the fact beside the priced
+figures and priced by neither (ADR 0003 prices input and output only; a
+byte-count heuristic is not a tokenizer). A provider reporting zero on both
+figures over delivered content is priced as spoken — zero is a price inside
+the hold's bounds, and a report is the pricing authority where the answer
+completed — and the delivery column beside the zero is where the mismatch
+shows later.
+
+One era marker belongs beside these figures: every count the runtime records
+is a **byte count**. The canonical tokenizer counts tokens as bytes — the
+whole request body at admission, the delivered bytes at settlement — and a
+future tokenizer that changes that arithmetic re-eras every figure on file;
+analytics reaching across the boundary must not mix the eras.
 
 The method travels on the usage event — it is the `usage_events.capture_method`
 column since B7's runtime storage landed, one of exactly these three values by

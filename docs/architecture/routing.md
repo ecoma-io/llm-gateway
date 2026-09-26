@@ -198,7 +198,18 @@ byte of the body. It is a one-way gate:
 
 The buffer is bounded: when a pre-content buffer reaches its cap the gateway
 commits by flushing it, trading a sliver of fallback window for memory — a
-cap-sized preamble is content for commitment purposes.
+cap-sized preamble is content for commitment purposes. The flush is the
+commit even when no content-bearing byte ever follows it: the answer settles
+as served, and the fact's delivery column records exactly what the flush
+moved, so a preamble-only answer is visible in the numbers for what it is
+rather than silently absent from them.
+
+The wall has a symmetric twin on the read side. A provider frame past the
+SSE reader's megabyte line wall breaks the stream where it stands — before
+commitment that is an unreadable answer and the walk falls through; after it
+the stream has failed and the ending settles on what was delivered. The wall
+is deliberate: a frame four orders of magnitude past anything a completion
+carries is a fault to be bounded, not a payload to be drained.
 
 The gate is also where the hold stops being a reservation and becomes a
 cost bound. Before commitment, a failed attempt costs provider-side effort
@@ -213,7 +224,18 @@ protects the call is the one the process validates at start: the execution
 duration sits strictly inside the hold window
 ([ADR 0009](../adr/0009-provider-adapters-and-egress.md)). Admission sized
 the hold before any candidate ran precisely so that no routing outcome —
-fallback, exhaustion, or mid-stream death — ever needs to resize it.
+fallback, exhaustion, or mid-stream death — ever needs to resize it. The
+hold window bounds the **walk**, not one call, and the enforced chain is
+honest about which half is arithmetic and which is policy: the process
+validates the per-call execution ceiling strictly below the window at
+start, and the walk's total — candidates × ceiling, plus the ending's unit
+of work — is the operator's arithmetic on top of it. A candidate list whose
+sum outruns the window meets the reaper honestly: the sweep expires the
+hold, the ending's close loses the compare-and-set it would otherwise win,
+and the loss is recorded rather than papered over — a release refuses to
+leave a closed hold without its fact, and a settle records the orphan tail.
+The window is sized so that shape belongs to misconfiguration, never to a
+served request.
 
 Consequence for clients: cross-provider resilience operates at request
 granularity. The gateway never splices two providers' output into one

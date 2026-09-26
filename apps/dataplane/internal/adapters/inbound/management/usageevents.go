@@ -36,13 +36,21 @@ import (
 // which is still a bound.
 const maxCursorLength = 512
 
-// usageEvent is one fact as this surface puts it on the wire: the five fields
-// the private protocol's page declares, which are the façade's `UsageEvent`
-// schema field for field. The two hops carry one page and this end is where it
+// usageEvent is one fact as this surface puts it on the wire: the envelope the
+// private protocol's page declares, which is the façade's `UsageEvent` schema
+// field for field — the identity and the envelope fields the page has always
+// carried, plus the typed settlement figures the fact contract requires
+// beside the payload. The two hops carry one page and this end is where it
 // is written, so the shape is stated here and only mirrored at the façade — a
 // field added on this side alone would be dropped at the façade's decoder, and
 // the protocol tests on both sides exist to make that a build failure rather
 // than a page that quietly loses a column.
+//
+// The pointer types are the null fidelity the contract requires: a nullable
+// field's null is the claim that this fact makes no such claim, and the wire
+// must carry the distinction a stored zero is not. encoding/json cannot
+// distinguish an absent field from a null one, and the contract requires every
+// field, so a nil pointer marshals to the null the contract reads.
 //
 // It is a transport type and not the port's Event for the usual reason: the
 // port's vocabulary is Go's and this one's is JSON's, and the day the wire
@@ -56,11 +64,23 @@ const maxCursorLength = 512
 // re-encode every number as a float and drop the key order for no one's
 // benefit.
 type usageEvent struct {
+	AppendSeq     int64           `json:"append_seq"`
 	RequestID     string          `json:"request_id"`
 	Kind          string          `json:"kind"`
 	SchemaVersion int             `json:"schema_version"`
 	OccurredAt    time.Time       `json:"occurred_at"`
 	Payload       json.RawMessage `json:"payload"`
+
+	CaptureMethod        *string `json:"capture_method"`
+	CommittedAttemptID   *string `json:"committed_attempt_id"`
+	ProviderInputTokens  *int64  `json:"provider_input_tokens"`
+	ProviderOutputTokens *int64  `json:"provider_output_tokens"`
+	DeliveryTokens       *int64  `json:"delivery_tokens"`
+	PriceRevisionID      *string `json:"price_revision_id"`
+	InputUnitPrice       *int64  `json:"input_unit_price"`
+	OutputUnitPrice      *int64  `json:"output_unit_price"`
+	SettledAmount        *int64  `json:"settled_amount"`
+	CorrectsAppendSeq    *int64  `json:"corrects_append_seq"`
 }
 
 type usageFactPage struct {
@@ -105,11 +125,23 @@ func usageEvents(app *application.App) stdhttp.HandlerFunc {
 		events := make([]usageEvent, 0, len(page.Events))
 		for _, event := range page.Events {
 			events = append(events, usageEvent{
+				AppendSeq:     event.AppendSeq,
 				RequestID:     event.RequestID,
 				Kind:          event.Kind,
 				SchemaVersion: event.SchemaVersion,
 				OccurredAt:    event.OccurredAt,
 				Payload:       payloadOrEmpty(event.Payload),
+
+				CaptureMethod:        event.CaptureMethod,
+				CommittedAttemptID:   event.CommittedAttemptID,
+				ProviderInputTokens:  event.ProviderInputTokens,
+				ProviderOutputTokens: event.ProviderOutputTokens,
+				DeliveryTokens:       event.DeliveryTokens,
+				PriceRevisionID:      event.PriceRevision,
+				InputUnitPrice:       event.InputUnitPrice,
+				OutputUnitPrice:      event.OutputUnitPrice,
+				SettledAmount:        event.SettledAmount,
+				CorrectsAppendSeq:    event.CorrectsAppendSeq,
 			})
 		}
 

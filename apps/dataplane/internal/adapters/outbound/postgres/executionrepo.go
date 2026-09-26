@@ -163,14 +163,22 @@ func NewAttemptRepository(store persistence.Store) *AttemptRepository {
 	return &AttemptRepository{store: store}
 }
 
-// Insert implements persistence.AttemptRepository. A 23505 on either unique
-// key of request_attempts — the row's own id, or its (request, candidate
-// position, retry sequence) business key — is not a store failure but the
-// answer that the attempt is already appended: an append whose commit
-// acknowledgement was lost looks exactly like a lost append to the caller
-// that retries it, and the engine's refusal is the only writer that knows the
-// difference. The constraint name is matched the way every classification in
-// this adapter is — never the message text.
+// Insert implements persistence.AttemptRepository. A 23505 on the row's own
+// id — request_attempts_pkey — is not a store failure but the answer that the
+// attempt is already appended: an append whose commit acknowledgement was lost
+// looks exactly like a lost append to the caller that retries it, and the
+// engine's refusal is the only writer that knows the difference. The
+// constraint name is matched the way every classification in this adapter is —
+// never the message text.
+//
+// The composite key's refusal is deliberately not classified. The business
+// unique key on (request, candidate position, retry sequence) guards one
+// attempt per position, and a second attempt at the same position carries a
+// different id by construction — so its 23505 is a caller bug (the walk made
+// two attempts at one position), not a raced append, and reporting it through
+// the already-appended sentinel would tell the caller its row was written when
+// what happened was that its attempt was illegitimate. It surfaces as the
+// engine's own error, loud, at the caller that made it.
 func (repository *AttemptRepository) Insert(ctx context.Context, attempt execution.Attempt) error {
 	var providerError any
 	if len(attempt.ProviderError) > 0 {
@@ -194,12 +202,29 @@ func (repository *AttemptRepository) Insert(ctx context.Context, attempt executi
 		attempt.FinishedAt,
 	)
 	if err != nil {
-		if code(err) == "23505" && (constraint(err) == "request_attempts_pkey" || constraint(err) == "request_attempts_business_key") {
+		if code(err) == "23505" && constraint(err) == "request_attempts_pkey" {
 			return fmt.Errorf("postgres: insert attempt: %w", persistence.ErrAttemptAlreadyAppended)
 		}
 		return fmt.Errorf("postgres: insert attempt: %w", err)
 	}
 	return nil
+}
+
+// attemptExists is the probe the unit-of-work insert is preceded by: a row's
+// presence read before any insert runs, so a raced append is recognised while
+// the unit can still act on the answer instead of poisoning itself on the
+// engine's abort.
+const attemptExists = `SELECT EXISTS (
+    SELECT 1 FROM public.request_attempts WHERE id = $1
+)`
+
+// Exists implements persistence.AttemptRepository.
+func (repository *AttemptRepository) Exists(ctx context.Context, attemptID identity.AttemptID) (bool, error) {
+	var exists bool
+	if err := repository.store.Querier(ctx).QueryRowContext(ctx, attemptExists, string(attemptID)).Scan(&exists); err != nil {
+		return false, fmt.Errorf("postgres: exists attempt: %w", err)
+	}
+	return exists, nil
 }
 
 // RecordProviderUsage implements persistence.AttemptRepository.

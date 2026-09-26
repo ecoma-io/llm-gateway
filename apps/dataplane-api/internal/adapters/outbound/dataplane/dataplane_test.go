@@ -29,7 +29,7 @@ const opaqueCursor = "cur:9f2 &=<not-a-number>/+=="
 // settledPageBody is a well-formed answer: one fact with a payload, one cursor,
 // one has_more. The timestamp is deliberately a whole second so that the
 // assertion below is about the instant rather than about a format choice.
-const settledPageBody = `{"events":[{"request_id":"req_01HZ","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{"allocation_id":"alloc-1"}}],"next_cursor":"` + opaqueCursor + `","has_more":true}`
+const settledPageBody = `{"events":[{"append_seq":1,"request_id":"req_01HZ","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{"allocation_id":"alloc-1"}}],"next_cursor":"` + opaqueCursor + `","has_more":true}`
 
 // recordedCall is one request as the Data Plane's listener saw it. The query is
 // kept as the parsed parameters rather than as the request, because a missing
@@ -312,7 +312,13 @@ func TestReadUsageEventsClassifiesEveryFailureTheSeamCanProduce(t *testing.T) {
 		{
 			name:    "a fact whose timestamp is not a timestamp is a page this façade cannot trust",
 			status:  stdhttp.StatusOK,
-			body:    `{"events":[{"request_id":"r","kind":"settled","schema_version":1,"occurred_at":"last Tuesday","payload":{}}],"next_cursor":"c","has_more":false}`,
+			body:    `{"events":[{"append_seq":1,"request_id":"r","kind":"settled","schema_version":1,"occurred_at":"last Tuesday","payload":{}}],"next_cursor":"c","has_more":false}`,
+			wantErr: dataplane.ErrUpstreamUnavailable,
+		},
+		{
+			name:    "a fact whose append_seq is below the one the contract allows is a page this façade cannot trust",
+			status:  stdhttp.StatusOK,
+			body:    `{"events":[{"append_seq":0,"request_id":"r","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
 			wantErr: dataplane.ErrUpstreamUnavailable,
 		},
 		{
@@ -371,11 +377,13 @@ func TestReadUsageEventsClassifiesEveryFailureTheSeamCanProduce(t *testing.T) {
 
 // validFactBody is one well-formed fact as the private listener writes it, for
 // the tests below to break one field of at a time.
-const validFactBody = `{"request_id":"req_01HZ","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{"allocation_id":"alloc-1"}}`
+const validFactBody = `{"append_seq":1,"request_id":"req_01HZ","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{"allocation_id":"alloc-1"}}`
 
 // TestReadUsageEventsRefusesAPageMissingRequiredFields is the fail-closed
 // table: every field the contract marks required — the page's three and the
-// fact's five — is refused when the body omits it or carries it as null.
+// fact's six, append_seq first because a fact without its place in the feed is
+// a fact no consumer can order — is refused when the body omits it or carries
+// it as null.
 //
 // The refusals are ErrUpstreamUnavailable, the same classification as a body
 // the façade cannot read at all, because they are the same condition from a
@@ -417,44 +425,52 @@ func TestReadUsageEventsRefusesAPageMissingRequiredFields(t *testing.T) {
 			body: `{"events":[],"next_cursor":"c","has_more":null}`,
 		},
 		{
+			name: "a fact with no append_seq field at all",
+			body: `{"events":[{"request_id":"r","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
+		},
+		{
+			name: "a fact whose append_seq field is null",
+			body: `{"events":[{"append_seq":null,"request_id":"r","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
+		},
+		{
 			name: "a fact with no request_id field at all",
-			body: `{"events":[{"kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
+			body: `{"events":[{"append_seq":1,"kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
 		},
 		{
 			name: "a fact whose request_id field is null",
-			body: `{"events":[{"request_id":null,"kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
+			body: `{"events":[{"append_seq":1,"request_id":null,"kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
 		},
 		{
 			name: "a fact with no kind field at all",
-			body: `{"events":[{"request_id":"r","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
+			body: `{"events":[{"append_seq":1,"request_id":"r","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
 		},
 		{
 			name: "a fact whose kind field is null",
-			body: `{"events":[{"request_id":"r","kind":null,"schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
+			body: `{"events":[{"append_seq":1,"request_id":"r","kind":null,"schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
 		},
 		{
 			name: "a fact with no schema_version field at all",
-			body: `{"events":[{"request_id":"r","kind":"settled","occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
+			body: `{"events":[{"append_seq":1,"request_id":"r","kind":"settled","occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
 		},
 		{
 			name: "a fact whose schema_version field is null",
-			body: `{"events":[{"request_id":"r","kind":"settled","schema_version":null,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
+			body: `{"events":[{"append_seq":1,"request_id":"r","kind":"settled","schema_version":null,"occurred_at":"2026-09-23T10:00:00Z","payload":{}}],"next_cursor":"c","has_more":false}`,
 		},
 		{
 			name: "a fact with no occurred_at field at all",
-			body: `{"events":[{"request_id":"r","kind":"settled","schema_version":1,"payload":{}}],"next_cursor":"c","has_more":false}`,
+			body: `{"events":[{"append_seq":1,"request_id":"r","kind":"settled","schema_version":1,"payload":{}}],"next_cursor":"c","has_more":false}`,
 		},
 		{
 			name: "a fact whose occurred_at field is null",
-			body: `{"events":[{"request_id":"r","kind":"settled","schema_version":1,"occurred_at":null,"payload":{}}],"next_cursor":"c","has_more":false}`,
+			body: `{"events":[{"append_seq":1,"request_id":"r","kind":"settled","schema_version":1,"occurred_at":null,"payload":{}}],"next_cursor":"c","has_more":false}`,
 		},
 		{
 			name: "a fact with no payload field at all",
-			body: `{"events":[{"request_id":"r","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z"}],"next_cursor":"c","has_more":false}`,
+			body: `{"events":[{"append_seq":1,"request_id":"r","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z"}],"next_cursor":"c","has_more":false}`,
 		},
 		{
 			name: "a fact whose payload field is null",
-			body: `{"events":[{"request_id":"r","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":null}],"next_cursor":"c","has_more":false}`,
+			body: `{"events":[{"append_seq":1,"request_id":"r","kind":"settled","schema_version":1,"occurred_at":"2026-09-23T10:00:00Z","payload":null}],"next_cursor":"c","has_more":false}`,
 		},
 		{
 			name: "a fact that is an empty object",
@@ -498,7 +514,10 @@ func TestReadUsageEventsRefusesAPageMissingRequiredFields(t *testing.T) {
 // the port, and a façade that started refusing them would be answering a
 // question the contract leaves to the applier.
 func TestAFactWithPresentButEmptyFieldsIsStillAPage(t *testing.T) {
-	body := `{"events":[{"request_id":"","kind":"a-kind-nobody-knows","schema_version":0,"occurred_at":"0001-01-01T00:00:00Z","payload":[1,2]}],"next_cursor":"c","has_more":false}`
+	// append_seq is present with the one value its bound allows an empty-ish
+	// page to carry: presence AND at least one are its whole check, so a zero
+	// would be a refusal rather than an emptiness this test is about.
+	body := `{"events":[{"append_seq":1,"request_id":"","kind":"a-kind-nobody-knows","schema_version":0,"occurred_at":"0001-01-01T00:00:00Z","payload":[1,2]}],"next_cursor":"c","has_more":false}`
 
 	up := &upstream{body: body}
 	client := up.server(t)

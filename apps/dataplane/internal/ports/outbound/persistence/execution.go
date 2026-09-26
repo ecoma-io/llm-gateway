@@ -22,14 +22,22 @@ var ErrDuplicateIntake = errors.New("persistence: replay record already exists")
 var ErrAttemptNotOfRequest = errors.New("persistence: attempt belongs to another request")
 
 // ErrAttemptAlreadyAppended says the attempt row Insert names is already on
-// disk — the unique keys on (id) and on (request, candidate position, retry
-// sequence) refused a second copy. Like ErrDuplicateIntake, this is
-// information, not a failure to retry: the append raced a writer that
-// persisted the same row, which without this sentinel is reachable without
-// any bug — an append whose commit acknowledgement was lost leaves its caller
-// unable to tell "never happened" from "happened and unacknowledged", and the
-// retry it then runs is the collision. A caller that receives this sentinel
-// reads the append as done.
+// disk — the unique key on (id) refused a second copy. Like
+// ErrDuplicateIntake, this is information, not a failure to retry: the append
+// raced a writer that persisted the same row, which without this sentinel is
+// reachable without any bug — an append whose commit acknowledgement was lost
+// leaves its caller unable to tell "never happened" from "happened and
+// unacknowledged", and the retry it then runs is the collision. A caller that
+// receives this sentinel reads the append as done.
+//
+// The sentinel names the (id) collision only. The composite unique key on
+// (request, candidate position, retry sequence) guards a different fact —
+// that one request has at most one attempt per position — and its refusal is
+// a domain violation a caller bug made, not a raced append: a second attempt
+// at the same position carries a different id by construction. An adapter
+// that reported both keys through this one sentinel would tell a caller its
+// append was done when what happened was that its attempt was illegitimate,
+// so the adapter refuses the composite case as itself.
 var ErrAttemptAlreadyAppended = errors.New("persistence: attempt is already appended")
 
 // RequestRepository persists and finalises requests.
@@ -74,7 +82,29 @@ type AttemptRepository interface {
 	// with ErrAttemptAlreadyAppended: the row exists, the append already
 	// happened, and the caller reads that as success rather than retrying an
 	// append only the engine's refusal can end.
+	//
+	// The sentinel's tolerance is an outside-a-unit shape. Inside a unit of
+	// work the engine has already aborted the transaction by the time the
+	// refusal surfaces — PostgreSQL poisons the unit after any unique-key
+	// failure — so a caller that swallowed the sentinel and kept writing
+	// would watch every later statement die with the aborted-transaction
+	// class instead. A caller that must survive the collision inside its own
+	// unit probes with Exists first, inserts only on a miss, and lets a
+	// residual collision abort the unit for its retry to take the probe's
+	// path.
 	Insert(ctx context.Context, attempt execution.Attempt) error
+
+	// Exists reports whether the attempt's row is already on disk. It is the
+	// probe the unit-of-work insert cannot be preceded by a tolerated
+	// collision: an append that races a writer which persisted the same row
+	// — the lost-commit-ack retry, or the orphan tail of a lost ending race —
+	// is read as the done thing it is before any insert runs, so the unit
+	// never poisons itself on a refusal that means "already done".
+	//
+	// It answers presence and nothing else: the row's content is not
+	// compared, and a present row written by a racer is the same observation
+	// this port's Insert tolerance reads as done.
+	Exists(ctx context.Context, attemptID identity.AttemptID) (bool, error)
 
 	// RecordProviderUsage is the one sanctioned update: the provider-usage
 	// telemetry columns alone, for usage that arrived after the row existed.

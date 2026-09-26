@@ -135,7 +135,7 @@ func TestReadUsageEventsOmitsAnEmptyPosition(t *testing.T) {
 func TestReadUsageEventsDecodesAPage(t *testing.T) {
 	body := `{
 		"events": [
-			{"request_id":"req-1","kind":"settled","schema_version":3,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}
+			{"append_seq":41,"request_id":"req-1","kind":"settled","schema_version":3,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}
 		],
 		"next_cursor":"opaque-cursor-2",
 		"has_more":true
@@ -153,6 +153,9 @@ func TestReadUsageEventsDecodesAPage(t *testing.T) {
 		t.Fatalf("len(Events) = %d, want %d", got, want)
 	}
 	event := page.Events[0]
+	if got, want := event.AppendSeq, int64(41); got != want {
+		t.Errorf("AppendSeq = %d, want %d — the fact's place in the feed crosses as its own field", got, want)
+	}
 	if got, want := event.RequestID, "req-1"; got != want {
 		t.Errorf("RequestID = %q, want %q", got, want)
 	}
@@ -257,8 +260,10 @@ func TestReadUsageEventsRefusesAPageItCannotAdvanceFrom(t *testing.T) {
 
 // TestReadUsageEventsRefusesAPageMissingRequiredFields is the fail-closed
 // table: every field the contract marks required — the page's three, the
-// fact's five — is refused when the body omits it or carries it as null,
-// because a page that must be filled in is not a page the contract describes.
+// fact's six, append_seq first because a fact without its place in the feed
+// cannot be ordered against the position it advances — is refused when the
+// body omits it or carries it as null, because a page that must be filled in
+// is not a page the contract describes.
 //
 // The danger each row stands against is the zero value: `encoding/json` used
 // to answer a missing `has_more` with false, an absent `events` with an empty
@@ -299,44 +304,52 @@ func TestReadUsageEventsRefusesAPageMissingRequiredFields(t *testing.T) {
 			body: `{"events":[],"next_cursor":"cursor-2","has_more":null}`,
 		},
 		{
+			name: "a fact with no append_seq field at all",
+			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+		{
+			name: "a fact whose append_seq field is null",
+			body: `{"events":[{"append_seq":null,"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+		{
 			name: "a fact with no request_id field at all",
-			body: `{"events":[{"kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+			body: `{"events":[{"append_seq":1,"kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
 		},
 		{
 			name: "a fact whose request_id field is null",
-			body: `{"events":[{"request_id":null,"kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+			body: `{"events":[{"append_seq":1,"request_id":null,"kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
 		},
 		{
 			name: "a fact with no kind field at all",
-			body: `{"events":[{"request_id":"req-1","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+			body: `{"events":[{"append_seq":1,"request_id":"req-1","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
 		},
 		{
 			name: "a fact whose kind field is null",
-			body: `{"events":[{"request_id":"req-1","kind":null,"schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+			body: `{"events":[{"append_seq":1,"request_id":"req-1","kind":null,"schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
 		},
 		{
 			name: "a fact with no schema_version field at all",
-			body: `{"events":[{"request_id":"req-1","kind":"settled","occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+			body: `{"events":[{"append_seq":1,"request_id":"req-1","kind":"settled","occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
 		},
 		{
 			name: "a fact whose schema_version field is null",
-			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":null,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+			body: `{"events":[{"append_seq":1,"request_id":"req-1","kind":"settled","schema_version":null,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
 		},
 		{
 			name: "a fact with no occurred_at field at all",
-			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":1,"payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+			body: `{"events":[{"append_seq":1,"request_id":"req-1","kind":"settled","schema_version":1,"payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
 		},
 		{
 			name: "a fact whose occurred_at field is null",
-			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":null,"payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+			body: `{"events":[{"append_seq":1,"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":null,"payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
 		},
 		{
 			name: "a fact with no payload field at all",
-			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z"}],"next_cursor":"cursor-2","has_more":true}`,
+			body: `{"events":[{"append_seq":1,"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z"}],"next_cursor":"cursor-2","has_more":true}`,
 		},
 		{
 			name: "a fact whose payload field is null",
-			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":null}],"next_cursor":"cursor-2","has_more":true}`,
+			body: `{"events":[{"append_seq":1,"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":null}],"next_cursor":"cursor-2","has_more":true}`,
 		},
 		{
 			name: "a fact that is an empty object",
@@ -394,11 +407,15 @@ func TestReadUsageEventsRefusesABodyItCannotDecode(t *testing.T) {
 		},
 		{
 			name: "a schema_version of the wrong type",
-			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":"1","occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+			body: `{"events":[{"append_seq":1,"request_id":"req-1","kind":"settled","schema_version":"1","occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
 		},
 		{
 			name: "an occurred_at that is not a timestamp",
-			body: `{"events":[{"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"not-a-time","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+			body: `{"events":[{"append_seq":1,"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"not-a-time","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
+		},
+		{
+			name: "an append_seq below the one the contract allows",
+			body: `{"events":[{"append_seq":0,"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"}}],"next_cursor":"cursor-2","has_more":true}`,
 		},
 	}
 
@@ -431,7 +448,10 @@ func TestReadUsageEventsRefusesABodyItCannotDecode(t *testing.T) {
 // the body carried; deciding which of them can settle is the applier's, and an
 // adapter that started refusing them would be taking that decision from it.
 func TestAFactWithPresentButEmptyFieldsIsStillAPage(t *testing.T) {
-	body := `{"events":[{"request_id":"","kind":"a-kind-nobody-knows","schema_version":0,"occurred_at":"0001-01-01T00:00:00Z","payload":[1,2]}],"next_cursor":"cursor-2","has_more":false}`
+	// append_seq carries the one value its bound admits rather than an empty
+	// one: presence AND at least one are its whole check, so a zero is a
+	// refusal above, not an emptiness this test is about.
+	body := `{"events":[{"append_seq":1,"request_id":"","kind":"a-kind-nobody-knows","schema_version":0,"occurred_at":"0001-01-01T00:00:00Z","payload":[1,2]}],"next_cursor":"cursor-2","has_more":false}`
 
 	var seen *http.Request
 	client := New(capturingClient(&seen, jsonResponse(http.StatusOK, body)), baseURL, credential)
@@ -457,7 +477,7 @@ func TestAFactWithPresentButEmptyFieldsIsStillAPage(t *testing.T) {
 // before this module ships, and an unfamiliar key is ignored, never refused.
 // A consumer that refused one would be a version lock on the plane it reads.
 func TestAPageMayCarryFieldsTheContractDoesNotName(t *testing.T) {
-	body := `{"events":[{"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"},"trace_id":"t-1"}],"next_cursor":"cursor-2","has_more":false,"published_at":"2026-09-24T10:11:12Z"}`
+	body := `{"events":[{"append_seq":1,"request_id":"req-1","kind":"settled","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"amount":"4200"},"trace_id":"t-1"}],"next_cursor":"cursor-2","has_more":false,"published_at":"2026-09-24T10:11:12Z"}`
 
 	var seen *http.Request
 	client := New(capturingClient(&seen, jsonResponse(http.StatusOK, body)), baseURL, credential)

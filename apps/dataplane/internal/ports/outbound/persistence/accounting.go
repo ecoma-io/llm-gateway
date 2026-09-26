@@ -250,6 +250,16 @@ type QuotaProjectionRepository interface {
 	// whose bucket has no row yet is a publication lag, not a loss to invent
 	// against — it is skipped, and the count of legs that landed comes back so
 	// the caller can decide what a lagging grant is worth complaining about.
+	//
+	// The credit is bucket-keyed on purpose, and the key is carried by the
+	// leg itself: capacity goes back to the exact ceiling row it was drawn
+	// from, never to an account-wide pool, so a reassignment of the account
+	// between drawdown and return — an entitlement cycle rolling over, a PAYG
+	// balance superseded by a new one — leaves the lapsed ceiling holding a
+	// credit it can no longer spend rather than topping the replacement
+	// beyond what was ever taken from it. A caller that wanted the old
+	// bucket's tail moved to the new one states that as its own explicit
+	// leg-shaped decision; this method does not infer it.
 	Return(ctx context.Context, legs []accounting.Allocation) (int, error)
 }
 

@@ -24,17 +24,29 @@ type Settlement struct {
 // actually spent, and the price the spend is provenance for. Held minus
 // consumed is the tail that goes back — the builder below writes that
 // arithmetic as legs, never as a field a caller could misstate.
+//
+// A zero is a value here, not the absence of one: a zero-priced model books
+// a hold of nothing and consumes nothing, and its slice of the settlement is
+// still an allocation — the header names the request as settled, and no leg
+// records a movement that never happened.
 type Allocation struct {
 	BucketID      FundingBucketID
 	ReservationID ReservationID
 	HeldBooked    Amount
 	Consumed      Amount
 	Price         PriceSnapshot
+
+	// settled is the once-only marker behind SettleConsumed's refusal. It is
+	// unexported so a struct literal is by construction un-settled, and it is
+	// not derived from Consumed because a settled-zero allocation is
+	// indistinguishable from an un-settled one by its amounts alone.
+	settled bool
 }
 
 // NewAllocation validates one allocation's parts before it can join a
-// settlement: a real bucket, a canonical reservation reference, a positive
-// booked hold.
+// settlement: a real bucket, a canonical reservation reference, a booked
+// hold that is at least nothing — zero for a model priced at nothing, never
+// below it.
 func NewAllocation(bucketID FundingBucketID, reservationID ReservationID, heldBooked Amount) (Allocation, error) {
 	if bucketID == "" {
 		return Allocation{}, fmt.Errorf("accounting: new allocation: %w: blank funding bucket id", ErrInvalidReference)
@@ -42,7 +54,7 @@ func NewAllocation(bucketID FundingBucketID, reservationID ReservationID, heldBo
 	if err := validateReservationID(reservationID); err != nil {
 		return Allocation{}, fmt.Errorf("accounting: new allocation: %w", err)
 	}
-	if _, err := NewAmount(heldBooked.Int64()); err != nil {
+	if err := validateAmountAtOrAboveZero(heldBooked.Int64()); err != nil {
 		return Allocation{}, fmt.Errorf("accounting: new allocation: %w", err)
 	}
 	return Allocation{BucketID: bucketID, ReservationID: reservationID, HeldBooked: heldBooked}, nil
@@ -50,12 +62,13 @@ func NewAllocation(bucketID FundingBucketID, reservationID ReservationID, heldBo
 
 // SettleConsumed records what the usage fact spent on one allocation, with
 // the price snapshot the charge is provenance for. A second call is a
-// caller defect and is refused — an allocation settles once.
+// caller defect and is refused — an allocation settles once, even when the
+// first settlement consumed nothing.
 func (a Allocation) SettleConsumed(consumed Amount, price PriceSnapshot) (Allocation, error) {
-	if a.Consumed != 0 {
+	if a.settled {
 		return Allocation{}, fmt.Errorf("accounting: allocation of bucket %s: %w: consumed already recorded", a.BucketID, ErrInvalidSettlement)
 	}
-	if _, err := NewAmount(consumed.Int64()); err != nil {
+	if err := validateAmountAtOrAboveZero(consumed.Int64()); err != nil {
 		return Allocation{}, fmt.Errorf("accounting: allocation of bucket %s: %w", a.BucketID, err)
 	}
 	if consumed > a.HeldBooked {
@@ -67,6 +80,7 @@ func (a Allocation) SettleConsumed(consumed Amount, price PriceSnapshot) (Alloca
 	}
 	a.Consumed = consumed
 	a.Price = price
+	a.settled = true
 	return a, nil
 }
 
@@ -122,15 +136,15 @@ func BuildSettle(settlementID SettlementID, requestID RequestID, allocations []A
 		}
 		seen[alloc.BucketID] = struct{}{}
 
-		if _, err := NewAmount(alloc.HeldBooked.Int64()); err != nil {
+		if err := validateAmountAtOrAboveZero(alloc.HeldBooked.Int64()); err != nil {
 			return SettlePlan{}, fmt.Errorf("accounting: build settle: allocation of bucket %s: %w", alloc.BucketID, err)
 		}
-		// Consumed is re-validated through NewAmount rather than only
+		// Consumed is re-validated to at least zero rather than only
 		// compared: the fields are exported, and a negative "consumed" is
 		// not a smaller settlement — it is a settlement whose tail
 		// arithmetic runs backwards. The refusal belongs here, in the
 		// words the caller reads, before any of it reaches the ledger.
-		if _, err := NewAmount(alloc.Consumed.Int64()); err != nil && alloc.Consumed != 0 {
+		if err := validateAmountAtOrAboveZero(alloc.Consumed.Int64()); err != nil {
 			return SettlePlan{}, fmt.Errorf("accounting: build settle: allocation of bucket %s: %w", alloc.BucketID, err)
 		}
 		if err := validateReservationID(alloc.ReservationID); err != nil {

@@ -6,47 +6,59 @@ import (
 	"unicode/utf8"
 )
 
-// The interim token counter's tests pin the two properties the hold depends
-// on: the count is in BYTES (so a multibyte script holds against its real
-// wire size) and it never under-counts (so a hold priced from it can only be
-// too large, never too small). The canonical tokenizer that replaces this
-// function (B11) must keep the second property; only the first is a
-// placeholder's approximation.
+// The canonical v1 input counter's tests pin the three properties the hold
+// depends on: the count is the UTF-8 byte length of the WHOLE body (so the
+// envelope's tools and schemas are priced, not only the message strings), it
+// is stated in bytes (so a multibyte script holds against its real wire
+// size), and it is an identity — the same body counts the same on every call,
+// and never below its own byte length, so a hold priced from it can only be
+// too large, never too small.
 
-func TestCountInputTokensSumsBytesAcrossContentParts(t *testing.T) {
+func TestCountInputTokensCountsTheWholeBodyInBytes(t *testing.T) {
 	tests := []struct {
-		name     string
-		contents []string
-		want     int64
+		name string
+		body string
 	}{
-		{name: "no content at all", contents: nil, want: 0},
-		{name: "an empty content list", contents: []string{}, want: 0},
-		{name: "one empty part", contents: []string{""}, want: 0},
-		{name: "one ASCII part", contents: []string{"hello"}, want: 5},
-		{name: "three ASCII parts", contents: []string{"one", "two", "three"}, want: 11},
-		{name: "a part per message with punctuation", contents: []string{"user: ", "hi", "\n"}, want: 9},
-		{name: "a CJK sentence in bytes, not runes", contents: []string{"你好世界"}, want: 12},
-		{name: "an emoji in bytes, not runes", contents: []string{"🔑"}, want: 4},
-		{name: "a family emoji in bytes, not runes", contents: []string{"👨‍👩‍👧"}, want: 18},
-		{name: "mixed scripts", contents: []string{"hi ", "你好", " 🔑"}, want: 14},
-		{name: "accented letters in bytes, not runes", contents: []string{"éé"}, want: 4},
+		{name: "an empty body", body: ""},
+		{name: "a single ascii character", body: "x"},
+		{name: "an ascii envelope", body: `{"model":"m","messages":[{"role":"user","content":"hi"}]}`},
+		{name: "a cjk sentence in bytes, not runes", body: "你好世界"},
+		{name: "an emoji in bytes, not runes", body: "🔑"},
+		{name: "a family emoji in bytes, not runes", body: "👨‍👩‍👧"},
+		{name: "accented letters in bytes, not runes", body: "éé"},
+		{name: "whitespace is bytes too", body: "  \t\n  "},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := CountInputTokens(tt.contents)
-			if got != tt.want {
-				t.Errorf("CountInputTokens(%q) = %d, want %d", tt.contents, got, tt.want)
+			got := CountInputTokens([]byte(tt.body))
+			if want := int64(len(tt.body)); got != want {
+				t.Errorf("CountInputTokens(%q) = %d, want the body's %d bytes", tt.body, got, want)
 			}
 		})
 	}
 }
 
+// The scope property, as its own test: the count is over the whole envelope
+// and not the message strings alone. A body whose tools and schemas dwarf its
+// one-line message must count what the provider will tokenize — everything —
+// and a future edit that reads only the message strings would halve this
+// number.
+func TestCountInputTokensCountsTheEnvelopeNotOnlyTheMessages(t *testing.T) {
+	messagesOnly := `{"messages":[{"role":"user","content":"hi"}]}`
+	withTools := `{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"search","description":"search the web","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}}]}`
+
+	if CountInputTokens([]byte(withTools)) <= CountInputTokens([]byte(messagesOnly)) {
+		t.Errorf("CountInputTokens counted the tools-bearing body at %d and the messages-only body at %d; the whole envelope must be counted",
+			CountInputTokens([]byte(withTools)), CountInputTokens([]byte(messagesOnly)))
+	}
+}
+
 // TestCountInputTokensCountsUTF8BytesNotRunes states the distinction as its
 // own test, because the value it protects is the one a future edit to a rune
-// count would silently break: the same content, two different numbers.
+// count would silently break: the same body, two different numbers.
 func TestCountInputTokensCountsUTF8BytesNotRunes(t *testing.T) {
 	const cjk = "模型"
-	got := CountInputTokens([]string{cjk})
+	got := CountInputTokens([]byte(cjk))
 	if got != int64(len(cjk)) {
 		t.Errorf("CountInputTokens(%q) = %d, want %d bytes", cjk, got, len(cjk))
 	}
@@ -55,31 +67,24 @@ func TestCountInputTokensCountsUTF8BytesNotRunes(t *testing.T) {
 	}
 }
 
-// TestCountInputTokensNeverUnderCountsBytes is the direction property: the
-// counter is at least the number of bytes in the content, for every part
-// shape the tests can build. A counter below the byte count would size a
-// hold under the request, which is the one failure this interim function
-// cannot have.
+// TestCountInputTokensNeverUnderCountsBytes is the direction property: for
+// every body the tests can build, the count is exactly the byte length —
+// which is at least the rune count and at least any tokenizer's token count,
+// so a hold priced from it can only be too large, never too small.
 func TestCountInputTokensNeverUnderCountsBytes(t *testing.T) {
-	parts := []string{
+	bodies := []string{
 		"", "a", "hello world", "你好世界", "🔑", "👨‍👩‍👧‍👦", "ééé",
 		strings.Repeat("x", 4096), strings.Repeat("好", 1024),
 		"mixed 混合 🔑 content", "  \t\n  ", "!@#$%^&*()", "Ω≈ç√∫˜µ",
+		`{"messages":["多","byte"]}`,
 	}
-	for _, part := range parts {
-		counted := CountInputTokens([]string{part})
-		if want := int64(len(part)); counted < want {
-			t.Errorf("CountInputTokens(%q) = %d, below the %d bytes it must never under-count", part, counted, want)
+	for _, body := range bodies {
+		counted := CountInputTokens([]byte(body))
+		if want := int64(len(body)); counted != want {
+			t.Fatalf("CountInputTokens(%q) = %d, want the body's %d bytes", body, counted, want)
 		}
-	}
-	// And the additive direction: a list counts at least the sum of its
-	// parts' bytes, which the parts-alone check would not catch.
-	joined := CountInputTokens(parts)
-	sum := 0
-	for _, part := range parts {
-		sum += len(part)
-	}
-	if joined < int64(sum) {
-		t.Errorf("CountInputTokens(parts) = %d, below the %d bytes of the parts", joined, sum)
+		if runes := int64(utf8.RuneCountInString(body)); counted < runes {
+			t.Errorf("CountInputTokens(%q) = %d, below its %d runes; the count must be in bytes", body, counted, runes)
+		}
 	}
 }

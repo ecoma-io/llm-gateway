@@ -171,6 +171,11 @@ func (r *ChatRouting) releaseOnce(ctx context.Context, in ChatInput, admitted *A
 		// held to the commit, so the order facts are allocated is the order
 		// they become visible, and this ending reads as one fact.
 		if _, err := r.facts.Append(txCtx, fact); err != nil {
+			if errors.Is(err, persistence.ErrDuplicateFact) {
+				// The same named bug a settle's append would be: a second
+				// settlement-relevant fact behind a CAS this unit owns.
+				return fmt.Errorf("application: release request %s: a settlement-relevant fact already exists for the hold this unit closed: %w", admitted.RuntimeRequestID, err)
+			}
 			return fmt.Errorf("application: release request %s: append the release: %w", admitted.RuntimeRequestID, err)
 		}
 		completed = true
@@ -263,13 +268,28 @@ func (r *ChatRouting) settleOnce(ctx context.Context, in ChatInput, admitted *Ad
 		// transaction is ever open across the provider call — this one
 		// opened after the call finished — and the row commits with the
 		// ending it belongs to, so a crash between them leaves neither.
-		if err := r.attempts.Insert(txCtx, attempt); err != nil {
-			if !errors.Is(err, persistence.ErrAttemptAlreadyAppended) {
+		//
+		// The insert is preceded by the probe, and the probe is the whole
+		// tolerance. A 23505 inside a unit aborts it — PostgreSQL poisons
+		// the transaction, and every later statement dies with the
+		// aborted-transaction class — so the swallowed-sentinel tolerance the
+		// append keeps outside a unit is unimplementable in here: the row
+		// after it would fail, the ending would roll back, and the hold
+		// would strand. The probe reads a raced append (this ladder's own
+		// earlier attempt committing past a lost ack, or the orphan tail of
+		// a lost ending race) while the unit can still act on the answer.
+		appended, err := r.attempts.Exists(txCtx, attempt.ID)
+		if err != nil {
+			return fmt.Errorf("application: settle request %s: probe the attempt: %w", admitted.RuntimeRequestID, err)
+		}
+		if !appended {
+			// A collision landing between probe and insert poisons the unit
+			// by the engine's own law; the sentinel it surfaces as is
+			// retryable, and the ladder's next attempt takes the probe's
+			// path and reads the row as the done thing it is.
+			if err := r.attempts.Insert(txCtx, attempt); err != nil {
 				return fmt.Errorf("application: settle request %s: append the attempt: %w", admitted.RuntimeRequestID, err)
 			}
-			// The append raced a writer that persisted the same row — the
-			// lost-commit-ack shape the sentinel exists for. The row is on
-			// disk; the append is done.
 		}
 		request := execution.Request{ID: admitted.RuntimeRequestID, Status: execution.StatusExecuting}
 		if succeeded {
@@ -318,6 +338,15 @@ func (r *ChatRouting) settleOnce(ctx context.Context, in ChatInput, admitted *Ad
 		// The append is the unit's LAST statement, the same order law the
 		// release keeps.
 		if _, err := r.facts.Append(txCtx, fact); err != nil {
+			if errors.Is(err, persistence.ErrDuplicateFact) {
+				// A second settlement-relevant fact for one request, while
+				// this unit holds the ending's CAS, is the feed's invariants
+				// broken — the dedup unique exists behind the CAS precisely
+				// so this cannot happen. It is a bug and it is named as one:
+				// the unit rolls back whole, and the refusal is not
+				// something a retry improves.
+				return fmt.Errorf("application: settle request %s: a settlement-relevant fact already exists for the hold this unit closed: %w", admitted.RuntimeRequestID, err)
+			}
 			return fmt.Errorf("application: settle request %s: append the settlement: %w", admitted.RuntimeRequestID, err)
 		}
 		return nil
@@ -354,8 +383,31 @@ func (r *ChatRouting) settleOrphanTail(ctx context.Context, in ChatInput, admitt
 		return fmt.Errorf("application: settle request %s: read the replay record for the orphan tail: %w", admitted.RuntimeRequestID, err)
 	}
 	if record.FinalStatus != nil {
-		return nil
+		// An ending was stated for this request, and the tail adds nothing
+		// only when the winner's own fact already carries this usage: a
+		// settle finalises succeeded or failed-after-commitment, and either
+		// way its settled fact priced the very committed attempt this tail
+		// would name. Every other pointer is a release's verdict — rejected,
+		// or failed through an abandoned ending — and its fact says the hold
+		// went back without settleable usage, which is exactly the part this
+		// unit's observation is not: the orphaned fact appends beside the
+		// winner's, the coexistence the kind and its own dedup unique were
+		// designed for.
+		switch *record.FinalStatus {
+		case execution.FinalSucceeded:
+			return nil
+		case execution.FinalFailed:
+			if record.FinalFailureReason == execution.FailedStreamAfterCommitment {
+				return nil
+			}
+		}
 	}
+	// The verdict read above is advisory, and the race it cannot see is
+	// stated rather than hidden: a winner still inside its unit finalises
+	// after this read, and a settled fact may then land beside this tail's
+	// orphan. Both are true sentences about the request — usage was observed,
+	// and an ending priced it — and the feed carries both; the consumer's
+	// kind-classed idempotency is what makes that free.
 	return r.store.WithinTx(ctx, func(txCtx context.Context) error {
 		now, err := r.clock.TransactionTimestamp(txCtx)
 		if err != nil {
@@ -367,6 +419,16 @@ func (r *ChatRouting) settleOrphanTail(ctx context.Context, in ChatInput, admitt
 			return fmt.Errorf("application: settle request %s: form the orphaned fact: %w", admitted.RuntimeRequestID, err)
 		}
 		if _, err := r.facts.Append(txCtx, fact); err != nil {
+			if errors.Is(err, persistence.ErrDuplicateFact) {
+				// The twin tail of the same lost race recorded the orphan
+				// first — two settles can both lose their CAS to one sweep,
+				// and both tails read the record before either appended. The
+				// orphan dedup unique let exactly one through, and the
+				// telemetry this tail exists for is on the feed: done, not
+				// an error, and certainly not a hard failure of a request
+				// whose ending someone else already wrote.
+				return nil
+			}
 			return fmt.Errorf("application: settle request %s: append the orphaned fact: %w", admitted.RuntimeRequestID, err)
 		}
 		return nil

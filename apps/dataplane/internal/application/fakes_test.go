@@ -1222,6 +1222,27 @@ func (f fakeAdmissionAttempts) Insert(ctx context.Context, attempt execution.Att
 	return nil
 }
 
+// Exists is the probe the settle unit runs before its insert, and the fake
+// answers it from the same two places the real store's unique key would: a
+// row this fake appended, and the attemptDuplicate shape whose row "is on
+// disk" by construction — that flag's whole meaning is that an insert would
+// collide, which is presence. Without the second source the probe would read
+// a miss where the insert is about to refuse, and the settle unit would
+// poison itself exactly the way the probe exists to prevent.
+func (f fakeAdmissionAttempts) Exists(ctx context.Context, attemptID identity.AttemptID) (bool, error) {
+	f.world.mu.Lock()
+	defer f.world.mu.Unlock()
+	if f.world.attemptDuplicate {
+		return true, nil
+	}
+	for _, attempt := range f.world.attempts {
+		if attempt.ID == attemptID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // fakeRoutingBackends is the backend half of the servable closure. Only ByID
 // is reachable from the routing stage's pre-unit reads; every other method of
 // the port panics on the nil embedded value, the honest answer for a call the
