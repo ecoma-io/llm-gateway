@@ -29,10 +29,12 @@ const (
 )
 
 // fakeHoldSettler records the movements it is asked for, in order, and
-// fails on demand.
+// fails on demand. A converged settle reports the re-acknowledgement path —
+// the settlement already on file, nothing moved again.
 type fakeHoldSettler struct {
 	moves       []string
 	failOn      string
+	converge    bool
 	settlements map[accounting.RequestID]accounting.Settlement
 }
 
@@ -63,7 +65,7 @@ func (f *fakeHoldSettler) Settle(_ context.Context, requestID accounting.Request
 		settlement = accounting.Settlement{ID: "e1000000-0000-7000-8000-0000000000e1", RequestID: requestID, SettledTotal: accounting.Amount(total)}
 		f.settlements[requestID] = settlement
 	}
-	return SettlementResult{Settlement: settlement}, nil
+	return SettlementResult{Settlement: settlement, Converged: f.converge}, nil
 }
 
 func i64(v int64) string {
@@ -245,6 +247,65 @@ func TestAReplayedFactIsAReadAndNotASecondWrite(t *testing.T) {
 	if len(world.ledger.rows) != 1 {
 		t.Fatalf("applied rows = %d, want the one", len(world.ledger.rows))
 	}
+	if len(world.quarantine.rows) != 0 {
+		t.Fatalf("a true redelivery was quarantined: %d rows", len(world.quarantine.rows))
+	}
+}
+
+func TestARedeliveryClaimingAClosedClassUnderADifferentKindIsQuarantined(t *testing.T) {
+	// One class books one effect, so the second fact claiming the request's
+	// settlement class is either the same outcome again — the same kind,
+	// whatever position it rides, because the runtime re-appends and a
+	// replayed range re-reads — or two terminal states claiming one request.
+	// The contradiction is recorded rather than applied in silence or
+	// wedged into a page stop: the disposition a fact-vs-books disagreement
+	// earns.
+	world := newApplierWorld(t)
+	if err := world.applier.Apply(context.Background(), settledFact(t)); err != nil {
+		t.Fatalf("the first settled fact: %v", err)
+	}
+	world.settler.moves = nil
+
+	t.Run("same kind at a different position is the same outcome again", func(t *testing.T) {
+		fact := settledFact(t)
+		fact.AppendSeq = 8
+		if err := world.applier.Apply(context.Background(), fact); err != nil {
+			t.Fatalf("Apply() error = %v, want the no-op the class key promises", err)
+		}
+		if len(world.quarantine.rows) != 0 {
+			t.Fatalf("a re-appended outcome was quarantined: %d rows", len(world.quarantine.rows))
+		}
+		if len(world.settler.moves) != 0 {
+			t.Fatalf("a redelivery moved money: %v", world.settler.moves)
+		}
+	})
+	t.Run("a different kind for the same class", func(t *testing.T) {
+		fact := persistence.Fact{
+			AppendSeq:     9,
+			RequestID:     applierRequestID,
+			Kind:          ingestion.KindExpired,
+			SchemaVersion: ingestion.SchemaVersion,
+			Payload:       envelopeFor(t, legFor{FundingBucketID: bucketA, Amount: 40, Ordinal: 1}),
+		}
+		if err := world.applier.Apply(context.Background(), fact); err != nil {
+			t.Fatalf("Apply() error = %v, want the recorded disposition", err)
+		}
+		if len(world.quarantine.rows) != 1 {
+			t.Fatalf("quarantine rows = %d, want the contradiction", len(world.quarantine.rows))
+		}
+		if reason := world.quarantine.rows[0].Reason; !strings.Contains(reason, "settled") || !strings.Contains(reason, "expired") {
+			t.Errorf("reason = %q, want both kinds named", reason)
+		}
+	})
+	t.Run("the contradiction moved no money and rewrote no row", func(t *testing.T) {
+		if len(world.settler.moves) != 0 {
+			t.Errorf("a quarantined contradiction moved money: %v", world.settler.moves)
+		}
+		row := world.ledger.rows[factKey{applierRequestID, ingestion.ClassSettlement}]
+		if row == nil || row.Kind != ingestion.KindSettled || row.AppendSeq != 7 {
+			t.Errorf("surviving row = %+v, want the first fact's (settled, 7)", row)
+		}
+	})
 }
 
 func TestAnOrphanBooksNothingButItsRow(t *testing.T) {
@@ -425,6 +486,28 @@ func TestAnAccountingRefusalStopsThePage(t *testing.T) {
 	}
 	if len(world.ledger.rows) != 0 {
 		t.Errorf("an effect that did not land recorded an applied row: %d rows", len(world.ledger.rows))
+	}
+}
+
+func TestAConvergedSettleWithNoAppliedRowStopsThePage(t *testing.T) {
+	// A settle that converges — the ledger already holds this request's
+	// settlement, matched total — with no applied fact on file means the
+	// books disagree about who closed the request: settled through another
+	// door, or a once-applied page lost its own atomicity. No double charge
+	// is possible, but the state is the plane's, not the fact's disposition
+	// to paper over: the page stops, the same doctrine as a conflicting
+	// total.
+	world := newApplierWorld(t)
+	world.settler.converge = true
+	err := world.applier.Apply(context.Background(), settledFact(t))
+	if err == nil || !strings.Contains(err.Error(), "already settled") {
+		t.Fatalf("Apply() error = %v, want the divergence named", err)
+	}
+	if len(world.ledger.rows) != 0 {
+		t.Errorf("the divergence recorded an applied row: %d rows", len(world.ledger.rows))
+	}
+	if len(world.quarantine.rows) != 0 {
+		t.Errorf("a ledger state was quarantined as if it were the fact's disposition: %d rows", len(world.quarantine.rows))
 	}
 }
 

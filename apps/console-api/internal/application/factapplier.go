@@ -112,7 +112,21 @@ func (applier *FactApplier) Apply(ctx context.Context, fact persistence.Fact) er
 			outcome.RequestID, outcome.Class, err)
 	}
 	if existing != nil {
-		return nil
+		// A redelivery is a read before it is ever a second write. The same
+		// kind for the same class is the same logical outcome — the runtime
+		// re-appends it, a replayed range re-reads it — and the append seq
+		// identifies the wire row, not the fact, so it stays a no-op
+		// whatever seq the redelivery rides. A different kind for the same
+		// class is two terminal states claiming one request: applying it
+		// would bury the disagreement in a silent nil, and refusing it
+		// outright would wedge the feed on the writer's defect. It is
+		// recorded instead, like any other contradiction between a fact and
+		// the books.
+		if existing.Kind == outcome.Kind {
+			return nil
+		}
+		return applier.quarantine(ctx, fact, fmt.Errorf("%w: request %s already carries a %s effect from append seq %d; this delivery claims the same class as %s at seq %d",
+			ingestion.ErrIncoherentFact, outcome.RequestID, existing.Kind, existing.AppendSeq, outcome.Kind, fact.AppendSeq))
 	}
 
 	var settlementID string
@@ -121,8 +135,13 @@ func (applier *FactApplier) Apply(ctx context.Context, fact persistence.Fact) er
 		settlementID, err = applier.applySettlement(ctx, outcome)
 	case ingestion.KindReleased, ingestion.KindExpired:
 		err = applier.applyRelease(ctx, outcome)
-	default: // ingestion.KindUnbillableOrphaned — no money moved.
+	case ingestion.KindUnbillableOrphaned: // no money moved.
 		err = nil
+	default:
+		// Unreachable — Interpret refuses every kind it does not name, so
+		// nothing derivable reaches this switch unnamed. Kept as the page
+		// stop it would be, so exhaustiveness never rests on that accident.
+		err = fmt.Errorf("ingestion: unknown fact kind %q", outcome.Kind)
 	}
 	if err != nil {
 		// The accounting primitives' refusals are the ledger's word: an
@@ -178,6 +197,17 @@ func (applier *FactApplier) applySettlement(ctx context.Context, outcome ingesti
 	result, err := applier.accounting.Settle(ctx, accounting.RequestID(outcome.RequestID), allocations)
 	if err != nil {
 		return "", fmt.Errorf("settle the derivation: %w", err)
+	}
+	if result.Converged {
+		// The ledger already holds this request's settlement while the
+		// consumer's applied ledger has no row for it — the request was
+		// closed through another door, or a page that settled it once
+		// failed without its own atomicity. The matched total means no
+		// double charge is possible, but the state is the plane's, not the
+		// fact's disposition to paper over: the page stops, the same
+		// doctrine as a conflicting total.
+		return "", fmt.Errorf("settle the derivation: request %s is already settled on the ledger as %s with no applied fact on file",
+			outcome.RequestID, result.Settlement.ID)
 	}
 	return string(result.Settlement.ID), nil
 }

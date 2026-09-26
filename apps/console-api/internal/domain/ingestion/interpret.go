@@ -140,10 +140,25 @@ type payloadV1 struct {
 // not written by a writer this contract describes — the same
 // refuse-don't-ignore rule the rest of the grammar runs on.
 func decodePayload(raw []byte) ([]wireLeg, error) {
+	// The document first, into RawMessage: `null` is the one JSON value that
+	// decodes into any target as a no-op, and read straight into the struct
+	// it would derive an empty tail from a payload that never named one.
+	// The document must be the envelope, and null is not an envelope.
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
+	var probe json.RawMessage
+	if err := dec.Decode(&probe); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrMalformedPayload, err)
+	}
+	if bytes.Equal(probe, []byte("null")) {
+		return nil, fmt.Errorf("%w: the payload document is null", ErrMalformedPayload)
+	}
+	// The envelope second, decoded over the captured document so the
+	// unknown-field refusal keeps its own sentence; a non-object document —
+	// an array, a string, a number — refuses here against the struct.
+	bound := json.NewDecoder(bytes.NewReader(probe))
+	bound.DisallowUnknownFields()
 	var payload payloadV1
-	if err := dec.Decode(&payload); err != nil {
+	if err := bound.Decode(&payload); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrMalformedPayload, err)
 	}
 	// One document, no trailing bytes: a second value in the body is not a
@@ -157,11 +172,20 @@ func decodePayload(raw []byte) ([]wireLeg, error) {
 	return payload.Allocations, nil
 }
 
+// bucketIDForm is the version-7 uuid shape the accounting domain mints
+// funding buckets with — the grammar the derived legs' Hold and consume
+// calls assert again deeper in (ids.go's validateMintedID). A leg naming
+// anything else was not drawn from a waterfall the runtime built, and left
+// to the primitives it would stop the page at the Hold — a wedged feed —
+// instead of at the grammar, where the refusal is a recorded disposition.
+var bucketIDForm = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
 // checkLegs enforces the allocation-tail grammar the writer's own
 // reservation validation pins: contiguous ordinals from 1 in drawdown
-// order, positive amounts, distinct buckets. The same three rules, in the
-// same order, because a consumer that accepted a tail the writer could not
-// have written would be deriving ledger legs from nothing.
+// order, positive amounts, distinct buckets, each bucket the identity the
+// runtime mints. The same rules, in the same order, because a consumer
+// that accepted a tail the writer could not have written would be deriving
+// ledger legs from nothing.
 func checkLegs(legs []wireLeg) error {
 	seen := make(map[string]bool, len(legs))
 	for i, leg := range legs {
@@ -173,6 +197,16 @@ func checkLegs(legs []wireLeg) error {
 		}
 		if leg.FundingBucketID == "" || seen[leg.FundingBucketID] {
 			return fmt.Errorf("%w: leg %d names a blank or repeated funding bucket", ErrMalformedPayload, i)
+		}
+		if !bucketIDForm.MatchString(leg.FundingBucketID) {
+			// The echo is %q — control characters cannot survive it — and
+			// bounded, so a grammar refusal quoting a body-length id writes
+			// a reason about the fact, not a second fact of its own.
+			shown := leg.FundingBucketID
+			if len(shown) > 64 {
+				shown = shown[:64]
+			}
+			return fmt.Errorf("%w: leg %d names funding bucket %q, which is not the version-7 uuid shape the runtime mints", ErrMalformedPayload, i, shown)
 		}
 		seen[leg.FundingBucketID] = true
 	}
@@ -257,8 +291,15 @@ func Interpret(fact Fact) (Outcome, error) {
 		return interpretSettled(fact, class, legs)
 	case KindReleased, KindExpired:
 		return interpretReleased(fact, class, legs)
-	default:
+	case KindUnbillableOrphaned:
 		return interpretOrphaned(fact, class, legs)
+	default:
+		// Unreachable while ClassOf maps only the four kinds named above —
+		// kept as the refusal it would be, so a kind added to ClassOf
+		// without teaching this switch about it arrives as a recorded
+		// unknown kind rather than whichever interpreter the fall-through
+		// happened to land on.
+		return Outcome{}, fmt.Errorf("%w: %q", ErrUnknownKind, fact.Kind)
 	}
 }
 

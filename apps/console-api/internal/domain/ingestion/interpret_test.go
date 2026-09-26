@@ -27,6 +27,14 @@ func envelope(t *testing.T, legs ...wireLeg) []byte {
 	return raw
 }
 
+// Two funding buckets in the version-7 uuid shape the runtime mints — the
+// leg grammar's own word (bucketIDForm), exercised by every coherent fact
+// below.
+const (
+	bucketA = "0b000000-0000-7000-8000-00000000000a"
+	bucketB = "0b000000-0000-7000-8000-00000000000b"
+)
+
 // settledFact builds a coherent settled fact the derivation accepts, with
 // the figures priced by the hold formula: 1_500_000 input at 200/M plus
 // 500_000 output at 800/M is 300_000_000 + 400_000_000 raw, one ceiling
@@ -68,8 +76,8 @@ func TestASettledFactDerivesTheWaterfall(t *testing.T) {
 	// the head, so the boundary leg is the second one and its tail goes
 	// back.
 	fact := settledFact(t,
-		wireLeg{FundingBucketID: "bucket-a", Amount: 450, Ordinal: 1},
-		wireLeg{FundingBucketID: "bucket-b", Amount: 400, Ordinal: 2},
+		wireLeg{FundingBucketID: bucketA, Amount: 450, Ordinal: 1},
+		wireLeg{FundingBucketID: bucketB, Amount: 400, Ordinal: 2},
 	)
 	out, err := Interpret(fact)
 	if err != nil {
@@ -85,8 +93,8 @@ func TestASettledFactDerivesTheWaterfall(t *testing.T) {
 		t.Errorf("Price = %+v, want the fact's pricing basis copied by value", out.Price)
 	}
 	want := []Leg{
-		{Bucket: "bucket-a", Held: 450, Consumed: 450, Released: 0},
-		{Bucket: "bucket-b", Held: 400, Consumed: 250, Released: 150},
+		{Bucket: bucketA, Held: 450, Consumed: 450, Released: 0},
+		{Bucket: bucketB, Held: 400, Consumed: 250, Released: 150},
 	}
 	if len(out.Legs) != len(want) {
 		t.Fatalf("Legs = %+v, want %d legs", out.Legs, len(want))
@@ -99,12 +107,12 @@ func TestASettledFactDerivesTheWaterfall(t *testing.T) {
 }
 
 func TestAFullyConsumedTailReleasesNothing(t *testing.T) {
-	fact := settledFact(t, wireLeg{FundingBucketID: "bucket-a", Amount: 700, Ordinal: 1})
+	fact := settledFact(t, wireLeg{FundingBucketID: bucketA, Amount: 700, Ordinal: 1})
 	out, err := Interpret(fact)
 	if err != nil {
 		t.Fatalf("Interpret() error = %v, want nil", err)
 	}
-	if out.Legs[0] != (Leg{Bucket: "bucket-a", Held: 700, Consumed: 700, Released: 0}) {
+	if out.Legs[0] != (Leg{Bucket: bucketA, Held: 700, Consumed: 700, Released: 0}) {
 		t.Fatalf("Legs = %+v, want the whole leg consumed", out.Legs)
 	}
 }
@@ -138,8 +146,8 @@ func TestReleasedAndExpiredFactsReleaseEveryLegInFull(t *testing.T) {
 			Kind:          kind,
 			SchemaVersion: SchemaVersion,
 			Payload: envelope(t,
-				wireLeg{FundingBucketID: "bucket-a", Amount: 40, Ordinal: 1},
-				wireLeg{FundingBucketID: "bucket-b", Amount: 10, Ordinal: 2},
+				wireLeg{FundingBucketID: bucketA, Amount: 40, Ordinal: 1},
+				wireLeg{FundingBucketID: bucketB, Amount: 10, Ordinal: 2},
 			),
 		}
 		out, err := Interpret(fact)
@@ -150,8 +158,8 @@ func TestReleasedAndExpiredFactsReleaseEveryLegInFull(t *testing.T) {
 			t.Fatalf("class = %s, want %s", out.Class, ClassSettlement)
 		}
 		want := []Leg{
-			{Bucket: "bucket-a", Held: 40, Consumed: 0, Released: 40},
-			{Bucket: "bucket-b", Held: 10, Consumed: 0, Released: 10},
+			{Bucket: bucketA, Held: 40, Consumed: 0, Released: 40},
+			{Bucket: bucketB, Held: 10, Consumed: 0, Released: 10},
 		}
 		for i, leg := range want {
 			if out.Legs[i] != leg {
@@ -172,7 +180,7 @@ func TestAnOrphanDerivesNoLegsAtAll(t *testing.T) {
 		RequestID:           "d9000000-0000-7000-8000-0000000000d3",
 		Kind:                KindUnbillableOrphaned,
 		SchemaVersion:       SchemaVersion,
-		Payload:             envelope(t, wireLeg{FundingBucketID: "bucket-a", Amount: 40, Ordinal: 1}),
+		Payload:             envelope(t, wireLeg{FundingBucketID: bucketA, Amount: 40, Ordinal: 1}),
 		CaptureMethod:       &capture,
 		CommittedAttemptID:  &attempt,
 		ProviderInputTokens: &inTokens,
@@ -265,17 +273,23 @@ func TestThePayloadGrammarRefusesWhatNoWriterWrote(t *testing.T) {
 		{"a field the envelope does not carry", []byte(`{"allocations":[],"note":"hi"}`)},
 		{"more than one JSON value", []byte(`{"allocations":[]} {"allocations":[]}`)},
 		{"an empty body", []byte("")},
-		{"an ordinal hole", envelope(t, wireLeg{FundingBucketID: "a", Amount: 1, Ordinal: 2})},
+		{"a bare null document — the decode that succeeds against anything", []byte("null")},
+		{"an array document", []byte(`[]`)},
+		{"a string document", []byte(`"settled"`)},
+		{"an ordinal hole", envelope(t, wireLeg{FundingBucketID: bucketA, Amount: 1, Ordinal: 2})},
 		{"ordinals out of drawdown order", envelope(t,
-			wireLeg{FundingBucketID: "a", Amount: 1, Ordinal: 1},
-			wireLeg{FundingBucketID: "b", Amount: 1, Ordinal: 1},
+			wireLeg{FundingBucketID: bucketA, Amount: 1, Ordinal: 1},
+			wireLeg{FundingBucketID: bucketB, Amount: 1, Ordinal: 1},
 		)},
-		{"a non-positive amount", envelope(t, wireLeg{FundingBucketID: "a", Amount: 0, Ordinal: 1})},
+		{"a non-positive amount", envelope(t, wireLeg{FundingBucketID: bucketA, Amount: 0, Ordinal: 1})},
 		{"a blank bucket", envelope(t, wireLeg{FundingBucketID: "", Amount: 1, Ordinal: 1})},
 		{"a repeated bucket", envelope(t,
-			wireLeg{FundingBucketID: "a", Amount: 1, Ordinal: 1},
-			wireLeg{FundingBucketID: "a", Amount: 1, Ordinal: 2},
+			wireLeg{FundingBucketID: bucketA, Amount: 1, Ordinal: 1},
+			wireLeg{FundingBucketID: bucketA, Amount: 1, Ordinal: 2},
 		)},
+		{"a bucket outside the uuid grammar", envelope(t, wireLeg{FundingBucketID: "prod-bucket-7", Amount: 1, Ordinal: 1})},
+		{"a v4-shaped bucket", envelope(t, wireLeg{FundingBucketID: "0b000000-0000-4000-8000-00000000000a", Amount: 1, Ordinal: 1})},
+		{"an uppercase bucket", envelope(t, wireLeg{FundingBucketID: "0B000000-0000-7000-8000-00000000000A", Amount: 1, Ordinal: 1})},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
@@ -312,8 +326,8 @@ func TestTheSettledPairingRules(t *testing.T) {
 	tail := func(t *testing.T) Fact {
 		t.Helper()
 		return settledFact(t,
-			wireLeg{FundingBucketID: "bucket-a", Amount: 450, Ordinal: 1},
-			wireLeg{FundingBucketID: "bucket-b", Amount: 400, Ordinal: 2},
+			wireLeg{FundingBucketID: bucketA, Amount: 450, Ordinal: 1},
+			wireLeg{FundingBucketID: bucketB, Amount: 400, Ordinal: 2},
 		)
 	}
 	cases := []struct {
@@ -334,7 +348,7 @@ func TestTheSettledPairingRules(t *testing.T) {
 		{"a zero amount over a real tail", func(f *Fact) { zero := int64(0); f.SettledAmount = &zero }},
 		{"a tail that cannot absorb the amount", func(f *Fact) {
 			// The legs sum to 70; the amount prices to 700.
-			f.Payload = envelope(t, wireLeg{FundingBucketID: "bucket-a", Amount: 70, Ordinal: 1})
+			f.Payload = envelope(t, wireLeg{FundingBucketID: bucketA, Amount: 70, Ordinal: 1})
 		}},
 	}
 	for _, tt := range cases {
@@ -361,7 +375,7 @@ func TestTheNoUsagePairingRules(t *testing.T) {
 			RequestID:     "d9000000-0000-7000-8000-0000000000d4",
 			Kind:          KindReleased,
 			SchemaVersion: SchemaVersion,
-			Payload:       envelope(t, wireLeg{FundingBucketID: "bucket-a", Amount: 40, Ordinal: 1}),
+			Payload:       envelope(t, wireLeg{FundingBucketID: bucketA, Amount: 40, Ordinal: 1}),
 		}
 		mutate(&fact)
 		return fact
@@ -455,5 +469,64 @@ func TestQuarantinableCoversTheRecordedVocabulary(t *testing.T) {
 	}
 	if Quarantinable(errors.New("store: connection refused")) {
 		t.Error("a foreign error is a page stop, never a disposition")
+	}
+}
+
+func TestEveryKindClassOfKnowsTheSwitchNames(t *testing.T) {
+	// The dispatch switch names its kinds outright and refuses the default,
+	// so a kind ClassOf learns without the switch learning it arrives as a
+	// recorded unknown kind instead of a silent fall-through. The proof is
+	// per kind: the minimal coherent fact of each kind interprets with no
+	// unknown-kind refusal and derives exactly its own class.
+	build := map[string]func(t *testing.T) Fact{
+		KindSettled: func(t *testing.T) Fact {
+			return settledFact(t, wireLeg{FundingBucketID: bucketA, Amount: 700, Ordinal: 1})
+		},
+		KindReleased: noUsageFact(KindReleased),
+		KindExpired:  noUsageFact(KindExpired),
+		KindUnbillableOrphaned: func(t *testing.T) Fact {
+			capture := "reported"
+			attempt := "att-4"
+			return Fact{
+				AppendSeq:          14,
+				RequestID:          "d9000000-0000-7000-8000-0000000000d7",
+				Kind:               KindUnbillableOrphaned,
+				SchemaVersion:      SchemaVersion,
+				Payload:            envelope(t),
+				CaptureMethod:      &capture,
+				CommittedAttemptID: &attempt,
+			}
+		},
+	}
+	for kind, makeFact := range build {
+		class, known := ClassOf(kind)
+		if !known {
+			t.Fatalf("ClassOf(%s) = unknown, want the kind the test builds a fact for", kind)
+		}
+		out, err := Interpret(makeFact(t))
+		if errors.Is(err, ErrUnknownKind) {
+			t.Fatalf("Interpret(%s) = %v, want the kind dispatched, not refused", kind, err)
+		}
+		if err != nil {
+			t.Fatalf("Interpret(%s) error = %v, want nil", kind, err)
+		}
+		if out.Kind != kind || out.Class != class {
+			t.Errorf("Interpret(%s) = (%s, %s), want the kind and its class %s", kind, out.Kind, out.Class, class)
+		}
+	}
+}
+
+// noUsageFact builds the minimal coherent released or expired fact: no
+// usage columns, a one-leg tail.
+func noUsageFact(kind string) func(t *testing.T) Fact {
+	return func(t *testing.T) Fact {
+		t.Helper()
+		return Fact{
+			AppendSeq:     13,
+			RequestID:     "d9000000-0000-7000-8000-0000000000d6",
+			Kind:          kind,
+			SchemaVersion: SchemaVersion,
+			Payload:       envelope(t, wireLeg{FundingBucketID: bucketA, Amount: 700, Ordinal: 1}),
+		}
 	}
 }
