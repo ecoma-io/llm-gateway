@@ -465,7 +465,10 @@ The retry rules follow from that:
 - **The consumer advances only after applying.** The `next_cursor` is stored in
   the same local transaction that durably records the effects of the facts it
   covers, so a crash between applying and advancing replays the page instead of
-  skipping it. The page is also the unit of belief, and it is believed only
+  skipping it. The advance is a compare-and-set on the position the pass read,
+  so a pass overtaken by another loses the advance, rolls its page back with
+  it, and re-applies idempotently next pass. The page is also the unit of
+  belief, and it is believed only
   once it is whole: **a usage-fact page is acknowledged by the consumer only
   after its required envelope and event fields have been validated, and a
   malformed page is rejected before anything is applied and before the position
@@ -473,11 +476,17 @@ The retry rules follow from that:
   would otherwise apply nothing and advance anyway, which is the one way this
   flow could skip facts permanently. A rejected page leaves the position where
   it was, so the range is read again rather than crossed.
-- **Applying a fact twice is a no-op.** `request_id` is the fact's immutable
-  business identity and the logical idempotency key for everything derived from
-  it — one settlement, one consume leg and one release leg per `request_id`,
-  however many times the fact is delivered. It is not the HTTP `X-Request-Id`,
-  which correlates a call and means nothing across a retry.
+- **Applying a fact twice is a no-op.** The idempotency key is the request's
+  identity scoped by kind class: a request's `settled`, `released` and
+  `expired` facts are one class — alternative endings of one money story — and
+  `unbillable_orphaned` is a second, separate one that coexists with the
+  settlement. A redelivery of a kind the record already carries, on whatever
+  `append_seq` the wire rides it on, is the same logical outcome and books
+  nothing twice; a _different_ kind claiming a class the record has closed is
+  two terminal states for one request, and the consumer refuses it as
+  incoherent rather than swallowing it as a replay. `request_id` is not the
+  HTTP `X-Request-Id`, which correlates a call and means nothing across a
+  retry.
 - **A transport failure is a retry; a refused position is not.** An unreadable
   or unreachable Data Plane is retried. A cursor past the retained history fails
   explicitly with `cursor_expired` (HTTP 410) and is never resumed from a newer
@@ -488,7 +497,7 @@ The retry rules follow from that:
 
 The two planes converge rather than synchronise. The Control Plane derives its
 records — the settlement, its consume and release legs, the bucket projections —
-from the facts it has applied, idempotently by `request_id`, and it must be able
+from the facts it has applied, idempotently per request and kind class, and it must be able
 to do so **without a synchronous call back into the Data Plane**. That is why
 the fact carries the allocation and bucket identities and the immutable
 reservation figures needed to derive those legs and the settled total, and why
