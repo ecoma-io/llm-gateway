@@ -498,6 +498,35 @@ func TestAdmissionAnswersFromTheRecordBeforeAnyUnitOpens(t *testing.T) {
 			},
 			wantFail: true,
 		},
+		{
+			name: "the same key and bytes whose original failed mid-stream is a failure, not an answer",
+			seed: func(world *admissionWorld) {
+				world.intakes[world.intakeKey(admissionAccount, "replay-key-1")] = execution.Intake{
+					AccountID:          admissionAccount,
+					IdempotencyKey:     "replay-key-1",
+					RequestDigest:      digest,
+					RequestID:          "original-1",
+					FinalStatus:        finalStatusPtr(execution.FinalFailed),
+					FinalFailureReason: execution.FailedStreamAfterCommitment,
+				}
+			},
+			wantFail: true,
+		},
+		{
+			name: "the same key and bytes whose original the runtime abandoned answers the spent key",
+			seed: func(world *admissionWorld) {
+				world.intakes[world.intakeKey(admissionAccount, "replay-key-1")] = execution.Intake{
+					AccountID:          admissionAccount,
+					IdempotencyKey:     "replay-key-1",
+					RequestDigest:      digest,
+					RequestID:          "original-1",
+					FinalStatus:        finalStatusPtr(execution.FinalFailed),
+					FinalFailureReason: execution.FailedGatewayAbandoned,
+				}
+			},
+			wantKind: OutcomeUnanswered,
+			wantOrig: "original-1",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			useCase, world := admissionFixture(t)

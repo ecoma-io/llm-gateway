@@ -298,8 +298,10 @@ func (a *ChatAdmission) refuseEarly(ctx context.Context, in ChatInput, reason ex
 // a nil error means this request is the first arrival, and admission goes on.
 // The raw bytes ride along for the one answer that needs them: a replayed
 // rejection re-derives its field detail from the same bytes the digest
-// matched. Two terminal shapes remain that this build cannot answer — a
-// succeeded original, whose answer bytes were never a decision the record
+// matched. An original the runtime abandoned before any answer existed is
+// answered with the key-spent cell — terminal without an answer, never to be
+// executed again. Two terminal shapes remain that this build cannot answer —
+// a succeeded original, whose answer bytes were never a decision the record
 // could carry, and an original that failed with a stream-era reason, whose
 // answer lived inside a stream that died. Inventing an answer for either
 // would be vocabulary the wire has no cell for.
@@ -344,6 +346,25 @@ func (a *ChatAdmission) probe(ctx context.Context, in ChatInput, digest string, 
 		return ChatOutcome{
 			Kind:             OutcomeReplay,
 			Failure:          record.FinalFailureReason,
+			Original:         record.RequestID,
+			RuntimeRequestID: in.RequestID,
+		}, true, nil
+	}
+	if *record.FinalStatus == execution.FinalFailed && record.FinalFailureReason == execution.FailedGatewayAbandoned {
+		// The original was abandoned: the runtime's own walk died before any
+		// candidate answered — the caller left, or the hold's lease was lost
+		// mid-walk — so nothing was committed, nothing was delivered, and the
+		// record carries no cell to re-serve. What it does carry is the fact
+		// that this key is spent: the record is terminal, the runtime will
+		// never execute the request again, and no answer will ever exist to
+		// replay. Answering the spent cell is the honest account — the same
+		// word the request row and the feed carry — and "send a new key" is
+		// the only advice that can ever be true, so the cell carries no
+		// Retry-After. The original's identity rides for the log line; like
+		// the delivered-content edge, the answer names no one else's
+		// correlation handle on the wire.
+		return ChatOutcome{
+			Kind:             OutcomeUnanswered,
 			Original:         record.RequestID,
 			RuntimeRequestID: in.RequestID,
 		}, true, nil

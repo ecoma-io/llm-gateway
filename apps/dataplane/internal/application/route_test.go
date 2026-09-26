@@ -521,6 +521,58 @@ func TestRoutingReleasesTheHoldWhenTheCallerLeaves(t *testing.T) {
 	}
 }
 
+// TestRoutingAnswersTheNoCandidateCellWhenTheLeaseIsLost: the other door to
+// the abandoned ending — the renewal reported the hold reaped mid-call, the
+// call was cancelled before anything was committed, and the caller's
+// connection may be perfectly alive. The lease died, not the request, so
+// the walk answers through the reply with the no-candidate cell — the
+// runtime cannot serve this request right now, the one reading a client can
+// act on — and then states the abandoned ending: the release whose CAS may
+// lose to whoever closed the hold, the request row's gateway_abandoned, and
+// the outcome that stays the log's fact.
+func TestRoutingAnswersTheNoCandidateCellWhenTheLeaseIsLost(t *testing.T) {
+	routing, world, reply, in := routingFixture(t)
+	world.seedCandidates("test-model",
+		catalog.Candidate{ID: "cand-a", BackendID: "backend-a", ProviderModel: "model-a", Position: 1},
+	)
+	world.seedBackend("backend-a", catalog.BackendActive)
+	world.renewalGone = 1
+	cfg := ExecutionConfig{MaxDuration: 30 * time.Second, LeaseTTL: 25 * time.Millisecond}
+	routing.execution = cfg
+	release := make(chan struct{}) // never closed: only the lost renewal can end this call
+	exec := &renewWatchingExecutor{release: release}
+	routing.registry = executors.NewRegistry(map[catalog.BackendID]executors.Executor{"backend-a": exec})
+
+	outcome, err := routing.Serve(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if outcome.Kind != OutcomeAbandoned {
+		t.Fatalf("outcome = %s, want abandoned — the hold is gone from the open set", outcome.Kind)
+	}
+	if len(reply.served) != 1 || reply.served[0] != "no_candidate" {
+		t.Fatalf("the reply served %v, want the one no-candidate cell — the caller was never told its lease died", reply.served)
+	}
+
+	// The ending is the whole abandoned release, exactly as the caller-gone
+	// door states it: on this fake world the hold is still open when the
+	// release's CAS runs, so the release wins it back — in production the
+	// sweep or a concurrent settlement has already closed the hold and the
+	// CAS loses, which changes nothing the caller reads.
+	wantEvents(t, world, []string{
+		"begin", "ledger.drawdown", "request.insert", "reservation.insert", "intake.insert", "commit",
+		"attempt.insert",
+		"begin", "reservation.close", "ledger.return", "request.finalise", "intake.finalise", "fact.append", "commit",
+	})
+	if reservation := admissionReservationRow(t, world); reservation.State != accounting.StateReleased {
+		t.Fatalf("the hold is %s, want released — the release unit claimed the ending this world left open", reservation.State)
+	}
+	row := admissionRequestRow(t, world)
+	if row.Status != execution.StatusFailed || row.FailureReason != execution.FailedGatewayAbandoned {
+		t.Fatalf("the request is %s/%s, want failed/gateway_abandoned", row.Status, row.FailureReason)
+	}
+}
+
 // TestRoutingSettlesAnEndingTheCallerDidNotStayFor: a client that leaves
 // after the commitment does not take the settlement with them — the bytes
 // that arrived were delivered, and the ending that records them runs

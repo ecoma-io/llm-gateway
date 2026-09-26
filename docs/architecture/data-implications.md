@@ -312,7 +312,11 @@ because a sequence allocated outside the unit it belongs to is a fact that
 commits before the close it reports — and the pairing is caught by the
 integration suite (`TestIntegrationSettlementUnitIsAllOrNothing`), not by a
 schema guard — no constraint enforces the fact↔reservation pairing, because
-`usage_events` references `requests`, not `reservations`.
+`usage_events` references `requests`, not `reservations`. The reaper's sweep
+is held to the same posture from its own side: `ExpireLapsedLeases` refuses a
+context that carries no unit of work, because a bare sweep's closes would
+commit one by one under autocommit, and a crash before the caller's unit
+opened would leave closed holds the feed never hears about.
 
 Catalog configuration activation (aliases, group versions, price revisions)
 is a coordinated transaction internal to the Catalog context (ADR 0003) —

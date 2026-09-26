@@ -71,6 +71,17 @@ var ErrDuplicateFact = errors.New("persistence: the request already has its sett
 // fact whose position the caller believes is atomic with something.
 var ErrAppendOutsideUnitOfWork = errors.New("persistence: a fact append needs a unit of work")
 
+// ErrExpireOutsideUnitOfWork says ExpireLapsedLeases arrived with no unit of
+// work in its context. The sweep's closes are the reaper's half of the
+// ending whose fact, request finalisation and replay pointer are the other
+// half — a sweep run bare commits each close the instant it happens
+// (autocommit), and a crash before the caller's unit opens would leave
+// closed holds the feed never hears about, the exact tear "no completed
+// close without its fact" exists to prevent. The refusal is the same
+// posture Append's is: the pairing is a property of the caller's unit of
+// work, and the store refuses to pretend otherwise.
+var ErrExpireOutsideUnitOfWork = errors.New("persistence: a lapsed-lease sweep needs a unit of work")
+
 // ExpiredLease is one hold the reaper closed, with everything the expired
 // fact derives from: the request it held for, the pricing basis it held
 // under, and the legs its hold was split into — the fact's allocation tail,
@@ -85,6 +96,16 @@ var ErrAppendOutsideUnitOfWork = errors.New("persistence: a fact append needs a 
 // unit of work, no second lookup. It is a read shape of the port, not a
 // domain aggregate — the reaper reads what it closed and settles from what it
 // read.
+//
+// The legs are for the return as much as for the fact. An expired close is
+// the release's twin — one composition, two doors (data-implications.md) —
+// so the ending returns the hold's capacity through
+// QuotaProjectionRepository.Return in the same unit of work, in the legs'
+// stored ordinal order, exactly as a release does, and the unconditional
+// giveback belongs to the unit whose CAS-class close won the hold. The
+// capacity return and the fact append are both last-statement work of the
+// one unit: a close that committed without either would be a hold the
+// runtime ended that no feed page reports and no bucket ever gets back.
 type ExpiredLease struct {
 	ID              identity.ReservationID
 	RequestID       identity.RequestID
@@ -126,7 +147,12 @@ type ReservationRepository interface {
 	// back whole — legs and replay identity included — so their facts can be
 	// appended and their requests and replay records finalised in the same
 	// unit of work: no completed close without its fact, and no closed hold
-	// whose request row stays executing forever. Both clocks must
+	// whose request row stays executing forever. The sweep must arrive
+	// inside a unit of work the caller opened — a call whose context carries
+	// none fails with ErrExpireOutsideUnitOfWork, because a bare sweep's
+	// closes would commit one by one under autocommit, and a crash before
+	// the caller's unit opened would leave closed holds the feed never hears
+	// about. Both clocks must
 	// have passed because they guard different disasters: a lapsed window is
 	// the caller walking away, a lapsed lease is the owner dying, and taking
 	// a hold on only one of them would close out a request that is still
