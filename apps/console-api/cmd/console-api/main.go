@@ -9,12 +9,14 @@
 // This is the only place in the module where an adapter is chosen and handed
 // to the application. Nothing above it names a concrete implementation: the
 // application depends on the outbound ports. The database pool is the one
-// piece of infrastructure wired today — this process owns Control Plane state
-// (ADR 0006 §7), so the pool is opened and validated at startup — and it is
-// wired as a store and a pool: the projection loop resolves its units of work
-// through the store, and the readiness probe asks the store whether the pool
-// can still answer. The repositories and use cases built over it arrive with
-// the first query to run, not before.
+// piece of storage infrastructure wired here — this process owns Control
+// Plane state (ADR 0006 §7), so the pool is opened and validated at startup —
+// and it is wired as a store and a pool: the two background loops resolve
+// their units of work through the store, and the readiness probe asks the
+// store whether the pool can still answer. The repositories and use cases
+// built over it arrive with the caller that needs them, and the loops are
+// those callers: the projection producer, the usage-fact consumer, and the
+// readiness probe.
 package main
 
 import (
@@ -37,6 +39,7 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/adapters/outbound/postgres"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/config"
+	dataplaneport "github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/dataplane"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
@@ -61,6 +64,11 @@ const postgresConnectTimeout = 5 * time.Second
 // under a cycle that is still finishing. One goroutine, one Add, one Wait.
 var projectionWG sync.WaitGroup
 
+// ingestionWG is the fact consumer's half of the same discipline: the pool
+// closes after the replay loop has stopped, not under the page it is still
+// applying. One goroutine, one Add, one Wait.
+var ingestionWG sync.WaitGroup
+
 // runProjectionLoop reconciles the Data Plane's credential mirror with the
 // Control Plane's projection log until the process is asked to stop: one
 // Reconcile per interval, each under its own deadline, the first immediately.
@@ -84,6 +92,61 @@ func runProjectionLoop(ctx context.Context, producer *application.ProjectionDeli
 		defer cancel()
 		if err := producer.Reconcile(cycleCtx, false); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("console-api projection cycle failed: %v", err)
+		}
+	}
+
+	runOnce()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runOnce()
+		}
+	}
+}
+
+// runIngestionLoop pulls the Data Plane's usage-fact feed until the process is
+// asked to stop: one Replay pass per interval, each under its own deadline,
+// the first immediately. The loop is the consumer half of the pull-with-replay
+// delivery model (ADR 0006 §5): the runtime records facts and never notifies
+// anyone, and this loop is what moves the Control Plane's position through
+// them.
+//
+// Every failure is a log line and nothing more, for the projection loop's
+// reason turned around: the feed is durable and replay is the delivery model,
+// so a failed pass loses nothing and the next pass re-reads the same page —
+// the applier's idempotency is what makes that free. The line is written
+// every interval, so a consumer that cannot apply a page is a log an operator
+// cannot miss. One failure has a remedy the next tick cannot supply and gets
+// its own sentence: an expired position means the Data Plane can no longer
+// replay from where this process stands, and the pass the loop wants is the
+// one only an operator can bring about — the loop keeps polling (the position
+// never moves but so does nothing else), and the repeated line is the state
+// staying visible until someone resolves it.
+//
+// A context cancellation is not a failure: it is the stop signal arriving
+// mid-pass, and it ends the loop quietly — the pass the signal interrupts is
+// one unit of work, so it either committed whole before the cancellation
+// landed or rolls back whole, and either way the next process re-reads the
+// same page.
+func runIngestionLoop(ctx context.Context, ingestion *application.FactIngestion, interval, timeout time.Duration) {
+	defer ingestionWG.Done()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	runOnce := func() {
+		cycleCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		_, err := ingestion.Replay(cycleCtx)
+		switch {
+		case err == nil:
+		case errors.Is(err, dataplaneport.ErrCursorExpired):
+			log.Printf("console-api ingestion position is no longer replayable; the feed holds until an operator resolves the position: %v", err)
+		case errors.Is(err, context.Canceled):
+		default:
+			log.Printf("console-api ingestion pass failed: %v", err)
 		}
 	}
 
@@ -151,15 +214,48 @@ func main() {
 	store := postgres.New(db)
 	projectionLog := postgres.NewProjectionLog(store)
 
-	// The Data Plane half of the producer: an HTTP client whose behaviour is
-	// deliberately the library default (the per-cycle deadline below is what
-	// bounds every call), and the adapter that speaks the management façade's
-	// projection contract with the credential this process was given. The
-	// credential travels on the wire and nowhere else — the adapter's errors
-	// are built from status codes and sentinels, never from the request.
+	// The accounting use cases, the money grammar the fact consumer's derived
+	// effects move through. Nothing else in this process calls them yet — no
+	// HTTP surface reaches a primitive — but the applier below is their
+	// consumer-side caller, and they are constructed here because a use case
+	// built and unwired was the state this file used to refuse. They are the
+	// same primitives the runtime's own settle path runs (B6); the consumer
+	// derives from the feed and books through them, it does not reimplement
+	// them.
+	accounting := application.NewAccounting(store,
+		postgres.NewFundingBuckets(store),
+		postgres.NewFundingLedger(store),
+		postgres.NewSettlements(store),
+		postgres.NewFundingProjections(store),
+		postgres.NewPaygAccounts(store),
+		postgres.NewClock(store),
+	)
+
+	// The Data Plane half of both loops: an HTTP client whose behaviour is
+	// deliberately the library default (the per-cycle deadlines below are what
+	// bound every call), and the adapter that speaks the management façade's
+	// two contracts — the projection producer's and the fact feed's — with
+	// the credential this process was given. The credential travels on the
+	// wire and nowhere else — the adapter's errors are built from status
+	// codes and sentinels, never from the request.
 	client := &stdhttp.Client{}
 	consumer := dataplaneadapter.New(client, cfg.DataPlane.URL, cfg.DataPlane.Credential)
 	producer := application.NewProjectionDelivery(projectionLog, consumer)
+
+	// The usage-fact consumer (ADR 0006 §5): the idempotency ledger and the
+	// quarantine it writes its effects and refusals into, the position store
+	// that is the one thing about the feed the Data Plane never learns, and
+	// the applier that turns facts into accounting effects — or into recorded
+	// refusals — inside the unit of work the replay use case opens for each
+	// page. The cursor and the applier's writes are unit-of-work-shaped by
+	// construction; the wiring gives them the store they resolve those units
+	// from, and the loop below is the only caller that drives the four
+	// together.
+	applier := application.NewFactApplier(accounting,
+		postgres.NewAppliedFacts(store),
+		postgres.NewQuarantinedFacts(store),
+	)
+	ingestion := application.NewFactIngestion(consumer, store, postgres.NewIngestionCursor(store), applier)
 
 	// One startup line naming the target — host, port, database — and
 	// nothing else. The DSN carries the role's password, so the pieces are
@@ -219,17 +315,28 @@ func main() {
 	projectionWG.Add(1)
 	go runProjectionLoop(ctx, producer, cfg.DataPlane.ProjectionInterval, cfg.DataPlane.ProjectionTimeout)
 
+	// The fact consumer's loop, in the same shape: one goroutine, one pass
+	// per tick, the first immediately, each pass under its own deadline. The
+	// pull model makes the cadence a freshness dial and nothing else — a page
+	// this pass missed is the page the next pass reads, from the position the
+	// last committed one wrote, and a pass that fails is one log line rather
+	// than a crash, because nothing was lost by failing.
+	ingestionWG.Add(1)
+	go runIngestionLoop(ctx, ingestion, cfg.DataPlane.IngestionInterval, cfg.DataPlane.IngestionTimeout)
+
 	log.Printf("console-api %s listening on %s", version, listener.Addr())
 	if err := <-errCh; err != nil {
 		log.Printf("console-api error: %v", err)
 		os.Exit(1)
 	}
 
-	// The pool closes after the projection loop has stopped, not before: the
-	// loop's cycle may still be finishing its last read on a pooled
-	// connection, and closing earlier would pull the pool out from under it —
-	// the same ordering the drain above observes for in-flight requests.
+	// The pool closes after both loops have stopped, not before: a loop's
+	// last cycle or pass may still be finishing its reads and writes on
+	// pooled connections, and closing earlier would pull the pool out from
+	// under them — the same ordering the drain above observes for in-flight
+	// requests.
 	projectionWG.Wait()
+	ingestionWG.Wait()
 
 	// The pool is closed here, after run has returned, and not before: the
 	// drain inside run may still be finishing in-flight requests, and those

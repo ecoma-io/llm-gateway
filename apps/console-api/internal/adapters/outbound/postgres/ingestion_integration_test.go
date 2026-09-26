@@ -323,6 +323,57 @@ func TestQuarantinedFactsRecordRefusesToRunAutocommitted(t *testing.T) {
 	}
 }
 
+func TestTheIngestionCursorRoundTripsThePositionVerbatim(t *testing.T) {
+	// The cursor is a singleton and nothing here deletes, so the position it
+	// starts this test on is whatever the last advance left — the assertion
+	// is the round trip, not the seed.
+	store, _, _, _ := integrationIngestion(t)
+	ctx := t.Context()
+	cursor := NewIngestionCursor(store)
+
+	before, err := cursor.Position(ctx)
+	if err != nil {
+		t.Fatalf("Position() error = %v, want the singleton row", err)
+	}
+
+	next := "cursor-" + string(acctRequestID(t))
+	err = store.WithinTx(ctx, func(txCtx context.Context) error {
+		// The advance and the read share the unit of work, so the position
+		// the applier's transaction would commit to is visible inside it —
+		// the same unit the whole-page rule advances in.
+		if err := cursor.Advance(txCtx, next); err != nil {
+			return err
+		}
+		inside, err := cursor.Position(txCtx)
+		if err != nil {
+			return err
+		}
+		if inside != next {
+			t.Errorf("Position() inside the unit of work = %q, want %q", inside, next)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("advance inside the unit of work: %v", err)
+	}
+	after, err := cursor.Position(ctx)
+	if err != nil || after != next {
+		t.Fatalf("Position() after the commit = (%q, %v), want %q — verbatim in, verbatim out", after, err, next)
+	}
+	if before == next {
+		t.Error("the advance wrote the position it read; the test proved nothing")
+	}
+}
+
+func TestTheIngestionCursorRefusesToAdvanceAutocommitted(t *testing.T) {
+	store, _, _, _ := integrationIngestion(t)
+	cursor := NewIngestionCursor(store)
+	err := cursor.Advance(t.Context(), "cursor-"+string(acctRequestID(t)))
+	if err == nil || !strings.Contains(err.Error(), "unit of work") {
+		t.Fatalf("Advance() outside a unit of work = %v, want the refusal", err)
+	}
+}
+
 func TestQuarantinedFactsRecordRefusesAPayloadTheSchemaCannotTake(t *testing.T) {
 	// 32768 octets is the column's whole grammar — the same cap the domain
 	// pins as MaxPayloadOctets, which is what stops an oversize payload one

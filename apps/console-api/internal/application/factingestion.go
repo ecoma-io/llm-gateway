@@ -49,12 +49,11 @@ const FactPageSize = 100
 // a position in an order only the Data Plane can name — and this use case
 // stores it verbatim.
 //
-// Nothing constructs this type yet, and nothing schedules it: there is no
-// worker loop, no ticker and no background goroutine, because the loop that
-// calls Replay belongs to the pull the schema PR builds, beside the table the
-// cursor is stored in. The postgres and valkey adapters sit unwired for the
-// same reason — their use case has not landed either — and a scheduler wired
-// ahead of its schema would be a process that polls a feed into nothing.
+// The process wiring is the loop's only home: cmd/console-api runs one Replay
+// pass per interval under its own deadline, and everything this type needs —
+// the position table, the applier's two effect tables, the accounting
+// primitives its derived effects book through — is composed there, beside the
+// pool those units of work resolve from.
 type FactIngestion struct {
 	facts   dataplane.UsageFacts
 	store   persistence.Store
@@ -93,10 +92,11 @@ type FactIngestionResult struct {
 	Applied int
 
 	// HasMore reports whether the Data Plane said the feed holds more facts
-	// after the page just applied. It is the stopping condition of the loop
-	// that does not exist yet, and it is deliberately not derived from Applied:
-	// a short page and a drained feed are different states, because a
-	// concurrent writer produces a short page too.
+	// after the page just applied. The loop takes it as an invitation to run
+	// again — a drained feed is answered by the next tick — and it is
+	// deliberately not derived from Applied: a short page and a drained feed
+	// are different states, because a concurrent writer produces a short page
+	// too.
 	HasMore bool
 }
 
