@@ -2224,6 +2224,16 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	// The sweep is the reaper's half of an ending whose fact, request
+	// finalisation and replay pointer are the other half, so the store
+	// refuses to run it outside a unit of work: a bare sweep's closes would
+	// commit one by one under autocommit, and a crash after one of them
+	// would leave a closed hold the feed never hears about — the exact tear
+	// the same-unit discipline exists to prevent.
+	if _, err := repos.reserves.ExpireLapsedLeases(ctx, 1); !errors.Is(err, persistence.ErrExpireOutsideUnitOfWork) {
+		t.Fatalf("a bare-context sweep = %v, want ErrExpireOutsideUnitOfWork — the closes commit only inside the unit that appends their facts", err)
+	}
+
 	now := time.Now().UTC()
 	created := now.Add(-2 * time.Hour)
 	expires := now.Add(time.Hour)
@@ -2241,10 +2251,23 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 	hiccup, hiccupRequest, _ := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-e"), created, expires, now.Add(-time.Hour))                              // lease lapsed, window live
 	walkedAway, walkedAwayRequest, _ := integrationReservation(t, ctx, repos, integrationRuntimeAccount(t, "reaper-f"), created, now.Add(-30*time.Minute), now.Add(30*time.Minute)) // window lapsed, lease live
 
-	victims, err := repos.reserves.ExpireLapsedLeases(ctx, 1)
-	if err != nil {
-		t.Fatalf("ExpireLapsedLeases(1): %v", err)
+	// The sweep's closes commit only inside the unit that appends their
+	// facts — the store refuses a bare-context sweep outright, and this
+	// helper is how every sweep below runs: one WithinTx, the sweep in it,
+	// the unit committed on return.
+	sweep := func(limit int) []persistence.ExpiredLease {
+		var swept []persistence.ExpiredLease
+		if err := store.WithinTx(ctx, func(ctx context.Context) error {
+			closed, err := repos.reserves.ExpireLapsedLeases(ctx, limit)
+			swept = closed
+			return err
+		}); err != nil {
+			t.Fatalf("ExpireLapsedLeases(%d): %v", limit, err)
+		}
+		return swept
 	}
+
+	victims := sweep(1)
 	if len(victims) != 1 {
 		t.Fatalf("the first sweep closed %d holds, want exactly the limit of 1", len(victims))
 	}
@@ -2269,18 +2292,12 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 		}
 	}
 
-	victims, err = repos.reserves.ExpireLapsedLeases(ctx, 1)
-	if err != nil {
-		t.Fatalf("the second ExpireLapsedLeases(1): %v", err)
-	}
+	victims = sweep(1)
 	if len(victims) != 1 || victims[0].ID != lapsedRecent || victims[0].RequestID != recentRequest {
 		t.Errorf("the second sweep = %+v, want exactly the half-hour lapsed hold %v for request %v", victims, lapsedRecent, recentRequest)
 	}
 
-	victims, err = repos.reserves.ExpireLapsedLeases(ctx, 5)
-	if err != nil {
-		t.Fatalf("the sweeping ExpireLapsedLeases(5): %v", err)
-	}
+	victims = sweep(5)
 	if len(victims) != 0 {
 		t.Errorf("the sweeping reaper closed %v, want none — a one-sided lapse is not the reaper's to take", victims)
 	}
@@ -2303,7 +2320,7 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 	// must clear the engine's envelope guard on the way in.
 	lostVictim, lostRequest, _ := integrationReservationWithLegs(t, ctx, repos, integrationRuntimeAccount(t, "reaper-d"), created, now.Add(-time.Hour), now.Add(-time.Hour))
 	var sweptAllocations []accounting.Allocation
-	err = store.WithinTx(ctx, func(ctx context.Context) error {
+	sweepErr := store.WithinTx(ctx, func(ctx context.Context) error {
 		closed, err := repos.reserves.ExpireLapsedLeases(ctx, 1)
 		if err != nil {
 			return err
@@ -2323,8 +2340,8 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 		_, err = repos.facts.Append(ctx, fact)
 		return err
 	})
-	if err != nil {
-		t.Fatalf("the reaping unit of work: %v", err)
+	if sweepErr != nil {
+		t.Fatalf("the reaping unit of work: %v", sweepErr)
 	}
 	if len(sweptAllocations) != 2 || sweptAllocations[0].FundingBucketID != "bucket-reaper-a" || sweptAllocations[0].Amount != 400 || sweptAllocations[0].Ordinal != 1 ||
 		sweptAllocations[1].FundingBucketID != "bucket-reaper-b" || sweptAllocations[1].Amount != 300 || sweptAllocations[1].Ordinal != 2 {
@@ -2363,10 +2380,7 @@ func TestIntegrationReaperExpiresOnlyLapsedLeases(t *testing.T) {
 	if err != nil || !renewed {
 		t.Fatalf("RenewLease(the hiccup hold) = (%t, %v), want (true, nil)", renewed, err)
 	}
-	victims, err = repos.reserves.ExpireLapsedLeases(ctx, 10)
-	if err != nil {
-		t.Fatalf("the post-renewal sweep: %v", err)
-	}
+	victims = sweep(10)
 	if len(victims) != 0 {
 		t.Errorf("the post-renewal sweep closed %v, want none — the renewed lease took the hold out of the predicate", victims)
 	}

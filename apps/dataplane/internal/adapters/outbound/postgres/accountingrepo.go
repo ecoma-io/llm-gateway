@@ -211,10 +211,18 @@ func (repository *ReservationRepository) Close(ctx context.Context, id identity.
 
 // ExpireLapsedLeases implements persistence.ReservationRepository, returning
 // the holds it closed so their facts can be appended in the same unit of work.
-// A limit below one is refused: an unbounded sweep is how a backlog becomes a
-// long transaction, and "no limit today" is a decision a caller makes by
-// passing the table's size, not by omitting the argument.
+// The unit-of-work refusal is first, for the same reason Append's is: the
+// closes this statement makes are the reaper's half of an ending whose fact,
+// request finalisation and replay pointer are the other half, and a sweep run
+// bare would commit each close the instant it happened — the tearing the
+// same-unit discipline exists to make impossible. A limit below one is
+// refused: an unbounded sweep is how a backlog becomes a long transaction,
+// and "no limit today" is a decision a caller makes by passing the table's
+// size, not by omitting the argument.
 func (repository *ReservationRepository) ExpireLapsedLeases(ctx context.Context, limit int) ([]persistence.ExpiredLease, error) {
+	if !repository.store.InUnitOfWork(ctx) {
+		return nil, fmt.Errorf("postgres: expire lapsed leases: %w", persistence.ErrExpireOutsideUnitOfWork)
+	}
 	if limit < 1 {
 		return nil, fmt.Errorf("postgres: expire lapsed leases: limit must be at least one, got %d", limit)
 	}
