@@ -493,11 +493,11 @@ assert_equals "the ownership namespace exists in the Control Plane's database" \
 assert_equals "the namespace carries the ownership comment, byte for byte" \
 	"$(psql_scalar "$control_db" "SELECT obj_description('$control_db'::regnamespace, 'pg_namespace')")" \
 	"Control Plane ownership namespace (ADR 0006 §7); owned by apps/console-api."
-assert_equals "the namespace holds exactly the identity, commerce, projection and accounting schemas' sixteen tables" \
-	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "16"
-assert_equals "the control tables are the identity, commerce, projection and accounting foundations' set" \
+assert_equals "the namespace holds exactly the identity, commerce, projection, accounting and ingestion schemas' nineteen tables" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "19"
+assert_equals "the control tables are the identity, commerce, projection, accounting and ingestion foundations' set" \
 	"$(psql_scalar "$control_db" "SELECT string_agg(tablename, ',' ORDER BY tablename COLLATE \"C\") FROM pg_tables WHERE schemaname = 'control'")" \
-	"account_payg,accounts,api_keys,entitlements,funding_buckets,ledger_entries,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,settlements,subscriptions,users"
+	"account_payg,accounts,api_keys,applied_facts,entitlements,funding_buckets,ingestion_cursor,ledger_entries,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,quarantined_facts,settlements,subscriptions,users"
 assert_equals "the projection counter is a seeded singleton with a timeline epoch" \
 	"$(psql_scalar "$control_db" "SELECT count(*) FROM control.projection_revision WHERE id = 1 AND last_revision = (SELECT count(*) FROM control.accounts) AND epoch IS NOT NULL")" \
 	"1"
@@ -1724,6 +1724,95 @@ SELECT (SELECT count(*) FROM control.plans WHERE id = 'b2000000-0000-7000-8000-0
            AND available_amount = (SELECT COALESCE(SUM(settled_delta - held_delta), 0) FROM control.ledger_entries WHERE funding_bucket_id = 'b9000000-0000-7000-8000-0000000000b1')
           FROM control.funding_buckets WHERE id = 'b9000000-0000-7000-8000-0000000000b1');
 ROLLBACK;")" "1|1|1|1|1|1|2|4|1|true"
+
+# -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+# The fact-ingestion tables (control migration 000008): the consumer's
+# position, its idempotency ledger, and its quarantine. The cursor is a
+# singleton by construction — the seed row is the only row the engine
+# permits — and the applied-facts primary key is (request_id, kind class),
+# the fact contract's identity for idempotency, so the probes below pin the
+# coexistence rule the contract states: an orphan fact and a settlement
+# fact for one request are two rows, while a redelivered class is one.
+
+expect_constraint_failure "a second cursor row is refused" ingestion_cursor_singleton "
+INSERT INTO control.ingestion_cursor (id, position)
+VALUES (2, 'cursor-2')"
+
+assert_equals "the cursor is seeded to the never-applied position" \
+	"$(psql_scalar "$control_db" "
+SELECT (SELECT count(*) FROM control.ingestion_cursor) || '|' ||
+       (SELECT position FROM control.ingestion_cursor WHERE id = 1)")" "1|"
+
+expect_constraint_failure "an applied fact of an unknown kind class is refused" applied_facts_kind_class_valid "
+INSERT INTO control.applied_facts (request_id, kind_class, kind, append_seq)
+VALUES ('verify probe request', 'expired_settlement', 'expired', 7)"
+
+expect_constraint_failure "an applied released fact carrying a settled amount is refused" applied_facts_settled_shape "
+INSERT INTO control.applied_facts (request_id, kind_class, kind, append_seq, settled_amount)
+VALUES ('verify probe request', 'settlement', 'released', 7, 30)"
+
+expect_constraint_failure "an applied released fact carrying a capture method is refused" applied_facts_capture_shape "
+INSERT INTO control.applied_facts (request_id, kind_class, kind, append_seq, capture_method)
+VALUES ('verify probe request', 'settlement', 'released', 7, 'reported')"
+
+expect_constraint_failure "an applied settled fact without its settlement reference is refused" applied_facts_settled_shape "
+INSERT INTO control.applied_facts (request_id, kind_class, kind, append_seq, settled_amount, capture_method)
+VALUES ('verify probe request', 'settlement', 'settled', 7, 30, 'reported')"
+
+expect_constraint_failure "a redelivered fact class is refused by the primary key" applied_facts_pkey "
+WITH seeded AS (
+  INSERT INTO control.applied_facts (request_id, kind_class, kind, append_seq, capture_method)
+  VALUES ('verify probe request', 'unbillable_orphaned', 'unbillable_orphaned', 7, 'gateway_observed')
+  RETURNING 1
+)
+INSERT INTO control.applied_facts (request_id, kind_class, kind, append_seq, capture_method)
+SELECT 'verify probe request', 'unbillable_orphaned', 'unbillable_orphaned', 9, 'gateway_observed' FROM seeded"
+
+# The coexistence positive: one request, two classes, two rows — and the
+# settlement class row named for a real settlement of record, the lineage
+# edge the foreign key keeps honest.
+assert_equals "an orphan and a settled fact of one request both apply" \
+	"$(psql_scalar "$control_db" "
+BEGIN;
+INSERT INTO control.settlements (id, request_id, settled_total, created_at)
+VALUES ('d9000000-0000-7000-8000-0000000000d8', 'verify probe request two classes', 30, now());
+INSERT INTO control.applied_facts (request_id, kind_class, kind, append_seq, settled_amount, capture_method, settlement_id)
+VALUES ('verify probe request two classes', 'settlement', 'settled', 8, 30, 'reported', 'd9000000-0000-7000-8000-0000000000d8');
+INSERT INTO control.applied_facts (request_id, kind_class, kind, append_seq, capture_method)
+VALUES ('verify probe request two classes', 'unbillable_orphaned', 'unbillable_orphaned', 7, 'gateway_observed');
+SELECT count(*) FROM control.applied_facts WHERE request_id = 'verify probe request two classes';
+ROLLBACK;")" "2"
+
+expect_constraint_failure "a quarantined fact outside the payload grammar is refused" quarantined_facts_payload_grammar "
+INSERT INTO control.quarantined_facts (request_id, append_seq, kind, schema_version, occurred_at, payload, reason)
+VALUES ('verify probe request', 7, 'settled', 1, now(), '', 'payload is not the version-1 allocation envelope')"
+
+expect_constraint_failure "a second quarantine of one fact is refused" quarantined_facts_fact_unique "
+WITH seeded AS (
+  INSERT INTO control.quarantined_facts (request_id, append_seq, kind, schema_version, occurred_at, payload, reason)
+  VALUES ('verify probe request', 7, 'settled', 99, now(), '{}', 'schema version 99 is not implemented')
+  RETURNING 1
+)
+INSERT INTO control.quarantined_facts (request_id, append_seq, kind, schema_version, occurred_at, payload, reason)
+SELECT 'verify probe request', 7, 'settled', 99, now(), '{}', 'schema version 99 is not implemented' FROM seeded"
+
+# The quarantine positive: the verbatim row, every typed column the fact
+# carried beside the envelope, and the reason the consumer refused it.
+assert_equals "a refused fact is recorded verbatim with its reason" \
+	"$(psql_scalar "$control_db" "
+BEGIN;
+INSERT INTO control.quarantined_facts
+  (request_id, append_seq, kind, schema_version, occurred_at, payload,
+   capture_method, price_revision_id, input_unit_price, output_unit_price,
+   settled_amount, corrects_append_seq, reason)
+VALUES
+  ('verify probe request quarantine', 11, 'settled', 1, now(),
+   '{\"allocations\":[{\"funding_bucket_id\":\"bucket-1\",\"amount\":30,\"ordinal\":1}]}',
+   'reported', 'verify probe revision', 1, 2, 30, 4,
+   'corrections are not implemented in this build');
+SELECT (SELECT count(*) FROM control.quarantined_facts WHERE request_id = 'verify probe request quarantine') || '|' ||
+       (SELECT corrects_append_seq FROM control.quarantined_facts WHERE request_id = 'verify probe request quarantine');
+ROLLBACK;")" "1|4"
 
 step "9/12 PostgreSQL transaction semantics hold"
 # Two probes, because the migration safety model rests on both: DDL rolled
