@@ -482,15 +482,3 @@ func TestAQuarantinableRefusalIsRecordedAndThePageAdvances(t *testing.T) {
 		t.Fatalf("Position() = (%q, %v), want the advance the recorded refusal made true", position, err)
 	}
 }
-
-func equalStrings(got, want []string) bool {
-	if len(got) != len(want) {
-		return false
-	}
-	for i := range got {
-		if got[i] != want[i] {
-			return false
-		}
-	}
-	return true
-}

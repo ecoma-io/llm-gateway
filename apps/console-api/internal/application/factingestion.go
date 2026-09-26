@@ -38,10 +38,13 @@ const FactPageSize = 100
 //     applier, whose idempotency by (request_id, kind class) is what makes a
 //     redelivered page free;
 //  4. the cursor advances inside that same unit of work and only after the last
-//     fact has been applied. The position is a claim about work already done,
-//     so it must never move ahead of the work: if any apply fails, the
-//     transaction rolls back, the position stays where it was, and the next
-//     pass reads the same page again. That is the whole crash-safety story, and
+//     fact has been applied, as a compare-and-set on the position the pass
+//     read. The position is a claim about work already done, so it must never
+//     move ahead of the work: if any apply fails, the transaction rolls back,
+//     the position stays where it was, and the next pass reads the same page
+//     again; if another pass moved the position meanwhile, the set refuses and
+//     this pass's work rolls back whole rather than landing under a position
+//     that was never its own. That is the whole crash-safety story, and
 //     it is why the advance is the last statement in the transaction rather
 //     than its own write.
 //
@@ -182,7 +185,11 @@ func (ingestion *FactIngestion) Replay(ctx context.Context) (FactIngestionResult
 		// resolves its query surface from the context it is handed, and an
 		// advance written through the pool would commit on its own, outside
 		// the rollback that exists to keep position and work moving together.
-		return ingestion.cursor.Advance(txCtx, page.NextCursor)
+		// The advance is a compare-and-set on the position this pass read:
+		// a pass that raced another to the same page loses the set, and its
+		// whole unit of work rolls back rather than two passes' effects
+		// landing under one position.
+		return ingestion.cursor.Advance(txCtx, position, page.NextCursor)
 	}); err != nil {
 		return FactIngestionResult{}, fmt.Errorf("application: apply usage facts: %w", err)
 	}

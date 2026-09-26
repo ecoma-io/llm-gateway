@@ -131,11 +131,11 @@ func (c fakeCursor) Position(_ context.Context) (string, error) {
 	return c.world.position, nil
 }
 
-func (c fakeCursor) Advance(ctx context.Context, next string) error {
+func (c fakeCursor) Advance(ctx context.Context, from, next string) error {
 	if !inTransaction(ctx) {
 		c.world.outsideTx++
 	}
-	c.world.record("advance:" + next)
+	c.world.record("advance-from:" + from + ":" + next)
 	if c.world.advanceErr != nil {
 		return c.world.advanceErr
 	}

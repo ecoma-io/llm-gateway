@@ -137,16 +137,28 @@ func runIngestionLoop(ctx context.Context, ingestion *application.FactIngestion,
 	defer ticker.Stop()
 
 	runOnce := func() {
+		// One deadline for the whole drain: a pass the feed answers with
+		// has_more is followed by another immediately, so a burst of facts
+		// costs at most one timeout of lag — the deadline, not the interval,
+		// is what bounds how far behind the consumer can fall. A pass that
+		// ends in an error stops the drain; the next tick retries it from
+		// the durable position, which is exactly where the failed one left
+		// off.
 		cycleCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		_, err := ingestion.Replay(cycleCtx)
-		switch {
-		case err == nil:
-		case errors.Is(err, dataplaneport.ErrCursorExpired):
-			log.Printf("console-api ingestion position is no longer replayable; the feed holds until an operator resolves the position: %v", err)
-		case errors.Is(err, context.Canceled):
-		default:
-			log.Printf("console-api ingestion pass failed: %v", err)
+		for {
+			result, err := ingestion.Replay(cycleCtx)
+			switch {
+			case err == nil:
+			case errors.Is(err, dataplaneport.ErrCursorExpired):
+				log.Printf("console-api ingestion position is no longer replayable; the feed holds until an operator resolves the position: %v", err)
+			case errors.Is(err, context.Canceled):
+			default:
+				log.Printf("console-api ingestion pass failed: %v", err)
+			}
+			if err != nil || !result.HasMore || cycleCtx.Err() != nil {
+				return
+			}
 		}
 	}
 
@@ -200,10 +212,11 @@ func main() {
 	// before. The foundation phases (identity, commerce) ship their use cases
 	// and repositories tested at the application boundary; wiring them ahead
 	// of a caller would be composition guessed at, and a guessed composition
-	// is exactly what this file exists to refuse. The projection loop is the
-	// first caller this process has gained, and the readiness probe the
-	// second: the wiring below is theirs, and the store reaches the server
-	// because the probe asks the pool a question no use case can.
+	// is exactly what this file exists to refuse. The projection loop was the
+	// first caller this process gained, the readiness probe the second, and
+	// the fact consumer the third: the wiring below is theirs, and the store
+	// reaches the server because the probe asks the pool a question no use
+	// case can.
 
 	// The Control Plane's state access, and the projection producer on top of
 	// it (ADR 0007). The store is the one object every persistence port
@@ -315,12 +328,16 @@ func main() {
 	projectionWG.Add(1)
 	go runProjectionLoop(ctx, producer, cfg.DataPlane.ProjectionInterval, cfg.DataPlane.ProjectionTimeout)
 
-	// The fact consumer's loop, in the same shape: one goroutine, one pass
-	// per tick, the first immediately, each pass under its own deadline. The
-	// pull model makes the cadence a freshness dial and nothing else — a page
-	// this pass missed is the page the next pass reads, from the position the
-	// last committed one wrote, and a pass that fails is one log line rather
-	// than a crash, because nothing was lost by failing.
+	// The fact consumer's loop, in the same shape: one goroutine, the first
+	// pass immediately, each pass under its own deadline — and a pass the
+	// feed answers with has_more keeps passing under that same deadline
+	// rather than waiting for the next tick, so the lag a burst of facts
+	// costs is bounded by one timeout, not by however long the burst outlasts
+	// the interval. The pull model makes the cadence a freshness dial and
+	// nothing else — a page this pass missed is the page the next pass
+	// reads, from the position the last committed one wrote, and a pass that
+	// fails is one log line rather than a crash, because nothing was lost by
+	// failing.
 	ingestionWG.Add(1)
 	go runIngestionLoop(ctx, ingestion, cfg.DataPlane.IngestionInterval, cfg.DataPlane.IngestionTimeout)
 

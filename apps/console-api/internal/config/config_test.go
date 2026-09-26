@@ -190,6 +190,20 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			wantErr: "CONSOLE_API_PROJECTION_TIMEOUT must be a Go duration",
 		},
 		{
+			name: "rejects a zero ingestion interval",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_INGESTION_INTERVAL": "0s",
+			}),
+			wantErr: "CONSOLE_API_INGESTION_INTERVAL must be greater than zero",
+		},
+		{
+			name: "rejects a malformed ingestion timeout",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_INGESTION_TIMEOUT": "soon",
+			}),
+			wantErr: "CONSOLE_API_INGESTION_TIMEOUT must be a Go duration",
+		},
+		{
 			name: "rejects an explicitly empty address",
 			env: merge(requiredDataPlaneEnv(), map[string]string{
 				"CONSOLE_API_ADDR": "",

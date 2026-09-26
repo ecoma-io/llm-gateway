@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -82,8 +83,11 @@ func (f *feedServer) askedFor() []string {
 // seamWorld is the Control Plane's durable state in miniature: the position,
 // the applier's effects, and the order things happened in. A rollback restores
 // the state and keeps the record, because what the assertions need to see is
-// both.
+// both. The mutex is for the loop test, which reads this state from its own
+// goroutine while the loop writes it from another; the synchronous tests
+// pass through it without contention.
 type seamWorld struct {
+	mu       sync.Mutex
 	position string
 	effects  map[factKey]persistence.Fact
 	log      []string
@@ -95,6 +99,8 @@ func newSeamWorld(position string) *seamWorld {
 
 // effect reads the recorded effect for one of a request's kind classes.
 func (w *seamWorld) effect(requestID, kind string) (persistence.Fact, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	fact, ok := w.effects[factKey{requestID: requestID, class: kindClass(kind)}]
 	return fact, ok
 }
@@ -129,19 +135,25 @@ type seamStore struct {
 }
 
 func (s seamStore) WithinTx(ctx context.Context, fn func(context.Context) error) error {
+	s.world.mu.Lock()
 	s.world.log = append(s.world.log, "begin")
 	position := s.world.position
 	effects := make(map[factKey]persistence.Fact, len(s.world.effects))
 	for key, fact := range s.world.effects {
 		effects[key] = fact
 	}
+	s.world.mu.Unlock()
 
 	if err := fn(context.WithValue(ctx, seamTxKey{}, true)); err != nil {
+		s.world.mu.Lock()
+		defer s.world.mu.Unlock()
 		s.world.position = position
 		s.world.effects = effects
 		s.world.log = append(s.world.log, "rollback")
 		return err
 	}
+	s.world.mu.Lock()
+	defer s.world.mu.Unlock()
 	s.world.log = append(s.world.log, "commit")
 	return nil
 }
@@ -160,11 +172,21 @@ func (s seamStore) InUnitOfWork(ctx context.Context) bool {
 type seamCursor struct{ world *seamWorld }
 
 func (c seamCursor) Position(context.Context) (string, error) {
+	c.world.mu.Lock()
+	defer c.world.mu.Unlock()
 	return c.world.position, nil
 }
 
-func (c seamCursor) Advance(_ context.Context, next string) error {
+func (c seamCursor) Advance(_ context.Context, from, next string) error {
+	c.world.mu.Lock()
+	defer c.world.mu.Unlock()
 	c.world.log = append(c.world.log, "advance:"+next)
+	if from != c.world.position {
+		// The compare-and-set the port promises: a pass that read one
+		// position and arrives to advance from another loses the set, and
+		// the refusal rolls its unit of work back with it.
+		return fmt.Errorf("seam: the position moved under this pass: read %q, found %q", from, c.world.position)
+	}
 	c.world.position = next
 	return nil
 }
@@ -172,6 +194,8 @@ func (c seamCursor) Advance(_ context.Context, next string) error {
 type seamApplier struct{ world *seamWorld }
 
 func (a seamApplier) Apply(_ context.Context, fact persistence.Fact) error {
+	a.world.mu.Lock()
+	defer a.world.mu.Unlock()
 	a.world.log = append(a.world.log, "apply:"+fact.RequestID)
 	key := factKey{requestID: fact.RequestID, class: kindClass(fact.Kind)}
 	if _, applied := a.world.effects[key]; applied {

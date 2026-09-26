@@ -79,19 +79,29 @@ type IngestionCursor interface {
 	// anything.
 	Position(ctx context.Context) (string, error)
 
-	// Advance records next as the applied-through position. It runs inside
-	// the caller's unit of work, and an implementation must refuse a call
-	// that arrives without one — an advance is only meaningful in the same
-	// transaction as the work it claims to sit after, and outside that
-	// transaction it is the claim without the work.
+	// Advance records next as the applied-through position, replacing from —
+	// the position the caller read before it read the page it is advancing
+	// past. The replace is a compare-and-set: if the durable position is no
+	// longer from, another pass moved it while this one worked, and the
+	// implementation refuses rather than overwrite — the caller's unit of
+	// work rolls back with the refusal, and the page it applied re-applies
+	// idempotently from wherever the position now stands. An advance that
+	// ran blind could interleave two passes' effects under one position, and
+	// the position would then claim work that was ordered differently than
+	// it happened.
 	//
-	// The obligation this signature cannot state, and which the caller carries:
-	// Advance is called after every fact the position covers has been applied,
-	// never before. A position is a claim about work already done, and the
-	// store cannot check the claim — it can only record it in the same
-	// transaction as the work, which is what makes the claim true or false
-	// together with the effects it speaks for.
-	Advance(ctx context.Context, next string) error
+	// Advance runs inside the caller's unit of work, and an implementation
+	// must refuse a call that arrives without one — an advance is only
+	// meaningful in the same transaction as the work it claims to sit
+	// after, and outside that transaction it is the claim without the work.
+	//
+	// The obligation this signature cannot state, and which the caller
+	// carries: Advance is called after every fact the position covers has
+	// been applied, never before. A position is a claim about work already
+	// done, and the store cannot check the claim — it can only record it in
+	// the same transaction as the work, which is what makes the claim true
+	// or false together with the effects it speaks for.
+	Advance(ctx context.Context, from, next string) error
 }
 
 // FactApplier applies the facts the Control Plane derives from.

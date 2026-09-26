@@ -95,7 +95,9 @@ func TestAFirstPageIsAppliedBeforeTheCursorAdvances(t *testing.T) {
 	if got, want := world.limits, []int{FactPageSize}; !slices.Equal(got, want) {
 		t.Errorf("page limits = %v, want %v", got, want)
 	}
-	want := []string{"begin", "apply:req-1", "apply:req-2", "advance:cursor-2", "commit"}
+	// The advance is the compare-and-set the port names: it records both the
+	// position this pass read and the one it moves to.
+	want := []string{"begin", "apply:req-1", "apply:req-2", "advance-from::cursor-2", "commit"}
 	if !slices.Equal(world.order, want) {
 		t.Errorf("the flow observed %v, want %v", world.order, want)
 	}

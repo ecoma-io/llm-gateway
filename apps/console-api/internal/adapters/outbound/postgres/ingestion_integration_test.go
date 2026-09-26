@@ -414,8 +414,9 @@ func TestTheIngestionCursorRoundTripsThePositionVerbatim(t *testing.T) {
 	err = store.WithinTx(ctx, func(txCtx context.Context) error {
 		// The advance and the read share the unit of work, so the position
 		// the applier's transaction would commit to is visible inside it —
-		// the same unit the whole-page rule advances in.
-		if err := cursor.Advance(txCtx, next); err != nil {
+		// the same unit the whole-page rule advances in. The set names the
+		// position this pass read (before) as the one it replaces.
+		if err := cursor.Advance(txCtx, before, next); err != nil {
 			return err
 		}
 		inside, err := cursor.Position(txCtx)
@@ -439,10 +440,38 @@ func TestTheIngestionCursorRoundTripsThePositionVerbatim(t *testing.T) {
 	}
 }
 
+func TestAnAdvanceFromAPositionNoLongerHeldIsRefused(t *testing.T) {
+	// The compare-and-set is the advance's spine: a pass that read one
+	// position and arrives to advance from another — a second worker moved
+	// the singleton while this pass applied its page — must lose the set
+	// and refuse, because an update that changed nothing is not an advance
+	// that happened. The caller's unit of work rolls back with the refusal;
+	// that part is the store's own discipline.
+	store, _, _, _ := integrationIngestion(t)
+	ctx := t.Context()
+	cursor := NewIngestionCursor(store)
+
+	held, err := cursor.Position(ctx)
+	if err != nil {
+		t.Fatalf("Position() error = %v, want the singleton row", err)
+	}
+	stale := held + "-stale"
+	err = store.WithinTx(ctx, func(txCtx context.Context) error {
+		return cursor.Advance(txCtx, stale, "cursor-"+string(acctRequestID(t)))
+	})
+	if err == nil || !strings.Contains(err.Error(), "moved under") {
+		t.Fatalf("Advance() from a position no longer held = %v, want the compare-and-set's refusal", err)
+	}
+	now, err := cursor.Position(ctx)
+	if err != nil || now != held {
+		t.Fatalf("Position() after the refused advance = (%q, %v), want %q unchanged", now, err, held)
+	}
+}
+
 func TestTheIngestionCursorRefusesToAdvanceAutocommitted(t *testing.T) {
 	store, _, _, _ := integrationIngestion(t)
 	cursor := NewIngestionCursor(store)
-	err := cursor.Advance(t.Context(), "cursor-"+string(acctRequestID(t)))
+	err := cursor.Advance(t.Context(), "", "cursor-"+string(acctRequestID(t)))
 	if err == nil || !strings.Contains(err.Error(), "unit of work") {
 		t.Fatalf("Advance() outside a unit of work = %v, want the refusal", err)
 	}

@@ -55,25 +55,38 @@ func (r *ingestionCursorRepo) Position(ctx context.Context) (string, error) {
 }
 
 // Advance writes next over the singleton's position, inside the caller's unit
-// of work. The position's grammar is the Data Plane's and stays unexamined
+// of work, and only where the row still holds the position from — the one the
+// caller's pass read before it read the page. The compare-and-set is what
+// keeps two passes from interleaving their effects under one position: the
+// loser's update names no row, its whole unit of work rolls back, and the
+// idempotency ledger makes its page free to re-apply from wherever the
+// position now stands.
+//
+// The position's grammar is the Data Plane's and stays unexamined
 // here — verbatim in, verbatim out — down to its size, which the column's own
 // CHECK (control migration 000008) is the bound of; a page whose position
 // outgrows the column fails the way any failed page does, rolled back whole
 // and retried, never advanced in part.
-func (r *ingestionCursorRepo) Advance(ctx context.Context, next string) error {
+func (r *ingestionCursorRepo) Advance(ctx context.Context, from, next string) error {
 	if !r.store.InUnitOfWork(ctx) {
 		return fmt.Errorf("postgres: advance the usage fact position: %w", errCursorAdvanceOutsideUnitOfWork)
 	}
 	result, err := r.store.Querier(ctx).ExecContext(ctx,
-		`UPDATE control.ingestion_cursor SET position = $1, updated_at = now() WHERE id = 1`, next)
+		`UPDATE control.ingestion_cursor SET position = $1, updated_at = now() WHERE id = 1 AND position = $2`, next, from)
 	if err != nil {
 		return fmt.Errorf("postgres: advance the usage fact position: %w", err)
 	}
-	if rows, err := result.RowsAffected(); err == nil && rows == 0 {
-		// Unreachable against the migrated schema — the singleton is seeded by
-		// the same migration that creates it — but an advance that named no
-		// row must never read as an advance that happened.
-		return fmt.Errorf("postgres: advance the usage fact position: no singleton row to advance")
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("postgres: advance the usage fact position: %w", err)
+	}
+	if rows == 0 {
+		// Two shapes, one answer: the singleton row is gone (unreachable
+		// against the migrated schema — the seeding migration creates it) or
+		// the position moved under this pass. Either way an update that
+		// changed nothing must never read as an advance that happened — the
+		// refusal rolls the page's effects back with it.
+		return fmt.Errorf("postgres: advance the usage fact position: no row at the position this pass read — the position moved under it, and the page rolls back")
 	}
 	return nil
 }
