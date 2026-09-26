@@ -43,10 +43,10 @@ var ErrHoldInputs = errors.New("accounting: hold inputs must not be negative")
 // Hold derives the hold a request opens on future spend: one ceiling over the
 // summed raw product, in integer minor units. It is the only place the
 // formula lives — the waterfall's verdicts and the settlement both re-derive
-// through it — so the number admission reserves, the number the schema's
-// trigger re-derives on the row, and the number a replayed audit computes can
-// only disagree if this function is wrong, which is a defect one test can
-// pin.
+// through it, and the settled fact's amount is bound to it at construction —
+// so the number admission reserves, the number the fact records, and the
+// number a replayed audit computes can only disagree if this function is
+// wrong, which is a defect one test can pin.
 //
 // Every path is checked arithmetic in 128 bits (math/bits.Mul64 /
 // bits.Add64 / bits.Div64): a wrapped product would silently understate a
@@ -93,17 +93,19 @@ func Hold(inputTokens, outputTokens int, inputUnitPrice, outputUnitPrice int64) 
 	return int64(quotient), nil
 }
 
-// ReDerivedHold re-derives the hold from the reservation's own stored columns
-// — the client-side half of the re-derivation invariant. The requests and
-// reservations rows re-derive the hold in a database trigger (the server-side
-// half, migration 000003), and the settlement re-derives it through Hold; this
-// method is what an application calls before the write to assert the same
-// equality where the decision is formed, so a caller that reserved an amount
-// these prices and counts do not support fails at admission instead of at the
-// row. NewReservation deliberately does not run this check — it validates the
-// legs against the amount it is given, not the amount against the formula —
-// because the formula's inputs arrive with the reservation and the assertion
-// is the caller's sentence to make.
+// ReDerivedHold re-derives the hold from the reservation's own stored
+// columns. What re-derives what is worth being precise about: the
+// reservations table's trigger (migration 000003) re-derives reserved_amount
+// from the reservation's allocation legs — a sum, not this formula — and the
+// settlement re-derives the settled amount through Hold; no database guard
+// re-derives the formula itself on the row. This method is the formula's
+// write-side assertion: what an application calls before the write to check
+// the equality where the decision is formed, so a caller that reserved an
+// amount these prices and counts do not support fails at admission instead
+// of at the ledger. NewReservation deliberately does not run this check — it
+// validates the legs against the amount it is given, not the amount against
+// the formula — because the formula's inputs arrive with the reservation and
+// the assertion is the caller's sentence to make.
 func (r Reservation) ReDerivedHold() (int64, error) {
 	return Hold(r.InputTokens, r.MaxOutputTokens, r.InputUnitPrice, r.OutputUnitPrice)
 }

@@ -15,8 +15,10 @@ type PriceSnapshot struct {
 	// it travels in usage facts and reservations.
 	RevisionID string
 	// Version is that revision's operator-facing ordinal — the human-legible
-	// twin of the id, so an operator can read a fact's price basis without a
-	// join.
+	// twin of the id, and what the management read surfaces. It lives in the
+	// catalog's own tables and in this read result; the runtime's rows and
+	// the usage facts carry only the revision id and the prices by value, so
+	// naming a fact's version takes the catalog, not the fact.
 	Version int
 	// InputUnitPrice prices prompt input, in integer minor units per 1M
 	// tokens. Zero is a legitimate price.
