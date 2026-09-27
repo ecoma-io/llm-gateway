@@ -163,6 +163,16 @@ type AppliedFact struct {
 	// never an idempotency key.
 	AppendSeq int64
 
+	// AppliedAt is when THIS PLANE recorded the derivation, which is the
+	// ledger's own record time rather than anything the fact carried. It is
+	// the key Recent pages by, so a caller walking a window needs it back:
+	// the walk's keyset is a position in this column, and a read that
+	// returned the rows without the instant they sort at could only resume
+	// by guessing. The pairing with RequestID is the whole ordering —
+	// applied_at alone is not unique, so a keyset on it alone would drop
+	// every row sharing an instant with the one it resumed after.
+	AppliedAt time.Time
+
 	// SettledAmount is what the settled fact charged; nil on every other
 	// kind, the same shape statement the schema's CHECK pins.
 	SettledAmount *int64
@@ -202,6 +212,32 @@ type AppliedFacts interface {
 	// same fact concurrently — the loser's whole page rolls back, and its
 	// retry finds the row).
 	Record(ctx context.Context, applied AppliedFact) error
+
+	// Recent returns at most limit applied rows whose recorded instant lies
+	// in the half-open window [from, to), oldest first. The window is over
+	// the ledger's OWN applied_at — when this plane recorded the derivation —
+	// and not over anything the fact carried: the fact's occurred_at is the
+	// Data Plane's clock, so ordering on it here would be ordering one plane
+	// by another plane's timestamps, and a clock skew between the two would
+	// show up as a fact applied outside the window it was applied in.
+	//
+	// This is the read a reconciliation pass (B13) sweeps the ledger with,
+	// and the reason it lives here rather than on some reporting port is that
+	// the sweep's question — "what effects does this plane hold, and does
+	// each one point at a settlement that exists" — is a question about the
+	// idempotency ledger itself.
+	//
+	// A page shorter than limit is the end of the window, and only the end:
+	// a full page says nothing about whether the window holds more, and a
+	// caller that stops on a full page has not swept the window it was
+	// given. Paging is keyset on the PAIR (applied_at, request_id), never on
+	// applied_at alone — a whole ingestion page commits in one transaction,
+	// so every row it applies shares one instant, and a keyset that resumed
+	// after that instant would skip every row of the page but the first. The
+	// two components travel together, and a caller that passed a
+	// requestID without the appliedAt it belongs to is describing a position
+	// the read cannot exist at.
+	Recent(ctx context.Context, from, to, after time.Time, afterID string, limit int) ([]AppliedFact, error)
 }
 
 // QuarantinedFact is one refused fact, recorded verbatim: every column the
@@ -243,6 +279,25 @@ type QuarantinedFact struct {
 }
 
 // QuarantinedFacts is where a refused fact is recorded.
+//
+// It is write-only, and that is the shape B13 left it in. A draft widened it
+// with a Recent so a pass could count the refusals in a window, and the
+// widening was honest about itself — an operator asking "what has this gateway
+// failed to bill" is owed that answer by something that reads the ledger — but
+// no check consumes it, and B13's own six checks all resolve from applied
+// facts, the settlements those facts name, and the funding buckets. A read
+// half with no reader is a promise the composition root makes and nothing
+// keeps, and the index the read would have wanted is not in the migration,
+// which is the shape of a thing nobody asked for.
+//
+// The count it was widened for is also the one figure this plane cannot
+// produce honestly: refused facts are this plane's own record of work it
+// declined, and a pass that counted them beside a count of applied facts
+// would be reporting a coverage rate whose denominator lives in the Data
+// Plane. A number that reads as coverage and measures nothing is worse than
+// no number. When a check lands that needs these rows, Recent comes back with
+// it — and with the window's index, which would be a migration rather than a
+// statement.
 type QuarantinedFacts interface {
 	// Record records quarantined verbatim. It runs inside the caller's unit
 	// of work — the same transaction that advances the position past the

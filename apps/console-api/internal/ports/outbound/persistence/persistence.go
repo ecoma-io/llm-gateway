@@ -55,6 +55,21 @@ var ErrNotFound = errors.New("persistence: not found")
 // statement's domain verdict, not a conflict.
 var ErrConflict = errors.New("persistence: unit of work aborted by a concurrent write, retry")
 
+// ErrWindowClaimed is a reconciliation pass whose window another RUNNING pass
+// is already covering. It is a sentinel rather than a failure because the
+// right response is to do nothing and wait for the next tick: the other pass is
+// doing the work this one would have done, and there is nothing to retry and
+// nothing to report.
+//
+// It exists because a claim is the one place where "the world moved" is the
+// expected answer rather than a defect, and because the alternative — letting
+// the unique violation arrive as a driver string — puts a distinction the
+// caller must act on into the hands of a string it would have to pattern
+// match. Two replicas of the control plane compute the same high-water mark
+// and therefore the same window; the engine arbitrates which of them sweeps
+// it, and the other is told so in a word.
+var ErrWindowClaimed = errors.New("persistence: reconciliation window is already claimed by a running pass")
+
 // Pinger reports whether the backing store is answering right now. Readiness
 // is what it is for: /readyz gates on this, over the port itself rather than
 // through the application — there is no use case for a ping — and nothing else

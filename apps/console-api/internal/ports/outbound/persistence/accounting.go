@@ -83,6 +83,33 @@ type FundingBuckets interface {
 	// before this is ever reached, and the statement repeats the held-zero
 	// gate because a leg can land between the read and the write.
 	Close(ctx context.Context, id accounting.FundingBucketID, fromVersion int64, updatedAt time.Time) (bool, error)
+
+	// Sweep returns at most limit buckets whose id is strictly greater than
+	// after, in ascending id order — the bounded, keyset-paginated walk a
+	// reconciliation pass (B13) makes. It is the ONLY enumeration member on
+	// this port and it was absent until a caller needed it, which is the port
+	// package's own rule stated as history: a member is added when a consumer
+	// asks for it, not before.
+	//
+	// Keyset pagination, never OFFSET, and the reason is the whole reason a
+	// sweep over a growing table is safe at all: OFFSET re-reads and re-discards
+	// every row already passed, so its cost grows with the table, and a pass
+	// that pages by OFFSET while legs land concurrently can both skip a row
+	// (a bucket inserted before the current offset shifts it forward) and read
+	// one twice. An exclusive lower bound on the id has neither failure: a
+	// bucket that appears mid-sweep sorts after the cursor or before it, and
+	// either way the next pass's sweep of the same keyspace reaches it. Ids
+	// are uuid v7, so id order is very nearly mint order and the walk is close
+	// to sequential; correctness does not depend on that at all.
+	//
+	// Fewer than limit rows means the table holds nothing further past the
+	// cursor — the ordinary end of the sweep, and never an error. A caller
+	// treating a short page as "done" is right: a row that appears after this
+	// read sorts at or after the cursor and the next pass's sweep finds it.
+	//
+	// It is a read, and it deliberately stays one: there is still no
+	// update-balance member on this port and there must never be one.
+	Sweep(ctx context.Context, after accounting.FundingBucketID, limit int) ([]accounting.Bucket, error)
 }
 
 // FundingLedger appends legs and reads a bucket's history. Every write goes
@@ -135,10 +162,96 @@ type Settlements interface {
 	// ByRequestID returns the settlement recorded for the request, or
 	// ErrNotFound.
 	ByRequestID(ctx context.Context, requestID accounting.RequestID) (accounting.Settlement, error)
+
+	// Recent is deliberately absent, and the absence is a decision rather than
+	// an oversight. A draft of the reconciliation pass added a windowed read
+	// over settlements here, and no check ended up calling it: F2 and F3 are
+	// reached through Ledger by settlement id, because a fact is the thing
+	// that names a settlement and the pass already holds the fact. A read half
+	// with no reader is a promise the composition root makes and nothing keeps,
+	// and the index it would have wanted is not in the migration — which is
+	// the shape of a thing nobody asked for. When a check needs to sweep
+	// settlements by time, it comes back with the index and the caller that
+	// wants it.
+	//
+	// Ledger returns the settlement with settlementID beside what its own legs
+	// say about it: the consume-leg sum, the leg count, the per-kind multiset
+	// and the two bucket counts. ErrNotFound when the settlement is not on
+	// file, which is a real answer a caller must be able to distinguish from
+	// "it is on file and carries no legs" — the zero-priced settle is the
+	// second case and is entirely legitimate.
+	//
+	// It sits here and not on FundingProjections because it is the settlement
+	// header's own read of its own history, and the header is this port's
+	// subject: a caller that has a settlement and wants to know what its legs
+	// say about it should not have to reach for the bucket projection to
+	// find out. (The aggregation itself lives in the same store either way;
+	// this is about which question the method is named after.)
+	Ledger(ctx context.Context, settlementID accounting.SettlementID) (SettlementLedger, error)
+}
+
+// SettlementLedger is what one settlement's own legs say about it: the sum of
+// its consume legs, how many legs it carries, and the per-kind multiset.
+//
+// It exists because a settlement's header and its legs are one fact written in
+// one unit of work, and the one question a header alone cannot answer is
+// whether its legs agree with it. It is deliberately a projection of the legs
+// and not a verdict: comparing ConsumeSum against the header's SettledTotal
+// is the caller's comparison, and a mismatch is a divergence to record rather
+// than a number to reconcile — this port moves no money and holds no opinion
+// about which of the two is right.
+//
+// The multiset is here, and not just the sum, because a PARTIAL leg write can
+// still balance. A consume of +50 against a release of -50 sums to the cached
+// zero, so an existence-only anti-join would report "this settlement has an
+// accounting effect" while the settlement in fact carries one consume leg
+// where the derivation said two, or a release leg no tail justified. A sum
+// cannot see that; a count per kind can, and the comparison against the
+// shape the terminal fact implies is what turns it into a finding.
+type SettlementLedger struct {
+	// Settlement is the header the legs are read beside, so a caller never
+	// has to re-read it to compare the two.
+	Settlement accounting.Settlement
+
+	// ConsumeSum is the sum of the settlement's consume leg amounts — the
+	// figure the header's SettledTotal is defined to equal (BuildSettle
+	// computes the total from the legs it wrote).
+	ConsumeSum int64
+
+	// Legs is the total leg count, and LegsByKind the per-kind multiset. A
+	// settlement with no legs is a legitimate shape — the zero-priced settle
+	// books a header of record and nothing else — so the empty multiset is an
+	// answer this port returns rather than a miss.
+	Legs       int64
+	LegsByKind map[string]int64
+
+	// Buckets is the number of distinct funding buckets the settlement's legs
+	// name.
+	//
+	// BucketsWithoutRelease is the number of those that carry a consume and no
+	// release beside it, and it is the OBSERVATION and not the cause: a consume
+	// with no release beside it has two explanations the legs cannot tell
+	// apart — the consume genuinely took the whole hold, or the release leg was
+	// never written — and a port that named it after the first would be
+	// asserting a cause its reader cannot see.
+	//
+	// It is no longer read by any check, and the reason is worth recording
+	// rather than leaving as an unused field. An earlier shape rule compared
+	// consume-count minus release-count against it, on the model that
+	// BuildSettle writes one of each leg per bucket; it does not. The two tests
+	// are independent — a consume iff the spend was positive, a release iff the
+	// tail was — so a bucket the spend never reached carries a release alone,
+	// and the equality fired on most ordinary multi-bucket settlements. The
+	// count is kept because it is one extra column of an aggregate this read
+	// already computes, and because a rule that wants it again should not have
+	// to add a query to find out. A shape rule must not use it to assert a
+	// consume/release pairing, which is the mistake it was last used for.
+	Buckets               int64
+	BucketsWithoutRelease int64
 }
 
 // FundingProjections reads what the ledger alone derives — the input
-// Reconcile compares a bucket's cached projection against.
+// ReconcileBucket compares a bucket's cached projection against.
 type FundingProjections interface {
 	// DerivedBalances recomputes a bucket's settled, held and available
 	// balances and its leg count from its legs alone, in one aggregate
