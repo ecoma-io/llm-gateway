@@ -655,6 +655,18 @@ func run(ctx context.Context, stop context.CancelFunc, services []service, shutd
 // a fleet of reapers duplicates work and loses none of it — which is the
 // point: the backoff is there for a store that is hurting, not to make a
 // reaper safe.
+//
+// The jitter is drawn from math/rand/v2 and NOT crypto/rand, which the
+// security scanner flags at the import and which this use does not need: the
+// draw decides how far this loop's next sleep lands from its neighbours', and
+// a predictable spread is the whole property being asked for — the point is
+// that a fleet does not sweep in lockstep, which is a property of the
+// DISTRIBUTION and not of any one value's unpredictability. Nothing here
+// derives a token, a nonce, an identifier or a key from the draw, and every
+// correctness decision in this loop (the window claim, the batch CAS) is made
+// by the database rather than by this number. crypto/rand here would buy
+// nothing and cost a syscall per sleep. The scan is a true positive about the
+// package and a false positive about this call.
 func runReaperLoop(ctx context.Context, reaper *application.Reaper, interval, cycleBudget time.Duration) {
 	defer reaperWG.Done()
 

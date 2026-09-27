@@ -491,6 +491,18 @@ func (r settlementLedgerReader) SettlementLedger(ctx context.Context, settlement
 // cancellation cannot reach, so nothing is owed on this goroutine's behalf
 // and backing off for it would only change how long the loop sits before
 // ctx.Done() returns it.
+//
+// The jitter is drawn from math/rand/v2 and NOT crypto/rand, which the
+// security scanner flags at the import and which this use does not need: the
+// draw decides how far this loop's next sleep lands from a sibling worker's,
+// and a predictable spread is the property being asked for — the point is
+// that two replicas do not open the same window at the same second, which is a
+// property of the DISTRIBUTION rather than of any one value's
+// unpredictability. Nothing here derives a token, a nonce, an identifier or a
+// key from the draw, and every correctness decision this loop depends on is
+// made by the database's window claim rather than by this number. The scan is
+// a true positive about the package and a false positive about this call. The
+// Data Plane's reaper draws its jitter the same way, for the same reason.
 func runReconciliationLoop(ctx context.Context, reconcile func(context.Context) (application.ReconcileSummary, error), interval, timeout time.Duration) {
 	defer reconciliationWG.Done()
 
