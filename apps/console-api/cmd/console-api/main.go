@@ -24,6 +24,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
+	"math/rand/v2"
 	"net"
 	stdhttp "net/http"
 	"net/url"
@@ -39,6 +41,7 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/adapters/outbound/postgres"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/config"
+	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/accounting"
 	dataplaneport "github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/dataplane"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
@@ -68,6 +71,12 @@ var projectionWG sync.WaitGroup
 // closes after the replay loop has stopped, not under the page it is still
 // applying. One goroutine, one Add, one Wait.
 var ingestionWG sync.WaitGroup
+
+// reconciliationWG is the reconciliation worker's half of it, and it carries
+// one more obligation than its two siblings: the worker's pass closes its run
+// row on a context derived from the cancelled one (ADR 0011), so this wait is
+// what gives that close its grace to land before the pool closes under it.
+var reconciliationWG sync.WaitGroup
 
 // runProjectionLoop reconciles the Data Plane's credential mirror with the
 // Control Plane's projection log until the process is asked to stop: one
@@ -270,6 +279,32 @@ func main() {
 	)
 	ingestion := application.NewFactIngestion(consumer, store, postgres.NewIngestionCursor(store), applier)
 
+	// The reconciliation pass (ADR 0011): the two tables it records into, and
+	// the three reads it derives its verdicts from. The pass is given no
+	// accounting use case — the ledger reader below is a two-method read
+	// interface over the same repositories the accounting primitives use, and
+	// it is the shape of the port, not a promise in a comment, that keeps
+	// Adjust and Settle one call away from a pass that must never make them.
+	//
+	// The bucket reader is the accounting use case itself, because F1 asks the
+	// question its own ReconcileBucket was written to answer. The settlement
+	// reader is the settlements repository, whose Ledger read was added for
+	// F2 and F3 and which the accounting primitives already hold.
+	settlements := postgres.NewSettlements(store)
+	reconciliation := application.NewReconciliation(
+		postgres.NewFundingBuckets(store),
+		postgres.NewAppliedFacts(store),
+		postgres.NewIngestionCursor(store),
+		postgres.NewReconciliationFindings(store),
+		postgres.NewReconciliationRuns(store),
+		settlementLedgerReader{accounting: accounting, settlements: settlements},
+		postgres.NewClock(store),
+		application.ReconciliationSettings{
+			Lookback: cfg.Reconciliation.Lookback,
+			Batch:    cfg.Reconciliation.Batch,
+		},
+	)
+
 	// One startup line naming the target — host, port, database — and
 	// nothing else. The DSN carries the role's password, so the pieces are
 	// read out of it rather than the whole of it printed; url.Parse is the
@@ -341,19 +376,50 @@ func main() {
 	ingestionWG.Add(1)
 	go runIngestionLoop(ctx, ingestion, cfg.DataPlane.IngestionInterval, cfg.DataPlane.IngestionTimeout)
 
+	// The reconciliation worker's loop: one goroutine, the first pass
+	// immediately, and a gap between passes that widens while the store is the
+	// one failing and spreads across replicas while it is not. The cadence and
+	// the bound come from the validated configuration, which refuses a bound
+	// at or below the cadence — that is the shape in which two passes sweep
+	// overlapping windows, and the window claim does not catch it.
+	reconciliationWG.Add(1)
+	go runReconciliationLoop(ctx, reconciliation.Reconcile,
+		cfg.Reconciliation.Interval, cfg.Reconciliation.Timeout)
+
 	log.Printf("console-api %s listening on %s", version, listener.Addr())
 	if err := <-errCh; err != nil {
 		log.Printf("console-api error: %v", err)
 		os.Exit(1)
 	}
 
-	// The pool closes after both loops have stopped, not before: a loop's
-	// last cycle or pass may still be finishing its reads and writes on
-	// pooled connections, and closing earlier would pull the pool out from
-	// under them — the same ordering the drain above observes for in-flight
-	// requests.
+	// The pool closes after every loop has stopped, not before: a loop's last
+	// cycle or pass may still be finishing its reads and writes on pooled
+	// connections, and closing earlier would pull the pool out from under them
+	// — the same ordering the drain above observes for in-flight requests.
+	//
+	// The reconciliation wait is BOUNDED, and the bound is the tail the drain
+	// already grants rather than a new budget. A pass in flight carries the
+	// context this process cancelled, so it returns when the store answers that
+	// cancellation — but "when the store answers" is not a bound, and the pass
+	// has a close of its own to finish on a context the cancellation cannot
+	// reach. An unbounded wait here would let a pass's own timeout, configured
+	// long on purpose, become the process's shutdown latency: a deployment that
+	// sends a signal and gets no exit for minutes reads it as a hung process
+	// and escalates to SIGKILL, which loses the very drain this wait protects.
+	// The dataplane's reaper drain is bounded the same way and for the same
+	// reason, so the two roots read as one rule.
 	projectionWG.Wait()
 	ingestionWG.Wait()
+	reconDone := make(chan struct{})
+	go func() {
+		reconciliationWG.Wait()
+		close(reconDone)
+	}()
+	select {
+	case <-reconDone:
+	case <-time.After(reconDrainTail):
+		log.Printf("console-api reconciliation pass still draining %s after the signal; closing the pool beneath it", reconDrainTail)
+	}
 
 	// The pool is closed here, after run has returned, and not before: the
 	// drain inside run may still be finishing in-flight requests, and those
@@ -371,6 +437,237 @@ func main() {
 
 	log.Printf("console-api %s stopped", version)
 }
+
+// settlementLedgerReader is the two-read face of the control plane's own money
+// tables that the reconciliation pass is given, and it is a struct at the
+// composition root rather than a method on an existing type for a reason that
+// is about reading: F1 and F2/F3 are answered by two different owners, and
+// naming both here is what makes it visible that the pass holds READS of the
+// ledger and not the ledger's write path.
+//
+// The field types are the narrowest each question admits — the accounting use
+// case for the bucket, whose own ReconcileBucket exists to answer it, and the
+// settlements repository for the legs, whose Ledger read exists for F2 and F3.
+// Nothing here widens to a use case without changing this type, and this type
+// is one line of the composition root.
+type settlementLedgerReader struct {
+	accounting  *application.Accounting
+	settlements persistence.Settlements
+}
+
+func (r settlementLedgerReader) ReconcileBucket(ctx context.Context, bucketID accounting.FundingBucketID) (application.ReconcileReport, error) {
+	return r.accounting.ReconcileBucket(ctx, bucketID)
+}
+
+func (r settlementLedgerReader) SettlementLedger(ctx context.Context, settlementID accounting.SettlementID) (persistence.SettlementLedger, error) {
+	return r.settlements.Ledger(ctx, settlementID)
+}
+
+// runReconciliationLoop sweeps one window per interval until the process is
+// asked to stop, widening the gap while the store is failing and spreading it
+// across replicas while it is not.
+//
+// It is the third loop in this process and the only one of the three that
+// backs off, and the reason is what its failures mean. A failed projection
+// cycle or a failed replay pass has already cost nothing: the next tick
+// re-reads the same durable page, so the loop's answer to every failure is
+// the next tick at the same cadence. A failed reconciliation pass has cost
+// nothing either — the window is unadvanced and the next pass re-sweeps it —
+// so the same answer would be defensible. What is not defensible is a plane
+// asking a database for a full pass every minute while that database is
+// unable to answer one, which is the state a tight retry cadence turns a
+// recoverable slowdown into. Hence a plain doubling, with no error
+// classifier: a worker cannot tell "the database is gone" from "one check's
+// read failed", and both are answered by waiting longer.
+//
+// The ceiling is higher here than on the Data Plane's reaper (sixteen against
+// eight) because the work is different in kind. A delayed reclaim widens the
+// window of stranded capacity; a delayed detection costs an operator a few
+// more minutes before they look at a finding that was already recorded, and
+// the finding table is not racing anything.
+//
+// A context cancellation is not a failure: it is the stop signal arriving
+// mid-pass. The pass it interrupts closes its own run row on a context the
+// cancellation cannot reach, so nothing is owed on this goroutine's behalf
+// and backing off for it would only change how long the loop sits before
+// ctx.Done() returns it.
+//
+// The jitter is drawn from math/rand/v2 and NOT crypto/rand, which the
+// security scanner flags at the import and which this use does not need: the
+// draw decides how far this loop's next sleep lands from a sibling worker's,
+// and a predictable spread is the property being asked for — the point is
+// that two replicas do not open the same window at the same second, which is a
+// property of the DISTRIBUTION rather than of any one value's
+// unpredictability. Nothing here derives a token, a nonce, an identifier or a
+// key from the draw, and every correctness decision this loop depends on is
+// made by the database's window claim rather than by this number. The scan is
+// a true positive about the package and a false positive about this call. The
+// Data Plane's reaper draws its jitter the same way, for the same reason.
+func runReconciliationLoop(ctx context.Context, reconcile func(context.Context) (application.ReconcileSummary, error), interval, timeout time.Duration) {
+	defer reconciliationWG.Done()
+
+	// The first gap is the configured interval with its jitter, not the
+	// interval bare: a worker that waited the interval before its first pass
+	// would have a cold start one cadence longer than a jittered one, and this
+	// loop's whole job is converging a window.
+	gap := jittered(interval, reconJitterFraction, rand.Int64N)
+
+	runOnce := func() bool {
+		cycleCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		summary, err := reconcile(cycleCtx)
+		switch {
+		case err == nil:
+		case errors.Is(err, context.Canceled):
+			return false
+		default:
+			// The CAUSE, and not the error. The pass's errors carry the
+			// identity of whatever it was reading — a bucket id, a settlement
+			// id, a request id — and the comment below explains why a log line
+			// in this loop must not. Printing the cause here would undo that
+			// rule on exactly the path it exists to protect: a store failing
+			// persistently, where the line repeats on every backoff cycle and
+			// the identities stream out of stderr at the rate the backoff was
+			// built to quiet. The run row the pass opened before it swept is
+			// the durable record of which window failed, and the findings
+			// table is where the identities belong.
+			log.Printf("console-api reconciliation pass failed (scanned %d, opened %d, unchanged %d): %T",
+				summary.Scanned, summary.FindingsOpened, summary.FindingsUnchanged, err)
+			return true
+		}
+		// Counts, and never an identity: a request id or a settlement id on a
+		// log line is a field one dashboard change away from being a metric
+		// label, and the findings table is where the identities belong. The
+		// failure branch above holds the same rule, which is why it prints the
+		// error's type and not the error.
+		log.Printf("console-api reconciliation pass: scanned %d, opened %d, unchanged %d",
+			summary.Scanned, summary.FindingsOpened, summary.FindingsUnchanged)
+		return false
+	}
+
+	// The first pass runs before the loop waits at all, because a pass that
+	// waited an interval before its first sweep would leave everything written
+	// during that interval unexamined after every restart. Its outcome seeds
+	// the streak: whatever it reports, the gap it sets is the base every
+	// doubling after it multiplies.
+	streak := 0
+	if runOnce() {
+		streak = 1
+	}
+	for {
+		timer := time.NewTimer(gap)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		// Recomputed per cycle, so one bad pass widens only the next one and a
+		// single success drops the cadence straight back to what the
+		// deployment configured.
+		streak, gap = nextBackoff(streak, runOnce(), interval)
+		gap = jittered(gap, reconJitterFraction, rand.Int64N)
+	}
+}
+
+// nextBackoff is the cadence arithmetic, a function rather than a field
+// because the loop's whole state is one integer and the arithmetic is what a
+// reader has to be able to check at a glance.
+//
+// Three properties are load-bearing, and each was a bug before it was a
+// property:
+//
+//   - a success resets to the CONFIGURED interval, so the loop returns to
+//     what the deployment asked for the moment the store recovers
+//   - the shift is CLAMPED, not merely bounded by the ceiling. A streak long
+//     enough to overflow a shift produces a negative duration, and a negative
+//     duration handed to time.NewTimer fires immediately — a worker backing
+//     off into a hot loop against the store it was backing off from
+//   - the ceiling is measured against the configured interval rather than
+//     against the gap the last doubling produced, so it stays a constant
+//     number of passes instead of drifting with this worker's own history
+func nextBackoff(failedStreak int, failedNow bool, interval time.Duration) (int, time.Duration) {
+	if !failedNow {
+		return 0, interval
+	}
+	streak := failedStreak + 1
+	shift := streak - 1
+	if shift > reconBackoffMaxShift {
+		shift = reconBackoffMaxShift
+	}
+	gap := interval * time.Duration(1<<shift)
+	if gap > reconBackoffCeiling*interval {
+		gap = reconBackoffCeiling * interval
+	}
+	return streak, gap
+}
+
+// jittered spreads a gap by a bounded fraction of itself, and only ever
+// LENGTHENS it. A spread that could also shrink a gap would let a fleet
+// re-synchronise on a short gap, which is the one thing the spread exists to
+// prevent — so the range handed to the draw starts at zero.
+//
+// int63n is a parameter rather than a direct call so the arithmetic can be
+// tested against both ends of the range without a loop that sleeps.
+func jittered(gap time.Duration, fraction float64, int63n func(int64) int64) time.Duration {
+	if gap <= 0 || fraction <= 0 {
+		return gap
+	}
+	span := int64(float64(gap) * fraction)
+	if span < 1 {
+		// Too short to spread by a whole nanosecond. Rounding up instead
+		// would turn a one-nanosecond gap into a two-nanosecond one, which is
+		// a hundred percent jitter rather than a jitter.
+		return gap
+	}
+	// Int64N is half-open, so the range is one wider than the span: passing
+	// the span itself would leave the top of the range undrawable.
+	//
+	// The addition SATURATES rather than wrapping. A time.Duration is an int64
+	// and the sum is 1.2x the gap, so a gap anywhere near the type's ceiling
+	// wraps negative — and a negative duration handed to time.NewTimer fires
+	// immediately, which is a hot loop the loop is not built to have. No
+	// interval a deployment can configure reaches the ceiling, which is
+	// exactly why it has to be an explicit guard rather than an assumption.
+	spread := time.Duration(int63n(span + 1))
+	if spread > time.Duration(math.MaxInt64)-gap {
+		return time.Duration(math.MaxInt64)
+	}
+	return gap + spread
+}
+
+const (
+	// reconBackoffMaxShift caps the doubling's exponent at six, which is
+	// already past the ceiling for any interval this process would be
+	// configured with. The clamp exists so an unbounded streak cannot
+	// overflow the shift: a wrapped shift is a NEGATIVE gap, and a negative
+	// gap handed to a timer is a hot loop.
+	reconBackoffMaxShift = 6
+
+	// reconBackoffCeiling is the longest gap a failing worker ever waits, as a
+	// multiple of the configured interval. Sixteen passes is a quarter of an
+	// hour at the shipped cadence — long enough that a plane asking a
+	// struggling database for a full pass every minute is not asking it every
+	// minute any more, and short enough that a recovery is noticed inside an
+	// operator's patience rather than across a shift.
+	reconBackoffCeiling = 16
+
+	// reconJitterFraction is how far a gap may be spread by its jitter, as a
+	// fraction of itself. Twenty percent spreads a fleet of workers wide
+	// enough that they stop colliding without making a one-minute cadence feel
+	// like a one-twenty cadence to the process reading the run rows.
+	reconJitterFraction = 0.2
+
+	// reconDrainTail bounds how long a pass in flight is waited for after the
+	// signal. Ten seconds is the same tail the Data Plane grants its reaper and
+	// the same one this process's own drain is bounded by, because the three
+	// are the same question — how long may a shutdown wait on a background
+	// writer — and one root answering it generously while the other answers it
+	// briefly is a deployment whose behaviour depends on which binary it is
+	// running. A pass that overruns it is not lost: the run row it already
+	// opened is the record of the pass, and the next pass opens a fresh window.
+	reconDrainTail = 10 * time.Second
+)
 
 // newHandler composes the one HTTP surface this process serves: the
 // application over the build stamp, and the store whose answers gate the

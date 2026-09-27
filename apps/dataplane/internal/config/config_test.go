@@ -40,6 +40,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
 				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				Postgres:                 postgresDefaults(),
 			},
 		},
@@ -58,6 +62,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
 				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				Postgres:                 postgresDefaults(),
 			},
 		},
@@ -123,6 +131,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
 				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				Postgres:                 postgresDefaults(),
 			},
 		},
@@ -140,6 +152,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      45 * time.Second,
 				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				Postgres:                 postgresDefaults(),
 			},
 		},
@@ -156,6 +172,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
 				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				Postgres:                 postgresDefaults(),
 			},
 		},
@@ -173,6 +193,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      time.Minute,
 				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				Postgres:                 postgresDefaults(),
 			},
 		},
@@ -272,6 +296,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      time.Second,
 				ExecutionMaxDuration:     time.Second,
 				ExecutionRegistryRefresh: time.Second,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				Postgres:                 postgresDefaults(),
 			},
 		},
@@ -288,6 +316,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
 				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				Postgres:                 postgresDefaults(),
 			},
 		},
@@ -305,6 +337,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
 				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				ManagementAddr:           "127.0.0.1:9091",
 				ManagementToken:          "a-service-credential",
 				Postgres:                 postgresDefaults(),
@@ -323,6 +359,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
 				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				Postgres: Postgres{
 					DSN:             "postgresql://gateway:not-the-fixture-password@db.internal:5433/dataplane?sslmode=require",
 					MaxOpenConns:    DefaultPostgresMaxOpenConns,
@@ -348,6 +388,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
 				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				Postgres: Postgres{
 					DSN:             DefaultPostgresDSN,
 					MaxOpenConns:    10,
@@ -522,6 +566,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
 				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				Egress: Egress{Policies: map[string]EgressPolicy{
 					"trusted": {Routes: []EgressRoute{{Type: "socks5h", Addr: "10.0.0.9:1080"}}},
 				}},
@@ -543,6 +591,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
 				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				Egress: Egress{Policies: map[string]EgressPolicy{
 					"rotated": {Routes: []EgressRoute{
 						{Type: "socks5", Addr: "10.0.0.9:1080"},
@@ -679,6 +731,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
 				ExecutionMaxDuration:     2 * time.Minute,
 				ExecutionRegistryRefresh: 3 * time.Second,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				Postgres:                 postgresDefaults(),
 			},
 		},
@@ -711,6 +767,10 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
 				ExecutionMaxDuration:     9*time.Minute + 59*time.Second,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
 				Postgres:                 postgresDefaults(),
 			},
 		},
@@ -720,6 +780,172 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				"DATAPLANE_EXECUTION_REGISTRY_REFRESH": "0s",
 			},
 			wantErr: "DATAPLANE_EXECUTION_REGISTRY_REFRESH must be greater than zero",
+		},
+		{
+			// The reaper's default is on, and the case that pins it is the
+			// bare-defaults row above: a deployment that says nothing gets a
+			// runtime that reclaims, because a runtime that does not is one
+			// that leaks every hold its process ever died on.
+			name: "reclaims by default",
+			want: Config{
+				Addr:                     DefaultAddr,
+				ShutdownTimeout:          DefaultShutdownTimeout,
+				ReadHeaderTimeout:        DefaultReadHeaderTimeout,
+				ReservationHoldWindow:    DefaultReservationHoldWindow,
+				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
+				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
+				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           DefaultReaperInterval,
+				ReaperTimeout:            DefaultReaperTimeout,
+				ReaperBatchSize:          DefaultReaperBatchSize,
+				Postgres:                 postgresDefaults(),
+			},
+		},
+		{
+			name: "reads the reaper's own settings from the environment",
+			env: map[string]string{
+				"DATAPLANE_REAPER_ENABLED":    "false",
+				"DATAPLANE_REAPER_INTERVAL":   "3s",
+				"DATAPLANE_REAPER_TIMEOUT":    "9s",
+				"DATAPLANE_REAPER_BATCH_SIZE": "200",
+			},
+			want: Config{
+				Addr:                     DefaultAddr,
+				ShutdownTimeout:          DefaultShutdownTimeout,
+				ReadHeaderTimeout:        DefaultReadHeaderTimeout,
+				ReservationHoldWindow:    DefaultReservationHoldWindow,
+				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
+				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
+				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            false,
+				ReaperInterval:           3 * time.Second,
+				ReaperTimeout:            9 * time.Second,
+				ReaperBatchSize:          200,
+				Postgres:                 postgresDefaults(),
+			},
+		},
+		{
+			// A reaper that is off still has its bounds checked, because the
+			// next edit is the one that turns it back on and a process that
+			// only then refuses to start has learned the rule at the worst
+			// possible moment.
+			name: "validates the reaper's bounds even with the reaper off",
+			env: map[string]string{
+				"DATAPLANE_REAPER_ENABLED":    "false",
+				"DATAPLANE_REAPER_BATCH_SIZE": "0",
+			},
+			wantErr: "DATAPLANE_REAPER_BATCH_SIZE (0) must be at least one; a cycle that can close nothing is not a drain",
+		},
+		{
+			// EQUALITY is accepted, and the case says why. An interval at the
+			// budget means every cycle spends the whole budget and the loop
+			// starts the next one the instant it returns: no overlap, because
+			// the two never run at once, and no idle time either, which is a
+			// tight loop rather than a broken one. What is refused is an
+			// interval PAST the budget, below, because there the next cycle is
+			// already due before this one started.
+			name: "accepts a reaper interval equal to its cycle budget",
+			env: map[string]string{
+				"DATAPLANE_REAPER_INTERVAL": "10s",
+				"DATAPLANE_REAPER_TIMEOUT":  "10s",
+			},
+			want: Config{
+				Addr:                     DefaultAddr,
+				ShutdownTimeout:          DefaultShutdownTimeout,
+				ReadHeaderTimeout:        DefaultReadHeaderTimeout,
+				ReservationHoldWindow:    DefaultReservationHoldWindow,
+				ReservationLeaseTTL:      DefaultReservationLeaseTTL,
+				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
+				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           10 * time.Second,
+				ReaperTimeout:            10 * time.Second,
+				ReaperBatchSize:          DefaultReaperBatchSize,
+				Postgres:                 postgresDefaults(),
+			},
+		},
+		{
+			name: "refuses a reaper cycle budget below its interval",
+			env: map[string]string{
+				"DATAPLANE_REAPER_INTERVAL": "20s",
+				"DATAPLANE_REAPER_TIMEOUT":  "10s",
+			},
+			wantErr: "must not exceed DATAPLANE_REAPER_TIMEOUT",
+		},
+		{
+			// A cadence above the lease TTL is NOT an error, and the case
+			// says so: the TTL is a claim's lifetime, not a recovery
+			// schedule, and a slow reaper costs a few more seconds of
+			// already-dead capacity. Refusing it would be a reaper tuned by
+			// something other than what it actually means.
+			//
+			// The TTL is what this case moves, not the cadence. The cadence is
+			// held at the ceiling because a case that could trip the ceiling
+			// instead would prove whichever rule ran first, and the cadence is
+			// not what is under test here. So the TTL drops to two seconds and
+			// the ten-second cadence is slower than it — which is the rule —
+			// while both dials stay inside the shutdown tail the ceiling draws.
+			name: "accepts a reaper cadence slower than the lease ttl",
+			env: map[string]string{
+				"DATAPLANE_REAPER_INTERVAL":       "10s",
+				"DATAPLANE_REAPER_TIMEOUT":        "10s",
+				"DATAPLANE_RESERVATION_LEASE_TTL": "2s",
+			},
+			want: Config{
+				Addr:                     DefaultAddr,
+				ShutdownTimeout:          DefaultShutdownTimeout,
+				ReadHeaderTimeout:        DefaultReadHeaderTimeout,
+				ReservationHoldWindow:    DefaultReservationHoldWindow,
+				ReservationLeaseTTL:      2 * time.Second,
+				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
+				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           10 * time.Second,
+				ReaperTimeout:            10 * time.Second,
+				ReaperBatchSize:          DefaultReaperBatchSize,
+				Postgres:                 postgresDefaults(),
+			},
+		},
+		{
+			// The ceiling is a shutdown budget, not a work budget: a cycle
+			// still running when the signal arrives is waited for on the tail
+			// this process grants its in-flight endings, and a budget past
+			// that tail is a cycle whose overrun only SIGKILL can end.
+			//
+			// The case above is the one the ceiling makes necessary. A ten-
+			// minute cadence inside a ten-second budget is the ordinary shape
+			// — most cycles finish well inside the budget and the cadence
+			// decides how often the loop starts — and reading the two dials
+			// as one number is exactly the confusion the ceiling's message
+			// exists to end.
+			name: "refuses a reaper cycle budget past the shutdown tail",
+			env: map[string]string{
+				"DATAPLANE_REAPER_INTERVAL": "1ms",
+				"DATAPLANE_REAPER_TIMEOUT":  "30m",
+			},
+			wantErr: "DATAPLANE_REAPER_TIMEOUT (30m0s) must be at most 10s",
+		},
+		{
+			name: "refuses a reaper switch that is neither true nor false",
+			env: map[string]string{
+				"DATAPLANE_REAPER_ENABLED": "yes",
+			},
+			wantErr: "DATAPLANE_REAPER_ENABLED must be either true or false, got \"yes\"",
+		},
+		{
+			name: "refuses a non-numeric reaper batch size",
+			env: map[string]string{
+				"DATAPLANE_REAPER_BATCH_SIZE": "many",
+			},
+			wantErr: "DATAPLANE_REAPER_BATCH_SIZE must be an integer",
+		},
+		{
+			name: "refuses a zero reaper interval",
+			env: map[string]string{
+				"DATAPLANE_REAPER_INTERVAL": "0s",
+			},
+			wantErr: "DATAPLANE_REAPER_INTERVAL must be greater than zero",
 		},
 	}
 

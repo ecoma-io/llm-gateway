@@ -42,6 +42,7 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					IngestionInterval:  DefaultIngestionInterval,
 					IngestionTimeout:   DefaultIngestionTimeout,
 				},
+				Reconciliation: defaultReconciliation(),
 			},
 		},
 		{
@@ -70,6 +71,7 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					IngestionInterval:  DefaultIngestionInterval,
 					IngestionTimeout:   DefaultIngestionTimeout,
 				},
+				Reconciliation: defaultReconciliation(),
 			},
 		},
 		{
@@ -100,6 +102,7 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					IngestionInterval:  DefaultIngestionInterval,
 					IngestionTimeout:   DefaultIngestionTimeout,
 				},
+				Reconciliation: defaultReconciliation(),
 			},
 		},
 		{
@@ -131,6 +134,7 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					IngestionInterval:  2 * time.Second,
 					IngestionTimeout:   45 * time.Second,
 				},
+				Reconciliation: defaultReconciliation(),
 			},
 		},
 		{
@@ -202,6 +206,139 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				"CONSOLE_API_INGESTION_TIMEOUT": "soon",
 			}),
 			wantErr: "CONSOLE_API_INGESTION_TIMEOUT must be a Go duration",
+		},
+		{
+			name: "uses supplied reconciliation values",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_RECONCILIATION_INTERVAL": "90s",
+				"CONSOLE_API_RECONCILIATION_TIMEOUT":  "10m",
+				"CONSOLE_API_RECONCILIATION_BATCH":    "250",
+				"CONSOLE_API_RECONCILIATION_LOOKBACK": "48h",
+			}),
+			want: Config{
+				Addr:              DefaultAddr,
+				ShutdownTimeout:   DefaultShutdownTimeout,
+				ReadHeaderTimeout: DefaultReadHeaderTimeout,
+				Postgres: Postgres{
+					DSN:             DefaultPostgresDSN,
+					MaxOpenConns:    DefaultPostgresMaxOpenConns,
+					MaxIdleConns:    DefaultPostgresMaxIdleConns,
+					ConnMaxLifetime: DefaultPostgresConnMaxLifetime,
+					ConnMaxIdleTime: DefaultPostgresConnMaxIdleTime,
+				},
+				DataPlane: DataPlane{
+					URL:                testDataplaneURL,
+					Credential:         testDataplaneCredential,
+					ProjectionInterval: DefaultProjectionInterval,
+					ProjectionTimeout:  DefaultProjectionTimeout,
+					IngestionInterval:  DefaultIngestionInterval,
+					IngestionTimeout:   DefaultIngestionTimeout,
+				},
+				Reconciliation: Reconciliation{
+					Interval: 90 * time.Second,
+					Timeout:  10 * time.Minute,
+					Batch:    250,
+					Lookback: 48 * time.Hour,
+				},
+			},
+		},
+		{
+			name: "rejects a zero reconciliation interval",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_RECONCILIATION_INTERVAL": "0s",
+			}),
+			wantErr: "CONSOLE_API_RECONCILIATION_INTERVAL must be greater than zero",
+		},
+		{
+			name: "rejects a malformed reconciliation timeout",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_RECONCILIATION_TIMEOUT": "soon",
+			}),
+			wantErr: "CONSOLE_API_RECONCILIATION_TIMEOUT must be a Go duration",
+		},
+		{
+			name: "rejects a zero reconciliation batch",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_RECONCILIATION_BATCH": "0",
+			}),
+			wantErr: "CONSOLE_API_RECONCILIATION_BATCH must be greater than zero",
+		},
+		{
+			name: "rejects a zero reconciliation lookback",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_RECONCILIATION_LOOKBACK": "0s",
+			}),
+			wantErr: "CONSOLE_API_RECONCILIATION_LOOKBACK must be greater than zero",
+		},
+		{
+			// EQUALITY is accepted, and the case says why. A pass that spends
+			// its whole budget ends as the next one is due: a tight loop, not
+			// two passes sweeping overlapping windows. The window claim is what
+			// cannot catch the overlapping shape, and the reason it is named
+			// here is that this is the boundary the old rule drew one step too
+			// tight — the shipped defaults sat exactly on it, so a plan of
+			// "timeout equal to interval" read as a refusal rather than as the
+			// tight loop it is.
+			name: "accepts a reconciliation timeout equal to the interval",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_RECONCILIATION_INTERVAL": "30s",
+				"CONSOLE_API_RECONCILIATION_TIMEOUT":  "30s",
+			}),
+			want: Config{
+				Addr:              DefaultAddr,
+				ShutdownTimeout:   DefaultShutdownTimeout,
+				ReadHeaderTimeout: DefaultReadHeaderTimeout,
+				Postgres: Postgres{
+					DSN:             DefaultPostgresDSN,
+					MaxOpenConns:    DefaultPostgresMaxOpenConns,
+					MaxIdleConns:    DefaultPostgresMaxIdleConns,
+					ConnMaxLifetime: DefaultPostgresConnMaxLifetime,
+					ConnMaxIdleTime: DefaultPostgresConnMaxIdleTime,
+				},
+				DataPlane: DataPlane{
+					URL:                testDataplaneURL,
+					Credential:         testDataplaneCredential,
+					ProjectionInterval: DefaultProjectionInterval,
+					ProjectionTimeout:  DefaultProjectionTimeout,
+					IngestionInterval:  DefaultIngestionInterval,
+					IngestionTimeout:   DefaultIngestionTimeout,
+				},
+				Reconciliation: Reconciliation{
+					Interval: 30 * time.Second,
+					Timeout:  30 * time.Second,
+					Batch:    DefaultReconciliationBatch,
+					Lookback: DefaultReconciliationLookback,
+				},
+			},
+		},
+		{
+			name: "rejects a reconciliation timeout below the interval",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_RECONCILIATION_INTERVAL": "1m",
+				"CONSOLE_API_RECONCILIATION_TIMEOUT":  "10s",
+			}),
+			wantErr: "CONSOLE_API_RECONCILIATION_TIMEOUT (10s) must be at least CONSOLE_API_RECONCILIATION_INTERVAL (" + time.Minute.String() + ")",
+		},
+		{
+			// The ceiling is a shutdown budget, not a work budget: a pass
+			// still running when the signal arrives is waited for on the tail
+			// this process grants its in-flight work, and a budget past that
+			// tail is a pass whose overrun only SIGKILL can end.
+			name: "rejects a reconciliation timeout past the shutdown tail",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_RECONCILIATION_INTERVAL": "1m",
+				"CONSOLE_API_RECONCILIATION_TIMEOUT":  "24h",
+			}),
+			wantErr: "CONSOLE_API_RECONCILIATION_TIMEOUT (24h0m0s) must be at most 15m0s",
+		},
+		{
+			name: "rejects a reconciliation lookback narrower than the interval",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_RECONCILIATION_INTERVAL": "10m",
+				"CONSOLE_API_RECONCILIATION_TIMEOUT":  "20m",
+				"CONSOLE_API_RECONCILIATION_LOOKBACK": "5m",
+			}),
+			wantErr: "CONSOLE_API_RECONCILIATION_LOOKBACK (" + (5 * time.Minute).String() + ") must be at least CONSOLE_API_RECONCILIATION_INTERVAL (" + (10 * time.Minute).String() + ")",
 		},
 		{
 			name: "rejects an explicitly empty address",
@@ -467,6 +604,41 @@ func TestPostgresLogValueRedactsADSNItCannotParseWhole(t *testing.T) {
 	}
 	if !strings.Contains(value, "[redacted]") {
 		t.Errorf("LogValue() = %q, want the redaction marker", value)
+	}
+}
+
+func TestTheShippedReconciliationDefaultsSatisfyTheRulesThatRefuseThem(t *testing.T) {
+	// The loader refuses a schedule whose timeout is not longer than its
+	// interval, and a schedule whose lookback is narrower than its interval.
+	// Nothing forces Defaults() through that refusal, so the defaults are
+	// checked against it here: a control plane that shipped defaults its own
+	// validator rejects would fail to start on every deployment that set none
+	// of the four dials — which is every deployment that trusted them.
+	//
+	// This is not a test that was added because the rule is right. It was
+	// added because the rule was added after the defaults were, and the
+	// defaults were exactly the violating shape: a one-minute pass bounded at
+	// one minute, on a plane with no check that noticed.
+	if err := validateReconciliation(defaultReconciliation()); err != nil {
+		t.Fatalf("the shipped reconciliation defaults are rejected by their own rule: %v", err)
+	}
+}
+
+func TestReconciliationLogValueNamesEveryDial(t *testing.T) {
+	// The group is secret-free, and this is the only thing that keeps it from
+	// being the one settings group a log line silently omits: a dial added to
+	// the struct without a line here renders in no log at all.
+	value := Reconciliation{
+		Interval: DefaultReconciliationInterval,
+		Timeout:  DefaultReconciliationTimeout,
+		Batch:    DefaultReconciliationBatch,
+		Lookback: DefaultReconciliationLookback,
+	}.LogValue().String()
+
+	for _, want := range []string{"interval", "timeout", "batch", "lookback"} {
+		if !strings.Contains(value, want) {
+			t.Errorf("LogValue() = %q, want it to name %s", value, want)
+		}
 	}
 }
 
