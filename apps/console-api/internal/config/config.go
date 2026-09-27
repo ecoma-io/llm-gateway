@@ -103,6 +103,48 @@ const (
 	// up to a full page of facts, each of them a handful of ledger writes,
 	// so it is the projection bound's equal and not its half.
 	DefaultIngestionTimeout = 30 * time.Second
+
+	// DefaultReconciliationInterval is how often the reconciliation pass
+	// sweeps its window (ADR 0011). A minute is a reporting cadence rather
+	// than a service one: the pass moves no money, writes findings an
+	// operator acts on by hand, and a divergence it finds late costs an
+	// operator an extra minute of looking at it — not a wrong balance. It is
+	// also the interval the pass's own window advances by, so a deployment
+	// that lengthens it lengthens the time between a derived effect and the
+	// check that the derivation still holds.
+	DefaultReconciliationInterval = time.Minute
+
+	// DefaultReconciliationTimeout bounds one pass: the run row, the sweep,
+	// and every finding it opens inside it.
+	//
+	// Five minutes against a one-minute interval is the relationship that
+	// matters here, and validateReconciliation refuses the opposite: a pass
+	// that outlived its own cadence would be two passes sweeping overlapping
+	// windows at once. Nothing else stops that — the window claim stops two
+	// passes sweeping the SAME window, which is a different and much rarer
+	// collision — so the timeout is configured long rather than short, and
+	// checked rather than trusted. A pass that hits this bound fails the way
+	// any failed pass does, logged and retried by the next tick, instead of
+	// wedging the loop behind one hung read.
+	DefaultReconciliationTimeout = 5 * time.Minute
+
+	// DefaultReconciliationBatch is how many facts one page of the sweep
+	// carries. A hundred is a page the applied-facts table answers from its
+	// own index without a scan, and a pass over a minute of traffic reads
+	// far fewer than that — the batch is a bound against a window that turns
+	// out to be enormous, not a target a normal deployment reaches.
+	DefaultReconciliationBatch = 100
+
+	// DefaultReconciliationLookback is how far back the FIRST pass after a
+	// cold start opens its window. A pass with no high-water mark to resume
+	// from has to choose between starting at the epoch and starting at now,
+	// and starting at now would leave everything before this process existed
+	// unexamined for ever — a pass that reported a clean window it had never
+	// swept. A day is a compromise rather than a principle: it covers a
+	// deployment's recent past, and a deployment whose effects can diverge
+	// over a longer horizon should read the lookback up, because the sweep is
+	// bounded by the batch and a longer lookback costs pages, not time.
+	DefaultReconciliationLookback = 24 * time.Hour
 )
 
 // ownedDatabase is the only database this application may open — the plane
@@ -132,6 +174,15 @@ type Config struct {
 	// for where the other plane is, and a management surface it cannot
 	// authenticate to is a projection that can never deliver.
 	DataPlane DataPlane
+
+	// Reconciliation is the reconciliation pass's own schedule: its cadence,
+	// its bound, its page size, and the width of the window the first pass
+	// after a cold start opens. It is separate from DataPlane rather than
+	// another two fields on it because it is not a projection onto the other
+	// plane at all — it reads this plane's own ledger and writes this plane's
+	// own tables — and the window's lookback is a decision about history
+	// rather than about a remote service.
+	Reconciliation Reconciliation
 }
 
 // DataPlane holds the settings for the Control → Data projection's producer
@@ -186,6 +237,47 @@ func (d DataPlane) LogValue() slog.Value {
 	)
 }
 
+// Reconciliation holds the reconciliation pass's schedule (ADR 0011).
+//
+// It carries no secret, so it has no LogValue of its own — but it does
+// satisfy slog.LogValuer anyway, for one reason: every other group of
+// settings in this package is logged through its LogValue, and a group that
+// silently rendered as a bare struct the moment it was added to a log line
+// would be the one that got missed the first time a dial was added to it.
+type Reconciliation struct {
+	// Interval is how often the pass sweeps. It must be positive.
+	Interval time.Duration
+
+	// Timeout bounds one pass under its own deadline. It must be positive,
+	// and it must be LONGER than Interval: a pass that outlived its own
+	// cadence would be two passes sweeping overlapping windows, and the
+	// window claim — which awards one window to one pass — is not what stops
+	// that.
+	Timeout time.Duration
+
+	// Batch is how many facts one page of the sweep carries. It must be at
+	// least one: a pass that can read nothing is not a pass.
+	Batch int
+
+	// Lookback is how far back the first pass after a cold start opens its
+	// window, since no high-water mark exists to resume from. It must be
+	// positive, and it must be at least the interval — a lookback narrower
+	// than the cadence would open a window the next pass has already passed
+	// by, which is a sweep of rows that were never examined.
+	Lookback time.Duration
+}
+
+// LogValue renders the pass's schedule for logs. See the type's comment for
+// why a secret-free group has one.
+func (r Reconciliation) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.Duration("interval", r.Interval),
+		slog.Duration("timeout", r.Timeout),
+		slog.Int("batch", r.Batch),
+		slog.Duration("lookback", r.Lookback),
+	)
+}
+
 // Postgres holds the connection settings for this application's own plane's
 // database — `control` (ADR 0006 §7). The DSN is a secret-bearing value: it
 // is redacted by LogValue and never appears in an error.
@@ -231,6 +323,21 @@ func Defaults() Config {
 			ConnMaxLifetime: DefaultPostgresConnMaxLifetime,
 			ConnMaxIdleTime: DefaultPostgresConnMaxIdleTime,
 		},
+		Reconciliation: defaultReconciliation(),
+	}
+}
+
+// defaultReconciliation is the pass's schedule when the deployment sets none
+// of it. It is a function for the reason Defaults is one — a caller owns its
+// copy — and it is separate so the rule that ties the timeout to the interval
+// can be stated once, against one value, in the test that checks the shipped
+// defaults against it.
+func defaultReconciliation() Reconciliation {
+	return Reconciliation{
+		Interval: DefaultReconciliationInterval,
+		Timeout:  DefaultReconciliationTimeout,
+		Batch:    DefaultReconciliationBatch,
+		Lookback: DefaultReconciliationLookback,
 	}
 }
 
@@ -277,10 +384,87 @@ func Load(lookup LookupEnv) (Config, error) {
 	}
 	cfg.DataPlane = dataPlane
 
+	reconciliation, err := loadReconciliation(lookup)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Reconciliation = reconciliation
+
 	if err := validateAddr(cfg.Addr); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// loadReconciliation reads the reconciliation pass's four dials.
+//
+// Every one of them is a documented default rather than a required value,
+// and the reason is the asymmetry the ADR draws: a pass that runs at the
+// wrong cadence is still a pass, while a control plane that refused to start
+// because nobody set a reconciliation dial would be a plane running no
+// reconciliation at all — which is exactly the state B13 was written to
+// leave behind.
+func loadReconciliation(lookup LookupEnv) (Reconciliation, error) {
+	cfg := defaultReconciliation()
+
+	if value, ok := lookup("CONSOLE_API_RECONCILIATION_INTERVAL"); ok {
+		duration, err := parsePositiveDuration("CONSOLE_API_RECONCILIATION_INTERVAL", value)
+		if err != nil {
+			return Reconciliation{}, err
+		}
+		cfg.Interval = duration
+	}
+	if value, ok := lookup("CONSOLE_API_RECONCILIATION_TIMEOUT"); ok {
+		duration, err := parsePositiveDuration("CONSOLE_API_RECONCILIATION_TIMEOUT", value)
+		if err != nil {
+			return Reconciliation{}, err
+		}
+		cfg.Timeout = duration
+	}
+	if value, ok := lookup("CONSOLE_API_RECONCILIATION_BATCH"); ok {
+		batch, err := parsePositiveInt("CONSOLE_API_RECONCILIATION_BATCH", value)
+		if err != nil {
+			return Reconciliation{}, err
+		}
+		cfg.Batch = batch
+	}
+	if value, ok := lookup("CONSOLE_API_RECONCILIATION_LOOKBACK"); ok {
+		duration, err := parsePositiveDuration("CONSOLE_API_RECONCILIATION_LOOKBACK", value)
+		if err != nil {
+			return Reconciliation{}, err
+		}
+		cfg.Lookback = duration
+	}
+
+	if err := validateReconciliation(cfg); err != nil {
+		return Reconciliation{}, err
+	}
+	return cfg, nil
+}
+
+// validateReconciliation refuses the two schedule shapes that look like
+// tuning and are actually breakage.
+//
+// The first is a timeout at or below the interval. The pass would then be
+// starting a cycle that its own deadline expires as the next one begins, and
+// the two would sweep overlapping windows forever. The window claim does not
+// catch that: it awards ONE window to ONE pass, and two passes on
+// ADJACENT windows collide nowhere, because each is a correct worker doing
+// the work the other was not going to do.
+//
+// The second is a lookback narrower than the interval. A cold start would
+// then open a window the next pass has already passed by, and the rows in
+// that gap would never be examined by either — a pass reporting a clean
+// window over facts it had not read, which is the one failure a detection
+// pass must not have.
+func validateReconciliation(cfg Reconciliation) error {
+	if cfg.Timeout <= cfg.Interval {
+		return fmt.Errorf("CONSOLE_API_RECONCILIATION_TIMEOUT (%s) must be longer than CONSOLE_API_RECONCILIATION_INTERVAL (%s): the timeout is what stops two passes running at once, and one that expires as the next begins cannot", cfg.Timeout, cfg.Interval)
+	}
+	if cfg.Lookback < cfg.Interval {
+		return fmt.Errorf("CONSOLE_API_RECONCILIATION_LOOKBACK (%s) must be at least CONSOLE_API_RECONCILIATION_INTERVAL (%s): a cold start's window narrower than the cadence would leave a gap of facts that no pass ever examines", cfg.Lookback, cfg.Interval)
+	}
+	return nil
 }
 
 // loadDataPlane reads where the Data Plane's management surface is and how

@@ -208,18 +208,17 @@ type findAnswer struct {
 // mentioning it — a reconciliation pass that reports "the sweep failed" with
 // nothing attached is a bug report nobody can act on.
 var (
-	errReconClock   = errors.New("fake: the database clock could not be read")
-	errReconLatest  = errors.New("fake: the high-water mark could not be read")
-	errReconBegin   = errors.New("fake: the run row could not be opened")
-	errReconFinish  = errors.New("fake: the run row could not be finished")
-	errReconSweep   = errors.New("fake: the bucket sweep could not be read")
-	errReconBucket  = errors.New("fake: a bucket could not be reconciled")
-	errReconRecent  = errors.New("fake: the applied-facts window could not be read")
-	errReconFind    = errors.New("fake: the applied ledger could not be looked up")
-	errReconSettle  = errors.New("fake: a settlement's own legs could not be read")
-	errReconOpen    = errors.New("fake: a finding could not be opened")
-	errReconCounter = errors.New("fake: the open findings could not be counted")
-	errReconCursor  = errors.New("fake: the ingestion position could not be read")
+	errReconClock  = errors.New("fake: the database clock could not be read")
+	errReconLatest = errors.New("fake: the high-water mark could not be read")
+	errReconBegin  = errors.New("fake: the run row could not be opened")
+	errReconFinish = errors.New("fake: the run row could not be finished")
+	errReconSweep  = errors.New("fake: the bucket sweep could not be read")
+	errReconBucket = errors.New("fake: a bucket could not be reconciled")
+	errReconRecent = errors.New("fake: the applied-facts window could not be read")
+	errReconFind   = errors.New("fake: the applied ledger could not be looked up")
+	errReconSettle = errors.New("fake: a settlement's own legs could not be read")
+	errReconOpen   = errors.New("fake: a finding could not be opened")
+	errReconCursor = errors.New("fake: the ingestion position could not be read")
 )
 
 // errReconWritesRefused is the refusal every money-bearing port in this file
@@ -460,23 +459,6 @@ type windowedRead struct {
 // take: the arch rules keep database/sql out of this package, so a fake
 // Querier here would have to name *sql.Rows to satisfy the port and would drag
 // the database into the application package's test build.
-type reconStore struct {
-	persistence.Store
-	world *reconWorld
-}
-
-func (s reconStore) WithinTx(_ context.Context, _ func(ctx context.Context) error) error {
-	s.world.write("store.within-tx")
-	return errReconWritesRefused
-}
-
-func (s reconStore) InUnitOfWork(_ context.Context) bool { return false }
-
-func (s reconStore) Querier(context.Context) persistence.Querier {
-	s.world.write("store.querier")
-	return nil
-}
-
 // reconBuckets is the funding-bucket repository. Sweep is the real keyset
 // walk — strictly-greater-than on the id, ascending, a short page as the end
 // of the table and never an error — because pagination is a claim about the
@@ -546,26 +528,6 @@ func (b reconBuckets) Close(context.Context, accounting.FundingBucketID, int64, 
 // repository, so a check that reached for one would have nothing to hold and
 // the build would fail. That is the stronger version of the guard the
 // refusals used to be — the compiler refuses it rather than a test noticing.
-type reconSettlements struct {
-	persistence.Settlements
-	world *reconWorld
-}
-
-func (s reconSettlements) Create(context.Context, accounting.Settlement) (bool, error) {
-	s.world.write("settlements.create")
-	return false, errReconWritesRefused
-}
-
-func (s reconSettlements) ByRequestID(context.Context, accounting.RequestID) (accounting.Settlement, error) {
-	s.world.write("settlements.by-request")
-	return accounting.Settlement{}, errReconWritesRefused
-}
-
-func (s reconSettlements) Ledger(context.Context, accounting.SettlementID) (persistence.SettlementLedger, error) {
-	s.world.write("settlements.ledger")
-	return persistence.SettlementLedger{}, errReconWritesRefused
-}
-
 // reconApplied is the idempotency ledger, and it is the one repository the
 // pass reads heavily — Find for the disposition conflict, Recent for the
 // windowed families and for the cursor's own existence — and never writes.
@@ -666,21 +628,6 @@ func (a reconApplied) Record(context.Context, persistence.AppliedFact) error {
 // the worker's shape promising it. Kept here, unwired, because a future check
 // that wants it must put the parameter back, and this is where its fake will
 // be when it does.
-type reconQuarantine struct {
-	persistence.QuarantinedFacts
-	world *reconWorld
-}
-
-func (q reconQuarantine) Record(context.Context, persistence.QuarantinedFact) error {
-	q.world.write("quarantine.record")
-	return errReconWritesRefused
-}
-
-func (q reconQuarantine) Recent(context.Context, time.Time, time.Time, int) ([]persistence.QuarantinedFact, error) {
-	q.world.write("quarantine.recent")
-	return nil, errReconWritesRefused
-}
-
 // reconCursor is the ingestion position. Position answers the world's value
 // and nothing else — the pass's own comment is at length about why the one
 // cursor question this plane may not answer is whether the position moved
@@ -1263,15 +1210,6 @@ func settledAmount(v int64) *int64 { return &v }
 
 // captureMethod is the same for the usage claim's provenance.
 func captureMethod(v string) *string { return &v }
-
-// equalWindows is the comparison every window assertion wants: two instants,
-// compared by value, with a message that says which bound is wrong. A
-// difference between two bounds is often the whole question — the doc on
-// windowLabel says as much about the error strings that carry them — so the
-// failure prints both.
-func equalWindows(gotFrom, gotTo, wantFrom, wantTo time.Time) bool {
-	return gotFrom.Equal(wantFrom) && gotTo.Equal(wantTo)
-}
 
 // bucketID mints a bucket id in uuid v7 form: version nibble 7, RFC 4122
 // variant, lowercase hex. The sweep compares ids as strings and a test whose

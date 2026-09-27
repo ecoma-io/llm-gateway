@@ -96,12 +96,14 @@ func TestTheJitterOnlyEverGrowsAGapAndOnlyByItsFraction(t *testing.T) {
 	// re-synchronise) and one that returns the top must add exactly the
 	// fraction.
 	bottom := func(int64) int64 { return 0 }
-	top := func(int64) int64 { return 0 } // replaced below, after the span is known
 
 	if got := jittered(base, reconJitterFraction, bottom); got != base {
 		t.Errorf("gap with the jitter at its bottom = %s, want the bare %s — the spread is an addition and nothing else", got, base)
 	}
-	top = func(n int64) int64 { return n - 1 }
+	// The top is `n-1` rather than `n` because Int64N is half-open: the largest
+	// value it can return is span-1, and a fake that answered `n` would prove a
+	// top the real generator can never draw.
+	top := func(n int64) int64 { return n - 1 }
 	wantTop := base + time.Duration(float64(base)*reconJitterFraction)
 	if got := jittered(base, reconJitterFraction, top); got != wantTop {
 		t.Errorf("gap with the jitter at its top = %s, want %s", got, wantTop)

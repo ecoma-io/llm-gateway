@@ -722,30 +722,105 @@ func (repository *QuotaProjectionRepository) Return(ctx context.Context, legs []
 	return returned, nil
 }
 
-// streamAppend allocates the next append sequence from the stream's single
-// row. The upsert is the whole mechanism: the insert branch mints the epoch
-// (the server's, never a migration's), every later append takes the conflict
-// branch and increments under the row lock — which is held to the
-// transaction's commit, so allocation order IS visibility order. This
-// statement is the LAST write of the settlement unit of work; moving it
-// earlier serialises more of the unit for nothing.
-const streamAppend = `INSERT INTO public.usage_events_stream (singleton, epoch, last_seq)
-VALUES (true, gen_random_uuid(), 1)
-ON CONFLICT (singleton)
-DO UPDATE SET last_seq = public.usage_events_stream.last_seq + 1,
-              updated_at = clock_timestamp()
-RETURNING epoch::text, last_seq`
-
-// factInsert writes the fact itself, with the sequence the stream just
-// allocated. The dedup partial uniques are the final idempotency guard: a
-// second settlement-relevant fact for one request is refused here, on the
-// engine's word, no matter what any caller believed.
-const factInsert = `INSERT INTO public.usage_events
+// factInsert allocates the sequence and writes the fact in ONE statement, and
+// the shape is load-bearing in a way that is not obvious from reading it.
+//
+// The obvious form is the two statements above's worth of work: allocate, then
+// insert. It is wrong, and it was wrong in a way a test had to find rather
+// than a reading. A second settlement-relevant fact for one request is refused
+// by a partial unique index — correctly, that is the idempotency guard — and
+// the refusal ABORTS the transaction. The sequence the first statement
+// allocated is part of that transaction, so the abort takes it with it, and
+// the feed's counter goes back where it was. That sounds right and is the
+// opposite: a sequence gap is invisible to every consumer. The feed is read
+// by a keyset on append_seq, and a gap does not stop it — the consumer
+// cannot distinguish "the next number was refused" from "the fact numbered N
+// exists and I have not read it", so it waits for a row that will never come
+// while the stream's real position sits behind the hole. One refused
+// settlement stalls the feed for good.
+//
+// The fix is to make the guard part of the ALLOCATION rather than something
+// that aborts after it. A data-modifying CTE runs to completion whether or
+// not the outer statement consumes its output, so the obvious repair —
+// wrapping the insert in a CTE and putting `WHERE NOT EXISTS` on the outer
+// insert — is worse than the original: the outer insert filters the row away
+// while the CTE's increment commits regardless, which is the gap with the
+// sequence on the other side of it.
+//
+// So the guard goes INSIDE the allocation, on the `DO UPDATE` arm, where a
+// refused row updates nothing and `RETURNING` yields nothing:
+//
+//	ON CONFLICT (singleton) DO UPDATE
+//	SET last_seq = ... WHERE NOT EXISTS (...)
+//
+// A false predicate on that arm means the arm does not fire, which means the
+// stream row is untouched and the outer insert receives no sequence. The
+// refusal path writes nothing at all — no row, no counter, no gap — and the
+// caller's INSERT yields no row, which is the signal it reads as the twin
+// having won.
+//
+// The guard MIRRORS the two partial uniques rather than stating a rule of its
+// own, and mirroring them means solving the problem they solve: which PRIOR
+// row would collide with the one being written, given the kind of the one
+// being written. That is what the CASE is. A single OR over both kinds is
+// wrong in a way that is easy to write and was written here first:
+//
+//   - read as "this request already has a settlement fact, OR already has an
+//     orphan", it refuses an ORPHAN beside an existing settlement, because
+//     the settlement fact satisfies the first arm. The engine would have
+//     accepted it — the orphan key is separate by design, and B6 books a
+//     zero-priced settle and its orphan classification for the SAME request.
+//   - read as "this request already has a settlement-class fact, OR this
+//     request already has an orphan", it refuses a CORRECTION beside the
+//     fact it corrects, because usage_events_settlement_key excludes rows
+//     with corrects_append_seq set. A correction is a refund as a fact, and
+//     one that can never be written is a refund that can never be booked.
+//
+// So the arms are keyed on $2, the kind being written, and the settlement
+// arm additionally excludes corrections. Anything wider than this is not a
+// safer guard — it is a second dedup policy disagreeing with the first, and
+// the uniques below are still there to catch whatever the mirror misses.
+// Append reports that second arm differently, for the reason its own comment
+// gives.
+//
+// $15 is corrects_append_seq and the cast is load-bearing: the parameter's
+// Go value is an `any` holding nil for every fact that is not a correction,
+// and without the cast PostgreSQL cannot resolve a type for the NULL and
+// infers one for the statement. The cast is the last parameter precisely
+// because a cast settles the type of every parameter the statement shares —
+// an earlier one would type payload and occurred_at as bigint along with it.
+const factInsert = `WITH allocated AS (
+    INSERT INTO public.usage_events_stream (singleton, epoch, last_seq)
+    VALUES (true, gen_random_uuid(), 1)
+    ON CONFLICT (singleton)
+    DO UPDATE SET last_seq = public.usage_events_stream.last_seq + 1,
+                  updated_at = clock_timestamp()
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM public.usage_events
+        WHERE request_id = $1
+          AND (CASE $2
+                   WHEN 'unbillable_orphaned' THEN kind = 'unbillable_orphaned'
+                   WHEN 'settled'             THEN kind IN ('settled', 'released', 'expired')
+                                                    AND $15::bigint IS NULL
+                   WHEN 'released'            THEN kind IN ('settled', 'released', 'expired')
+                                                    AND $15::bigint IS NULL
+                   WHEN 'expired'             THEN kind IN ('settled', 'released', 'expired')
+                                                    AND $15::bigint IS NULL
+                   ELSE FALSE
+               END)
+    )
+    RETURNING last_seq
+)
+INSERT INTO public.usage_events
     (append_seq, request_id, kind, schema_version, capture_method,
      committed_attempt_id, provider_input_tokens, provider_output_tokens,
      delivery_tokens, price_revision_id, input_unit_price, output_unit_price,
-     settled_amount, corrects_append_seq, payload, occurred_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`
+     settled_amount, payload, occurred_at, corrects_append_seq)
+SELECT allocated.last_seq, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+       $12, $13, $14, $15
+FROM allocated
+RETURNING append_seq`
 
 // FactRepository is the PostgreSQL implementation of the fact half of the
 // persistence port.
@@ -759,30 +834,35 @@ func NewFactRepository(store persistence.Store) *FactRepository {
 }
 
 // Append implements persistence.FactRepository: refuse a contextless append,
-// allocate the sequence, write the fact, return the sequence. The refusal is
-// first because it decides whether the two statements after it may run
-// together at all: a sequence allocated outside a unit of work could commit
-// apart from the fact it numbers — a consumer's cursor would then hold a
-// position for a fact that does not exist yet, and no error anywhere would
-// say so.
+// then allocate the sequence and write the fact as ONE statement, returning
+// the sequence it numbered.
+//
+// The refusal is first because it decides whether the statement after it may
+// run at all: a sequence allocated outside a unit of work could commit apart
+// from the fact it numbers — a consumer's cursor would then hold a position
+// for a fact that does not exist yet, and no error anywhere would say so.
+//
+// The zero return is the other half of the contract and the subtle one: a
+// refused append returns (0, ErrDuplicateFact) having written NOTHING — no
+// fact row, and no sequence. That is what factInsert's shape buys, and it is
+// what lets a caller read the sentinel as "the twin already landed" and commit
+// its own unit honestly. See the constant for why no other shape can say it.
 func (repository *FactRepository) Append(ctx context.Context, fact accounting.Fact) (int64, error) {
 	if !repository.store.InUnitOfWork(ctx) {
 		return 0, fmt.Errorf("postgres: append fact: %w", persistence.ErrAppendOutsideUnitOfWork)
 	}
 	querier := repository.store.Querier(ctx)
 
-	var epoch string
-	var appendSeq int64
-	if err := querier.QueryRowContext(ctx, streamAppend).Scan(&epoch, &appendSeq); err != nil {
-		return 0, fmt.Errorf("postgres: allocate append sequence: %w", err)
-	}
-
 	var corrects any
 	if fact.CorrectsAppendSeq != nil {
 		corrects = *fact.CorrectsAppendSeq
 	}
-	if _, err := querier.ExecContext(ctx, factInsert,
-		appendSeq,
+	// The discriminator is the RETURNING, not RowsAffected: ON CONFLICT DO
+	// UPDATE reports one row affected on the update arm as well as the insert
+	// arm, so an affected count cannot tell "wrote a fact" from "refused
+	// before touching the counter". Only a missing row says the guard fired.
+	var appendSeq int64
+	err := querier.QueryRowContext(ctx, factInsert,
 		string(fact.RequestID),
 		string(fact.Kind),
 		fact.SchemaVersion,
@@ -791,16 +871,33 @@ func (repository *FactRepository) Append(ctx context.Context, fact accounting.Fa
 		fact.ProviderInputTokens,
 		fact.ProviderOutputTokens,
 		fact.DeliveryTokens,
-		textOrNil(fact.PriceRevision),
+		textOrNil(string(fact.PriceRevision)),
 		fact.InputUnitPrice,
 		fact.OutputUnitPrice,
 		fact.SettledAmount,
-		corrects,
 		[]byte(fact.Payload),
 		fact.OccurredAt,
-	); err != nil {
+		corrects,
+	).Scan(&appendSeq)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// The guard fired, before the counter moved. Nothing was written and
+		// nothing was spent, and the unit is still open — so the caller's next
+		// statement runs and its commit is a real one.
+		return 0, fmt.Errorf("postgres: append fact: %w", persistence.ErrDuplicateFact)
+	case err != nil:
+		// The unique fired rather than the guard: two facts for one request
+		// raced between the guard's read and this statement, which is the one
+		// case the shape cannot make atomic on its own, because the guard
+		// reads a different table than the one it updates. The abort it
+		// causes rolls the allocation back with it, so the counter is still
+		// whole — but the transaction is now aborted, and a caller that
+		// swallowed this sentinel would be committing a rollback. The sentinel
+		// is therefore NOT returned on this arm: the error travels as itself,
+		// so the caller has to roll back and is told why.
 		if code(err) == "23505" && (constraint(err) == "usage_events_settlement_key" || constraint(err) == "usage_events_orphan_key") {
-			return 0, fmt.Errorf("postgres: append fact: %w", persistence.ErrDuplicateFact)
+			return 0, fmt.Errorf("postgres: append fact: the unique fired rather than the guard, and this unit has already been rolled back: %w", err)
 		}
 		return 0, fmt.Errorf("postgres: append fact: %w", err)
 	}

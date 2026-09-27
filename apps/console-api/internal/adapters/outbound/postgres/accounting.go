@@ -235,6 +235,36 @@ func scanFundingBucket(row *sql.Row) (accounting.Bucket, error) {
 	return b, nil
 }
 
+// scanFundingBucketRow is the same decode over a cursor row rather than a
+// single-row result, for the sweep a reconciliation pass pages over.
+//
+// It is a second scanner and not a generic one over an interface, because
+// *sql.Row's Scan and *sql.Rows' Next are different shapes and the only thing
+// they share is the destination list — and the destination list is the part
+// that has to stay identical to the single-row read's, or a bucket would
+// decode differently depending on which read found it. The one thing worth
+// duplicating is that list; a shared scannable interface over both would be
+// the alternative, and it would put a *sql.Row behind a *sql.Rows' error
+// handling, where a failed advance is reported as a failed decode.
+func scanFundingBucketRow(rows *sql.Rows) (accounting.Bucket, error) {
+	var b accounting.Bucket
+	var id, status string
+	var entitlementID, accountID sql.NullString
+	var settled, held, available int64
+	if err := rows.Scan(&id, &entitlementID, &accountID, &status, &b.Version, &b.LastSequence,
+		&settled, &held, &available, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		return accounting.Bucket{}, err
+	}
+	b.ID = accounting.FundingBucketID(id)
+	b.EntitlementID = accounting.EntitlementID(entitlementID.String)
+	b.AccountID = accounting.AccountID(accountID.String)
+	b.Status = accounting.BucketStatus(status)
+	b.Settled = accounting.Balance(settled)
+	b.Held = accounting.Balance(held)
+	b.Available = accounting.Balance(available)
+	return b, nil
+}
+
 // wrapBucketRead turns a bucket lookup's failure into the port's vocabulary:
 // a miss is ErrNotFound and only a miss; everything else is wrapped.
 func wrapBucketRead(err error, id accounting.FundingBucketID) error {

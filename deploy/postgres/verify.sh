@@ -493,11 +493,11 @@ assert_equals "the ownership namespace exists in the Control Plane's database" \
 assert_equals "the namespace carries the ownership comment, byte for byte" \
 	"$(psql_scalar "$control_db" "SELECT obj_description('$control_db'::regnamespace, 'pg_namespace')")" \
 	"Control Plane ownership namespace (ADR 0006 §7); owned by apps/console-api."
-assert_equals "the namespace holds exactly the identity, commerce, projection, accounting and ingestion schemas' nineteen tables" \
-	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "19"
-assert_equals "the control tables are the identity, commerce, projection, accounting and ingestion foundations' set" \
+assert_equals "the namespace holds exactly the identity, commerce, projection, accounting, ingestion and reconciliation schemas' twenty-one tables" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "21"
+assert_equals "the control tables are the identity, commerce, projection, accounting, ingestion and reconciliation foundations' set" \
 	"$(psql_scalar "$control_db" "SELECT string_agg(tablename, ',' ORDER BY tablename COLLATE \"C\") FROM pg_tables WHERE schemaname = 'control'")" \
-	"account_payg,accounts,api_keys,applied_facts,entitlements,funding_buckets,ingestion_cursor,ledger_entries,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,quarantined_facts,settlements,subscriptions,users"
+	"account_payg,accounts,api_keys,applied_facts,entitlements,funding_buckets,ingestion_cursor,ledger_entries,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,quarantined_facts,reconciliation_findings,reconciliation_runs,settlements,subscriptions,users"
 assert_equals "the projection counter is a seeded singleton with a timeline epoch" \
 	"$(psql_scalar "$control_db" "SELECT count(*) FROM control.projection_revision WHERE id = 1 AND last_revision = (SELECT count(*) FROM control.accounts) AND epoch IS NOT NULL")" \
 	"1"
@@ -1841,6 +1841,163 @@ VALUES
 SELECT (SELECT count(*) FROM control.quarantined_facts WHERE request_id = 'verify probe request quarantine') || '|' ||
        (SELECT corrects_append_seq FROM control.quarantined_facts WHERE request_id = 'verify probe request quarantine');
 ROLLBACK;")" "1|4"
+
+# The reconciliation tables (B13) hold the same kind of rules every other
+# table in this lane holds, and the same reason applies: a constraint that has
+# never refused a row is a comment, not a constraint. These are the guards the
+# pass's correctness rests on — the run row's lifecycle pairing, the window
+# claim, and the two triggers that make a finding durable rather than editable.
+expect_constraint_failure "a run window that is empty is refused" reconciliation_runs_window_order \
+"INSERT INTO control.reconciliation_runs (scope, window_from, window_to)
+VALUES ('verify', now(), now())"
+
+expect_constraint_failure "a reversed run window is refused" reconciliation_runs_window_order \
+"INSERT INTO control.reconciliation_runs (scope, window_from, window_to)
+VALUES ('verify', now(), now() - interval '1 hour')"
+
+# The status probe carries a finish instant, because a status outside the
+# vocabulary is ALSO a status the finish-shape pairing refuses (anything that is
+# not 'running' must have a finish, and 'paused' does not). Giving the status
+# its finish isolates the constraint under test from the one that would fire
+# first — a probe that proves a rule by tripping a different rule proves
+# nothing about the first.
+expect_constraint_failure "a run status outside the lifecycle is refused" reconciliation_runs_status_valid \
+"INSERT INTO control.reconciliation_runs (scope, window_from, window_to, status, finished_at)
+VALUES ('verify', now() - interval '1 hour', now(), 'paused', now())"
+
+expect_constraint_failure "a finished run carrying no finish instant is refused" reconciliation_runs_finish_shape \
+"INSERT INTO control.reconciliation_runs (scope, window_from, window_to, status)
+VALUES ('verify', now() - interval '1 hour', now(), 'completed')"
+
+expect_constraint_failure "a running run carrying a finish instant is refused" reconciliation_runs_finish_shape \
+"INSERT INTO control.reconciliation_runs (scope, window_from, window_to, status, finished_at)
+VALUES ('verify', now() - interval '1 hour', now(), 'running', now())"
+
+expect_constraint_failure "a negative run counter is refused" reconciliation_runs_counters_nonnegative \
+"INSERT INTO control.reconciliation_runs (scope, window_from, window_to, buckets_scanned)
+VALUES ('verify', now() - interval '1 hour', now(), -1)"
+
+expect_constraint_failure "an empty run scope is refused" reconciliation_runs_scope_grammar \
+"INSERT INTO control.reconciliation_runs (scope, window_from, window_to)
+VALUES ('', now() - interval '1 hour', now())"
+
+# The window claim, and the whole of its design in one statement: two passes
+# reading the same high-water mark compute the same window, and the partial
+# unique index over running rows awards it to exactly one. Without it both
+# would sweep and NEITHER would advance the mark — the silent failure ADR 0011
+# names as the one concurrency defect in this design that does not announce
+# itself.
+expect_constraint_failure "a second running pass over the same window is refused" reconciliation_runs_window_claim \
+"WITH first_pass AS (
+  INSERT INTO control.reconciliation_runs (scope, window_from, window_to)
+  VALUES ('verify', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')
+  RETURNING 1
+)
+INSERT INTO control.reconciliation_runs (scope, window_from, window_to)
+SELECT 'verify', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z' FROM first_pass"
+
+# ...and the claim is RELEASED by finishing, which is the predicate's own
+# work: a completed row is outside the partial index, so the next pass over the
+# same window is a legitimate row rather than a collision. This is the positive
+# the claim's negative above is meaningless without.
+assert_equals "finishing a run releases its window claim" \
+	"$(psql_scalar "$control_db" "
+BEGIN;
+INSERT INTO control.reconciliation_runs (scope, window_from, window_to)
+VALUES ('verify', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z');
+UPDATE control.reconciliation_runs
+SET status = 'completed', finished_at = now()
+WHERE scope = 'verify' AND status = 'running';
+INSERT INTO control.reconciliation_runs (scope, window_from, window_to)
+VALUES ('verify', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z');
+SELECT count(*) FROM control.reconciliation_runs WHERE scope = 'verify';
+ROLLBACK;")" "2"
+
+# Every probe below states the columns the table requires but the constraint
+# under test does not speak for. PostgreSQL evaluates NOT NULL before any CHECK
+# and does not order the CHECKs among themselves, so a probe that omits severity
+# is refused by the column before it ever reaches the vocabulary — which would
+# make the proof of a rule a proof of a different rule.
+expect_constraint_failure "a finding severity outside the vocabulary is refused" reconciliation_findings_severity_valid \
+"INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity)
+VALUES ('bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'urgent')"
+
+# ...and the status probe carries the resolution instant, for the same reason on
+# the finding's own pairing rule: a status outside the vocabulary is also a
+# status the resolution-shape rule refuses, and the resolution instant is what
+# keeps that rule satisfied so the vocabulary is what fires.
+expect_constraint_failure "a finding status outside the lifecycle is refused" reconciliation_findings_status_valid \
+"INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, status, resolved_at)
+VALUES ('bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'warning', 'fixed', now())"
+
+expect_constraint_failure "a resolved finding carrying no resolution instant is refused" reconciliation_findings_resolution_shape \
+"INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, status)
+VALUES ('bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'warning', 'resolved')"
+
+expect_constraint_failure "an open finding carrying a resolution instant is refused" reconciliation_findings_resolution_shape \
+"INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, status, resolved_at)
+VALUES ('bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'warning', 'open', now())"
+
+expect_constraint_failure "a finding observed as anything but an object is refused" reconciliation_findings_observed_is_object \
+"INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, observed)
+VALUES ('bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'warning', '[]')"
+
+expect_constraint_failure "a finding detail past the prose bound is refused" reconciliation_findings_detail_grammar \
+"INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, detail)
+VALUES ('bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'warning', repeat('x', 2049))"
+
+expect_constraint_failure "a finding check kind with no name is refused" reconciliation_findings_check_kind_grammar \
+"INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity)
+VALUES ('', 'funding_bucket', 'verify-bucket', 'warning')"
+
+# The dedup key, and the whole of its design in one statement: a re-run over
+# unchanged data converges on the open finding rather than writing another row.
+# A key that admitted a second open row would make the table grow with the
+# number of PASSES rather than the number of PROBLEMS.
+expect_constraint_failure "a second open finding of one identity is refused" reconciliation_findings_open_key \
+"WITH first_finding AS (
+  INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, observed)
+  VALUES ('bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'critical', jsonb_build_object('cached_held', 1))
+  RETURNING 1
+)
+INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, observed)
+SELECT 'bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'critical', jsonb_build_object('cached_held', 1) FROM first_finding"
+
+# ...and a RESOLUTION frees the key, so a genuine recurrence is a new finding
+# rather than a re-opened one carrying the old evidence. This positive is the
+# half of the key's design the negative above cannot show.
+assert_equals "resolving a finding frees its dedup key for a genuine recurrence" \
+	"$(psql_scalar "$control_db" "
+BEGIN;
+INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, observed)
+VALUES ('bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'critical', jsonb_build_object('cached_held', 1));
+UPDATE control.reconciliation_findings
+SET status = 'resolved', resolved_at = now()
+WHERE check_kind = 'bucket_derivation_drift' AND subject_id = 'verify-bucket';
+INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, observed)
+VALUES ('bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'critical', jsonb_build_object('cached_held', 2));
+SELECT count(*) FROM control.reconciliation_findings WHERE subject_id = 'verify-bucket';
+ROLLBACK;")" "2"
+
+# Both guards are row-shaped, so both need a row to bite. The finding is planted
+# and re-identified inside one transaction: a probe that depended on a row some
+# earlier probe had left behind would pass or fail according to the order the
+# suite happens to run in, which is not a property the guard has.
+# The needle here is the refusal's own sentence, not a constraint name: a
+# trigger raises with a SQLSTATE and a message, and grepping for a name the
+# error never prints would make the probe pass for the wrong reason if some
+# other check ever happened to fire. The message is the guard's identity, and it
+# says exactly which columns it froze.
+expect_constraint_failure "an UPDATE of a finding's identity is refused" \
+"control.reconciliation_findings is append-only for its identity" \
+"INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, observed)
+VALUES ('identity_rewrite_probe', 'funding_bucket', 'verify-identity', 'warning', '{}'::jsonb);
+UPDATE control.reconciliation_findings SET subject_id = 'verify-other-bucket'
+WHERE check_kind = 'identity_rewrite_probe'"
+
+expect_constraint_failure "a DELETE from the findings table is refused" \
+"control.reconciliation_findings rows are never removed" \
+"DELETE FROM control.reconciliation_findings"
 
 step "9/12 PostgreSQL transaction semantics hold"
 # Two probes, because the migration safety model rests on both: DDL rolled

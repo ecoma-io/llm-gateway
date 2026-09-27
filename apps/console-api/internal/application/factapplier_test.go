@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/accounting"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/ingestion"
@@ -97,6 +98,17 @@ func (f *fakeAppliedLedger) Record(_ context.Context, applied persistence.Applie
 	}
 	f.rows[key] = &applied
 	return nil
+}
+
+// Recent is the reconciliation pass's sweep over this same ledger, and the
+// applier's tests never make it: the fake implements it only to keep the port
+// satisfied, and it refuses rather than inventing a page, because a fake that
+// answered a windowed read it was never asked about would be a second thing to
+// trust. The pass's own tests exercise the semantics — the half-open window,
+// the ordering and the (applied_at, request_id) keyset — against the
+// postgres adapter, which is where the SQL that implements them lives.
+func (f *fakeAppliedLedger) Recent(_ context.Context, _, _, _ time.Time, _ string, _ int) ([]persistence.AppliedFact, error) {
+	return nil, errors.New("fakeAppliedLedger: Recent is not exercised by the applier's tests")
 }
 
 // fakeQuarantine records what it is given.

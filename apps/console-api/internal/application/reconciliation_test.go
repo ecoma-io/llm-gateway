@@ -1927,7 +1927,7 @@ func TestTheFamiliesRunInOrderOfCostAndTheCursorCheckLast(t *testing.T) {
 	if sweepAt < 0 || windowAt < 0 || cursorAt < 0 {
 		t.Fatalf("the log does not name all three families; it was %v", w.order)
 	}
-	if !(sweepAt < windowAt && windowAt < cursorAt) {
+	if sweepAt >= windowAt || windowAt >= cursorAt {
 		t.Errorf("the families ran at buckets %d, window %d, cursor %d; F1 is windowless and the cursor's value decays, so the order is buckets, window, cursor",
 			sweepAt, windowAt, cursorAt)
 	}

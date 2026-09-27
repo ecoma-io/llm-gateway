@@ -48,6 +48,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	stdhttp "net/http"
 	"net/url"
@@ -55,6 +56,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -114,13 +116,21 @@ const (
 	// whose sockets the force-close severed. The endings — the release that
 	// returns a hold nobody answered, the settlement of the usage that
 	// arrived — run detached from the caller's context on their own budget,
-	// and they are the work a shutdown must not take with it: the reaper
-	// that would otherwise reclaim their holds is not wired yet (debt #80),
-	// so an ending that dies with the process strands its hold until the
-	// hold window expires. Ten seconds is several endings' worth under
-	// ordinary latency and a rounding error against an operator's patience.
+	// and they are the work a shutdown must not take with it: the reaper's
+	// loop is what reclaims a hold whose ending could not write one, so an
+	// ending that dies with the process strands its hold until either that
+	// loop or the hold window returns it. Ten seconds is several endings'
+	// worth under ordinary latency and a rounding error against an operator's
+	// patience.
 	drainTailGrace = 10 * time.Second
 )
+
+// reaperWG waits for the reaper's loop to finish its cycle in flight before
+// run() closes the pool it drains through. It is a package var rather than a
+// local because run() is where the pool is closed and the loop is started
+// inside bind, and a cycle still writing at that moment is a write against a
+// closed pool rather than a reclaim that finished.
+var reaperWG sync.WaitGroup
 
 // service is one listener this process serves, together with the name that
 // makes a failure or a startup line say which one it was.
@@ -386,6 +396,36 @@ func bind(ctx context.Context, cfg config.Config, pool *sql.DB) ([]service, erro
 		closeLog.Info("usage close", attrs...)
 	}
 
+	// The reaper (ADR 0011) over the same six ports admission already holds
+	// and the same store, because a reclaim is a second door into an ending
+	// and not a different kind of write: the hold closes, the capacity comes
+	// back, the request and its replay record finalise and the fact lands
+	// last, in that order, because that is the order the routing stage's own
+	// release writes them in. Two doors, one unit of work each.
+	//
+	// Its batch and its budget are the validated configuration's, which is
+	// what makes a misconfigured reaper a boot failure rather than a
+	// reaper that drains a whole table in one transaction.
+	reaper := application.NewReaper(
+		catalogStore,
+		postgres.NewReservationRepository(catalogStore),
+		postgres.NewQuotaProjectionRepository(catalogStore),
+		postgres.NewRequestRepository(catalogStore),
+		postgres.NewIntakeRepository(catalogStore),
+		postgres.NewFactRepository(catalogStore),
+		application.ReaperConfig{
+			BatchSize:   cfg.ReaperBatchSize,
+			CycleBudget: cfg.ReaperTimeout,
+		},
+	)
+	// The reclaim's structured record, on the runtime's standard log beside
+	// the close's — same redaction law and for the same reason: a reclaim
+	// carries a request id, an outcome and two instants, and nothing that a
+	// prompt or a credential could travel on.
+	reaper.ObserveReap = func(o application.ReapObservation) {
+		closeLog.Info("reaped hold", "request_id", o.RequestID, "usage_event_id", o.UsageEventID, "final_status", o.FinalStatus, "outcome", o.Outcome, "reclaimed_legs", o.ReclaimedLegs, "sweep_duration_ms", o.SweepDuration.Milliseconds())
+	}
+
 	runtimeListener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return nil, err
@@ -405,6 +445,23 @@ func bind(ctx context.Context, cfg config.Config, pool *sql.DB) ([]service, erro
 	// listener it serves — a bind that still fails past this point fails the
 	// process, and the goroutine dies with it.
 	go refreshExecutors(ctx, backendRepo, registry, cfg, snapshotSignature(rows))
+
+	// The reaper's loop starts beside the refresher, on the same signal
+	// context, and for the same reason: a drain that outlived the process's
+	// stop signal would be a goroutine writing endings after the pool it
+	// writes through has been closed. It is started here and not in main
+	// because bind is where the store it drains through is built, and
+	// building a second store over the same pool would be two claims on one
+	// pool's lifecycle.
+	//
+	// The wait group is this package's rather than a local one because the
+	// drain has to outlive run(): run closes the pool when the listeners are
+	// down, and a reaper cycle still in flight would then be a write against
+	// a closed pool rather than a reclaim that finished.
+	if cfg.ReaperEnabled {
+		reaperWG.Add(1)
+		go runReaperLoop(ctx, reaper, cfg.ReaperInterval)
+	}
 
 	if cfg.ManagementAddr == "" {
 		return services, nil
@@ -551,11 +608,197 @@ func run(ctx context.Context, stop context.CancelFunc, services []service, shutd
 		}
 	}
 
+	// The reaper's cycle in flight is waited for before the pool closes, and
+	// on a bounded budget rather than unconditionally: the context this loop
+	// carries was cancelled by the same signal that brought us here, so a
+	// cycle waiting on that context returns as soon as the store answers the
+	// cancellation. The bound is the drain tail this function already grants
+	// the in-flight endings, because a reaper that overruns that has not
+	// overrun anything a shutdown has to protect.
+	//
+	// This wait is what makes the reaper safe to start from bind rather than
+	// from main: main does not outlive run(), and run() is the only thing
+	// that closes the pool the reaper writes through.
+	reaperDone := make(chan struct{})
+	go func() {
+		reaperWG.Wait()
+		close(reaperDone)
+	}()
+	select {
+	case <-reaperDone:
+	case <-time.After(drainTail):
+		log.Printf("dataplane reaper still draining %s after the signal; closing the pool beneath it", drainTail)
+	}
+
 	if closeErr := pool.Close(); closeErr != nil {
 		serveErr = errors.Join(serveErr, closeErr)
 	}
 	return serveErr
 }
+
+// runReaperLoop drains the reaper once per interval until the context ends,
+// and backs off and spreads the gap while the store is the one failing.
+//
+// Two mechanisms, kept apart because they answer for different things. The
+// backoff answers for the DATABASE: a store answering every cycle slowly or
+// not at all is being asked for more than it can give, so the loop asks less
+// often. The jitter answers for the REPLICAS: N processes configured with one
+// interval are N processes that wake at the same instant, and spreading them
+// is what keeps a plane scaled by replicas from hammering one database in
+// unison at the moment that database is struggling.
+//
+// Neither is needed for correctness — the sweep is FOR UPDATE SKIP LOCKED, so
+// a fleet of reapers duplicates work and loses none of it — which is the
+// point: the backoff is there for a store that is hurting, not to make a
+// reaper safe.
+func runReaperLoop(ctx context.Context, reaper *application.Reaper, interval time.Duration) {
+	defer reaperWG.Done()
+
+	// The first gap is the configured interval with its jitter, not the
+	// interval bare, so N reapers started by the same deployment do not sweep
+	// in lockstep from the first cycle onward.
+	gap := jittered(interval, reaperJitterFraction, rand.Int64N)
+
+	// A cycle that failed widens the NEXT gap and nothing else, and a cycle
+	// that succeeded resets the streak to zero — so one bad cycle costs one
+	// interval and a single good one drops the cadence straight back to what
+	// the deployment configured. A cancellation is not a failure: it is the
+	// stop signal arriving, so the loop is ending and backing off for it would
+	// only change how long this goroutine sits before ctx.Done() returns it.
+	runOnce := func() bool {
+		cycleCtx, cancel := context.WithTimeout(ctx, reaperCycleDeadline)
+		defer cancel()
+		report, err := reaper.Reap(cycleCtx)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("dataplane reaper cycle failed: %v", err)
+			}
+			return !errors.Is(err, context.Canceled)
+		}
+		// A cycle that reclaimed something says so once, on one line, and
+		// stays silent when the sweep found nothing: an idle cycle is the
+		// common case, and a line every five seconds saying so would bury the
+		// cycles that are not idle.
+		if report.Recovered > 0 || report.Skipped > 0 {
+			log.Printf("dataplane reaper cycle: %d scanned, %d recovered, %d skipped", report.Scanned, report.Recovered, report.Skipped)
+		}
+		return false
+	}
+
+	// The first cycle runs before the loop waits at all, because a reaper
+	// that waits an interval before its first sweep leaves a hold stranded
+	// for that whole interval after every restart. Its outcome seeds the
+	// streak: whatever it reports, the gap it sets is the base every doubling
+	// after it multiplies.
+	streak := 0
+	if runOnce() {
+		streak = 1
+	}
+	for {
+		timer := time.NewTimer(gap)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		streak, gap = nextBackoff(streak, runOnce(), interval)
+		gap = jittered(gap, reaperJitterFraction, rand.Int64N)
+	}
+}
+
+// nextBackoff is the cadence arithmetic, and it is a function rather than a
+// field because the loop's whole state is one integer and the arithmetic is
+// what a reader has to be able to check at a glance.
+//
+// Three properties are load-bearing, and each was a bug before it was a
+// property:
+//
+//   - a success resets to the CONFIGURED interval, so the loop returns to
+//     what the deployment asked for the moment the store recovers
+//   - the shift is CLAMPED, not merely bounded by the ceiling. A streak long
+//     enough to overflow a shift produces a negative duration, and a negative
+//     duration handed to time.NewTimer fires immediately — a reaper backing
+//     off into a hot loop against the store it was backing off from
+//   - the ceiling is measured against the configured interval rather than
+//     against the gap the last doubling produced, so it stays a constant
+//     number of passes instead of drifting with the worker's own history
+func nextBackoff(failedStreak int, failedNow bool, interval time.Duration) (int, time.Duration) {
+	if !failedNow {
+		return 0, interval
+	}
+	streak := failedStreak + 1
+	shift := streak - 1
+	if shift > reaperBackoffMaxShift {
+		shift = reaperBackoffMaxShift
+	}
+	gap := interval * time.Duration(1<<shift)
+	if gap > reaperBackoffCeiling*interval {
+		gap = reaperBackoffCeiling * interval
+	}
+	return streak, gap
+}
+
+// jittered spreads a gap by a bounded fraction of itself, and only ever
+// LENGTHENS it. A spread that could also shrink a gap would let a fleet
+// re-synchronise on a short gap, which is the one thing the spread exists to
+// prevent — so the range handed to the draw starts at zero.
+//
+// int63n is a parameter rather than a direct call so the arithmetic can be
+// tested against both ends of the range without a loop that sleeps.
+func jittered(gap time.Duration, fraction float64, int63n func(int64) int64) time.Duration {
+	if gap <= 0 || fraction <= 0 {
+		return gap
+	}
+	span := int64(float64(gap) * fraction)
+	if span < 1 {
+		// Too short to spread by a whole nanosecond. Rounding up instead
+		// would turn a one-nanosecond gap into a two-nanosecond one, which is
+		// a hundred percent jitter rather than a jitter.
+		return gap
+	}
+	// Int64N is half-open, so the range is one wider than the span: passing
+	// the span itself would leave the top of the range undrawable.
+	return gap + time.Duration(int63n(span+1))
+}
+
+const (
+	// reaperBackoffMaxShift caps the doubling's exponent at six, which is
+	// already past the ceiling for any interval this process would be
+	// configured with — the ceiling, not the shift, is what an operator reads
+	// off a stalled reaper. The clamp exists so an unbounded streak cannot
+	// overflow the shift, and it is stated separately from the ceiling
+	// because it answers a different question: the ceiling answers "how long
+	// is the wait", the clamp answers "does the arithmetic still fit".
+	reaperBackoffMaxShift = 6
+
+	// reaperBackoffCeiling is the longest gap a failing reaper ever waits,
+	// as a multiple of the configured interval. It is lower than the control
+	// plane worker's (eight against sixteen) for a reason about the work
+	// itself: a delayed reconciliation pass delays a detection, while a
+	// delayed reaper widens the very window of stranded capacity the reaper
+	// exists to close.
+	reaperBackoffCeiling = 8
+
+	// reaperJitterFraction is how far a gap may be spread by its jitter, as a
+	// fraction of itself. Twenty percent spreads a fleet of reapers wide
+	// enough that they stop colliding without making a five-second cadence
+	// feel like a six-second one to the process reading the metric.
+	reaperJitterFraction = 0.2
+)
+
+// reaperCycleDeadline bounds one cycle of the loop above.
+//
+// It is the SAME value the reaper's own cycle budget is configured with
+// (DATAPLANE_REAPER_TIMEOUT), stated here rather than read from the
+// configuration, and that duplication is deliberate and slightly ugly: the
+// loop's deadline is what bounds a cycle whose store has stopped answering,
+// while the reaper's budget bounds a cycle whose store is answering slowly.
+// Nothing enforces the relationship between the two, and a deployment that
+// raised the timeout past this would find the deadline firing first — which
+// costs a cycle its remaining batch and nothing else, because the next cycle
+// starts where the last one stopped.
+const reaperCycleDeadline = 10 * time.Second
 
 // shutdown drains every listener and reports what went wrong, if anything
 // did, and whether the drain overran its deadline.
