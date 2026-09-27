@@ -806,8 +806,8 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			name: "reads the reaper's own settings from the environment",
 			env: map[string]string{
 				"DATAPLANE_REAPER_ENABLED":    "false",
-				"DATAPLANE_REAPER_INTERVAL":   "15s",
-				"DATAPLANE_REAPER_TIMEOUT":    "45s",
+				"DATAPLANE_REAPER_INTERVAL":   "3s",
+				"DATAPLANE_REAPER_TIMEOUT":    "9s",
 				"DATAPLANE_REAPER_BATCH_SIZE": "200",
 			},
 			want: Config{
@@ -819,8 +819,8 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
 				ReaperEnabled:            false,
-				ReaperInterval:           15 * time.Second,
-				ReaperTimeout:            45 * time.Second,
+				ReaperInterval:           3 * time.Second,
+				ReaperTimeout:            9 * time.Second,
 				ReaperBatchSize:          200,
 				Postgres:                 postgresDefaults(),
 			},
@@ -838,31 +838,17 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			wantErr: "DATAPLANE_REAPER_BATCH_SIZE (0) must be at least one; a cycle that can close nothing is not a drain",
 		},
 		{
-			name: "refuses a reaper interval at its own cycle budget",
+			// EQUALITY is accepted, and the case says why. An interval at the
+			// budget means every cycle spends the whole budget and the loop
+			// starts the next one the instant it returns: no overlap, because
+			// the two never run at once, and no idle time either, which is a
+			// tight loop rather than a broken one. What is refused is an
+			// interval PAST the budget, below, because there the next cycle is
+			// already due before this one started.
+			name: "accepts a reaper interval equal to its cycle budget",
 			env: map[string]string{
 				"DATAPLANE_REAPER_INTERVAL": "10s",
 				"DATAPLANE_REAPER_TIMEOUT":  "10s",
-			},
-			wantErr: "DATAPLANE_REAPER_INTERVAL (10s) must be shorter than DATAPLANE_REAPER_TIMEOUT (10s); a cycle that outlives its own cadence would be two cycles running at once",
-		},
-		{
-			name: "refuses a reaper cycle budget below its interval",
-			env: map[string]string{
-				"DATAPLANE_REAPER_INTERVAL": "20s",
-				"DATAPLANE_REAPER_TIMEOUT":  "10s",
-			},
-			wantErr: "must be shorter than DATAPLANE_REAPER_TIMEOUT",
-		},
-		{
-			// A cadence above the lease TTL is NOT an error, and the case
-			// says so: the TTL is a claim's lifetime, not a recovery
-			// schedule, and a slow reaper costs a few more seconds of
-			// already-dead capacity. Refusing it would be a reaper tuned by
-			// something other than what it actually means.
-			name: "accepts a reaper cadence slower than the lease ttl",
-			env: map[string]string{
-				"DATAPLANE_REAPER_INTERVAL": "10m",
-				"DATAPLANE_REAPER_TIMEOUT":  "20m",
 			},
 			want: Config{
 				Addr:                     DefaultAddr,
@@ -873,11 +859,72 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
 				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
 				ReaperEnabled:            true,
-				ReaperInterval:           10 * time.Minute,
-				ReaperTimeout:            20 * time.Minute,
+				ReaperInterval:           10 * time.Second,
+				ReaperTimeout:            10 * time.Second,
 				ReaperBatchSize:          DefaultReaperBatchSize,
 				Postgres:                 postgresDefaults(),
 			},
+		},
+		{
+			name: "refuses a reaper cycle budget below its interval",
+			env: map[string]string{
+				"DATAPLANE_REAPER_INTERVAL": "20s",
+				"DATAPLANE_REAPER_TIMEOUT":  "10s",
+			},
+			wantErr: "must not exceed DATAPLANE_REAPER_TIMEOUT",
+		},
+		{
+			// A cadence above the lease TTL is NOT an error, and the case
+			// says so: the TTL is a claim's lifetime, not a recovery
+			// schedule, and a slow reaper costs a few more seconds of
+			// already-dead capacity. Refusing it would be a reaper tuned by
+			// something other than what it actually means.
+			//
+			// The TTL is what this case moves, not the cadence. The cadence is
+			// held at the ceiling because a case that could trip the ceiling
+			// instead would prove whichever rule ran first, and the cadence is
+			// not what is under test here. So the TTL drops to two seconds and
+			// the ten-second cadence is slower than it — which is the rule —
+			// while both dials stay inside the shutdown tail the ceiling draws.
+			name: "accepts a reaper cadence slower than the lease ttl",
+			env: map[string]string{
+				"DATAPLANE_REAPER_INTERVAL":       "10s",
+				"DATAPLANE_REAPER_TIMEOUT":        "10s",
+				"DATAPLANE_RESERVATION_LEASE_TTL": "2s",
+			},
+			want: Config{
+				Addr:                     DefaultAddr,
+				ShutdownTimeout:          DefaultShutdownTimeout,
+				ReadHeaderTimeout:        DefaultReadHeaderTimeout,
+				ReservationHoldWindow:    DefaultReservationHoldWindow,
+				ReservationLeaseTTL:      2 * time.Second,
+				ExecutionMaxDuration:     DefaultExecutionMaxDuration,
+				ExecutionRegistryRefresh: DefaultExecutionRegistryRefresh,
+				ReaperEnabled:            true,
+				ReaperInterval:           10 * time.Second,
+				ReaperTimeout:            10 * time.Second,
+				ReaperBatchSize:          DefaultReaperBatchSize,
+				Postgres:                 postgresDefaults(),
+			},
+		},
+		{
+			// The ceiling is a shutdown budget, not a work budget: a cycle
+			// still running when the signal arrives is waited for on the tail
+			// this process grants its in-flight endings, and a budget past
+			// that tail is a cycle whose overrun only SIGKILL can end.
+			//
+			// The case above is the one the ceiling makes necessary. A ten-
+			// minute cadence inside a ten-second budget is the ordinary shape
+			// — most cycles finish well inside the budget and the cadence
+			// decides how often the loop starts — and reading the two dials
+			// as one number is exactly the confusion the ceiling's message
+			// exists to end.
+			name: "refuses a reaper cycle budget past the shutdown tail",
+			env: map[string]string{
+				"DATAPLANE_REAPER_INTERVAL": "1ms",
+				"DATAPLANE_REAPER_TIMEOUT":  "30m",
+			},
+			wantErr: "DATAPLANE_REAPER_TIMEOUT (30m0s) must be at most 10s",
 		},
 		{
 			name: "refuses a reaper switch that is neither true nor false",

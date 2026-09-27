@@ -759,6 +759,29 @@ func (repository *QuotaProjectionRepository) Return(ctx context.Context, legs []
 // caller's INSERT yields no row, which is the signal it reads as the twin
 // having won.
 //
+// What the guard is FOR is the fast, gap-free refusal, and what actually
+// ARBITRATES a concurrent twin is the partial unique index underneath it.
+// Those are different jobs and it is worth saying which is which, because the
+// two are easy to confuse and confusing them invites a repair that fixes
+// nothing. The guard's NOT EXISTS reads the snapshot its statement started
+// with, which is taken BEFORE the `ON CONFLICT` blocks on the singleton row —
+// so a twin that is still in flight is invisible to it, and the guard's own
+// predicate is not what decides the race. Measured on PostgreSQL 17, with the
+// singleton held open by a first writer and a second writer one second behind:
+// the second was refused by the index in every same-class case, and with that
+// index dropped the two identical facts both landed. The guard is the path
+// that turns the refusal into "no row, no counter, no gap"; the index is the
+// authority. Nothing below is trying to improve on that, and a per-request
+// advisory lock taken in an EARLIER statement does not change it — the guard's
+// snapshot is taken per statement, so the lock has to be inside the same one,
+// and the index is already both cheaper and the actual arbiter.
+//
+// The consequence worth stating plainly: the guard cannot refuse a CROSS-class
+// pair, and it is not supposed to. A settlement and an orphan for one request
+// are a legitimate combination B6 books deliberately, so the CASE below refuses
+// only what the indices refuse — a prior fact of the SAME class — and lets the
+// cross-class pair through by design.
+//
 // The guard MIRRORS the two partial uniques rather than stating a rule of its
 // own, and mirroring them means solving the problem they solve: which PRIOR
 // row would collide with the one being written, given the kind of the one

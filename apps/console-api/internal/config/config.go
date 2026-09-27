@@ -128,6 +128,13 @@ const (
 	// wedging the loop behind one hung read.
 	DefaultReconciliationTimeout = 5 * time.Minute
 
+	// MaxReconciliationTimeout is the longest pass the configuration accepts,
+	// and it is the bound the composition root's drain tail is drawn from. The
+	// shipped default sits well inside it and so does the drain tail, so the
+	// ceiling only refuses a value an operator set past the point where the
+	// process could still shut down on its own terms.
+	MaxReconciliationTimeout = 15 * time.Minute
+
 	// DefaultReconciliationBatch is how many facts one page of the sweep
 	// carries. A hundred is a page the applied-facts table answers from its
 	// own index without a scan, and a pass over a minute of traffic reads
@@ -442,15 +449,18 @@ func loadReconciliation(lookup LookupEnv) (Reconciliation, error) {
 	return cfg, nil
 }
 
-// validateReconciliation refuses the two schedule shapes that look like
+// validateReconciliation refuses the three schedule shapes that look like
 // tuning and are actually breakage.
 //
-// The first is a timeout at or below the interval. The pass would then be
-// starting a cycle that its own deadline expires as the next one begins, and
-// the two would sweep overlapping windows forever. The window claim does not
-// catch that: it awards ONE window to ONE pass, and two passes on
-// ADJACENT windows collide nowhere, because each is a correct worker doing
-// the work the other was not going to do.
+// The first is a timeout below the interval. The pass would then be starting a
+// cycle its own deadline expires before, and the two would sweep overlapping
+// windows for ever. The window claim does not catch that: it awards ONE window
+// to ONE pass, and two passes on ADJACENT windows collide nowhere, because
+// each is a correct worker doing the work the other was not going to do.
+// EQUALITY is not that shape and is accepted: a pass that spends its whole
+// budget ends as the next one is due, which is a tight loop rather than an
+// overlapping one — and the Data Plane's reaper pairs its two dials the same
+// way round, so the two roots read as one rule rather than as two.
 //
 // The second is a lookback narrower than the interval. A cold start would
 // then open a window the next pass has already passed by, and the rows in
@@ -458,11 +468,24 @@ func loadReconciliation(lookup LookupEnv) (Reconciliation, error) {
 // window over facts it had not read, which is the one failure a detection
 // pass must not have.
 func validateReconciliation(cfg Reconciliation) error {
-	if cfg.Timeout <= cfg.Interval {
-		return fmt.Errorf("CONSOLE_API_RECONCILIATION_TIMEOUT (%s) must be longer than CONSOLE_API_RECONCILIATION_INTERVAL (%s): the timeout is what stops two passes running at once, and one that expires as the next begins cannot", cfg.Timeout, cfg.Interval)
+	if cfg.Timeout < cfg.Interval {
+		return fmt.Errorf("CONSOLE_API_RECONCILIATION_TIMEOUT (%s) must be at least CONSOLE_API_RECONCILIATION_INTERVAL (%s): the timeout is what stops two passes running at once, and one that expires before the next begins cannot", cfg.Timeout, cfg.Interval)
 	}
 	if cfg.Lookback < cfg.Interval {
 		return fmt.Errorf("CONSOLE_API_RECONCILIATION_LOOKBACK (%s) must be at least CONSOLE_API_RECONCILIATION_INTERVAL (%s): a cold start's window narrower than the cadence would leave a gap of facts that no pass ever examines", cfg.Lookback, cfg.Interval)
+	}
+	// The ceiling, and it is the one rule here that is about the process rather
+	// than about the schedule. The timeout above is deliberately configured
+	// LONG, because a pass that gives up early is a pass that never finished
+	// its window — but a pass in flight also becomes this process's shutdown
+	// latency the moment a signal arrives, and the drain that waits for it is
+	// bounded rather than open-ended. A timeout past the bound changes a
+	// bounded wait into a wait that only ends when the process is killed, so
+	// the dial is refused rather than silently outranked: a deployment that
+	// wants a longer pass needs a longer tail, which is a number the operator
+	// chose on purpose.
+	if cfg.Timeout > MaxReconciliationTimeout {
+		return fmt.Errorf("CONSOLE_API_RECONCILIATION_TIMEOUT (%s) must be at most %s: the pass budget is this worker's whole per-pass deadline, not a bound on one read inside it, and a deployment that needs a longer pass needs a longer shutdown tail rather than a pass that outlives its own process", cfg.Timeout, MaxReconciliationTimeout)
 	}
 	return nil
 }

@@ -271,17 +271,45 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			wantErr: "CONSOLE_API_RECONCILIATION_LOOKBACK must be greater than zero",
 		},
 		{
-			// The rule this case exists for is the one the shipped defaults
-			// were silently violating: a timeout equal to the interval is a
-			// pass whose deadline expires exactly as the next one begins. The
-			// window claim cannot catch it — the two passes are on adjacent
-			// windows, where neither is the other's competitor.
-			name: "rejects a reconciliation timeout equal to the interval",
+			// EQUALITY is accepted, and the case says why. A pass that spends
+			// its whole budget ends as the next one is due: a tight loop, not
+			// two passes sweeping overlapping windows. The window claim is what
+			// cannot catch the overlapping shape, and the reason it is named
+			// here is that this is the boundary the old rule drew one step too
+			// tight — the shipped defaults sat exactly on it, so a plan of
+			// "timeout equal to interval" read as a refusal rather than as the
+			// tight loop it is.
+			name: "accepts a reconciliation timeout equal to the interval",
 			env: merge(requiredDataPlaneEnv(), map[string]string{
 				"CONSOLE_API_RECONCILIATION_INTERVAL": "30s",
 				"CONSOLE_API_RECONCILIATION_TIMEOUT":  "30s",
 			}),
-			wantErr: "CONSOLE_API_RECONCILIATION_TIMEOUT (30s) must be longer than CONSOLE_API_RECONCILIATION_INTERVAL (30s)",
+			want: Config{
+				Addr:              DefaultAddr,
+				ShutdownTimeout:   DefaultShutdownTimeout,
+				ReadHeaderTimeout: DefaultReadHeaderTimeout,
+				Postgres: Postgres{
+					DSN:             DefaultPostgresDSN,
+					MaxOpenConns:    DefaultPostgresMaxOpenConns,
+					MaxIdleConns:    DefaultPostgresMaxIdleConns,
+					ConnMaxLifetime: DefaultPostgresConnMaxLifetime,
+					ConnMaxIdleTime: DefaultPostgresConnMaxIdleTime,
+				},
+				DataPlane: DataPlane{
+					URL:                testDataplaneURL,
+					Credential:         testDataplaneCredential,
+					ProjectionInterval: DefaultProjectionInterval,
+					ProjectionTimeout:  DefaultProjectionTimeout,
+					IngestionInterval:  DefaultIngestionInterval,
+					IngestionTimeout:   DefaultIngestionTimeout,
+				},
+				Reconciliation: Reconciliation{
+					Interval: 30 * time.Second,
+					Timeout:  30 * time.Second,
+					Batch:    DefaultReconciliationBatch,
+					Lookback: DefaultReconciliationLookback,
+				},
+			},
 		},
 		{
 			name: "rejects a reconciliation timeout below the interval",
@@ -289,7 +317,19 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 				"CONSOLE_API_RECONCILIATION_INTERVAL": "1m",
 				"CONSOLE_API_RECONCILIATION_TIMEOUT":  "10s",
 			}),
-			wantErr: "CONSOLE_API_RECONCILIATION_TIMEOUT (10s) must be longer than CONSOLE_API_RECONCILIATION_INTERVAL (" + time.Minute.String() + ")",
+			wantErr: "CONSOLE_API_RECONCILIATION_TIMEOUT (10s) must be at least CONSOLE_API_RECONCILIATION_INTERVAL (" + time.Minute.String() + ")",
+		},
+		{
+			// The ceiling is a shutdown budget, not a work budget: a pass
+			// still running when the signal arrives is waited for on the tail
+			// this process grants its in-flight work, and a budget past that
+			// tail is a pass whose overrun only SIGKILL can end.
+			name: "rejects a reconciliation timeout past the shutdown tail",
+			env: merge(requiredDataPlaneEnv(), map[string]string{
+				"CONSOLE_API_RECONCILIATION_INTERVAL": "1m",
+				"CONSOLE_API_RECONCILIATION_TIMEOUT":  "24h",
+			}),
+			wantErr: "CONSOLE_API_RECONCILIATION_TIMEOUT (24h0m0s) must be at most 15m0s",
 		},
 		{
 			name: "rejects a reconciliation lookback narrower than the interval",

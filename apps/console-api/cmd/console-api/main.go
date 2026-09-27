@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"math/rand/v2"
 	"net"
 	stdhttp "net/http"
@@ -391,14 +392,34 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The pool closes after both loops have stopped, not before: a loop's
-	// last cycle or pass may still be finishing its reads and writes on
-	// pooled connections, and closing earlier would pull the pool out from
-	// under them — the same ordering the drain above observes for in-flight
-	// requests.
+	// The pool closes after every loop has stopped, not before: a loop's last
+	// cycle or pass may still be finishing its reads and writes on pooled
+	// connections, and closing earlier would pull the pool out from under them
+	// — the same ordering the drain above observes for in-flight requests.
+	//
+	// The reconciliation wait is BOUNDED, and the bound is the tail the drain
+	// already grants rather than a new budget. A pass in flight carries the
+	// context this process cancelled, so it returns when the store answers that
+	// cancellation — but "when the store answers" is not a bound, and the pass
+	// has a close of its own to finish on a context the cancellation cannot
+	// reach. An unbounded wait here would let a pass's own timeout, configured
+	// long on purpose, become the process's shutdown latency: a deployment that
+	// sends a signal and gets no exit for minutes reads it as a hung process
+	// and escalates to SIGKILL, which loses the very drain this wait protects.
+	// The dataplane's reaper drain is bounded the same way and for the same
+	// reason, so the two roots read as one rule.
 	projectionWG.Wait()
 	ingestionWG.Wait()
-	reconciliationWG.Wait()
+	reconDone := make(chan struct{})
+	go func() {
+		reconciliationWG.Wait()
+		close(reconDone)
+	}()
+	select {
+	case <-reconDone:
+	case <-time.After(reconDrainTail):
+		log.Printf("console-api reconciliation pass still draining %s after the signal; closing the pool beneath it", reconDrainTail)
+	}
 
 	// The pool is closed here, after run has returned, and not before: the
 	// drain inside run may still be finishing in-flight requests, and those
@@ -488,13 +509,25 @@ func runReconciliationLoop(ctx context.Context, reconcile func(context.Context) 
 		case errors.Is(err, context.Canceled):
 			return false
 		default:
-			log.Printf("console-api reconciliation pass failed (scanned %d, opened %d, unchanged %d): %v",
+			// The CAUSE, and not the error. The pass's errors carry the
+			// identity of whatever it was reading — a bucket id, a settlement
+			// id, a request id — and the comment below explains why a log line
+			// in this loop must not. Printing the cause here would undo that
+			// rule on exactly the path it exists to protect: a store failing
+			// persistently, where the line repeats on every backoff cycle and
+			// the identities stream out of stderr at the rate the backoff was
+			// built to quiet. The run row the pass opened before it swept is
+			// the durable record of which window failed, and the findings
+			// table is where the identities belong.
+			log.Printf("console-api reconciliation pass failed (scanned %d, opened %d, unchanged %d): %T",
 				summary.Scanned, summary.FindingsOpened, summary.FindingsUnchanged, err)
 			return true
 		}
 		// Counts, and never an identity: a request id or a settlement id on a
 		// log line is a field one dashboard change away from being a metric
-		// label, and the findings table is where the identities belong.
+		// label, and the findings table is where the identities belong. The
+		// failure branch above holds the same rule, which is why it prints the
+		// error's type and not the error.
 		log.Printf("console-api reconciliation pass: scanned %d, opened %d, unchanged %d",
 			summary.Scanned, summary.FindingsOpened, summary.FindingsUnchanged)
 		return false
@@ -577,7 +610,18 @@ func jittered(gap time.Duration, fraction float64, int63n func(int64) int64) tim
 	}
 	// Int64N is half-open, so the range is one wider than the span: passing
 	// the span itself would leave the top of the range undrawable.
-	return gap + time.Duration(int63n(span+1))
+	//
+	// The addition SATURATES rather than wrapping. A time.Duration is an int64
+	// and the sum is 1.2x the gap, so a gap anywhere near the type's ceiling
+	// wraps negative — and a negative duration handed to time.NewTimer fires
+	// immediately, which is a hot loop the loop is not built to have. No
+	// interval a deployment can configure reaches the ceiling, which is
+	// exactly why it has to be an explicit guard rather than an assumption.
+	spread := time.Duration(int63n(span + 1))
+	if spread > time.Duration(math.MaxInt64)-gap {
+		return time.Duration(math.MaxInt64)
+	}
+	return gap + spread
 }
 
 const (
@@ -601,6 +645,16 @@ const (
 	// enough that they stop colliding without making a one-minute cadence feel
 	// like a one-twenty cadence to the process reading the run rows.
 	reconJitterFraction = 0.2
+
+	// reconDrainTail bounds how long a pass in flight is waited for after the
+	// signal. Ten seconds is the same tail the Data Plane grants its reaper and
+	// the same one this process's own drain is bounded by, because the three
+	// are the same question — how long may a shutdown wait on a background
+	// writer — and one root answering it generously while the other answers it
+	// briefly is a deployment whose behaviour depends on which binary it is
+	// running. A pass that overruns it is not lost: the run row it already
+	// opened is the record of the pass, and the next pass opens a fresh window.
+	reconDrainTail = 10 * time.Second
 )
 
 // newHandler composes the one HTTP surface this process serves: the

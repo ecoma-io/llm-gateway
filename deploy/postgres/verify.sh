@@ -1896,10 +1896,35 @@ expect_constraint_failure "a second running pass over the same window is refused
 INSERT INTO control.reconciliation_runs (scope, window_from, window_to)
 SELECT 'verify', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z' FROM first_pass"
 
+# ...and the claim is only ever about what is IN FLIGHT, never about what
+# happened. A pass that FAILED keeps its row, and the next pass over the same
+# window is a legitimate row beside it — the failed pass is a record of a pass
+# that did not finish, not a claim the plane is still inside. That is what
+# makes a pass able to retry its own window after a failure, and it is the same
+# decision the findings key makes: the key is about what is OPEN now, not about
+# what has ever been seen. A predicate that held on failed rows instead would
+# wedge the plane on the first pass that ever failed, because nothing would
+# ever be able to open that window again.
+assert_equals "a failed pass leaves its window claimable by the next pass" \
+	"$(psql_scalar "$control_db" "
+BEGIN;
+INSERT INTO control.reconciliation_runs (scope, window_from, window_to, status, finished_at)
+VALUES ('verify-retry', '2026-05-01T00:00:00Z', '2026-05-02T00:00:00Z', 'failed', now());
+INSERT INTO control.reconciliation_runs (scope, window_from, window_to)
+VALUES ('verify-retry', '2026-05-01T00:00:00Z', '2026-05-02T00:00:00Z');
+SELECT count(*) FILTER (WHERE status = 'running') FROM control.reconciliation_runs WHERE scope = 'verify-retry';
+ROLLBACK;")" "1"
+
 # ...and the claim is RELEASED by finishing, which is the predicate's own
 # work: a completed row is outside the partial index, so the next pass over the
 # same window is a legitimate row rather than a collision. This is the positive
 # the claim's negative above is meaningless without.
+#
+# The count is FILTERED to the rows the index covers. A plain count would be 2
+# with or without the index — two rows on different windows, or on the same one
+# with no index at all — so it would pass a schema that had lost the claim
+# entirely and proved nothing about release. One row still RUNNING is the fact
+# only a partial index's predicate can state.
 assert_equals "finishing a run releases its window claim" \
 	"$(psql_scalar "$control_db" "
 BEGIN;
@@ -1910,8 +1935,9 @@ SET status = 'completed', finished_at = now()
 WHERE scope = 'verify' AND status = 'running';
 INSERT INTO control.reconciliation_runs (scope, window_from, window_to)
 VALUES ('verify', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z');
-SELECT count(*) FROM control.reconciliation_runs WHERE scope = 'verify';
-ROLLBACK;")" "2"
+SELECT count(*) FILTER (WHERE status = 'running') FROM control.reconciliation_runs WHERE scope = 'verify';
+ROLLBACK;")" "1"
+
 
 # Every probe below states the columns the table requires but the constraint
 # under test does not speak for. PostgreSQL evaluates NOT NULL before any CHECK
@@ -1946,9 +1972,33 @@ expect_constraint_failure "a finding detail past the prose bound is refused" rec
 "INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, detail)
 VALUES ('bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'warning', repeat('x', 2049))"
 
+expect_constraint_failure "a finding subject kind with no name is refused" reconciliation_findings_subject_kind_grammar \
+"INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity)
+VALUES ('bucket_derivation_drift', '', 'verify-bucket', 'warning')"
+
+# The subject's bound is an EVIDENCE bound and not a grammar — a check that
+# cannot record its subject is not a check — so it is a ceiling alone, and this
+# is the row that reaches it.
+expect_constraint_failure "a finding subject past the evidence bound is refused" reconciliation_findings_subject_id_evidence \
+"INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity)
+VALUES ('bucket_derivation_drift', 'funding_bucket', repeat('x', 4097), 'warning')"
+
 expect_constraint_failure "a finding check kind with no name is refused" reconciliation_findings_check_kind_grammar \
 "INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity)
 VALUES ('', 'funding_bucket', 'verify-bucket', 'warning')"
+
+# The pairing rule has FOUR states, and the two above are only the half where
+# the finding is named by its status. An ACKNOWLEDGED finding is the one the
+# rule's own comment singles out — an operator has seen it and nobody has
+# decided, so it carries no resolution instant and is still open for the
+# dedup key's purposes — so it is pinned in both directions like the rest.
+expect_constraint_failure "an acknowledged finding carrying a resolution instant is refused" reconciliation_findings_resolution_shape \
+"INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, status, resolved_at)
+VALUES ('bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'warning', 'acknowledged', now())"
+
+expect_constraint_failure "an ignored finding carrying no resolution instant is refused" reconciliation_findings_resolution_shape \
+"INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, status)
+VALUES ('bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'warning', 'ignored')"
 
 # The dedup key, and the whole of its design in one statement: a re-run over
 # unchanged data converges on the open finding rather than writing another row.
@@ -1966,6 +2016,11 @@ SELECT 'bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'critical',
 # ...and a RESOLUTION frees the key, so a genuine recurrence is a new finding
 # rather than a re-opened one carrying the old evidence. This positive is the
 # half of the key's design the negative above cannot show.
+#
+# The count is FILTERED to the OPEN rows, for the reason the runs claim above
+# gives: two rows of one identity coexisting is exactly what a schema WITHOUT
+# the key produces, so a bare count would read 2 either way and would call a
+# missing key a working one.
 assert_equals "resolving a finding frees its dedup key for a genuine recurrence" \
 	"$(psql_scalar "$control_db" "
 BEGIN;
@@ -1976,7 +2031,27 @@ SET status = 'resolved', resolved_at = now()
 WHERE check_kind = 'bucket_derivation_drift' AND subject_id = 'verify-bucket';
 INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, observed)
 VALUES ('bucket_derivation_drift', 'funding_bucket', 'verify-bucket', 'critical', jsonb_build_object('cached_held', 2));
-SELECT count(*) FROM control.reconciliation_findings WHERE subject_id = 'verify-bucket';
+SELECT count(*) FILTER (WHERE status = 'open') FROM control.reconciliation_findings WHERE subject_id = 'verify-bucket';
+ROLLBACK;")" "1"
+
+# ...and the key is over OPEN rows ALONE, which is the choice the pass's own
+# convergence rests on and the one the migration's header already argues: an
+# ACKNOWLEDGED row is one a human has seen and decided nothing about, so the
+# very next pass would open a second row for a divergence that already has one,
+# and the table would grow with the number of TICKETS rather than the number of
+# PROBLEMS. That is why the assertion here is TWO rows. It reads as a
+# regression to anyone skimming, so the label says plainly what it is: the
+# acknowledged row is outside the key, and a fresh sighting beside it is the
+# correct answer, not a duplicate. A predicate widened to cover both statuses
+# would read 1 here — and would be the bug.
+assert_equals "an acknowledged finding is outside the key, so the next sighting is a new row" \
+	"$(psql_scalar "$control_db" "
+BEGIN;
+INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, status)
+VALUES ('ack_probe', 'funding_bucket', 'verify-ack', 'warning', 'acknowledged');
+INSERT INTO control.reconciliation_findings (check_kind, subject_kind, subject_id, severity, observed)
+VALUES ('ack_probe', 'funding_bucket', 'verify-ack', 'critical', '{}'::jsonb);
+SELECT count(*) FROM control.reconciliation_findings WHERE subject_id = 'verify-ack';
 ROLLBACK;")" "2"
 
 # Both guards are row-shaped, so both need a row to bite. The finding is planted

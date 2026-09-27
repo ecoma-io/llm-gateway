@@ -117,7 +117,18 @@ const (
 	// stop. It sits above the interval deliberately: a cycle that outlived its
 	// own cadence would be two cycles overlapping in one goroutine, which is
 	// not a shape this loop has.
-	DefaultReaperTimeout = 10 * time.Second
+	//
+	// It is also the SHUTDOWN budget, and that is the half of it the ceiling
+	// below enforces. A cycle still running when the signal arrives is waited
+	// for on the tail the process grants its in-flight endings, so a budget
+	// past that tail is a cycle whose overrun only SIGKILL can end — and the
+	// default is exactly the tail, which is the tightest pairing the two can
+	// have: a cycle that spends its whole budget has exactly as long left to
+	// be waited for as it was allowed to run. The dials answer different
+	// questions — the interval is how fast a backlog recovers, the budget is
+	// how long a pass may occupy this goroutine — and the second being capped
+	// by the first is the mistake this pairing exists to make impossible.
+	DefaultReaperTimeout = drainTailBudget
 
 	// DefaultReaperBatchSize bounds how many holds one cycle may take. Fifty
 	// is not a tuned number: each victim is a whole unit of work whose last
@@ -250,7 +261,11 @@ type Config struct {
 	// states it, and retuning it changes only how quickly stranded capacity
 	// comes back, never what a reclaim means. It must be positive, and it
 	// must not be stretched past ReaperTimeout, because a cycle that
-	// outlived its own cadence would be two cycles running at once.
+	// outlived its own cadence would be two cycles running at once. That
+	// ordering is a ceiling and not a floor, so an interval may be set below
+	// the budget — it is the smaller of the two that has to fit in the larger,
+	// and a slow sweep with a fast cadence is the right shape for a plane with
+	// a deep backlog and idle capacity.
 	ReaperInterval time.Duration
 
 	// ReaperTimeout bounds one drain cycle under its own deadline. It must be
@@ -879,6 +894,22 @@ func validateExecutionBudgets(hold, execution time.Duration) error {
 	return nil
 }
 
+// drainTailBudget is the tail this process grants its in-flight endings when a
+// drain overran, and it is the budget the reaper's cycle is held to. The two
+// are the same number on purpose: the work a shutdown waits on and the work a
+// cycle may start are the same question asked at two moments, and a reaper
+// budget larger than the tail is a cycle no shutdown can wait for.
+const drainTailBudget = 10 * time.Second
+
+// MaxReaperTimeout is the longest cycle the configuration accepts, and it is
+// the value the composition root hands the loop as its per-cycle deadline. The
+// ceiling is a shutdown budget rather than a work budget: a cycle that is still
+// running when the signal arrives is waited for on the tail this process
+// already grants its in-flight endings, and a budget past that tail is a cycle
+// whose overrun only SIGKILL can end. The shipped default sits inside it, so
+// the ceiling refuses only a value an operator set past that point.
+const MaxReaperTimeout = drainTailBudget
+
 // validateReaper checks the reaper's own settings as a set. The per-variable
 // rules — a Go duration at all, greater than zero, an integer at all — are
 // applied where each variable is read, by parsePositiveDuration and parseInt
@@ -890,7 +921,9 @@ func validateExecutionBudgets(hold, execution time.Duration) error {
 //   - a cycle budget below the interval is a loop whose own deadline fires
 //     before its next tick is even due, so every cycle is cut short and the
 //     one bound the operator set to protect the process becomes the thing
-//     stopping the reaping.
+//     stopping the reaping. This is the same overlap read from the other side
+//     and is refused for the same reason; the check below takes the direction
+//     that lets the interval vary under a fixed budget.
 //
 // The horizon relationship the reaper's cadence could imply is deliberately
 // NOT checked: an interval longer than the lease TTL would not be wrong. The
@@ -911,10 +944,29 @@ func validateReaper(cfg Config) error {
 			"DATAPLANE_REAPER_BATCH_SIZE (%d) must be at least one; a cycle that can close nothing is not a drain",
 			cfg.ReaperBatchSize)
 	}
-	if cfg.ReaperInterval >= cfg.ReaperTimeout {
+	// The ordering is a CEILING and not a floor, and the direction matters: the
+	// interval has to fit inside the budget, never the other way round. A
+	// budget stretched past the cadence to accommodate a slow interval is the
+	// mistake the ceiling above already refuses, and accepting it here would
+	// undo that refusal through the other door. What a slow sweep needs is a
+	// slower interval beside an unchanged budget — two loops in one goroutine
+	// is a shape this loop does not have, and one cycle inside its budget is.
+	if cfg.ReaperInterval > cfg.ReaperTimeout {
 		return fmt.Errorf(
-			"DATAPLANE_REAPER_INTERVAL (%s) must be shorter than DATAPLANE_REAPER_TIMEOUT (%s); a cycle that outlives its own cadence would be two cycles running at once",
+			"DATAPLANE_REAPER_INTERVAL (%s) must not exceed DATAPLANE_REAPER_TIMEOUT (%s); a cadence at its own budget leaves the loop no room for anything but the cycle, and stretching the budget to fit the cadence is the same overlap read from the other side",
 			cfg.ReaperInterval, cfg.ReaperTimeout)
+	}
+	// The ceiling answers the question the loop's own per-cycle deadline asks,
+	// and asking it here is what keeps the dial honest. The loop bounds each
+	// cycle at the deadline it was given, so a timeout configured PAST that
+	// deadline would be read by an operator as in force while the loop quietly
+	// cut the cycle at a smaller number — a dial that looks like tuning and is
+	// not. Refusing the value is the honest answer: a deployment that wants a
+	// longer cycle says so in the one place the loop reads it.
+	if cfg.ReaperTimeout > MaxReaperTimeout {
+		return fmt.Errorf(
+			"DATAPLANE_REAPER_TIMEOUT (%s) must be at most %s: the cycle budget is this reaper's whole per-cycle deadline, not a bound on one read inside it, and a deployment that needs a longer cycle needs a longer shutdown tail rather than a reaper that outlives its own process",
+			cfg.ReaperTimeout, MaxReaperTimeout)
 	}
 	return nil
 }
