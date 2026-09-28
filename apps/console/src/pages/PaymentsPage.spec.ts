@@ -4,10 +4,12 @@
 // collect instrument data — there is no card field anywhere on it and no field
 // at all. It refuses to decide that a payment succeeded: the only writer of a
 // payment's status is a signature-verified webhook from the provider's servers,
-// so coming back from a checkout is a re-read and the screen says in as many
-// words that returning does not mark anything paid. And it refuses to price a
+// so the customer's own return, or their own say-so, is a re-read and the screen
+// says in as many words that neither marks anything paid. It refuses to price a
 // top-up: the request names an OFFER, the server prices it, and the assertion
-// over the whole outgoing body is what holds that.
+// over the whole outgoing body is what holds that. And it refuses to send the
+// browser anywhere: the instrument is a bank transfer, so the instructions are
+// rendered in place and no link leaves the origin.
 //
 // The other half is the idempotency key's lifetime, driven through the real
 // rule in `modules/payments/idempotency.ts` rather than through a stub — the
@@ -33,24 +35,12 @@ vi.mock("@/lib/api", async () => {
   return { ...actual, ...seam };
 });
 
-/**
- * The one side effect a test cannot observe in jsdom: leaving the origin.
- *
- * `window.location.assign` is not implemented there, so the page's navigation
- * lives in a module of its own and is mocked here. That is not convenience —
- * sending the customer to the PROVIDER rather than collecting anything here is
- * the single most important thing this screen does, and a page that navigated
- * inline could only be tested by accident.
- */
-const checkout = vi.hoisted(() => ({ sendToCheckout: vi.fn() }));
-
-vi.mock("@/modules/payments/checkout", () => ({ sendToCheckout: checkout.sendToCheckout }));
-
 import PaymentsPage from "@/pages/PaymentsPage.vue";
 import { createConsoleRouter } from "@/router";
 import { describe as describeViolations, inspect } from "@/lib/arch/roster";
 import { CONSOLE_BEHAVIOUR, type ApiErrorCode } from "@/lib/failure-matrix";
 import type { ApiFailure, ApiResult } from "@/lib/api";
+import type { TransferInstructions } from "@/modules/payments/instructions";
 import type {
   PaymentIntent,
   PaymentIntentPage,
@@ -112,17 +102,23 @@ const OFFERS: TopUpOfferList = {
   ],
 };
 
-const CHECKOUT_URL = "https://pay.example.test/checkout/y1";
+/** A destination as the provider states one, QR and all. */
+const INSTRUCTIONS: TransferInstructions = {
+  transfer_code: "00112233445566",
+  bank_name: "Example Bank",
+  account_holder: "Example Ltd",
+  qr_url: "https://pay.example.test/qr/y1",
+};
 
 /** A payment the OLDEST way round: the newest first, as the operation returns them. */
 function payment(overrides: Partial<PaymentIntent> = {}): PaymentIntent {
   return {
     id: "pay-1",
-    status: "checkout_open",
+    status: "awaiting_transfer",
     amount_minor_units: 2_500,
     currency: "EUR",
     minor_unit_exponent: 2,
-    checkout_url: CHECKOUT_URL,
+    transfer_instructions: INSTRUCTIONS,
     created_at: "2026-09-20T09:00:00Z",
     expires_at: "2026-09-20T09:30:00Z",
     ...overrides,
@@ -136,7 +132,11 @@ const PAYMENTS: PaymentIntentPage = {
       id: "pay-2",
       status: "succeeded",
       amount_minor_units: 10_000,
-      checkout_url: "https://pay.example.test/checkout/y2",
+      // A settled payment keeps its recorded destination — the contract says so
+      // on the field — and the screen must NOT present it: paying into it again
+      // would send money after the payment is over. The distinct account number
+      // is what makes a screen that showed it detectable.
+      transfer_instructions: { ...INSTRUCTIONS, transfer_code: "99998888777766" },
       created_at: "2026-09-18T09:00:00Z",
     }),
     payment({
@@ -149,7 +149,9 @@ const PAYMENTS: PaymentIntentPage = {
       // anything. A table that read the exponent off the live price list, or
       // that assumed two places, would render this row as a different amount.
       minor_unit_exponent: 0,
-      checkout_url: null,
+      // The durable `created` a `503` leaves behind: the provider was never
+      // reached, so there is no destination to name.
+      transfer_instructions: null,
       created_at: "2026-09-17T09:00:00Z",
     }),
   ],
@@ -169,6 +171,17 @@ function topUpButtons(wrapper: VueWrapper) {
   return wrapper.findAll("button").filter((button) => button.text().startsWith("Add "));
 }
 
+/** Every `href` that leaves the origin, so a forgotten navigation is visible. */
+function externalHrefs(wrapper: VueWrapper): readonly string[] {
+  return wrapper
+    .findAll("a")
+    .map((link) => link.attributes("href"))
+    .filter((href): href is string => href !== undefined && /^https?:/.test(href));
+}
+
+/** The transfer-instructions panel's section, which is labelled by its heading. */
+const PANEL = "[aria-labelledby='payments-transfer']";
+
 beforeAll(() => {
   // Loom's `SegmentedControl` sizes its indicator on mount and jsdom ships no
   // `ResizeObserver`. This screen renders none today; the stub keeps a filter
@@ -185,7 +198,6 @@ const mounted: VueWrapper[] = [];
 
 beforeEach(() => {
   for (const mock of Object.values(seam)) mock.mockReset();
-  checkout.sendToCheckout.mockReset();
   seam.getSessionResult.mockResolvedValue(
     ok({ class: "user", account_id: "a0000000-0000-4000-8000-0000000000a1" }),
   );
@@ -234,24 +246,24 @@ describe("PaymentsPage", () => {
       "Amount",
       "Currency",
       "Status",
-      "Checkout expires",
-      "Checkout",
+      "We wait until",
+      "Destination account",
     ]);
     expect(table.findAll("th[scope='row']")).toHaveLength(3);
 
     // The status cell is the presentation map's phrase and never the contract's
-    // token: `checkout_open` is not a sentence a customer can act on.
+    // token: `awaiting_transfer` is not a sentence a customer can act on.
     const statuses = wrapper.findAll("tbody tr").map((row) => row.get('[data-cell$="c3"]').text());
-    expect(statuses[0]).toContain("Waiting at your provider");
+    expect(statuses[0]).toContain("Waiting for your transfer");
     expect(statuses[1]).toContain("Paid");
-    expect(statuses[2]).toContain("Checkout not open yet");
+    expect(statuses[2]).toContain("Not ready to pay yet");
     // And the token is nowhere in the CELL that would have shown it. Scanned
     // per cell rather than over the page, because the page's own prose is
     // allowed to contain the English word ("nothing here decides that a payment
     // succeeded") — it is the contract's own TOKEN that must never reach a
     // reader, and the cell is where a token would surface if the map were
     // bypassed.
-    for (const [index, token] of ["checkout_open", "succeeded", "created"].entries()) {
+    for (const [index, token] of ["awaiting_transfer", "succeeded", "created"].entries()) {
       expect(statuses[index], token).not.toContain(token);
     }
 
@@ -262,6 +274,17 @@ describe("PaymentsPage", () => {
     // the row — would render it as `12.50`.
     const amounts = wrapper.findAll("tbody tr").map((row) => row.get('[data-cell$="c1"]').text());
     expect(amounts).toEqual(["25.00", "100.00", "1,250"]);
+
+    // The destination cell names the account exactly while the payment is one
+    // the provider has not settled: the payable row shows the provider's own
+    // number, the settled row shows nothing to pay into, and the row with no
+    // destination says so rather than rendering a dead control.
+    const destinations = wrapper
+      .findAll("tbody tr")
+      .map((row) => row.get('[data-cell$="c5"]').text().trim());
+    expect(destinations[0]).toBe("00112233445566");
+    expect(destinations[1]).toBe("—");
+    expect(destinations[2]).toBe("Not ready yet");
 
     // The timestamp is the contract's own string in a `<time datetime>`, and the
     // expiry is the PAYMENT's field rather than a deadline this page computed.
@@ -302,79 +325,130 @@ describe("PaymentsPage", () => {
     expect(request).not.toHaveProperty("currency");
   });
 
-  it("hands the provider's URL to the browser, verbatim and unfetched", async () => {
+  it("renders the transfer instructions in place, and sends the browser nowhere", async () => {
+    // The whole of the behavioural change, in one test. The old provider's
+    // instrument was a hosted page and the console's job was to hand the
+    // browser over to it; a bank transfer has no page to visit, so the
+    // destination is drawn on this screen and the browser stays. The assertion
+    // is the negative one — no link leaves the origin — because a page that
+    // navigated would be the very thing this replaced, and because the URL a
+    // hosted page arrived at is exactly what must not appear as an href here.
     seam.createPaymentForOffer.mockResolvedValue(ok(payment()));
 
     const { wrapper } = await mountAt("/payments");
     await topUpButtons(wrapper)[1]!.trigger("click");
     await flushPromises();
 
-    // The URL goes to the browser and nowhere else: this console does not fetch
-    // it, does not parse a session id out of it, and does not decide whether it
-    // looks reasonable. `sendToCheckout` is the whole of what happens to it.
-    expect(checkout.sendToCheckout).toHaveBeenCalledTimes(1);
-    expect(checkout.sendToCheckout).toHaveBeenCalledWith(CHECKOUT_URL);
-
-    // And the same URL is a real link on the row, so a customer who stays on
-    // this screen — or comes back to it — can reach their checkout again. The
-    // contract says a returning customer is sent back to this same URL. The row
-    // carrying it is the first one, which is `checkout_open`: a link the screen
-    // offers only while the provider still has something to confirm.
-    const hrefs = wrapper
-      .findAll("a")
-      .map((link) => link.attributes("href"))
-      .filter((href) => href !== undefined);
-    expect(hrefs).toContain(CHECKOUT_URL);
+    expect(externalHrefs(wrapper)).toEqual([]);
+    expect(wrapper.text()).toContain("00112233445566");
   });
 
-  it("does not send the browser to a checkout the provider has already settled", async () => {
+  it("presents no destination for a payment the provider has already settled", async () => {
     // The converged answer the contract's `idempotency_key` note warns about: a
     // repeated key is answered with the payment it already names, and that
     // payment "may be in any state by then, including one that has already
-    // succeeded". A customer who has paid must not be walked back onto a
-    // provider page for a payment that is over — so neither is the browser
-    // sent there automatically NOR is the link left live on the row. It reads
-    // as closed instead, which is the one answer that is true of every settled
-    // state: the provider's page can no longer change this payment.
-    seam.createPaymentForOffer.mockResolvedValue(
-      ok(payment({ status: "succeeded", checkout_url: "https://pay.example.test/checkout/y2" })),
-    );
+    // succeeded". The destination is still recorded — the contract keeps it in
+    // every later state — but a customer who has paid must not be shown an
+    // account to pay into again, so it is not rendered and no QR is drawn. The
+    // list is emptied of anything payable so the assertion is about THIS
+    // payment and not about a neighbour's instructions.
+    const settled = payment({ id: "pay-9", status: "succeeded" });
+    seam.fetchPaymentIntents.mockResolvedValue(ok({ ...PAYMENTS, items: [settled] }));
+    seam.createPaymentForOffer.mockResolvedValue(ok(settled));
 
     const { wrapper } = await mountAt("/payments");
     await topUpButtons(wrapper)[0]!.trigger("click");
     await flushPromises();
 
-    expect(checkout.sendToCheckout).not.toHaveBeenCalled();
     expect(wrapper.text()).toContain("Paid");
-    const hrefs = wrapper
-      .findAll("a")
-      .map((link) => link.attributes("href"))
-      .filter((href) => href !== undefined);
-    expect(hrefs).not.toContain("https://pay.example.test/checkout/y2");
-    expect(wrapper.text()).toContain("Checkout closed");
+    expect(wrapper.text()).not.toContain(INSTRUCTIONS.transfer_code);
+    expect(wrapper.find(`${PANEL} img`).exists()).toBe(false);
+    expect(wrapper.find(PANEL).exists()).toBe(false);
   });
 
-  it("says 'not open yet' rather than rendering a dead link for a payment with no checkout", async () => {
+  it("says 'not ready yet' rather than rendering a dead destination for a payment with no account", async () => {
     const { wrapper } = await mountAt("/payments");
 
-    // The third row is `created` with a null `checkout_url` — the durable
-    // payment the contract writes BEFORE it calls the provider, so a 503 has
-    // something to converge on. There is nowhere to send the customer yet, and
-    // an anchor with no href is a link a keyboard user can focus and cannot use.
+    // The third row is `created` with null `transfer_instructions` — the
+    // durable payment the contract writes BEFORE it calls the provider, so a
+    // 503 has something to converge on. There is no account to send money to,
+    // and an empty cell would read as one the customer had missed.
     const cell = wrapper.findAll("tbody tr")[2]!.get('[data-cell$="c5"]');
-    expect(cell.text()).toContain("Not open yet");
-    expect(cell.find("a").exists()).toBe(false);
+    expect(cell.text()).toContain("Not ready yet");
     // The row is still rendered: the payment exists, and hiding it would be the
-    // console deciding that a payment with no checkout is not a payment.
+    // console deciding that a payment with no destination is not a payment.
     expect(cell.text().trim()).not.toBe("");
+  });
+
+  describe("the transfer instructions panel", () => {
+    it("shows the amount, the account, the bank and the holder the provider named", async () => {
+      const { wrapper } = await mountAt("/payments");
+
+      // The panel is the newest payment the customer can still pay into, which
+      // is the first row here. Every value is the server's own — the amount
+      // from the payment's minor units and exponent, the rest from the
+      // instructions verbatim.
+      const text = wrapper.get(PANEL).text();
+      expect(text).toContain("25.00 EUR");
+      expect(text).toContain(INSTRUCTIONS.transfer_code);
+      expect(text).toContain(INSTRUCTIONS.bank_name);
+      expect(text).toContain(INSTRUCTIONS.account_holder);
+    });
+
+    it("renders the provider's QR as an image with meaningful alternative text", async () => {
+      const { wrapper } = await mountAt("/payments");
+
+      const image = wrapper.get(`${PANEL} img`);
+      // The URL is the provider's own, handed to the `<img>` exactly as it
+      // arrived: this console does not rewrite it, proxy it or read anything
+      // out of it.
+      expect(image.attributes("src")).toBe(INSTRUCTIONS.qr_url);
+      const alt = image.attributes("alt");
+      expect(alt).toBeDefined();
+      // A meaningful alternative, and not the URL read aloud: an `alt` that is
+      // empty hides the image from a screen reader, and one that is the URL
+      // tells the reader nothing about what they are looking at.
+      expect(alt!.trim().length).toBeGreaterThan(0);
+      expect(alt).not.toContain("http");
+    });
+
+    it("treats a provider that drew no QR as ordinary, not as an error", async () => {
+      // A null `qr_url` is a fact about the provider's answer — "the three
+      // members above are always present and are always enough to pay" — so the
+      // panel still renders the account and says the customer can type it in.
+      // No image is drawn, and nothing frames the missing one as a failure.
+      const noQr = { ...INSTRUCTIONS, qr_url: null };
+      seam.fetchPaymentIntents.mockResolvedValue(
+        ok({ ...PAYMENTS, items: [payment({ transfer_instructions: noQr })] }),
+      );
+
+      const { wrapper } = await mountAt("/payments");
+
+      expect(wrapper.find(`${PANEL} img`).exists()).toBe(false);
+      expect(wrapper.text()).toContain(noQr.transfer_code);
+      expect(wrapper.text()).toMatch(/type the account number/i);
+      expect(wrapper.text()).not.toMatch(/\berror\b|\bfailed\b|\bproblem\b/i);
+    });
+
+    it("says the payment succeeds only on the provider's confirmation, and that the customer may leave", async () => {
+      // The two sentences a redirect used to say silently — the browser left, so
+      // of course the customer could go. A page that renders in place has to say
+      // both in words: the payment is not paid by this screen, and it does not
+      // need this screen open.
+      const { wrapper } = await mountAt("/payments");
+
+      expect(wrapper.text()).toMatch(/becomes successful only when your provider/i);
+      expect(wrapper.text()).toMatch(/confirm the transfer/i);
+      expect(wrapper.text()).toMatch(/you can leave this page/i);
+    });
   });
 
   describe("the idempotency key", () => {
     it("is REUSED while the top-up is unfinished, so a retry is the same request", async () => {
       // A dropped response, then a 503 from a provider that never answered.
       // Neither is an answer, so neither ends the act: the contract says the
-      // payment is durable in `created` with a null `checkout_url` and that a
-      // retry under the same key converges on it.
+      // payment is durable in `created` with null `transfer_instructions` and
+      // that a retry under the same key converges on it.
       seam.createPaymentForOffer.mockResolvedValueOnce({
         ok: false,
         failure: { kind: "transport", error: new TypeError("Failed to fetch") },
@@ -401,7 +475,7 @@ describe("PaymentsPage", () => {
       expect(keys[2]).toBe(keys[0]);
     });
 
-    it("is RETIRED once the customer has a checkout, so funding again funds again", async () => {
+    it("is RETIRED once the customer has a destination, so funding again funds again", async () => {
       seam.createPaymentForOffer.mockResolvedValue(ok(payment()));
 
       const { wrapper } = await mountAt("/payments");
@@ -413,8 +487,9 @@ describe("PaymentsPage", () => {
       const keys = sentKeys();
       expect(keys).toHaveLength(2);
       // The second click on the same offer is a NEW top-up: the first one ended
-      // when the provider's URL came back, and a reused key here would answer
-      // "already done" while the customer waited for money that is not coming.
+      // when the provider's account came back, and a reused key here would
+      // answer "already done" while the customer waited for money that is not
+      // coming.
       expect(keys[1]).not.toBe(keys[0]);
     });
 
@@ -530,39 +605,35 @@ describe("PaymentsPage", () => {
     });
   });
 
-  describe("coming back from the provider's checkout", () => {
-    it("says it is waiting for the provider, and that returning proves nothing", async () => {
+  describe("waiting on the provider", () => {
+    it("says it is waiting for the provider, and that the customer's own word proves nothing", async () => {
       const { wrapper } = await mountAt("/payments");
 
-      // The screen the customer lands on when the browser sends them back while
-      // the provider has not spoken. The status is the server's, unchanged —
-      // `checkout_open` is exactly where it was left — and the copy says so out
-      // loud rather than letting the return read as a confirmation.
+      // The copy the customer reads while the money is in flight. The status is
+      // the server's, unchanged — `awaiting_transfer` is exactly where it was
+      // left — and the copy says so out loud rather than letting the customer
+      // read their own refresh as a confirmation.
       expect(wrapper.text()).toMatch(/waiting for your provider to confirm/i);
-      expect(wrapper.text()).toMatch(/retur\w* (from|to) (a |the )?checkout/i);
-      expect(wrapper.text()).toMatch(/does not mark anything paid/i);
-      // The claim is made about the provider's own message, which is the only
-      // thing that can move a payment.
       expect(wrapper.text()).toMatch(/signature-verified/i);
+      expect(wrapper.text()).toMatch(/saying you have paid does not mark anything paid/i);
     });
 
-    it("does not treat the customer's return as a state change", async () => {
+    it("does not treat a re-read as a state change", async () => {
       const { wrapper } = await mountAt("/payments");
       const before = wrapper.findAll("tbody tr").map((row) => row.text());
 
-      // Nothing about the browser's return is persisted, so a re-read is the
+      // Nothing about the customer's refresh is persisted, so a re-read is the
       // only thing that happens — and a re-read of the same server state renders
       // the same page. If this screen had inferred a funded state from the
-      // return, the second render would differ from the first.
+      // refresh, the second render would differ from the first.
       await flushPromises();
       await flushPromises();
       expect(wrapper.findAll("tbody tr").map((row) => row.text())).toEqual(before);
       // The re-read happened — so the screen did look — and the rows did not
       // move, because the server's answer did not move. The status cell is the
-      // contract's `checkout_open` rendered as the phrase it earns, and the
-      // provider link is still there to be used again.
+      // contract's `awaiting_transfer` rendered as the phrase it earns.
       expect(seam.fetchPaymentIntents.mock.calls.length).toBeGreaterThan(0);
-      expect(before[0]).toContain("Waiting at your provider");
+      expect(before[0]).toContain("Waiting for your transfer");
     });
 
     it("does not render the waiting card when the provider has spoken", async () => {
@@ -590,30 +661,33 @@ describe("PaymentsPage", () => {
     it("never claims success on the strength of the create call alone", async () => {
       // The create answered with a payment the provider has not confirmed. The
       // page may say what that payment's status IS — because that is what the
-      // server said — and it may not say the money arrived.
+      // server said — and it may not say the money arrived. The list is emptied
+      // so the only payment in play is this answer.
+      seam.fetchPaymentIntents.mockResolvedValue(ok({ ...PAYMENTS, items: [] }));
       seam.createPaymentForOffer.mockResolvedValue(
-        ok(payment({ status: "created", checkout_url: null })),
+        ok(payment({ status: "created", transfer_instructions: null })),
       );
 
       const { wrapper } = await mountAt("/payments");
       await topUpButtons(wrapper)[0]!.trigger("click");
       await flushPromises();
 
-      expect(wrapper.text()).toContain("Checkout not open yet");
       // What the answer paragraph may say, and it is the explanation for
       // `created` rather than a sentence about money that moved. Asserted
       // positively because the negative is unreadable — a bare "must not match
       // /succeeded/" also bans the page's own disclaimer prose, which has to be
-      // able to say that returning from a checkout does not mark anything paid.
+      // able to say that nothing here marks anything paid.
       expect(wrapper.text()).toContain(
-        "We have recorded this payment but its checkout is not open yet. Nothing has been charged.",
+        "We have recorded this payment but it has no transfer destination yet. Nothing has been charged.",
       );
       // The succeeded explanation credits the account, and it is the sentence
       // that would appear if this page had read its own request as a payment.
       expect(wrapper.text()).not.toMatch(/has been credited/i);
       expect(wrapper.text()).not.toMatch(/your payment is confirmed/i);
-      // And with no checkout to visit, the browser is not sent anywhere.
-      expect(checkout.sendToCheckout).not.toHaveBeenCalled();
+      // And with no destination to send money to, no panel and no account is
+      // rendered.
+      expect(wrapper.find(PANEL).exists()).toBe(false);
+      expect(wrapper.find("img").exists()).toBe(false);
     });
   });
 
@@ -749,19 +823,20 @@ describe("PaymentsPage", () => {
     const { wrapper } = await mountAt("/payments");
 
     // The non-negotiable, asserted on the rendered document rather than on the
-    // source: the card is entered on the PROVIDER's page, and there is no field
-    // for one here. Not a number, not a CVV, not an expiry, not a cardholder's
-    // name, and no "billing address" form — a field that collects instrument
-    // data is the failure regardless of what it is labelled.
+    // source: the money moves as a bank transfer the customer makes in their own
+    // banking app, and there is no field for an instrument here. Not a card
+    // number, not a CVV, not an expiry, not a cardholder's name, and no "billing
+    // address" form — a field that collects instrument data is the failure
+    // regardless of what it is labelled.
     expect(wrapper.findAll("input")).toHaveLength(0);
     expect(wrapper.findAll("select")).toHaveLength(0);
     expect(wrapper.findAll("textarea")).toHaveLength(0);
     expect(wrapper.findAll("form")).toHaveLength(0);
-    // The PROSE is not scanned for the word "card": this screen explains, in two
-    // places, that the card is entered on the provider's page and that the
-    // console never sees a number — which is the sentence a rule against the
-    // word would delete. What is scanned is the language of COLLECTION, which
-    // only appears where there is a field to put the answer in.
+    // The PROSE is not scanned for the word "card": this screen explains, in
+    // more than one place, that this console never sees an instrument — which is
+    // the sentence a rule against a word would delete. What is scanned is the
+    // language of COLLECTION, which only appears where there is a field to put
+    // the answer in.
     expect(wrapper.text()).not.toMatch(
       /\benter your\b|\byour card number\b|\bcvv\b|\bcvc\b|security code|cardholder|expiry date|billing address|\biban\b/i,
     );

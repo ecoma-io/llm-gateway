@@ -226,8 +226,8 @@ export const LEDGER_KIND_PRESENTATION = {
  *     status alone.
  */
 export const PAYMENT_STATE_PRESENTATION = {
-  created: { label: "Checkout not open yet", icon: Clock, tone: "info" },
-  checkout_open: { label: "Waiting at your provider", icon: CircleDashed, tone: "info" },
+  created: { label: "Not ready to pay yet", icon: Clock, tone: "info" },
+  awaiting_transfer: { label: "Waiting for your transfer", icon: CircleDashed, tone: "info" },
   requires_action: {
     label: "Your provider needs another step",
     icon: TriangleAlert,
@@ -257,9 +257,9 @@ export const PAYMENT_STATE_PRESENTATION = {
 
 /**
  * The same ten states, as the sentence a screen shows when it has to explain
- * one. A badge carries a label; a reader who has just come back from a
- * provider's checkout needs the paragraph, and it is the paragraph that says
- * out loud that returning from checkout proves nothing.
+ * one. A badge carries a label; a reader who has just opened a payment needs the
+ * paragraph, and it is the paragraph that says out loud that the customer's own
+ * word — or the browser's — proves nothing about the money.
  *
  * Exhaustive for the same reason and in the same way as the map above — the
  * two are one claim split in two, and a state with a badge and no sentence
@@ -267,9 +267,9 @@ export const PAYMENT_STATE_PRESENTATION = {
  */
 export const PAYMENT_STATE_EXPLANATION = {
   created:
-    "We have recorded this payment but its checkout is not open yet. Nothing has been charged.",
-  checkout_open:
-    "The provider's checkout is open and the payment is not finished. If you have just come back from it, we are still waiting for the provider to confirm — coming back does not mark anything paid.",
+    "We have recorded this payment but it has no transfer destination yet. Nothing has been charged.",
+  awaiting_transfer:
+    "Your provider has given you an account to send the money to and has not reported a transfer yet, so we are still waiting for the provider to confirm. Saying you have paid does not mark anything paid: this payment becomes successful only when the provider's own servers confirm the transfer, and refreshing this page is how you learn the outcome.",
   requires_action:
     "Your provider has asked for one more step before this payment can complete. Nothing is charged until the provider reports it.",
   succeeded:
@@ -277,7 +277,7 @@ export const PAYMENT_STATE_EXPLANATION = {
   failed: "Your provider reported that this payment did not go through. Nothing was credited.",
   cancelled: "This payment was cancelled before it completed. Nothing was credited.",
   expired:
-    "We stopped waiting for this checkout, so it can no longer be opened. A confirmation arriving late from your provider is still honoured, so this payment may yet be funded — your provider is the only party that says whether you paid.",
+    "We stopped waiting for this transfer. A confirmation arriving late from your provider is still honoured, so this payment may yet be funded — your provider is the only party that says whether you paid.",
   partially_refunded:
     "Your provider gave part of this payment back. What you keep changed; what was funded did not.",
   refunded: "Your provider gave this payment back. What you keep changed; what was funded did not.",
@@ -287,13 +287,15 @@ export const PAYMENT_STATE_EXPLANATION = {
 
 /**
  * The states in which the provider has not yet spoken about the money, which is
- * the set a customer who has just returned from a checkout is most likely to be
- * looking at. `quarantined` is deliberately absent: it is an operator-facing
+ * the set a customer who has just opened a payment is most likely to be looking
+ * at. It also decides whether a payment's transfer instructions are shown: a
+ * destination is actionable exactly while the payment is one the provider has
+ * not settled. `quarantined` is deliberately absent — it is an operator-facing
  * fact about a delivery and not a payment waiting on anything.
  */
 export const PAYMENT_AWAITING_PROVIDER_STATES: ReadonlySet<PaymentIntentState> = new Set([
   "created",
-  "checkout_open",
+  "awaiting_transfer",
   "requires_action",
 ]);
 

@@ -10,26 +10,35 @@
 //
 // The rule under test is deliberately NOT "same offer" alone. It is whether the
 // PREVIOUS attempt is finished, and "finished" is read off the answer: the
-// contract's `checkout_url` is non-null exactly when the customer has been
-// handed a page they can complete, and until then the act is still open. The
+// contract's `transfer_instructions` is non-null exactly when the provider was
+// reached and a destination obtained, and until then the act is still open. The
 // 503 case is why that matters — the contract says the payment is durable in
-// `created` with a null `checkout_url` and that a retry under the same key
-// converges on it, so a client that retired the key on a FAILURE would open a
-// second payment on the retry that the server was built to absorb.
+// `created` with a null `transfer_instructions` and that a retry under the same
+// key converges on it, so a client that retired the key on a FAILURE would open
+// a second payment on the retry that the server was built to absorb.
 import { describe, expect, it, vi } from "vitest";
 
 import { beginTopUp, retireTopUp, type TopUpAttempt } from "@/modules/payments/idempotency";
+import type { TransferInstructions } from "@/modules/payments/instructions";
 import type { PaymentIntent } from "@ecoma-io/llm-gateway-console-api-client";
 
-/** A payment as the API returns one, with the two fields this module reads. */
-function payment(checkout_url: string | null): PaymentIntent {
+/** A destination as the provider states one, so the retire tests carry a real answer. */
+const INSTRUCTIONS: TransferInstructions = {
+  transfer_code: "00112233445566",
+  bank_name: "Example Bank",
+  account_holder: "Example Ltd",
+  qr_url: "https://pay.example.test/qr/y1",
+};
+
+/** A payment as the API returns one, with the one field this module reads. */
+function payment(transfer_instructions: TransferInstructions | null): PaymentIntent {
   return {
     id: "y0000000-0000-4000-8000-0000000000y1",
-    status: checkout_url === null ? "created" : "checkout_open",
+    status: transfer_instructions === null ? "created" : "awaiting_transfer",
     amount_minor_units: 2_500,
     currency: "EUR",
     minor_unit_exponent: 2,
-    checkout_url,
+    transfer_instructions,
     created_at: "2026-09-20T09:00:00Z",
     expires_at: "2026-09-20T09:30:00Z",
   };
@@ -88,25 +97,26 @@ describe("beginTopUp", () => {
 });
 
 describe("retireTopUp", () => {
-  it("retires the key once the answer carries a checkout to visit", () => {
-    // The act is over: the customer has been handed the provider's page. The
-    // same offer clicked again afterwards is a NEW top-up — this is the half
-    // that stops "fund me once" from meaning "fund me forever".
+  it("retires the key once the answer carries a destination to pay", () => {
+    // The act is over: the customer has been handed an account to send money
+    // to. The same offer clicked again afterwards is a NEW top-up — this is the
+    // half that stops "fund me once" from meaning "fund me forever".
     const attempt: TopUpAttempt = { offer: "offer-a", key: "key-1" };
-    expect(retireTopUp(attempt, payment("https://pay.example.test/checkout/y1"))).toBeUndefined();
+    expect(retireTopUp(attempt, payment(INSTRUCTIONS))).toBeUndefined();
   });
 
-  it("keeps the key when the answer has no checkout, so the retry converges", () => {
+  it("keeps the key when the answer has no destination, so the retry converges", () => {
     // The 503 shape the contract describes: the payment exists in `created`
-    // with a null `checkout_url` because the provider never answered. Retiring
-    // here would make the customer's retry a second payment instead of the same
-    // one — which is precisely the convergence the key exists to provide.
+    // with null `transfer_instructions` because the provider never answered.
+    // Retiring here would make the customer's retry a second payment instead of
+    // the same one — which is precisely the convergence the key exists to
+    // provide.
     const attempt: TopUpAttempt = { offer: "offer-a", key: "key-1" };
     expect(retireTopUp(attempt, payment(null))).toBe(attempt);
   });
 
   it("has nothing to retire when no attempt was open", () => {
-    expect(retireTopUp(undefined, payment("https://pay.example.test/checkout/y1"))).toBeUndefined();
+    expect(retireTopUp(undefined, payment(INSTRUCTIONS))).toBeUndefined();
     expect(retireTopUp(undefined, payment(null))).toBeUndefined();
   });
 });
@@ -128,8 +138,8 @@ describe("one top-up, from first click to a second deliberate one", () => {
     expect(retry.key).toBe(first.key);
     expect(mint).toHaveBeenCalledTimes(1);
 
-    // That retry succeeded and handed back a checkout.
-    const afterSuccess = retireTopUp(retry, payment("https://pay.example.test/checkout/y1"));
+    // That retry succeeded and handed back a destination to pay into.
+    const afterSuccess = retireTopUp(retry, payment(INSTRUCTIONS));
     expect(afterSuccess).toBeUndefined();
 
     // The customer comes back later and funds the same offer again on purpose.
@@ -154,7 +164,7 @@ describe("what this module is not", () => {
 
     const attempt = beginTopUp(undefined, "offer-a", mint);
     const retry = beginTopUp(attempt, "offer-a", mint);
-    retireTopUp(retry, payment("https://pay.example.test/checkout/y1"));
+    retireTopUp(retry, payment(INSTRUCTIONS));
 
     expect(local).not.toHaveBeenCalled();
     local.mockRestore();

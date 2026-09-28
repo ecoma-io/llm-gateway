@@ -16,8 +16,8 @@
 //     customer's first request reached the server, the answer did not come
 //     back, they press the button again, and the second request names a
 //     different act — so the server prices a second payment and the customer is
-//     charged twice for one top-up, or is sent to a checkout for a payment that
-//     already succeeded.
+//     charged twice for one top-up, or is shown a destination to send money to
+//     for a payment that already succeeded.
 //   - **A key REUSED across two deliberate top-ups** is a payment silently
 //     swallowed. The customer funds the account, comes back, decides to fund it
 //     again, and the second request converges on the payment the first key
@@ -29,18 +29,18 @@
 // The rule that separates them is not "same offer" and not "same session". It
 // is whether the PREVIOUS attempt is finished. An attempt is finished when the
 // server has handed back a payment the customer can act on — the contract's
-// `checkout_url`, non-null exactly when there is a provider-hosted page to send
-// them to. Until then the key is live and a retry is a retry; from then on the
-// act is over and the next click is a new one.
+// `transfer_instructions`, non-null exactly when this plane holds a destination
+// to send money to. Until then the key is live and a retry is a retry; from then
+// on the act is over and the next click is a new one.
 //
 // `retireTopUp` therefore reads the ANSWER rather than the failure. A `503`
 // from a provider that never answered leaves the payment durable in `created`
-// with a null `checkout_url` — the contract says so on that status — so the key
-// stays live and the retry the customer makes converges on the payment this
-// platform already wrote, which is the outcome the server's own key semantics
-// are built to absorb. A `201` carrying a `checkout_url` retires it, so the
-// same customer funding the same offer again later gets a new payment rather
-// than a rendering of the old one.
+// with no `transfer_instructions` — the contract says the field is null exactly
+// while the payment is `created` — so the key stays live and the retry the
+// customer makes converges on the payment this platform already wrote, which is
+// the outcome the server's own key semantics are built to absorb. A `201`
+// carrying instructions retires it, so the same customer funding the same offer
+// again later gets a new payment rather than a rendering of the old one.
 import type { PaymentIntent } from "@ecoma-io/llm-gateway-console-api-client";
 
 /**
@@ -88,18 +88,21 @@ export function beginTopUp(
 /**
  * The attempt still live after one answer, or `undefined` when the act is over.
  *
- * `checkout_url !== null` is the whole test, and it is deliberately the
- * contract's field rather than a status the console interprets. The contract
- * says the field is null "exactly while the payment is `created`" and that a
- * customer returning to a payment they started is sent back to this same URL —
- * so a payment with a URL is one the customer can still complete, and a payment
- * without one is an attempt whose provider call has not yet produced anything
- * to visit. Retiring the key in the first case is what makes a second top-up a
- * second payment; keeping it in the second is what makes a retry converge.
+ * `transfer_instructions !== null` is the whole test, and it is deliberately
+ * the contract's field rather than a status the console interprets. The
+ * contract says the field is null "exactly while the payment is `created`" —
+ * the state a provider call that never answered leaves behind — so a payment
+ * carrying instructions is one where the provider WAS reached and a destination
+ * was obtained, and a payment without them is an attempt that has produced
+ * nothing to send money to yet. Whether that destination is one the customer
+ * can still pay into or one whose payment is already settled does not matter
+ * here: either way the attempt has finished. Retiring the key on an answer that
+ * carries instructions is what makes a second top-up a second payment; keeping
+ * it on a null is what makes a retry converge.
  */
 export function retireTopUp(
   pending: TopUpAttempt | undefined,
   payment: PaymentIntent,
 ): TopUpAttempt | undefined {
-  return payment.checkout_url === null ? pending : undefined;
+  return payment.transfer_instructions === null ? pending : undefined;
 }

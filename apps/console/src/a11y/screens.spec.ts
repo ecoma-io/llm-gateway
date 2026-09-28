@@ -364,17 +364,19 @@ const FINDINGS: FindingPage = {
  * distinguishable accessible names rather than one string rendered twice.
  *
  * The payments are chosen to reach the branches a green audit would otherwise
- * skip: a `checkout_open` row, which renders the provider link AND the
- * waiting-for-confirmation card a customer returning from checkout lands on,
- * and a `succeeded` row, which renders the paid badge. Both carry a
- * `checkout_url` because the contract keeps it after the payment completes —
- * "a customer returning to a payment they started is sent back to this same
- * URL" — and the fixture is deliberately built so the two rows are told apart
- * by the control they render: the open one by its live link, the settled one
- * by the closed-checkout text where that link would have been. A screen that
- * offered the link on both rows would therefore pass this audit while showing
- * a customer a way back onto a provider page for a payment that is over, and
- * the settled row is here precisely to catch that.
+ * skip: an `awaiting_transfer` row, which renders the in-place
+ * transfer-instructions panel — the amount, the account, the bank, the holder
+ * and the provider's QR — AND the waiting-for-confirmation card a customer who
+ * has just opened a payment lands on, and a `succeeded` row, which renders the
+ * paid badge. Both keep a recorded destination, because the contract keeps it
+ * in every later state, and the fixture is deliberately built so the two rows
+ * are told apart by what they OFFER: the payable row shows its account number,
+ * and the settled one shows an em-dash where that account would be. A screen
+ * that rendered the account on both rows would therefore pass this audit while
+ * inviting a customer to transfer again into an account whose payment is over,
+ * and the settled row is here precisely to catch that. Only the payable row
+ * carries a `qr_url`, so the panel's image is audited with a real `src` and a
+ * real `alt` rather than with the null branch that draws nothing.
  * The amounts sit well inside the money formatter's exact range on
  * purpose: an unrenderable figure puts an `aria-label` on a roleless `<span>`,
  * which is the one `aria-prohibited-attr` judgement this console has made, and
@@ -403,11 +405,16 @@ const PAYMENTS: PaymentIntentPage = {
   items: [
     {
       id: "y0000000-0000-4000-8000-0000000000y1",
-      status: "checkout_open",
+      status: "awaiting_transfer",
       amount_minor_units: 2_500,
       currency: "EUR",
       minor_unit_exponent: 2,
-      checkout_url: "https://pay.example.test/checkout/y1",
+      transfer_instructions: {
+        transfer_code: "00112233445566",
+        bank_name: "Example Bank",
+        account_holder: "Example Ltd",
+        qr_url: "https://pay.example.test/qr/y1",
+      },
       created_at: "2026-09-20T09:00:00Z",
       expires_at: "2026-09-20T09:30:00Z",
     },
@@ -417,7 +424,12 @@ const PAYMENTS: PaymentIntentPage = {
       amount_minor_units: 10_000,
       currency: "EUR",
       minor_unit_exponent: 2,
-      checkout_url: "https://pay.example.test/checkout/y2",
+      transfer_instructions: {
+        transfer_code: "99998888777766",
+        bank_name: "Example Bank",
+        account_holder: "Example Ltd",
+        qr_url: null,
+      },
       created_at: "2026-09-18T09:00:00Z",
       expires_at: "2026-09-18T09:30:00Z",
     },
@@ -546,12 +558,13 @@ const SCREENS: ReadonlyArray<{ readonly path: string; readonly label: string }> 
   { path: "/catalog", label: "catalog" },
   { path: "/commerce", label: "commerce" },
   // Audited with an offer published and payments already on the account, which
-  // is the state that renders the chooser's buttons, the provider link and the
-  // waiting-for-confirmation card. The no-offers state is a different screen
-  // with different markup, and it is audited in `PaymentsPage.spec.ts` rather
-  // than here, where it would make this list's fixtures a special case of one
-  // screen. NOT audited here in a "just returned from checkout" state, because
-  // there is no such state: the return is a re-read, and the re-read is this.
+  // is the state that renders the chooser's buttons, the in-place
+  // transfer-instructions panel and the waiting-for-confirmation card. The
+  // no-offers state is a different screen with different markup, and it is
+  // audited in `PaymentsPage.spec.ts` rather than here, where it would make
+  // this list's fixtures a special case of one screen. There is no "just
+  // returned from a payment" state to audit separately: the customer's return
+  // is a re-read, and the re-read is this.
   { path: "/payments", label: "payments" },
   { path: "/accounting", label: "accounting" },
   { path: "/reconciliation", label: "reconciliation" },

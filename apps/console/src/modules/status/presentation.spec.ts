@@ -1,7 +1,7 @@
 // The payment state vocabulary, held to the contract rather than to itself.
 //
 // Two maps over one union — the badge's three channels and the sentence a
-// customer who has just come back from a checkout needs — and a set of states
+// customer who has just opened a payment needs — and a set of states
 // the console treats as "the provider has not spoken yet". The claim this file
 // makes is that all three are TOTAL over `PaymentIntentState`: the source is
 // written with `satisfies Record<PaymentIntentState, …>`, which is the compile
@@ -48,7 +48,7 @@ import type { PaymentIntentState } from "@ecoma-io/llm-gateway-console-api-clien
  */
 const CONTRACT_STATES = [
   "created",
-  "checkout_open",
+  "awaiting_transfer",
   "requires_action",
   "succeeded",
   "failed",
@@ -108,8 +108,8 @@ describe("the payment state maps are total over the contract's union", () => {
 
   it("labels a state with a phrase, never with the contract's own token", () => {
     // The defect the file header names on `GatewayStatusPage.vue:87`: a badge
-    // reading `checkout_open` tells a customer nothing they could act on. The
-    // test is that no label is the token, or the token with its underscores
+    // reading `awaiting_transfer` tells a customer nothing they could act on.
+    // The test is that no label is the token, or the token with its underscores
     // turned into spaces and its first letter capitalised — both of which are
     // the same defect wearing a tidy-up.
     for (const state of CONTRACT_STATES) {
@@ -181,8 +181,8 @@ describe("quarantined is a fact about a message, not about a payment", () => {
   });
 
   it("is not one of the states the console treats as waiting on the provider", () => {
-    // The waiting set drives the sentence a customer sees when they come back
-    // from a checkout. A quarantined payment is not waiting for anything, and a
+    // The waiting set drives the sentence a customer sees while they wait on a
+    // transfer. A quarantined payment is not waiting for anything, and a
     // card telling the customer their provider is still thinking would be the
     // console explaining the wrong problem to the wrong person.
     expect(PAYMENT_AWAITING_PROVIDER_STATES.has("quarantined")).toBe(false);
@@ -192,7 +192,7 @@ describe("quarantined is a fact about a message, not about a payment", () => {
 describe("the states the console treats as waiting on the provider", () => {
   it("is exactly the three the provider has not spoken about", () => {
     expect([...PAYMENT_AWAITING_PROVIDER_STATES].sort()).toEqual([
-      "checkout_open",
+      "awaiting_transfer",
       "created",
       "requires_action",
     ]);
@@ -213,13 +213,16 @@ describe("the states the console treats as waiting on the provider", () => {
     }
   });
 
-  it("says, in the sentence a returning customer reads, that coming back proves nothing", () => {
+  it("says, in the sentence a customer waiting on a transfer reads, that their own word proves nothing", () => {
     // The single most load-bearing sentence on the screen, asserted where it is
     // written rather than only where it is rendered. The browser is not a
-    // financial boundary, and this is the copy that says so out loud.
-    expect(PAYMENT_STATE_EXPLANATION.checkout_open).toMatch(
-      /coming back does not mark anything paid/i,
+    // financial boundary, and this is the copy that says so out loud: the
+    // customer saying they have paid is not evidence, and refreshing is how the
+    // outcome is learned.
+    expect(PAYMENT_STATE_EXPLANATION.awaiting_transfer).toMatch(
+      /saying you have paid does not mark anything paid/i,
     );
-    expect(PAYMENT_STATE_EXPLANATION.checkout_open).toMatch(/waiting for the provider/i);
+    expect(PAYMENT_STATE_EXPLANATION.awaiting_transfer).toMatch(/waiting for the provider/i);
+    expect(PAYMENT_STATE_EXPLANATION.awaiting_transfer).toMatch(/refreshing this page/i);
   });
 });

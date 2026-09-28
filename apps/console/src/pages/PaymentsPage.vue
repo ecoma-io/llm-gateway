@@ -4,20 +4,27 @@
 //
 // **The browser is not a financial boundary, and this screen is where that has
 // to be visible rather than merely true.** A payment's status is written ONLY
-// by a signature-verified webhook from the provider's own servers. The card is
-// entered on the provider's hosted page, this application never sees a card
-// number and there is no field for one anywhere in the contract — so there is
-// no card form here and there is nothing on this screen that collects
-// instrument data. The customer is handed the provider's URL and leaves.
+// by a signature-verified webhook from the provider's own servers. The money
+// moves as a domestic bank transfer to an account the provider holds for the
+// payment; this application never sees an instrument of any kind, there is no
+// card number and no bank credential anywhere in the contract, and so there is
+// no form here and nothing on this screen that collects one. The customer is
+// handed the account to pay into and stays on this page.
 //
-// The return from that checkout is a status REFRESH and nothing else. It cannot
-// mark anything paid: the customer coming back is not evidence that money
-// moved, and a console that treated it as evidence would be deciding the
-// instant a balance changed. So the copy says so in as many words — while a
+// **Nothing here navigates, and that is the shape of the whole change.** The
+// previous provider's instrument was a hosted page, so the console's job after
+// opening a payment was to send the browser to it. A bank transfer has no page
+// to visit, so the instructions are rendered in place and the browser never
+// leaves. The one thing that redirect said silently — that the customer may
+// stop looking at this screen — is now said in words beside the instructions.
+//
+// A refresh is a status RE-READ and nothing else. It cannot mark anything paid:
+// the customer coming back, or saying they have sent the money, is not evidence
+// that money moved, and a console that treated it as evidence would be deciding
+// the instant a balance changed. So the copy says so in as many words — while a
 // payment is in a state the provider has not confirmed, the screen says it is
-// waiting for the provider and that returning from checkout does not mark
-// anything paid. Nothing on this page ever derives a funded state from a
-// browser event.
+// waiting for the provider and that refreshing is how the outcome is learned.
+// Nothing on this page ever derives a funded state from a browser event.
 //
 // **The offer carries the price and the request must not.** A top-up names an
 // offer and nothing else: `CreatePaymentIntentRequest` has no amount and no
@@ -45,7 +52,11 @@ import type { DataTableColumn } from "@/components/data-table";
 import type { Failure } from "@/lib/api";
 import FailureView from "@/modules/failure/FailureView.vue";
 import { beginTopUp, retireTopUp, type TopUpAttempt } from "@/modules/payments/idempotency";
-import { sendToCheckout } from "@/modules/payments/checkout";
+import {
+  showTransferInstructions,
+  type TransferInstructions,
+} from "@/modules/payments/instructions";
+import TransferInstructionsPanel from "@/modules/payments/TransferInstructionsPanel.vue";
 import { formatPrice, formatPriceAmount } from "@/modules/payments/offer-price";
 import InstantCell from "@/modules/status/InstantCell.vue";
 import StatusBadge from "@/modules/status/StatusBadge.vue";
@@ -106,7 +117,7 @@ const commitFailure = ref<Failure | undefined>(undefined);
  * `upstream_unavailable` is the row the failure matrix declares `retry` for,
  * and the contract's note on that `503` says the payment is durable and that a
  * retry "under the same idempotency key converges on that same payment and
- * opens the checkout this attempt could not". So the retry button the matrix
+ * obtains the instructions this attempt could not". So the retry button the matrix
  * puts on screen has to send the SAME request: the same offer, whose key
  * `beginTopUp` reuses because the failed attempt never retired. A retry wired
  * to nothing would be an affordance that promises the customer a second
@@ -133,19 +144,18 @@ onMounted(() => {
  * and this refuses a second request that got past them.
  *
  * A FAILED attempt never retires the key. A `503` leaves a durable payment in
- * `created` with no checkout to visit, and the retry the customer makes has to
- * carry the same key for the server to converge on it rather than open a second
- * payment. Only an answer with a `checkout_url` closes the attempt — see
+ * `created` with no transfer instructions, and the retry the customer makes has
+ * to carry the same key for the server to converge on it rather than open a
+ * second payment. Only an answer carrying instructions closes the attempt — see
  * `retireTopUp`.
  *
  * A converged answer is RENDERED, never acted on. The contract's note on
  * `idempotency_key` is exact about this: a payment a repeated key converges on
  * "may be in any state by then, including one that has already succeeded", and
  * the honest thing to do with that answer is "render what it was told" — a retry
- * after a customer paid must not send them to a checkout again. So the browser
- * is only ever sent to a checkout that is still waiting on the provider; a
- * payment whose status is already settled is shown here with its URL as a link
- * the customer may still choose to follow.
+ * after a customer paid must not present them with a destination to send money
+ * to again. `payable` below is the one thing that decides what this handler's
+ * answer puts on screen, and it is where that rule lives.
  */
 async function startTopUp(offer: TopUpOffer): Promise<void> {
   if (committing.value !== null) return;
@@ -171,16 +181,9 @@ async function startTopUp(offer: TopUpOffer): Promise<void> {
     lastAnswer.value = result.data;
     pendingTopUp.value = retireTopUp(pendingTopUp.value, result.data);
     // The new payment is the newest row of the first page. Re-reading keeps the
-    // list honest when the browser does not leave this screen — and when it
-    // does, the customer comes back here and the read happens on mount anyway.
+    // list honest when the page does not change — and the customer's own refresh
+    // is the same read happening again.
     payments.run();
-
-    if (
-      result.data.checkout_url !== null &&
-      PAYMENT_AWAITING_PROVIDER_STATES.has(result.data.status)
-    ) {
-      sendToCheckout(result.data.checkout_url);
-    }
   } finally {
     committing.value = null;
   }
@@ -244,12 +247,65 @@ const offerList = computed<readonly TopUpOffer[]>(() => offers.data.value?.items
 const offersAnswered = computed(() => offers.data.value !== undefined);
 
 /**
+ * The one payment whose instructions this page presents, with those
+ * instructions, or `undefined` when there is no payment to pay.
+ *
+ * The contract leaves this to the client and says so — "Whether a destination
+ * should be SHOWN is a question about the status beside this field, and it is a
+ * client's to answer" — and `showTransferInstructions` is that answer. What is
+ * decided HERE is only which payment gets the panel, and there are two cases,
+ * both of them the customer looking for where to send money:
+ *
+ *   - The payment the customer just opened. `lastAnswer` is the direct answer to
+ *     the button they pressed, and it is available before the list re-read has
+ *     landed, so the instructions appear the moment the server hands them back.
+ *   - Otherwise the newest payment on the list that can still be paid into. A
+ *     customer who has left and come back has no in-memory answer, and this is
+ *     how they find the account again — the capability the old row link carried
+ *     for a hosted page, now that there is no URL to link to.
+ *
+ * One panel rather than one per payable row. The panel is an INSTRUCTION — the
+ * full account, bank, holder and drawing — and the table is the HISTORY; a
+ * screen that repeated the whole block under every unpaid row would make the
+ * list unreadable for the customer who has one to pay and several they once
+ * did, and would ask a reader to work out which block was newest. The table's
+ * own destination column still names every payable row, so nothing is hidden:
+ * only the richest presentation is singular, and it is the newest one.
+ */
+const payable = computed<
+  { readonly payment: PaymentIntent; readonly instructions: TransferInstructions } | undefined
+>(() => {
+  if (lastAnswer.value !== undefined) {
+    const instructions = showTransferInstructions(lastAnswer.value);
+    if (instructions !== undefined) return { payment: lastAnswer.value, instructions };
+  }
+  for (const row of payments.rows.value) {
+    const instructions = showTransferInstructions(row);
+    if (instructions !== undefined) return { payment: row, instructions };
+  }
+  return undefined;
+});
+
+/**
+ * The account number to show in a row's destination cell, or `undefined` when
+ * the row has none to act on.
+ *
+ * A string rather than the whole instruction block because a cell holds one
+ * value and the panel is where the bank, the holder and the drawing live. It
+ * answers the same question `payable` answers, through the same function, so a
+ * row and the panel cannot disagree about whether a payment is payable.
+ */
+function destinationAccount(row: PaymentIntent): string | undefined {
+  return showTransferInstructions(row)?.transfer_code;
+}
+
+/**
  * The states present in the list that the provider has not confirmed yet.
  *
- * A customer who has just come back from a checkout lands here, and this is
- * what the screen says to them: the payment is where the provider left it, and
- * coming back did not move it. Set-ordered by the list itself, so the sentence
- * a reader sees is about a payment they can see.
+ * A customer who has just opened a payment lands here, and this is what the
+ * screen says to them: the payment is where the provider left it, and their own
+ * return — or their own say-so — did not move it. Set-ordered by the list
+ * itself, so the sentence a reader sees is about a payment they can see.
  */
 const unconfirmed = computed<readonly PaymentIntentState[]>(() => {
   const seen: PaymentIntentState[] = [];
@@ -265,8 +321,8 @@ const columns: readonly DataTableColumn[] = [
   { key: "amount_minor_units", label: "Amount", align: "right" },
   { key: "currency", label: "Currency" },
   { key: "status", label: "Status" },
-  { key: "expires_at", label: "Checkout expires" },
-  { key: "checkout_url", label: "Checkout" },
+  { key: "expires_at", label: "We wait until" },
+  { key: "transfer_instructions", label: "Destination account" },
 ];
 
 /**
@@ -313,8 +369,9 @@ function paymentsTableState(): "ready" | "loading" | "empty" {
 
       <template v-else>
         <p class="text-sm text-muted-foreground">
-          Choosing an offer opens your provider's own checkout page, where the card is entered. This
-          console never sees a card number, and no field on this page asks for one.
+          Choosing an offer opens a payment and shows you an account to transfer into. The money
+          moves as a bank transfer, and this console never sees your bank details — no field on this
+          page asks for any.
         </p>
 
         <ul aria-label="Top-up offers" class="flex flex-wrap gap-2">
@@ -344,6 +401,13 @@ function paymentsTableState(): "ready" | "loading" | "empty" {
       </template>
     </section>
 
+    <section v-if="payable" aria-labelledby="payments-transfer" class="flex flex-col gap-3">
+      <h2 id="payments-transfer" class="text-lg font-semibold text-foreground">
+        Pay by bank transfer
+      </h2>
+      <TransferInstructionsPanel :payment="payable.payment" :instructions="payable.instructions" />
+    </section>
+
     <section aria-labelledby="payments-list" class="flex flex-col gap-3">
       <h2 id="payments-list" class="text-lg font-semibold text-foreground">Payments</h2>
 
@@ -353,8 +417,8 @@ function paymentsTableState(): "ready" | "loading" | "empty" {
         </p>
         <p class="mt-1 text-sm text-muted-foreground">
           A payment's status is written only by a signature-verified message from your provider's
-          own servers. Returning from a checkout page does not mark anything paid, so a payment that
-          still reads as waiting here is one the provider has not spoken about yet.
+          own servers. This page cannot see your transfer until your provider reports it, so a
+          payment that still reads as waiting here is one the provider has not spoken about yet.
         </p>
         <ul class="mt-2 flex list-disc flex-col gap-1 pl-5 text-sm text-muted-foreground">
           <li v-for="state in unconfirmed" :key="state">
@@ -396,35 +460,42 @@ function paymentsTableState(): "ready" | "loading" | "empty" {
         <template #expires_at="{ row }: { row: PaymentIntent }">
           <InstantCell :value="row.expires_at" />
         </template>
-        <template #checkout_url="{ row }: { row: PaymentIntent }">
-          <a
-            v-if="row.checkout_url !== null && PAYMENT_AWAITING_PROVIDER_STATES.has(row.status)"
-            :href="row.checkout_url"
-            class="inline-flex min-h-11 items-center rounded-md text-sm text-foreground underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
-          >
-            Go to checkout
-          </a>
-          <span v-else-if="row.checkout_url !== null" class="text-xs text-muted-foreground">
-            Checkout closed
+        <template #transfer_instructions="{ row }: { row: PaymentIntent }">
+          <!-- The account a customer can pay into, selectable so it can be
+               copied rather than retyped. It is shown exactly while the payment
+               is one the provider has not settled, and the three branches are
+               three different facts: a destination to pay, a payment whose
+               destination was never obtained, and a payment that is over and
+               whose account must not be paid again. -->
+          <span v-if="destinationAccount(row) !== undefined" class="select-all font-mono text-xs">
+            {{ destinationAccount(row) }}
           </span>
-          <span v-else class="text-xs text-muted-foreground">Not open yet</span>
+          <span
+            v-else-if="row.transfer_instructions === null"
+            class="text-xs text-muted-foreground"
+          >
+            Not ready yet
+          </span>
+          <span v-else class="text-xs text-muted-foreground">—</span>
         </template>
       </DataTable>
 
       <p class="text-xs text-muted-foreground">
-        Each row is one payment, rendered from the server's own fields. The checkout link is the
-        provider's own URL, handed to the browser as it arrived: this console does not fetch it, and
-        nothing here decides that a payment succeeded. The link is only live while the provider has
-        something left to confirm; on a settled payment it reads as closed, because following it
-        would be sending a customer back to a page that cannot change their payment.
+        Each row is one payment, rendered from the server's own fields. The destination account is
+        the provider's own account number, handed to the browser as it arrived: this console does
+        not derive it, does not build a payment code of its own, and nothing here decides that a
+        payment succeeded. The account is shown only while the provider still has something to
+        confirm; on a settled payment it reads as a dash, because transferring to it again would
+        send money to an account whose payment is already over.
       </p>
     </section>
 
     <Card>
       <p class="text-sm text-muted-foreground">
         A payment's status is written only by a signature-verified webhook from the provider's own
-        servers. The card is entered on the provider's page; this console never sees a card number,
-        and returning from a checkout is a status refresh and nothing more.
+        servers. The money moves as a bank transfer to an account the provider holds for the
+        payment; this console never sees your bank details, and refreshing this page is a status
+        re-read and nothing more.
       </p>
     </Card>
   </Stack>
