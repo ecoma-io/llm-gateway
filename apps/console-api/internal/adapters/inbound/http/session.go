@@ -2,7 +2,6 @@ package http
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
@@ -119,17 +118,28 @@ func (t SessionToken) MarshalJSON() ([]byte, error) {
 	return nil, errors.New("console-api: a session token refuses serialisation: it belongs in a Set-Cookie and nowhere else")
 }
 
-// Digest is the form a session store keeps: the SHA-256 of the token. It is
-// what makes a database disclosure alone insufficient — the rows carry digests,
-// and a digest is not a cookie the browser will send.
-func (t SessionToken) Digest() string {
-	sum := sha256.Sum256([]byte(t))
-	return base64.RawURLEncoding.EncodeToString(sum[:])
-}
+// CookieValue returns the token's text, which is the only form a browser can
+// carry and therefore the only one this package will spend.
+//
+// It is exported for exactly one caller: the composition root, holding the
+// plaintext identity.NewSession returned, which must put it on the wire. A
+// value handed to anything else — a log verb, a struct, a URL — redacts
+// instead, so the existence of this method is not a weakening of String but a
+// single named door onto the plaintext. That the argument is a `string` and not
+// a token is the point: a cookie's value is text, and converting here is what
+// makes that conversion happen once instead of at every call site.
+func (t SessionToken) CookieValue() string { return string(t) }
 
 // newSessionToken mints a session's plaintext. It panics rather than falling
 // back for the reason newRequestID does: a guessable session token is a
 // forgeable session, and a silently weak one would be worse than an outage.
+//
+// The transport does not mint SESSIONS — identity.NewSession does, in the
+// composition root, and it returns the plaintext exactly once — so this is the
+// double-submit token's and the test suite's minter, and nothing in a request
+// path calls it. A second minter in a second layer is how two token formats end
+// up in one cookie jar, and only one of them is the one a session row was
+// written for.
 func newSessionToken() SessionToken { return randomToken(sessionTokenBytes) }
 
 // newRequestToken mints a double-submit token. Same failure posture as
@@ -221,18 +231,25 @@ func clearSessionCookies(w stdhttp.ResponseWriter) {
 
 // sessionFromRequest extracts the session token from a request's cookie.
 //
-// An absent, empty or wrong-length cookie is reported as absent rather than as
-// an error: to the caller it is one fact — there is no usable session here — and
-// the answer is the same 401 in every case, so distinguishing them at this
-// level would only create a difference for something to leak. The length check
-// is a cheap early refusal of anything this server did not mint, before any
-// digest is computed.
+// An absent or empty cookie is reported as absent rather than as an error: to
+// the caller it is one fact — there is no usable session here — and the answer
+// is the same 401 in every case, so distinguishing them at this level would
+// only create a difference for something to leak.
+//
+// A cookie that is PRESENT but does not parse is a different question, and this
+// function deliberately does not answer it. The grammar is identity's —
+// ses_<uuid>_<secret>, validated by identity.ParseSessionToken, which this
+// package cannot call because an inbound adapter is forbidden from reaching a
+// domain package — so any length or shape rule spelled here would be a second
+// authority on what a session token is, and the two would be free to disagree
+// about a cookie that the browser presented and the server minted. The value
+// therefore crosses the seam whole, and the composition root is the one place
+// allowed to parse it: a wrong one reaches the use case and comes back as
+// "no live session", which is the one answer a caller holding a junk cookie
+// should get anyway.
 func sessionFromRequest(r *stdhttp.Request) (SessionToken, bool) {
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil || cookie.Value == "" {
-		return "", false
-	}
-	if len(cookie.Value) != base64.RawURLEncoding.EncodedLen(sessionTokenBytes) {
 		return "", false
 	}
 	return SessionToken(cookie.Value), true

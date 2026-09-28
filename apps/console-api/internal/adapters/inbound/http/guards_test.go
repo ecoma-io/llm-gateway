@@ -409,8 +409,18 @@ func TestASessionIsUnauthenticatedWhateverTheReason(t *testing.T) {
 	}{
 		{name: "absent"},
 		{
-			name:   "malformed — not a token this server would have minted",
-			cookie: &stdhttp.Cookie{Name: sessionCookieName, Value: "not-a-session-token"},
+			// The reason this case carries sessionErr as well as a junk cookie,
+			// and the reason the fake is built with a field the production
+			// composition root does not have. The production resolve path parses
+			// the token with identity.ParseSessionToken BEFORE it reaches a
+			// store, so a cookie this malformed is refused there and the fake's
+			// Session is never consulted. Without that field the test would
+			// assert the fake's own behaviour rather than the wiring's, and a
+			// deletion of the parse step would go unnoticed — the junk cookie
+			// would still be answered with the fake's success.
+			name:       "malformed — not a token this server would have minted",
+			cookie:     &stdhttp.Cookie{Name: sessionCookieName, Value: "not-a-session-token"},
+			sessionErr: errNoSession,
 		},
 		{
 			name:       "expired",

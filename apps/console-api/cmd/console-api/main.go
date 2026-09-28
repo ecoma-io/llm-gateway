@@ -319,6 +319,22 @@ func main() {
 	}
 	log.Printf("console-api postgres pool ready for %s/%s", net.JoinHostPort(target.Hostname(), target.Port()), strings.TrimPrefix(target.Path, "/"))
 
+	// The console surface itself, over the same store the loops run on. This
+	// is the first caller this process has gained for the identity and console
+	// read repositories, and it is why they are built here rather than
+	// speculated at above: a screen is a real request, and this is it.
+	//
+	// It is built BEFORE the listener binds, so a surface that cannot be
+	// constructed fails the process with a startup line rather than answering
+	// the first real request with a 500. Nothing has been announced at this
+	// point, so there is no window in which this process was reachable and
+	// could not serve.
+	sessions, reads, err := buildConsoleSurface(store, projectionLog)
+	if err != nil {
+		log.Printf("console-api console surface: %v", err)
+		os.Exit(1)
+	}
+
 	// Binding before announcing or serving: a port already in use is a
 	// startup failure with a clear line, not a race between two goroutines.
 	listener, err := net.Listen("tcp", cfg.Addr)
@@ -334,7 +350,7 @@ func main() {
 	defer stop()
 
 	server := &stdhttp.Server{
-		Handler: newHandler(version, store),
+		Handler: newHandler(version, store, sessions, reads),
 		// ReadHeaderTimeout guards against a peer that connects and says
 		// nothing — a slowloris costs a goroutine forever without it. The
 		// read/write body and idle timeouts wait until there is real traffic
@@ -671,129 +687,93 @@ const (
 
 // newHandler composes the one HTTP surface this process serves: the
 // application over the build stamp, the store whose answers gate the readiness
-// probe, and the session use cases the session surface is written against. It
-// is a function rather than an inline field so the composition is a fact a test
-// can drive — the probe's gate is the one piece of wiring whose absence would
-// leave this process answering ready while its database is lost, and a handler
-// rebuilt without the store is exactly the regression nothing else would notice.
+// probe, and the two seams the console is written against.
+//
+// It is a function rather than an inline field so the composition is a fact a
+// test can drive. main builds the use cases and the store above and hands both
+// in; a test builds a different set and drives that. Nothing here chooses an
+// adapter — that happened in main — and nothing here knows a repository type.
 //
 // Readiness never travels through the application: there is no use case for a
 // ping, and the probe wants the port itself, so the constructor receives the
 // store beside the application rather than an application carrying it.
 //
-// The session use cases are the composition root's to choose and are not wired
-// to a store yet, so this hands the surface a fail-closed stand-in rather than
-// a nil — see unwiredSessionUseCases. The three probes and /version answer
-// exactly as they did before; the four session operations refuse every
-// request, which is the only safe answer from a process that has no session
-// store to resolve a token against.
+// BOTH the session use cases and the ten console reads are required, and a
+// failure to build EITHER fails the process. That is a change from the state
+// this function used to be in, and the change is the point: the two stand-ins
+// it held (unwiredSessionUseCases, unwiredConsoleReadUseCases) existed because
+// a session surface had no implementation, and every read behind a session that
+// could not resolve was refusing on purpose. With the session surface in
+// place, the reads are authorized against it, and a console that served
+// account data over a boundary that did not exist is no longer a
+// fail-closed state to be proud of — it is a screen behind a 500.
 //
-// The ten console reads take the same treatment, and for the same reason. The
-// read use cases ARE constructible here — the SQL adapters implement every
-// port NewConsoleReads asks for — and they are still handed over unwired, on
-// purpose. A session this process cannot resolve is the whole of the
-// authentication boundary, and a read surface behind it would be a console
-// serving account data over a boundary that does not exist yet. So the ten
-// reads answer 500 until the session surface is wired, and the first wiring to
-// arrive replaces both stand-ins together: a read screen is unreachable without
-// a session, and neither half is honest on its own.
-func newHandler(version string, readiness persistence.Pinger) stdhttp.Handler {
-	return http.New(application.New(version), readiness, unwiredSessionUseCases{}, unwiredConsoleReadUseCases{})
+// A screen that half-loads is worse than one that does not: the shell renders,
+// the navigation works, and only the data is missing. So the process refuses
+// to start rather than serve a surface it knows it cannot fill, and the error
+// names the constructor that refused so the line in the log is actionable.
+func newHandler(
+	version string,
+	readiness persistence.Pinger,
+	sessions http.SessionUseCases,
+	reads http.ConsoleReadUseCases,
+) stdhttp.Handler {
+	return http.New(application.New(version), readiness, sessions, reads)
 }
 
-// unwiredSessionUseCases is the session surface's answer to a process with no
-// session store wired behind it: every operation fails, so the four session
-// endpoints answer 500 and no caller is ever told it is signed in.
+// buildConsoleSurface is the wiring newHandler refuses to do for itself: it
+// takes the store, constructs the repositories and the use cases over them, and
+// returns the two seams.
 //
-// It is a refusal rather than a stub that returns a plausible success because
-// the alternative is the failure mode this whole surface exists to prevent —
-// a mint that reports a credential nobody can later revoke, or a session that
-// authenticates on the strength of a token no row is behind. Failing closed
-// costs availability; succeeding falsely costs credentials.
-//
-// Reconciling this is the composition root's job once the application layer
-// lands its SignIn/Session/SignOut/MintAPIKey: it replaces this value with the
-// real use cases, and nothing in the http package changes.
-type unwiredSessionUseCases struct{}
+// It is a separate function because main is already the longest thing in this
+// process, and a composition buried in a field literal is a composition nobody
+// can test or re-read. Both constructors PANIC on a nil dependency rather than
+// returning a half-built value — application.NewConsoleReads says so, and
+// newConsoleSessions returns an error for the same reason — so the only failure
+// this function can report is the session one, which is a refusal rather than
+// a panic by design: a nil there is a wiring mistake, and a mistake named in a
+// startup line beats a stack trace.
+func buildConsoleSurface(store persistence.Store, projectionLog persistence.ProjectionLog) (http.SessionUseCases, http.ConsoleReadUseCases, error) {
+	// The identity repositories, built once and SHARED between the two
+	// surfaces. That sharing is the reason the account predicate can be the
+	// same repository on both: a sign-in that resolved against one account
+	// table and a read that authorized against another would be two truths,
+	// and the sign-in would be the one nobody tests.
+	accounts := postgres.NewAccounts(store)
+	users := postgres.NewUsers(store)
+	keys := postgres.NewAPIKeys(store)
+	clock := postgres.NewClock(store)
 
-var errSessionUseCasesUnwired = errors.New("console-api: the session use cases are not wired to a store")
+	sessions, err := newConsoleSessions(
+		application.NewIdentity(store, accounts, users, keys, postgres.NewProjectionChangeRecorder(store), projectionLog),
+		postgres.NewSessions(store),
+		users,
+		accounts,
+		keys,
+		clock,
+		sessionTTL,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
 
-func (unwiredSessionUseCases) SignIn(context.Context, http.SignInInput) (http.SessionResult, error) {
-	return http.SessionResult{}, errSessionUseCasesUnwired
-}
-
-func (unwiredSessionUseCases) Session(context.Context, http.SessionToken) (http.SessionResult, error) {
-	return http.SessionResult{}, errSessionUseCasesUnwired
-}
-
-func (unwiredSessionUseCases) SignOut(context.Context, http.SessionToken) error {
-	return errSessionUseCasesUnwired
-}
-
-func (unwiredSessionUseCases) MintAPIKey(context.Context, http.MintAPIKeyInput) (http.MintedAPIKeyResult, error) {
-	return http.MintedAPIKeyResult{}, errSessionUseCasesUnwired
-}
-
-// unwiredConsoleReadUseCases is the ten product reads' answer to a process whose
-// session surface is not wired: every read fails, so each of the ten screens
-// answers 500 and no account data is served over a boundary that does not exist.
-//
-// It is a stand-in rather than a nil for the reason unwiredSessionUseCases is,
-// and it is a NON-nil one for a second reason beyond fail-closedness: a nil seam
-// reaching a handler would nil-dereference on the floor of a request goroutine,
-// where the stack names a request rather than the wiring that caused it. The
-// stand-in makes the mistake answerable at the boundary instead — the same
-// discipline that keeps application.NewConsoleReads panicking rather than
-// returning a half-wired read surface.
-//
-// The real implementation is written and sits in the http package
-// (http.NewConsoleReads): it is ten methods over the ten use cases, and the
-// SQL adapters behind them are constructed in main above. What is missing is
-// not code but the SESSION the reads are authorized against, so the first
-// wiring to land replaces this value — and unwiredSessionUseCases with it —
-// and nothing in the http package changes.
-type unwiredConsoleReadUseCases struct{}
-
-var errConsoleReadUseCasesUnwired = errors.New("console-api: the console read use cases are not wired behind a session surface")
-
-func (unwiredConsoleReadUseCases) AccountOverview(context.Context, string) (http.AccountOverviewResult, error) {
-	return http.AccountOverviewResult{}, errConsoleReadUseCasesUnwired
-}
-
-func (unwiredConsoleReadUseCases) ListUsers(context.Context, string, string, string, int) (http.UserPageResult, error) {
-	return http.UserPageResult{}, errConsoleReadUseCasesUnwired
-}
-
-func (unwiredConsoleReadUseCases) ListAPIKeys(context.Context, string, string, int) (http.APIKeyPageResult, error) {
-	return http.APIKeyPageResult{}, errConsoleReadUseCasesUnwired
-}
-
-func (unwiredConsoleReadUseCases) ListPlans(context.Context, string, int) (http.PlanPageResult, error) {
-	return http.PlanPageResult{}, errConsoleReadUseCasesUnwired
-}
-
-func (unwiredConsoleReadUseCases) ListSubscriptions(context.Context, string, string, int) (http.SubscriptionPageResult, error) {
-	return http.SubscriptionPageResult{}, errConsoleReadUseCasesUnwired
-}
-
-func (unwiredConsoleReadUseCases) ListEntitlements(context.Context, string, string, int) (http.EntitlementPageResult, error) {
-	return http.EntitlementPageResult{}, errConsoleReadUseCasesUnwired
-}
-
-func (unwiredConsoleReadUseCases) ListFundingBuckets(context.Context, string, string, int) (http.FundingBucketPageResult, error) {
-	return http.FundingBucketPageResult{}, errConsoleReadUseCasesUnwired
-}
-
-func (unwiredConsoleReadUseCases) ListLedgerEntries(context.Context, string, string, string, string, int) (http.LedgerEntryPageResult, error) {
-	return http.LedgerEntryPageResult{}, errConsoleReadUseCasesUnwired
-}
-
-func (unwiredConsoleReadUseCases) ListFindings(context.Context, string, string, string, int) (http.FindingPageResult, error) {
-	return http.FindingPageResult{}, errConsoleReadUseCasesUnwired
-}
-
-func (unwiredConsoleReadUseCases) ListReconciliationRuns(context.Context, string, int) (http.ReconciliationRunPageResult, error) {
-	return http.ReconciliationRunPageResult{}, errConsoleReadUseCasesUnwired
+	reads, err := newConsoleReads(application.NewConsoleReads(
+		accounts,
+		postgres.NewAccountUsers(store),
+		postgres.NewAccountAPIKeys(store),
+		postgres.NewAccountPlans(store),
+		postgres.NewAccountSubscriptions(store),
+		postgres.NewAccountEntitlements(store),
+		postgres.NewAccountBuckets(store),
+		postgres.NewAccountLedger(store),
+		postgres.NewAccountFindings(store),
+		postgres.NewAccountRuns(store),
+		postgres.NewReconciliationFindings(store),
+	))
+	if err != nil {
+		return nil, nil, err
+	}
+	return sessions, reads, nil
 }
 
 // run serves until the process is asked to stop, then drains.

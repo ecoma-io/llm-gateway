@@ -109,7 +109,7 @@ func optionalQuery(r *stdhttp.Request, name string) string {
 // computed from the buckets, no count derived from a page — and that is the
 // point of the operation existing rather than a client making three requests
 // and joining them in the browser.
-func handleGetAccountOverview(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
+func handleGetAccountOverview(sessions SessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
@@ -130,7 +130,7 @@ func handleGetAccountOverview(sessions sessionUseCases, reads ConsoleReadUseCase
 // together, which is what a member list is. The account is the session's and
 // the port's predicate, so a user of another account is a row the statement
 // never returned.
-func handleListUsers(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
+func handleListUsers(sessions SessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
@@ -155,7 +155,7 @@ func handleListUsers(sessions sessionUseCases, reads ConsoleReadUseCases) stdhtt
 // Unfiltered, and the page is the only thing a caller learns: there is no total
 // here, so a console that wanted "12 keys" is asking the overview, whose
 // active_api_key_count is a stored figure — not this list, whose page is not.
-func handleListAPIKeys(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
+func handleListAPIKeys(sessions SessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
@@ -183,7 +183,7 @@ func handleListAPIKeys(sessions sessionUseCases, reads ConsoleReadUseCases) stdh
 // the session that reached it at all. A session is still required: the
 // catalogue is a product surface read, and nothing here is reachable without
 // one.
-func handleListPlans(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
+func handleListPlans(sessions SessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if _, ok := resolveSession(w, r, sessions); !ok {
 			return
@@ -207,7 +207,7 @@ func handleListPlans(sessions sessionUseCases, reads ConsoleReadUseCases) stdhtt
 // A scheduled cancellation renders as a cancel_at beside an unchanged state, so
 // a row carrying a future cancellation reads as active with a date attached —
 // which is what it is.
-func handleListSubscriptions(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
+func handleListSubscriptions(sessions SessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
@@ -234,7 +234,7 @@ func handleListSubscriptions(sessions sessionUseCases, reads ConsoleReadUseCases
 // it is drawn on a funding bucket, which is a separate operation with a
 // separate reason. The port's predicate is an EXISTS against the owning
 // subscription, still in the WHERE clause and still before any row is returned.
-func handleListEntitlements(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
+func handleListEntitlements(sessions SessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
@@ -262,7 +262,7 @@ func handleListEntitlements(sessions sessionUseCases, reads ConsoleReadUseCases)
 // server maintains, the legs win over them, and a browser's arithmetic has no
 // authority behind it. There is no currency field on any of them and no symbol
 // on any of them — see readwire.go.
-func handleListFundingBuckets(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
+func handleListFundingBuckets(sessions SessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
@@ -298,7 +298,7 @@ func handleListFundingBuckets(sessions sessionUseCases, reads ConsoleReadUseCase
 // The kind filter is a real predicate in the same statement, and the cursor
 // carries it and the bucket id, so a cursor earned on one bucket or under one
 // kind cannot be replayed against another.
-func handleListLedgerEntries(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
+func handleListLedgerEntries(sessions SessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
@@ -338,7 +338,7 @@ func handleListLedgerEntries(sessions sessionUseCases, reads ConsoleReadUseCases
 // required — this is a product read and nothing here is reachable without one —
 // and the account is not consulted, because a count of it would be a
 // projection the list does not offer.
-func handleListFindings(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
+func handleListFindings(sessions SessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if _, ok := resolveSession(w, r, sessions); !ok {
 			return
@@ -364,7 +364,7 @@ func handleListFindings(sessions sessionUseCases, reads ConsoleReadUseCases) std
 // A run whose finished_at is null is rendered as such: a wedged worker and an
 // idle one are otherwise indistinguishable, and the contract says rendering
 // that is worth the trouble.
-func handleListReconciliationRuns(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
+func handleListReconciliationRuns(sessions SessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if _, ok := resolveSession(w, r, sessions); !ok {
 			return
@@ -539,10 +539,17 @@ func renderLedgerEntry(row LedgerEntryRecord) ledgerEntryRecord {
 }
 
 // renderFinding converts one recorded divergence. The evidence crosses as the
-// raw JSON the check wrote — decoded once here to prove it IS json, and then
-// re-encoded byte-for-byte by the encoder — and is never interpreted: no key
+// raw JSON the check wrote — validated once here to prove it IS json, and then
+// emitted by the encoder as the bytes it was — and is never interpreted: no key
 // is looked up, no figure is summed, no shape is imposed. Its vocabulary is
 // that check's business and not this contract's.
+//
+// json.RawMessage is what makes "as the bytes it was" true rather than
+// aspirational: the encoder writes a RawMessage through verbatim, where a
+// decoded map[string]any would be re-encoded from Go's map iteration and a
+// hand-rolled interface{} would be re-encoded by whatever the column happened
+// to parse into. Neither preserves key order, and key order is the only thing
+// left that distinguishes two findings recording the same figures.
 func renderFinding(row FindingRecord) findingRecord {
 	record := findingRecord{
 		ID:          row.ID,

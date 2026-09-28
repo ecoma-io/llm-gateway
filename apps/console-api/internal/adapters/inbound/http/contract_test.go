@@ -30,10 +30,10 @@ const contractPath = "../../../../../../api/openapi/console.yaml"
 // and ADR 0012's Consequences names this exact moment: the moment the
 // panic-on-nil-port discipline gets quietly defeated if nobody says so.
 //
-// The temptation is real. routes() now takes a sessionUseCases, and the
+// The temptation is real. routes() now takes a SessionUseCases, and the
 // contract test needs a route table; so the route table gets a real store, and
 // the test needs a database, and a contract test that needs a database stops
-// running in CI's unit tier. The seam prevents it: sessionUseCases is an
+// running in CI's unit tier. The seam prevents it: SessionUseCases is an
 // interface declared in this package, so a fake of it needs no port, no
 // connection string and no cluster — the dependency the test-local constructor
 // exists to avoid is the one the seam was declared to keep out.

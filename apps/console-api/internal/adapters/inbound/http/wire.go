@@ -195,11 +195,11 @@ func quoteJSON(value string) (string, error) {
 // id string, a user id) rather than a domain type, for the import-rule reason at
 // the top of this file.
 
-// sessionUseCases is the four session operations, as the transport needs them.
+// SessionUseCases is the four session operations, as the transport needs them.
 // A missing, expired or revoked session is one outcome — not a session — so the
 // sign-out and mint paths are written to tolerate it rather than to branch on
 // which it was.
-type sessionUseCases interface {
+type SessionUseCases interface {
 	// SignIn resolves (account id, email) over live rows, checks the
 	// credential, and returns the session it created together with the Principal
 	// it belongs to. Every pre-credential failure is one uniform answer, so a
@@ -231,6 +231,18 @@ type SignInInput struct {
 	Email     string
 	Password  string
 }
+
+// SessionTokenFromString wraps a minted session's plaintext so it can cross the
+// seam as the type the rest of this package refuses to print, marshal or nest.
+//
+// It exists because identity.NewSession returns a plain `string` — the domain
+// will not hand out a type whose String redacts, because a domain is not a log
+// sink — and this is the one crossing point where that string becomes a
+// credential value. A conversion spelled at a call site would be a plain
+// `SessionToken(…)` that the compiler accepts as readily as this one, and the
+// difference is a door: this one is named, so a reader can find every place a
+// plaintext session token becomes a SessionToken, and there is exactly one.
+func SessionTokenFromString(plaintext string) SessionToken { return SessionToken(plaintext) }
 
 // SessionResult is a live session's answer: the Principal it names and the
 // plaintext token that addresses it. The token is returned to the transport

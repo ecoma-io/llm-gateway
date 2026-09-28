@@ -104,7 +104,7 @@ func (e *badRequestError) response() (int, string, string) {
 // The guards themselves are applied at the mount, so nothing here reads a
 // header or a cookie for them: a request that failed one never reaches this
 // function, and its body was never read.
-func handleSignIn(useCases sessionUseCases) stdhttp.HandlerFunc {
+func handleSignIn(useCases SessionUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		var in signInRequest
 		if err := decodeJSONBody(w, r, &in); err != nil {
@@ -183,7 +183,7 @@ func (signInError) response() (int, string, string) {
 // said. So the only thing this handler adds is the shape, and the only thing it
 // withholds is account data: an unauthenticated caller must not be able to
 // enumerate anything by asking.
-func handleSession(useCases sessionUseCases) stdhttp.HandlerFunc {
+func handleSession(useCases SessionUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		Principal, ok := resolveSession(w, r, useCases)
 		if !ok {
@@ -205,7 +205,7 @@ func handleSession(useCases sessionUseCases) stdhttp.HandlerFunc {
 // It writes the refusal itself and reports false, so a handler's failure path is
 // a two-line early return rather than a repeated error construction that could
 // drift.
-func resolveSession(w stdhttp.ResponseWriter, r *stdhttp.Request, useCases sessionUseCases) (Principal, bool) {
+func resolveSession(w stdhttp.ResponseWriter, r *stdhttp.Request, useCases SessionUseCases) (Principal, bool) {
 	token, ok := sessionFromRequest(r)
 	if !ok {
 		writeError(w, r, unauthenticatedError{})
@@ -246,7 +246,7 @@ func resolveSession(w stdhttp.ResponseWriter, r *stdhttp.Request, useCases sessi
 // token to a surface that is failing; the application has still revoked it
 // server-side, so a token captured some other way stops working too. Nothing
 // here can produce a state where the browser believes it is still signed in.
-func handleSignOut(useCases sessionUseCases) stdhttp.HandlerFunc {
+func handleSignOut(useCases SessionUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		defer clearSessionCookies(w)
 
@@ -285,7 +285,7 @@ func handleSignOut(useCases sessionUseCases) stdhttp.HandlerFunc {
 // issued, and a live session. That is the whole of the mint's trust
 // precondition, and the account follows from the session rather than from
 // anything in the request.
-func handleMintAPIKey(useCases sessionUseCases) stdhttp.HandlerFunc {
+func handleMintAPIKey(useCases SessionUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		// Guard 1, the one that can still fail on a request that cleared all the
 		// others: a caller with no session is told exactly that, rather than

@@ -174,7 +174,7 @@ func (f *fakeConsoleReadUseCases) ListAPIKeys(_ context.Context, accountID, afte
 		return *f.keys, nil
 	}
 	return APIKeyPageResult{
-		Items:      []APIKeyRecord{{ID: "key-1", AccountID: accountID, DisplayName: "ci", Prefix: "gw_key", State: "active", CreatedAt: fixtureTime}},
+		Items:      []APIKeyRecord{{ID: "key-1", AccountID: accountID, DisplayName: "ci", Prefix: "gw_key", State: "active", CreatedAt: fixtureTime, UpdatedAt: fixtureTime}},
 		NextCursor: "cursor-keys",
 	}, nil
 }
@@ -284,7 +284,8 @@ func (f *fakeConsoleReadUseCases) ListFindings(_ context.Context, status, severi
 	return FindingPageResult{
 		Items: []FindingRecord{{
 			ID: 7, CheckKind: "f1", SubjectKind: "funding_bucket", SubjectID: "bucket-1",
-			Severity: "warning", Status: "open", DetectedAt: fixtureTime, LastSeenAt: fixtureTime,
+			Severity: "warning", Status: "open", Observed: string(jsonBytes),
+			DetectedAt: fixtureTime, LastSeenAt: fixtureTime,
 		}},
 		NextCursor: "cursor-findings",
 	}, nil
@@ -320,14 +321,30 @@ var errNoReads = errors.New("console-api: the read use cases answered nothing")
 // notFoundForForeignAccount is the fake's cross-account refusal. It is a 404
 // and not a 403, and the reason is the whole of the rule: a 403 confirms the
 // resource exists, so "not yours" and "not there" must be one answer.
+//
+// It is built through the APPLICATION's vocabulary rather than a bare
+// errors.New, because that is what a real use case returns and because the
+// status a refusal gets is decided by errorResponse's classification rather
+// than by the sentence: a plain error is not an application error at all and
+// would be rendered as a 500. Returning the 500 here would still be
+// indistinguishable from the 404 to a cross-account prober — which is a
+// weaker property than the one the rule asks for — so the fake says the one
+// thing it means, in the only vocabulary that carries it to a status.
 func notFoundForForeignAccount() error {
-	return errors.New("not found: the resource is not available to this account")
+	return application.NotFound("the resource is not available to this account")
 }
 
-// jsonBytes is the evidence a finding carries. It is written as a literal here
-// so a test can assert it reaches the wire byte-for-byte — a client that
-// re-encodes the evidence and gets a different shape has learned something the
-// surface did not promise them.
+// jsonBytes is the evidence a finding carries, and it is attached to the
+// fixture row above rather than left beside it as a spare.
+//
+// It is written as a literal here so a test can assert it reaches the wire
+// byte-for-byte — a client that re-encodes the evidence and gets a different
+// shape has learned something the surface did not promise them — and it is
+// spelled with its keys in the order the check wrote them, because a re-encoded
+// object with the same keys is still a different artifact to anyone diffing two
+// findings. The numbers are the bucket's own, so a client that tried to
+// reconcile them against the cached balances would find them consistent: the
+// evidence is a snapshot, not a different truth.
 var jsonBytes = json.RawMessage(`{"cached_available":90,"from_legs":90}`)
 
 // ensure the fake satisfies the seam at compile time, so a change to the seam

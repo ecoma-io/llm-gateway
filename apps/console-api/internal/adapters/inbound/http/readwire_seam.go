@@ -6,7 +6,7 @@ import (
 
 // The ten read operations, as the narrow seam their handlers call.
 //
-// It is a separate interface from sessionUseCases rather than ten more methods
+// It is a separate interface from SessionUseCases rather than ten more methods
 // on that one, and the reason is what a nil means. The session surface is this
 // service's authentication boundary: a process that started with none would
 // answer every product operation as though every caller were signed in. The

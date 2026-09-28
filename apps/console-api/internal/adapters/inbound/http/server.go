@@ -80,7 +80,7 @@ const (
 // The surface itself is declared in routes.go and mounted here; this function
 // owns everything around it — the middleware, the two fallbacks below, and the
 // order they are composed in.
-func New(app *application.App, readiness persistence.Pinger, sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.Handler {
+func New(app *application.App, readiness persistence.Pinger, sessions SessionUseCases, reads ConsoleReadUseCases) stdhttp.Handler {
 	if readiness == nil {
 		panic("http: New requires a readiness Pinger; /readyz has nothing to gate on without one")
 	}
@@ -255,6 +255,25 @@ func errorResponse(err error) (status int, code string, message string) {
 	switch applicationError.Code {
 	case application.CodeNotFound:
 		return stdhttp.StatusNotFound, string(application.CodeNotFound), applicationError.Message
+	case application.CodeInvalidRequest:
+		// 400 invalid_request, and the message is forwarded rather than replaced
+		// by a fixed one. CodeInvalidRequest says the request is well-formed HTTP
+		// and its inputs do not satisfy the contract — a limit outside the
+		// bounds, a cursor this surface cannot place, a cursor carried under
+		// filters the request no longer makes — and the contract promises the
+		// caller which one it was. It has already been reduced to that
+		// category by the layer below, which is the only layer that could name
+		// an account, and the answers themselves name no account: a page size
+		// and a cursor.
+		//
+		// This branch did not exist and the omission was a live defect rather
+		// than a gap: a `limit=abc` on any of the nine lists classified as
+		// CodeInvalidRequest, fell to the default, and answered 500 `internal`
+		// — a server fault for a value the server was told about and chose not
+		// to read, on a surface whose contract states plainly that "not an
+		// integer at all" is `400 invalid_request`. A generated client reads 500
+		// as retryable and a malformed page size is not retryable.
+		return stdhttp.StatusBadRequest, string(application.CodeInvalidRequest), applicationError.Message
 	default:
 		return stdhttp.StatusInternalServerError, string(application.CodeInternal), internalErrorMessage
 	}

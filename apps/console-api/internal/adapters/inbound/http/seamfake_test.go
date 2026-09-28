@@ -9,7 +9,7 @@ import (
 // The test seam's fake. It lives in a _test.go file beside the tests rather
 // than in a non-test file so it can never be reached by cmd/console-api, and it
 // is the constructor ADR 0012's Consequences names: contract_test.go and the
-// route inventory both need a sessionUseCases to call routes(), and the seam is
+// route inventory both need a SessionUseCases to call routes(), and the seam is
 // a narrow interface precisely so a fake of it needs no database, no
 // persistence port and no application wiring.
 //

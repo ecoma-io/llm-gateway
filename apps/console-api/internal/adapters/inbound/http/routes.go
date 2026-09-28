@@ -48,7 +48,7 @@ type route struct {
 // the wire itself needs. The ten read use cases travel as their own seam beside
 // them rather than as members of the session one, because the two have
 // different consequences when they are absent — see ConsoleReadUseCases.
-func routes(app *application.App, readiness persistence.Pinger, sessions sessionUseCases, reads ConsoleReadUseCases) []route {
+func routes(app *application.App, readiness persistence.Pinger, sessions SessionUseCases, reads ConsoleReadUseCases) []route {
 	product := []route{
 		// Sign-in: the only unauthenticated write, and the only way a session
 		// comes into existence. It carries the origin, content-type and
