@@ -134,6 +134,29 @@ func TestApplicationErrorsMapToSafeHTTPResponses(t *testing.T) {
 			wantBody:   "{\"error\":{\"code\":\"not_found\",\"message\":\"the requested version does not exist\"},\"request_id\":\"error-request\"}\n",
 		},
 		{
+			// 400 carries the use case's own message rather than a generic one:
+			// a caller refused for asking for a range longer than the bound is
+			// sent back with the same request by a generic message, because
+			// nothing in the response says what to change. The bound is the only
+			// thing a caller can act on here.
+			name:       "an invalid request application error keeps the message that names the bound",
+			err:        application.InvalidRequest("the range is longer than the 2160h0m0s this surface serves"),
+			wantStatus: stdhttp.StatusBadRequest,
+			wantBody:   "{\"error\":{\"code\":\"invalid_request\",\"message\":\"the range is longer than the 2160h0m0s this surface serves\"},\"request_id\":\"error-request\"}\n",
+		},
+		{
+			// 401 with a message that describes THIS credential and no other. The
+			// use case writes a fixed sentence, so an absent credential, one the
+			// deployment never issued and one that has been retired are refused
+			// identically — and the mapping must not add anything to that. The
+			// assertion the loop makes below is that no challenge rides along
+			// with it either.
+			name:       "an unauthenticated application error keeps the fixed refusal",
+			err:        application.Unauthenticated(),
+			wantStatus: stdhttp.StatusUnauthorized,
+			wantBody:   "{\"error\":{\"code\":\"unauthenticated\",\"message\":\"the credential presented does not resolve to an account\"},\"request_id\":\"error-request\"}\n",
+		},
+		{
 			name:       "an internal application error hides its cause",
 			err:        application.Internal(errors.New(secret)),
 			wantStatus: stdhttp.StatusInternalServerError,
@@ -169,6 +192,17 @@ func TestApplicationErrorsMapToSafeHTTPResponses(t *testing.T) {
 			}
 			if strings.Contains(rec.Body.String(), secret) {
 				t.Errorf("writeError() leaked an internal detail: body = %q", rec.Body.String())
+			}
+			// No operation on this surface declares a WWW-Authenticate header,
+			// and the reason is stated rather than accidental: a challenge names
+			// a realm, and this scheme is a deployment-supplied bearer token,
+			// so a challenge would tell a caller where to look for credentials
+			// without telling this surface anything it would act on. The header
+			// is checked on EVERY case in this table rather than on the 401
+			// alone, because a header added somewhere shared would arrive on the
+			// refusals too.
+			if got := rec.Header().Get("WWW-Authenticate"); got != "" {
+				t.Errorf("writeError() sent a WWW-Authenticate challenge %q; this surface answers a credential failure with the envelope and nothing else", got)
 			}
 		})
 	}
