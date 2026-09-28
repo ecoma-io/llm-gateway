@@ -2,11 +2,20 @@
 // This is a purposeful foundation page, not a dashboard: health and readiness
 // are the only two operations the current OpenAPI contract defines. Calling
 // them through lib/api means every field still comes from generated types.
-import { Badge, Button, Card, ErrorState, LoadingState, PageHeader, Stack } from "@ecoma-io/loom";
+//
+// The probe badge routes through `probeStatusPresentation` rather than
+// building a `variant` here, and that is the whole point of the choice
+// (ADR 0012 §7, which names this line): a badge handed a `variant` is two
+// channels from being colour-only, because the contract token `ok` says nothing
+// to an operator and the only other channel is the shade of the box. Every
+// other badge in this console is a `StatusBadge` — the one component that
+// renders a status, so a status cannot be rendered two ways.
+import { Button, Card, ErrorState, LoadingState, PageHeader, Stack } from "@ecoma-io/loom";
 import { computed, onMounted, ref } from "vue";
 
 import { getHealth, getReadiness, type HealthStatus } from "@/lib/api";
-import { probeStatusVariant } from "@/lib/probe-status";
+import StatusBadge from "@/modules/status/StatusBadge.vue";
+import { probeStatusPresentation } from "@/modules/status/presentation";
 
 type ProbeName = "health" | "readiness";
 type ProbeState = {
@@ -84,9 +93,7 @@ onMounted(refresh);
           title="Probe unavailable"
           description="The gateway did not return a successful probe response."
         />
-        <Badge v-else :variant="probeStatusVariant(probes[probe.key].status)">{{
-          probes[probe.key].status
-        }}</Badge>
+        <StatusBadge v-else :status="probeStatusPresentation(probes[probe.key].status)" />
       </Card>
     </section>
   </Stack>
