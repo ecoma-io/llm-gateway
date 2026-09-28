@@ -35,11 +35,12 @@ const (
 	// refusal case a comparison against a random string.
 	usageRequestID = "usage-request"
 
-	// usagePath is the served path. The `/v1` base is the document's server base
-	// and the operation's declared path joined, exactly as console.yaml says it
-	// is served — the one thing a hand-written test that spelled the path
-	// wrongly would not notice, and the reason this constant is not "/usage".
-	usagePath = "/v1/usage"
+	// usagePath is the served path, and it is the operation's declared path
+	// in console.yaml rather than one spelled here: the document's server base
+	// is `/`, so the path a caller calls is the path the contract declares.
+	// A test that spelled it wrongly would otherwise agree with itself while
+	// the surface and the contract drifted apart.
+	usagePath = "/usage"
 
 	// usageQuery is a well-formed request: a three-hour range at the hour grain
 	// in UTC, which is the smallest question the surface answers. A bare date is
@@ -61,7 +62,7 @@ var (
 // accepted whatever account a test asked for would let every other assertion
 // pass while the one property the surface has was never under test.
 func usageServer(readModel persistence.Analytics) stdhttp.Handler {
-	return New(application.New("v0.1.0"), &answeringPinger{}, application.NewUsageUseCase(readModel, stubScoper{}))
+	return New(application.New("v0.1.0"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), application.NewUsageUseCase(readModel, stubScoper{}))
 }
 
 // issueUsage is one request against a mounted surface, returning the recorded
@@ -249,7 +250,7 @@ func TestTheUsageSurfaceRefusesEveryCredentialItCannotResolve(t *testing.T) {
 			if envelope.RequestID != usageRequestID {
 				t.Errorf("request_id = %q, want %q", envelope.RequestID, usageRequestID)
 			}
-			if want := application.Unauthenticated().Message; envelope.Error.Message != want {
+			if want := application.UnresolvedCredential().Message; envelope.Error.Message != want {
 				t.Errorf("message = %q, want %q; every unresolved credential answers identically, and a caller that can tell two apart has been told one bit about the credential space", envelope.Error.Message, want)
 			}
 		})
@@ -438,7 +439,8 @@ func TestTheUsageSurfaceAnswersAReadModelThatHoldsNothing(t *testing.T) {
 	}
 
 	want := `{"availability":"not_available","metric":"usage",` +
-		`"range":{"from":"2026-09-01T00:00:00Z","to":"2026-09-01T03:00:00Z","granularity":"hour","timezone":"UTC"},` +
+		`"range":{"start_at":"2026-09-01T00:00:00Z","end_at":"2026-09-01T03:00:00Z","timezone":"UTC"},` +
+		`"granularity":"hour",` +
 		`"final_bucket_partial":false,"series":[],` +
 		`"requests_with_usage_facts":0,"requests_settled":0,` +
 		`"settled_amount_minor_units":0,"released_amount_minor_units":0,"funds_added_minor_units":0,` +
@@ -506,7 +508,8 @@ func TestTheUsageSurfaceRendersTheContractedEnvelope(t *testing.T) {
 	}
 
 	want := `{"availability":"available","metric":"usage",` +
-		`"range":{"from":"2026-09-01T00:00:00Z","to":"2026-09-01T03:00:00Z","granularity":"hour","timezone":"UTC"},` +
+		`"range":{"start_at":"2026-09-01T00:00:00Z","end_at":"2026-09-01T03:00:00Z","timezone":"UTC"},` +
+		`"granularity":"hour",` +
 		`"final_bucket_partial":false,` +
 		`"series":[` +
 		`{"bucket_start":"2026-09-01T00:00:00Z","bucket_end":"2026-09-01T01:00:00Z","requests_with_usage_facts":412,"requests_settled":410},` +
@@ -593,12 +596,12 @@ func TestTheUsageEnvelopeFollowsTheZoneItWasCutIn(t *testing.T) {
 	// The grain is carried inside the range the envelope echoes, because a
 	// figure cannot be re-aggregated without re-deriving what a bucket meant —
 	// and a report mixing grains is a defect rather than a wide sheet.
-	if envelope.Range.Granularity != string(analytics.GranularityHour) {
-		t.Errorf("range.granularity = %q, want %q", envelope.Range.Granularity, analytics.GranularityHour)
+	if envelope.Granularity != string(analytics.GranularityHour) {
+		t.Errorf("range.granularity = %q, want %q", envelope.Granularity, analytics.GranularityHour)
 	}
-	if envelope.Range.From != "2026-09-01T00:00:00Z" || envelope.Range.To != "2026-09-01T03:00:00Z" {
+	if envelope.Range.StartAt != "2026-09-01T00:00:00Z" || envelope.Range.EndAt != "2026-09-01T03:00:00Z" {
 		t.Errorf("the range came back as [%s, %s), want the range asked for; a zone moves where a bucket begins, not where the range is",
-			envelope.Range.From, envelope.Range.To)
+			envelope.Range.StartAt, envelope.Range.EndAt)
 	}
 	if !envelope.FinalBucketPartial {
 		t.Error("final_bucket_partial = false, want true; the range's end falls inside the last bucket, and that is a fact about the range rather than about the data")

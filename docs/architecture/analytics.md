@@ -218,15 +218,15 @@ Every bound is a **refusal**, never a clamp: a clamped answer is
 indistinguishable from a real page, so the caller "could learn about the mismatch
 nowhere" (`usage-facts.yaml:78-91`).
 
-| Bound            | Value                                                                            | Where enforced                              |
-| ---------------- | -------------------------------------------------------------------------------- | ------------------------------------------- |
-| Max range        | 90 days                                                                          | contract description; `400 invalid_request` |
-| `from`/`to`      | required, half-open `[from, to)`                                                 | `400`                                       |
-| Granularity      | closed enum `hour \| day \| calendar_month`                                      | `400`                                       |
-| Max series items | 2160 (90 days × 24 h) — the natural cap, stated rather than asked for            | contract `maxItems`                         |
-| Dimensions       | **no client-named `group_by` at all** (see below)                                | —                                           |
-| Query timeout    | 5 s at the application layer + `statement_timeout` in the read's own transaction | maps to `503`                               |
-| Page size        | n/a — aggregate series are bounded by `maxItems`                                 | —                                           |
+| Bound            | Value                                                                                                                | Where enforced                              |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
+| Max range        | 90 days                                                                                                              | contract description; `400 invalid_request` |
+| `from`/`to`      | required, half-open `[from, to)`                                                                                     | `400`                                       |
+| Granularity      | closed enum `hour \| day \| calendar_month`                                                                          | `400`                                       |
+| Max series items | 2161 (90 days × 24 h, plus the bucket containing an unaligned start) — the natural cap, stated rather than asked for | contract `maxItems`                         |
+| Dimensions       | **no client-named `group_by` at all** (see below)                                                                    | —                                           |
+| Query timeout    | 5 s at the application layer + `statement_timeout` in the read's own transaction                                     | maps to `503`                               |
+| Page size        | n/a — aggregate series are bounded by `maxItems`                                                                     | —                                           |
 
 **No client-named dimension.** Each granularity is a _pre-written query_ in the
 adapter, chosen by an allowlist of `const` statements. A `?group_by=` parameter

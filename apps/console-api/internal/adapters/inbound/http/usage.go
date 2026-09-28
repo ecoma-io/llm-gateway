@@ -270,10 +270,10 @@ func (response usageResponse) MarshalJSON() ([]byte, error) {
 	return json.Marshal(usageEnvelope{
 		Availability: string(answer.Availability),
 		Metric:       "usage",
+		Granularity:  string(answer.Range.Granularity),
 		Range: usageRange{
-			From:        answer.Range.From.Format(time.RFC3339),
-			To:          answer.Range.To.Format(time.RFC3339),
-			Granularity: string(answer.Range.Granularity),
+			StartAt: answer.Range.From.Format(time.RFC3339),
+			EndAt:   answer.Range.To.Format(time.RFC3339),
 			// Already the canonical name: the domain's NewQuery resolved the
 			// caller's spelling and stored the resolved location's name when
 			// none was given, so the response echoes the zone the buckets were
@@ -305,6 +305,7 @@ type usageEnvelope struct {
 	Availability       string        `json:"availability"`
 	Metric             string        `json:"metric"`
 	Range              usageRange    `json:"range"`
+	Granularity        string        `json:"granularity"`
 	FinalBucketPartial bool          `json:"final_bucket_partial"`
 	Series             []usageBucket `json:"series"`
 
@@ -321,11 +322,17 @@ type usageEnvelope struct {
 	Freshness usageFreshness `json:"freshness"`
 }
 
+// usageRange is the range the answer covers, and it carries the GRAIN OUTSIDE
+// itself. The contract puts `granularity` on the response rather than on the
+// range: a range is an interval, and an interval has a width, but the grain is
+// the width of one point in the series rather than a property of the interval
+// — the same interval is a hundred points at hourly grain and one at monthly.
+// A client built from the fragment reads the field where the fragment puts it,
+// and a handler that nests it produces a document the client cannot parse.
 type usageRange struct {
-	From        string `json:"from"`
-	To          string `json:"to"`
-	Granularity string `json:"granularity"`
-	Timezone    string `json:"timezone"`
+	StartAt  string `json:"start_at"`
+	EndAt    string `json:"end_at"`
+	Timezone string `json:"timezone"`
 }
 
 type usageBucket struct {

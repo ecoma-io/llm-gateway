@@ -152,7 +152,7 @@ func TestApplicationErrorsMapToSafeHTTPResponses(t *testing.T) {
 			// assertion the loop makes below is that no challenge rides along
 			// with it either.
 			name:       "an unauthenticated application error keeps the fixed refusal",
-			err:        application.Unauthenticated(),
+			err:        application.UnresolvedCredential(),
 			wantStatus: stdhttp.StatusUnauthorized,
 			wantBody:   "{\"error\":{\"code\":\"unauthenticated\",\"message\":\"the credential presented does not resolve to an account\"},\"request_id\":\"error-request\"}\n",
 		},
