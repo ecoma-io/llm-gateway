@@ -26,6 +26,9 @@
 // below is either inside a string literal (rule 1 stops at the `<script>` tag,
 // so a string is code and is never a violation) or a prose line quoted in a
 // way that does not itself form a collapsed marker.
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { extname, join, relative, resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { checkLine } from "./check-comment-blocks.mjs";
@@ -325,5 +328,45 @@ describe("what the check is not", () => {
     // first, and the first does not even run on this text.
     const narrow = ['<script setup lang="ts">', "// A.", "// B.", "</script>", ""].join("\n");
     expect(flagged(narrow, "Narrow.vue")).toEqual([]);
+  });
+});
+
+/**
+ * The console's OWN files, checked by the same function.
+ *
+ * Every test above passes a string. That is the right way to test a checker's
+ * LOGIC — the corruption is reproduced deliberately, the cases are small, and a
+ * failure names the rule rather than a path — but it means the suite would stay
+ * green if all five shredded headers came back tomorrow, because the fixtures
+ * are synthetic and the real files are never read.
+ *
+ * That is not a hypothetical gap: it is exactly what happened the first time.
+ * The corruption was found by a person reading a file, not by anything in this
+ * suite, and the suite was written afterwards. This last test is what closes
+ * the loop — it walks `src` and hands every file to the same `checkLine` the
+ * fixtures use, so the gate the build runs is the gate these tests describe.
+ *
+ * It is asserted over the real tree rather than over a list of the five known
+ * files, because a list would need editing the moment a sixth screen is added,
+ * and a rule that only applies to the files someone remembered is not a rule.
+ */
+describe("the console's own sources", () => {
+  it("carry no orphaned header and no collapsed comment block", () => {
+    const root = resolve(import.meta.dirname, "..", "..");
+    const files: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir)) {
+        const path = join(dir, entry);
+        if (statSync(path).isDirectory()) walk(path);
+        else if ([".vue", ".ts", ".mjs"].includes(extname(path))) files.push(path);
+      }
+    };
+    walk(root);
+
+    expect(files.length).toBeGreaterThan(20);
+    const violations = files.flatMap((path) =>
+      checkLine(readFileSync(path, "utf8"), relative(root, path)),
+    );
+    expect(violations).toEqual([]);
   });
 });

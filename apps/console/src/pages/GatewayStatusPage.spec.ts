@@ -49,13 +49,32 @@ interface Badge {
  * text; the badge is found by SHAPE inside it, a `<span>` carrying an
  * `aria-hidden` icon beside a label, so a card whose badge went away reports a
  * missing badge rather than a card title found by accident.
+ *
+ * `lastMatch` rather than `Array.prototype.findLast`, which is the obvious
+ * spelling and does not type-check here: this app's `lib` predates ES2023,
+ * where `findLast` arrived. Raising the whole application's lib to buy one
+ * spec would widen the ground every source file is checked against, so the
+ * two lines are written out instead. It is a loop that runs to the end and
+ * keeps the LAST hit, which is the behaviour being asked for — "the
+ * outermost element with this title", so a nested span with the same text
+ * cannot win.
  */
+function lastMatch<T>(items: Iterable<T>, predicate: (item: T) => boolean): T | undefined {
+  let found: T | undefined;
+  for (const item of items) {
+    if (predicate(item)) found = item;
+  }
+  return found;
+}
+
 function badgeIn(title: string): Badge {
-  const card = [...document.querySelectorAll("div")].findLast(
+  const card = lastMatch(
+    document.querySelectorAll("div"),
     (element) => element.querySelector(":scope > div > p")?.textContent === title,
   );
   expect(card, `no card titled ${title}`).toBeDefined();
-  const badge = [...card!.querySelectorAll("span")].findLast(
+  const badge = lastMatch(
+    card!.querySelectorAll("span"),
     (element) => element.querySelector("[aria-hidden]") !== null,
   );
   expect(badge, `no badge on the card titled ${title}`).toBeDefined();

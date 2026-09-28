@@ -25,9 +25,7 @@
  * reflowed onto one physical line looks like: still commented, still unreadable.
  */
 export type ViolationKind =
-  | "header outside the script block"
-  | "not commented out"
-  | "collapsed comment block";
+  "header outside the script block" | "not commented out" | "collapsed comment block";
 
 /** One problem with one line of one file, named by where it is. */
 export interface Violation {
