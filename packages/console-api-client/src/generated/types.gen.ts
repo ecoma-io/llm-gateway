@@ -5,8 +5,9 @@ export type ClientOptions = {
 };
 
 /**
- * Whether this plane holds a derivation for the queried range.
- * `available` means the figures below ARE the answer to the range asked of, and it is what a run that legitimately found nothing reports. `not_available` means this plane holds no derived rows for the range at all: the usage it names has not been ingested, or it predates this surface. It is an ANSWER, not a failure — a caller renders it as an empty series and asks for a later range.
+ * Whether this plane holds a derivation for the account it answered for.
+ * `available` means the figures below ARE the answer to the range asked of, and it is what a run that legitimately found nothing reports: an account this plane has ingested, in a range that was quiet, comes back available with every bucket zero. `not_available` means this plane holds no derived rows for that ACCOUNT at all — none in the queried range and none in any other: the usage it names has not been ingested, or it predates this surface. It is an ANSWER, not a failure — a caller renders it as an empty series and asks for a later range.
+ * The axis is the account's coverage and not the range's, because every range can be answered: a bucket this plane found nothing for is a bucket with a zero in it, so a range that was simply quiet is the same shape as a range this plane has no rows for, and only the coverage of the account tells the two apart.
  * It is never a stand-in for a failed derivation. A failure is a non-2xx status carrying the ErrorEnvelope, and no value of this enum is ever returned with one. The distinction is the whole reason this field exists rather than the absence of the figures: "nothing happened" and "we do not know" are different sentences, and a caller that cannot tell them apart will draw a chart of the second and call it the first.
  */
 export type AnalyticsAvailability = "available" | "not_available";
@@ -36,7 +37,7 @@ export type AnalyticsRange = {
    */
   end_at: string;
   /**
-   * The IANA zone the bucket boundaries in this answer are rendered in.
+   * The IANA zone the bucket boundaries in this answer were CUT in. It is not how the instants are written — every instant in this document is an absolute one in UTC — it is the calendar the cuts were made against.
    * The STORAGE of every figure in this contract is UTC and always will be: a wall-clock reading in some operator's zone must never move a commercial boundary, so a day boundary is a UTC instant before it is a local one. This field exists because that is not the same as being what the reader wants to see, and a chart labelled in the wrong zone is wrong in a way no number can defend. The response echoes the zone its buckets were cut on, so a caller renders the instants it was given rather than re-deriving them.
    * A zone changes where the bucket EDGES fall and nothing else. The monetary figures are sums of UTC instants either way, so the same range costs the same amount at `Asia/Ho_Chi_Minh` as it does at UTC — only the labels move.
    * Under a daylight-saving transition a `day` bucket is 23 or 25 hours long, and a `calendar_month` is the zone's calendar month. This is why every bucket carries BOTH `bucket_start` and `bucket_end` rather than a start and a nominal width: a reader can tell how long the bucket actually was, and an export can be re-aggregated without re-deriving what a bucket meant.
@@ -46,11 +47,11 @@ export type AnalyticsRange = {
 
 export type AnalyticsSeriesPoint = {
   /**
-   * The inclusive start of this bucket, in the range's zone.
+   * The inclusive start of this bucket, as an absolute instant in RFC 3339 with a `Z` offset. The range's zone decides where the EDGE falls and never how it is written: an instant is an instant, and a client renders it in whatever zone it displays.
    */
   bucket_start: string;
   /**
-   * The exclusive end of this bucket, in the range's zone.
+   * The exclusive end of this bucket, an absolute instant written the same way `bucket_start` is. Half-open with it, so two consecutive buckets tile the timeline with neither overlap nor gap.
    */
   bucket_end: string;
   /**
@@ -114,18 +115,19 @@ export type AnalyticsUsageResponse = {
    */
   released_amount_minor_units: number;
   /**
-   * Capacity the account was credited across the range — entitlement grants and operator top-ups alike, from the ledger's two crediting leg kinds. BUCKETED BY `ledger_entries.created_at`.
+   * Capacity the account was credited across the range — entitlement grants and operator top-ups alike. BUCKETED BY `ledger_entries.created_at`.
+   * The population is exactly the ledger's two crediting leg kinds, `grant` and `topup`, summed over their `amount`. The ledger has four other kinds and none of them is a credit: `hold`, `release` and `consume` move capacity the account already has, and `adjustment` is an operator CORRECTION whose stated deltas are free values, one of which may be negative — its `amount` column is the magnitude of whichever delta moved, so adding it to this figure would book the size of a downward correction as capacity credited, and it arrives as a compensating pair besides. A correction fixes records; it never adds capacity, and this figure counts only what does.
    * Keyed on the ledger's own leg kinds rather than on a payment concept, because the ledger already HAS both kinds and a payment integration adds a WRITER to them rather than new concepts. A figure computed from these kinds is correct today and needs no shape change when an automated top-up starts arriving through one.
    * This is capacity credited, which is not revenue and not income. Nothing in this plane has ever received a payment.
    */
   funds_added_minor_units: number;
   /**
-   * Capacity reserved and not yet consumed, as at the range's end.
+   * Capacity reserved and not yet consumed, as at the moment this read ran.
    */
   held_minor_units: number;
   /**
-   * Capacity settled and unspent, as at the range's end: the settled balance less the held balance.
-   * `held_minor_units` and `available_minor_units` are POINT-IN-TIME balances and are NOT bucketed: they are the account's balance as at the range's end, reported on every point of the series because a caller that received them once had no way to know they were true only of the end. `available` is `settled - held` and both terms are non-negative by construction.
+   * Capacity settled and unspent, as at the moment this read ran: the settled balance less the held balance.
+   * `held_minor_units` and `available_minor_units` are POINT-IN-TIME balances and are NOT bucketed, and the instant they are true of is the READ's and not the range's: the accounting projection caches the account's present balance and keeps no history, so a range that ended in June is answered with the balance the account holds today, and there is no as-of read that could answer anything else. They are reported once, beside the series rather than on every point, because a caller that received them per point had no way to know they were true of none of them. `available` is `settled - held` and both terms are non-negative by construction.
    * They are the CACHED balances the accounting projection already maintains, read and never re-derived — and they are exact in a way a per-request spend is not. A cached balance is a running exact integer accumulation of signed leg deltas, never a sum of rounded per-request figures, which is why these two may be summed and the money above may not be summed from its parts.
    */
   available_minor_units: number;
@@ -135,7 +137,18 @@ export type AnalyticsUsageResponse = {
    * `reservation_floor` is the interesting one and the reason this split exists at all: it is the count of settlements whose figure was the reservation's own — a clamp that bound, or the basis fall-through when neither the provider's report nor the gateway's own count arrived. It is a measure of pricing confidence, and a rising floor is a signal about the upstream's usage reporting rather than about this account. A figure derived from it is biased upward against a report that would have arrived, and no average cost computed here mixes the two without saying so.
    */
   capture: {
-    [key: string]: never;
+    /**
+     * Settlements priced as the provider's own report of its usage.
+     */
+    reported: number;
+    /**
+     * Settlements priced as the gateway's own count of what it received. Delivery is always the gateway's count by construction, and it never decides the label — a figure the gateways observed that arrived beside a provider's report is priced as the report.
+     */
+    gateway_observed: number;
+    /**
+     * Settlements whose figure was the reservation's own: a clamp that bound, or the basis fall-through when neither the provider's report nor the gateway's count arrived. This is a measure of PRICING CONFIDENCE — it is biased upward against a report that would have arrived, so a rising floor is a statement about the upstream's usage reporting and not about this account.
+     */
+    reservation_floor: number;
   };
   freshness: AnalyticsFreshness;
 };
@@ -1563,11 +1576,11 @@ export type GetUsageData = {
 
 export type GetUsageErrors = {
   /**
-   * The request is well-formed HTTP but a parameter does not satisfy this surface's contract — an unparseable value, a value outside its declared bounds, or an unknown parameter the caller cannot be allowed to believe took effect. On the projection operations this response also carries `unsupported_version`: the message was written for a protocol version this surface does not support, so its meaning cannot be vouched for and nothing about it is applied — the sender succeeds unchanged once both ends speak the same version.
+   * A bound does not satisfy the contract: a range longer than 90 days, a `from` at or after `to`, a granularity outside the enumeration, an instant that is not RFC 3339, or an unknown query parameter.
    */
   400: ErrorEnvelope;
   /**
-   * The caller did not identify itself as a service this surface accepts. Management surfaces authenticate callers, not users: a browser session and a customer API key are both rejected here, because neither is a service identity (ADR 0006 §9).
+   * The request carried no credential this deployment resolves. This is the one operation on this surface that does not identify its caller by a session — `consoleCredential` is a bearer credential a script or an operator's tooling presents, and there is nothing to sign in to — so the answer says the credential did not resolve and says nothing about which of absent, unknown or retired it was. One answer for every cause, deliberately: a difference is a disclosure to anyone willing to present tokens. The account these figures are about is derived from the credential and is never named by the request, so a caller that cannot tell it was refused would be the caller that draws a chart of someone else's spend.
    */
   401: ErrorEnvelope;
   /**
@@ -1592,7 +1605,7 @@ export type GetUsageError = GetUsageErrors[keyof GetUsageErrors];
 
 export type GetUsageResponses = {
   /**
-   * The account's usage over the range. A range this plane holds no derivation for is a 200 with `availability: not_available` and an empty series — an answer, not a failure, and distinct from a range that is simply quiet.
+   * The account's usage over the range. An account this plane holds no derived rows for is a 200 with `availability: not_available` and an empty series — an answer, not a failure, and distinct from a range that is simply quiet.
    */
   200: AnalyticsUsageResponse;
 };

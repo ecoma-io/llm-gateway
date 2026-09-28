@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/identity"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
@@ -63,8 +62,13 @@ type StaticScoper struct {
 }
 
 type scopedDigest struct {
-	digest    [sha256.Size]byte
-	accountID identity.AccountID
+	digest [sha256.Size]byte
+	// accountID is the deployment's own spelling of the account, held as the
+	// string it was configured as and converted at the one place a scope is
+	// built. The transport does not name the identity grammar — see
+	// persistence.ScopeFor — so the table's account column arrives and leaves
+	// this package as text.
+	accountID string
 }
 
 // NewStaticScoper builds the resolver from the deployment's token-to-account
@@ -89,7 +93,7 @@ func NewStaticScoper(table map[string]string) (*StaticScoper, error) {
 		}
 		resolver.digests = append(resolver.digests, scopedDigest{
 			digest:    sha256.Sum256([]byte(token)),
-			accountID: identity.AccountID(accountID),
+			accountID: accountID,
 		})
 	}
 	return resolver, nil
@@ -105,7 +109,7 @@ func NewStaticScoper(table map[string]string) (*StaticScoper, error) {
 func (s *StaticScoper) ScopeOf(_ context.Context, presented string) (persistence.RequestScope, error) {
 	presentedDigest := sha256.Sum256([]byte(presented))
 
-	var resolved identity.AccountID
+	var resolved string
 	matched := 0
 	for _, candidate := range s.digests {
 		// ConstantTimeCompare returns 0 for a length mismatch without
@@ -127,5 +131,5 @@ func (s *StaticScoper) ScopeOf(_ context.Context, presented string) (persistence
 		// should depend on.
 		return persistence.RequestScope{}, ErrUnresolvedCredential
 	}
-	return persistence.RequestScope{AccountID: resolved}, nil
+	return persistence.ScopeFor(resolved), nil
 }

@@ -33,17 +33,16 @@ import (
 //   - the attribution stamps its own instant, because the column has no
 //     default and a caller cannot be the one keeping two columns equal.
 
-// The five reads the answer is made of, and the shape each one projects, are
-// declared in scripteddriver_test.go beside the shapes themselves.
+// The six statements the answer is made of, and the shape each one projects,
+// are declared in scripteddriver_test.go beside the shapes themselves.
 //
-// The readShape here is the read's own ORDER, and a change to it that a
-// statement did not follow would fail every test in this file at the scan —
-// which is the point: the order IS the contract, and a test that discovered it
-// by a nil pointer would be a test that only proves the code runs.
-var _ = readShape
+// readShape is the read's own ORDER, and a change to it that a statement did
+// not follow would fail every test in this file at the scan — which is the
+// point: the order IS the contract, and a test that discovered it by a nil
+// pointer would be a test that only proves the code runs.
 
 // scriptedAnalytics builds a store over the scripted driver and the read model
-// on top of it. The script is the five reads above, in order.
+// on top of it. The script is readShape, in order.
 func scriptedAnalytics(t *testing.T) (*scriptedDriver, persistence.Analytics) {
 	t.Helper()
 	s, db := newScripted(t, readShape...)
@@ -415,17 +414,17 @@ func conflictTarget(statement string) string {
 // records what it was handed sees the level directly, and one that does not
 // would make this assertion pass vacuously, which is why the driver records it
 // rather than ignoring it.
-func TestTheFiveReadsShareOneSnapshot(t *testing.T) {
+func TestTheSixStatementsShareOneSnapshot(t *testing.T) {
 	s, db := newScripted(t, readShape...)
 	_, _, _ = NewAnalytics(New(db)).Usage(t.Context(), scriptedQuery("018f0000-0000-7000-8000-000000000001"))
 
 	levels := s.isolations()
 	if len(levels) == 0 {
-		t.Fatalf("the read began no transaction; its five statements each take their own snapshot and a settlement committing between them makes the answer internally inconsistent")
+		t.Fatalf("the read began no transaction; its six statements each take their own snapshot and a settlement committing between them makes the answer internally inconsistent")
 	}
 	for i, level := range levels {
 		if level != "repeatable read" {
-			t.Errorf("unit of work %d began at %s, want repeatable read: the read's five statements answer one question, and at read committed a settlement committing between the series read and the money read yields a bucket that says settled beside a settled amount that excludes it", i+1, level)
+			t.Errorf("unit of work %d began at %s, want repeatable read: the read's six statements answer one question, and at read committed a settlement committing between the series read and the money read yields a bucket that says settled beside a settled amount that excludes it", i+1, level)
 		}
 	}
 }
@@ -515,6 +514,16 @@ func TestTheBoundIsSetOnEveryReadRatherThanOnce(t *testing.T) {
 // that flattened one of those subqueries into a bare bucket list would put
 // every account's ledger legs in one answer, and no test above would see it —
 // the figures would still be the right SHAPE.
+// TestTheReadCarriesTheAccountOnEveryStatement is the tenancy guard, and it
+// reads the ARGUMENTS rather than the statement text.
+//
+// The distinction is the whole value of the test. A statement that mentioned a
+// placeholder without binding it would fail loudly at the server, but the
+// failure this guards is the quiet one: a statement that bound the WRONG value
+// in the account's place — a bucket id, a range bound, another account —
+// returns rows of the wrong tenancy with no error anywhere, and a claim about
+// the text cannot see the difference. The account is the only thing in this
+// read that may not be dropped, so it is checked value by value.
 func TestTheReadCarriesTheAccountOnEveryStatement(t *testing.T) {
 	s, repo := scriptedAnalytics(t)
 	query := scriptedQuery("018f0000-0000-7000-8000-000000000001")
@@ -522,31 +531,65 @@ func TestTheReadCarriesTheAccountOnEveryStatement(t *testing.T) {
 		t.Fatalf("Usage() error = %v", err)
 	}
 
-	// Every statement that names one of the account's own tables must bind the
-	// account, either as a predicate or through the bucket subquery.
-	scoped := map[string]bool{
+	statements, arguments := s.statements(), s.arguments()
+	if len(statements) != len(arguments) {
+		t.Fatalf("the driver recorded %d statements and %d argument lists; they are indexed together below and a mismatch would check one statement's arguments against another's", len(statements), len(arguments))
+	}
+
+	// Every table the read may disclose from is named by some statement, so a
+	// route that stopped being read is a failure here rather than a figure that
+	// silently went to zero.
+	named := map[string]bool{
 		"control.analytics_fact_dimensions": false,
 		"control.settlements":               false,
 		"control.applied_facts":             false,
 		"control.funding_buckets":           false,
+		"control.ledger_entries":            false,
 	}
-	for _, statement := range s.statements() {
-		for table := range scoped {
-			if !strings.Contains(statement, table) {
-				continue
-			}
-			scoped[table] = true
-			if !strings.Contains(statement, query.AccountID[:8]) &&
-				!strings.Contains(statement, "$1") && !strings.Contains(statement, "$3") {
-				t.Errorf("the statement against %s binds no account:\n%s", table, statement)
+	scoped := 0
+	for i, statement := range statements {
+		for table := range named {
+			if strings.Contains(statement, table) {
+				named[table] = true
 			}
 		}
+		if strings.Contains(statement, "SET LOCAL") {
+			// The bound is a statement this read SETS rather than one it asks,
+			// and it has no account in it to bind.
+			continue
+		}
+		scoped++
+		if !bindsAccount(arguments[i], query.AccountID) {
+			t.Errorf("statement %d binds %v where %s was expected among the arguments: a read scoped to one account must bind that account on every statement it asks, or it discloses every account's figures to whoever reaches it:\n%s",
+				i, arguments[i], query.AccountID, statement)
+		}
 	}
-	for table, found := range scoped {
+	// The count is pinned to the shapes rather than to a literal, so a
+	// statement added without a shape — which would be answered from the
+	// script's next shape and misread here — fails as a count and not as
+	// whatever the misread happens to look like.
+	if scoped != len(readShape) {
+		t.Errorf("the read asked %d account-scoped statements, want the %d its shapes declare", scoped, len(readShape))
+	}
+	for table, found := range named {
 		if !found {
-			t.Errorf("no statement named %s; the read issued:\n%s", table, strings.Join(s.statements(), "\n---\n"))
+			t.Errorf("no statement named %s; the read issued:\n%s", table, strings.Join(statements, "\n---\n"))
 		}
 	}
+}
+
+// bindsAccount is whether the account reached the driver as one of a
+// statement's arguments. It is an exact comparison of the value the statement
+// was handed and not a substring of anything, because the account is a uuid
+// that shares its first eight characters with every id in the same time
+// prefix, and a prefix match would accept a bucket.
+func bindsAccount(arguments []driver.Value, account string) bool {
+	for _, argument := range arguments {
+		if value, ok := argument.(string); ok && value == account {
+			return true
+		}
+	}
+	return false
 }
 
 // TestTheLedgerFlowsResolveThroughTheBucketSubquery is the specific claim the
@@ -678,27 +721,52 @@ func TestTheFlowsAndTheBalancesNeverShareAStatement(t *testing.T) {
 // issued and the Control Plane is forbidden to decompose, so a statement that
 // touched it would be a decomposition in waiting. What the read wants is the
 // row's own updated_at.
+//
+// The same statement carries the account's coverage, and the second half of
+// this test is why that is not a second statement: a coverage read in a
+// snapshot of its own could answer "this plane holds nothing for you" beside a
+// freshness instant from after that account's first pass — two facts about one
+// question read at two moments, which is the failure mode the read's
+// REPEATABLE READ unit exists to prevent.
 func TestTheFreshnessReadsTheRecordTimeAndNeverThePosition(t *testing.T) {
 	s, repo := scriptedAnalytics(t)
-	if _, _, err := repo.Usage(t.Context(), scriptedQuery("018f0000-0000-7000-8000-000000000001")); err != nil {
+	account := "018f0000-0000-7000-8000-000000000001"
+	if _, _, err := repo.Usage(t.Context(), scriptedQuery(account)); err != nil {
 		t.Fatalf("Usage() error = %v", err)
 	}
 
-	var cursor string
-	for _, statement := range s.statements() {
+	var (
+		cursor   string
+		atCursor int
+	)
+	for i, statement := range s.statements() {
 		if strings.Contains(statement, "ingestion_cursor") {
-			cursor = statement
+			cursor, atCursor = statement, i
 			break
 		}
 	}
 	if cursor == "" {
 		t.Fatal("no statement read the ingestion cursor")
 	}
-	if !containsAll(cursor, "SELECT updated_at", "WHERE id = 1") {
+	if !containsAll(cursor, "c.updated_at", "c.id = 1") {
 		t.Errorf("the freshness statement is not the singleton's own record time:\n%s", cursor)
 	}
 	if strings.Contains(cursor, "position") {
 		t.Errorf("the freshness statement touches the cursor's position:\n%s\nthe position is opaque and this plane is forbidden to decompose it; only the row's own updated_at is a statement this plane can honestly make", cursor)
+	}
+	if !containsAll(cursor, "EXISTS", "analytics_fact_dimensions", "account_id = $1") {
+		t.Errorf("the coverage column is not an EXISTS over this account's derived rows:\n%s\nthe answer's availability turns on whether this plane holds ANY derivation for the account, and the series cannot answer that — a bucket with no facts in it comes back as a zero, so a quiet range and an un-ingested account have the same shape", cursor)
+	}
+	// The account is the statement's ONE argument, and it is the same account
+	// the series was scoped to: the tenancy rule is the query's, and a coverage
+	// probe that asked about another account would make one caller's
+	// availability depend on another's rows.
+	args := s.arguments()
+	if atCursor >= len(args) {
+		t.Fatalf("the recorded arguments are not parallel to the recorded statements: %d statements, %d argument lists", len(s.statements()), len(args))
+	}
+	if asked := args[atCursor]; len(asked) != 1 || asked[0] != account {
+		t.Errorf("the ingestion cursor statement was asked with %v, want exactly [%s]", asked, account)
 	}
 }
 
@@ -806,6 +874,23 @@ func TestTheBoundIsRefusedTheSameWayWhereverItIsReached(t *testing.T) {
 					t.Errorf("the read failed with %v, want the overrun refusal: the surface answers this with a retry rather than a failure, because the database is answering and only this report is slow", err)
 				} else {
 					t.Errorf("the read reported %v as an overrun, want the error itself: a query error is a failure, and telling the caller to retry sends it back to a statement the database refuses identically every time", err)
+				}
+			}
+			// The sentinel is the adapter's own, and nothing above this tier
+			// can name it: the use case and the transport both decide what
+			// this read is by asking whether the error IS a deadline
+			// (`errors.Is(err, context.DeadlineExceeded)`), which is the only
+			// predicate that reaches them through the port. So the wrapping
+			// is asserted HERE, where the classification is made, because a
+			// sentinel that stopped wrapping would leave every test above
+			// green — each of them hands the shape it needs to its own
+			// fixture — while the surface answered 500 for a bound the
+			// contract calls 503.
+			if got := errors.Is(err, context.DeadlineExceeded); got != tt.wantOverflow {
+				if tt.wantOverflow {
+					t.Errorf("the overrun refusal %v does not unwrap to context.DeadlineExceeded: the use case and the transport both classify on that predicate, so this read would be answered as a server fault rather than as a retry", err)
+				} else {
+					t.Errorf("a plain query failure %v unwraps to context.DeadlineExceeded, want the error itself: a statement the database refuses identically every time must not be reported as a retry", err)
 				}
 			}
 		})

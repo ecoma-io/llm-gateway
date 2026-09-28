@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/application"
-	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/analytics"
 )
 
 // maxTimezoneOctets is the bound the contract puts on the timezone parameter
@@ -21,11 +20,108 @@ import (
 // refusal the caller experiences as cheap.
 const maxTimezoneOctets = 64
 
-// usage is the one product endpoint this plane serves, and the handler is
-// deliberately thin: it parses a query string, hands four values to the use
-// case, and writes what comes back. Every decision worth arguing about is
-// below that line — the bounds are the domain's, the scope is the use case's,
-// and the status is the mapping's.
+// UsageUseCases is the usage read's seam, and it is declared HERE rather than
+// taken as the application's type for the reason ConsoleReadUseCases is: the
+// import rule forbids this package from reaching internal/domain, so the seam
+// speaks in the plain fields the wire itself needs (readwire_seam.go states the
+// argument in full). The one difference between the two seams is what
+// authenticates them — a read is a session cookie resolved before the call and
+// an account passed as an argument, while this one is a CREDENTIAL handed over
+// whole, because this surface is authenticated by a bearer token rather than by
+// a session and nothing above this line is entitled to interpret one.
+//
+// It stays a separate interface rather than eleven more methods on
+// ConsoleReadUseCases because the two are wired from different things — the ten
+// reads take an account, this one resolves one — and a process whose credential
+// resolution is missing is a different defect from a process whose screens are
+// missing.
+type UsageUseCases interface {
+	// Usage answers one usage range for the account the presented token speaks
+	// for. An unresolved credential is a refusal this method returns; the
+	// handler does not interpret the token, and a caller that handed one over
+	// and got an answer has learned nothing from this package about how it was
+	// resolved.
+	Usage(ctx context.Context, token string, request application.UsageRequest) (UsageAnswer, error)
+}
+
+// UsageAnswer is one usage answer in the transport's own vocabulary, and every
+// field is plain: strings, integers, booleans and instants. No domain type
+// crosses this boundary, which is what lets the composition root — the one
+// place allowed to speak both grammars — do the rendering, and lets this
+// package's tests drive the surface without naming a grammar at all.
+//
+// The instants are time.Time rather than pre-formatted strings because
+// formatting is a WIRE decision and it belongs on this side of the seam: the
+// envelope below writes them as RFC 3339 in UTC, and an answer type that
+// arrived already formatted would have moved the transport's one formatting
+// decision into the layer above it.
+//
+// The account is NOT here. It is not in the contract either, and a field that
+// carried it would be the one field a test could pin — see usageResponse.
+type UsageAnswer struct {
+	// Availability is the contract's enum spelled as the contract spells it.
+	Availability string
+	// Granularity is the resolved grain, and it lives outside the range
+	// because the contract puts it on the response: the same interval is a
+	// hundred points at hourly grain and one at monthly.
+	Granularity string
+	From        time.Time
+	To          time.Time
+	// Timezone is the canonical name of the zone the buckets were cut in, so
+	// the response echoes a zone rather than re-deriving a name here.
+	Timezone string
+	// FinalBucketPartial is true when the range's last bucket ends after the
+	// figures are complete, so a client does not read a short bucket as a drop.
+	FinalBucketPartial bool
+	// Series is one entry per requested bucket, in order, with no bucket
+	// omitted.
+	Series []UsageAnswerBucket
+
+	RequestsWithUsageFacts int64
+	RequestsSettled        int64
+
+	// The money axes, in the currency's minor units, as exact integers. They
+	// are never netted against one another and no figure here is derived from
+	// the series above.
+	SettledMinorUnits    int64
+	ReleasedMinorUnits   int64
+	FundsAddedMinorUnits int64
+	HeldMinorUnits       int64
+	AvailableMinorUnits  int64
+
+	// Capture splits the settlements that captured, by the method each used.
+	Capture UsageAnswerCapture
+	// Freshness says how current the figures are.
+	Freshness UsageAnswerFreshness
+}
+
+// UsageAnswerBucket is one point of the series: the interval it covers and the
+// two counts over it.
+type UsageAnswerBucket struct {
+	Start                  time.Time
+	End                    time.Time
+	RequestsWithUsageFacts int64
+	RequestsSettled        int64
+}
+
+// UsageAnswerCapture is the three-way split of the settlements that captured.
+type UsageAnswerCapture struct {
+	Reported         int64
+	GatewayObserved  int64
+	ReservationFloor int64
+}
+
+// UsageAnswerFreshness is the answer's own currency: the instant the figures
+// are complete through, and which pass established it.
+type UsageAnswerFreshness struct {
+	DataThrough time.Time
+	Basis       string
+}
+
+// The handler is deliberately thin: it parses a query string, hands three
+// values to the use case, and writes what comes back. Every decision worth
+// arguing about is below that line — the bounds are the domain's, the scope is
+// the use case's, and the status is the mapping's.
 //
 // What the handler does own, and what a thin handler is still responsible for:
 //
@@ -41,7 +137,7 @@ const maxTimezoneOctets = 64
 //     travels as a field. A bucket edge in a local zone is what the caller
 //     asked for, but a date-time with an offset in an envelope that stores
 //     everything in UTC is a place two clients will disagree about.
-func usage(readModel *application.Usage) http.HandlerFunc {
+func handleUsage(useCases UsageUseCases) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token, ok := bearerToken(r)
 		if !ok {
@@ -67,7 +163,7 @@ func usage(readModel *application.Usage) http.HandlerFunc {
 			return
 		}
 
-		answer, err := readModel.Usage(r.Context(), token, request)
+		answer, err := useCases.Usage(r.Context(), token, request)
 		if err != nil {
 			// A read that ran out of its budget is a 503 and not a 500: the
 			// contract promises the caller a retry-later answer, and a 500
@@ -242,43 +338,44 @@ func isDeadline(err error) bool {
 // account parameter. The scope is proven by the numbers, not asserted by an
 // echo.
 type usageResponse struct {
-	usage analytics.Usage
+	usage UsageAnswer
 }
 
 // MarshalJSON writes the envelope the contract declares, field for field.
 //
-// It is hand-written because the domain's shape is not the wire shape: the
-// domain carries time.Time and the contract carries RFC 3339 strings, the
-// domain's balances are minor units and the contract's are the same integers
-// with the currency's unit in the name, and the domain's availability is a
-// string enum the contract spells out. A reflection-based marshaller would get
-// all three approximately right, and approximately right is how a date-time
-// ends up in local time and a _minor_units field ends up in major units.
+// It is hand-written because the answer's shape is not the wire shape in three
+// specific places: the answer carries time.Time and the contract carries RFC
+// 3339 strings, the answer's balances are minor units and the contract's are
+// the same integers with the currency's unit in the name, and the answer's
+// series is one struct per bucket while the contract names each field. A
+// reflection-based marshaller would get all three approximately right, and
+// approximately right is how a date-time ends up in local time and a
+// `_minor_units` field ends up in major units.
 func (response usageResponse) MarshalJSON() ([]byte, error) {
 	answer := response.usage
 
 	buckets := make([]usageBucket, 0, len(answer.Series))
 	for _, point := range answer.Series {
 		buckets = append(buckets, usageBucket{
-			Start:                  point.Start.Format(time.RFC3339),
-			End:                    point.End.Format(time.RFC3339),
-			RequestsWithUsageFacts: point.WithUsageFacts,
-			RequestsSettled:        point.Settled,
+			Start:                  wireInstant(point.Start),
+			End:                    wireInstant(point.End),
+			RequestsWithUsageFacts: point.RequestsWithUsageFacts,
+			RequestsSettled:        point.RequestsSettled,
 		})
 	}
 
 	return json.Marshal(usageEnvelope{
-		Availability: string(answer.Availability),
+		Availability: answer.Availability,
 		Metric:       "usage",
-		Granularity:  string(answer.Range.Granularity),
+		Granularity:  answer.Granularity,
 		Range: usageRange{
-			StartAt: answer.Range.From.Format(time.RFC3339),
-			EndAt:   answer.Range.To.Format(time.RFC3339),
-			// Already the canonical name: the domain's NewQuery resolved the
-			// caller's spelling and stored the resolved location's name when
-			// none was given, so the response echoes the zone the buckets were
-			// cut in rather than re-deriving a name at the transport.
-			Timezone: answer.Range.Timezone,
+			StartAt: wireInstant(answer.From),
+			EndAt:   wireInstant(answer.To),
+			// The zone the buckets were cut in, echoed as the answer named it:
+			// resolving the caller's spelling is the use case's, and
+			// re-deriving a name from the instants here is a second
+			// implementation of that.
+			Timezone: answer.Timezone,
 		},
 		FinalBucketPartial:     answer.FinalBucketPartial,
 		Series:                 buckets,
@@ -295,8 +392,8 @@ func (response usageResponse) MarshalJSON() ([]byte, error) {
 			ReservationFloor: answer.Capture.ReservationFloor,
 		},
 		Freshness: usageFreshness{
-			DataThrough: answer.Freshness.DataThrough.Format(time.RFC3339),
-			Basis:       string(answer.Freshness.Basis),
+			DataThrough: wireInstant(answer.Freshness.DataThrough),
+			Basis:       answer.Freshness.Basis,
 		},
 	})
 }
@@ -320,6 +417,22 @@ type usageEnvelope struct {
 
 	Capture   usageCapture   `json:"capture"`
 	Freshness usageFreshness `json:"freshness"`
+}
+
+// wireInstant renders one instant the way this contract spells instants: RFC
+// 3339, in UTC.
+//
+// The zone is stated rather than merely formatted, and that is the difference
+// between a claim and a convention. `Format(time.RFC3339)` writes the offset the
+// instant happens to carry, so a bucket edge that arrived in the zone the caller
+// asked about would go out as `2026-09-01T05:30:00+05:30` — a correct instant
+// that a caller comparing two responses from two zones could not compare, and
+// that a client in a third zone would have to re-derive. Storage is UTC (the
+// contract's `timezone` parameter says so), the zone travels as its own field,
+// and this function is what makes both of those true of every response this
+// surface writes rather than true by luck.
+func wireInstant(instant time.Time) string {
+	return instant.UTC().Format(time.RFC3339)
 }
 
 // usageRange is the range the answer covers, and it carries the GRAIN OUTSIDE

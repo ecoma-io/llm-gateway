@@ -31,8 +31,15 @@ _closed_ to exactly `{"allocations": [...]}` by a trigger. `control.applied_fact
 
 `occurred_at` _is_ already in hand at the apply site —
 `factingestion.go` passes `persistence.Fact` (which carries it) and
-`factapplier.go:155-164` narrows it to five columns when recording. One column,
-one line, in control migration `000012`.
+`factapplier.go:174-182` records the disposition without it: the `AppliedFact`
+written there names the request, the class, the kind, the append seq, the
+settled amount, the capture method and the settlement, and no `occurred_at`.
+Carrying it into a table would therefore be one column in one migration — and
+control migration `000012` does **not** carry it, which is a decision rather
+than an omission. The account dimension it adds keys on `applied_at`, this
+plane's own record clock, because a bucket axis may not be another plane's
+(`000012_analytics.up.sql:105`, §10.3). The column is available and refused on
+the same grounds, not missing for want of an apply site.
 
 `account_id` and the model are **not** recoverable from either plane without a
 contract change, because the Data Plane's `public.requests` table (which has
@@ -89,7 +96,7 @@ request in the same way, come from the ledger's own cached balances where a
 balance is what's wanted — never from a re-derived per-fact sum.
 
 Every money aggregate carries `::bigint` on the `SUM`, copied verbatim from the
-existing precedent at `adapters/outbound/postgres/accounting.go:841-843`.
+existing precedent at `adapters/outbound/postgres/accounting.go:845-847`.
 PostgreSQL widens `SUM(bigint)` to `numeric`; the cast back is deliberate so an
 overflow is a loud error at the driver instead of a silently-typed scan.
 
@@ -100,23 +107,24 @@ overflow is a loud error at the driver instead of a silently-typed scan.
 Reviewer A's census, cross-checked against the schema. **This table is the
 metric registry's skeleton** and any metric not in it does not ship.
 
-| Area           | Metric                                                                                                               | Numerator                                                     | Denominator / population                                                 | Source                                       | v1?                                                                              |
-| -------------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------ | -------------------------------------------- | -------------------------------------------------------------------------------- |
-| request        | requests with usage facts                                                                                            | count of distinct `request_id` in `analytics_fact_dimensions` | the requests whose usage reached the account's capacity and was recorded | `control.analytics_fact_dimensions`          | **yes**                                                                          |
-| request        | requests settled                                                                                                     | count of `settlements`                                        | requests with usage facts                                                | `control.settlements`                        | **yes**                                                                          |
-| request        | requests released / expired                                                                                          | count of `applied_facts.kind`                                 | requests with usage facts                                                | `control.applied_facts`                      | **yes**                                                                          |
-| financial      | settled amount                                                                                                       | `SUM(settlements.settled_total)`                              | — (absolute, not a rate)                                                 | `control.settlements`                        | **yes**                                                                          |
-| financial      | settled at zero                                                                                                      | count of settlements where `settled_total = 0`                | **settlements** (not requests)                                           | `control.settlements`                        | **yes**                                                                          |
-| financial      | settlement rate                                                                                                      | settled requests                                              | **requests with usage facts**                                            | derived                                      | **yes**                                                                          |
-| usage          | released amount                                                                                                      | `SUM(ledger_entries.amount) WHERE kind='release'`             | —                                                                        | `control.ledger_entries`                     | **yes**                                                                          |
-| financial      | held (unconsumed)                                                                                                    | `SUM(funding_buckets.held_amount)`                            | —                                                                        | `control.funding_buckets`                    | **yes**                                                                          |
-| financial      | available                                                                                                            | `SUM(funding_buckets.available_amount)`                       | —                                                                        | `control.funding_buckets`                    | **yes**                                                                          |
-| commerce       | funds added                                                                                                          | `SUM(amount) WHERE kind IN ('grant','topup')`                 | —                                                                        | `control.ledger_entries`                     | **yes**                                                                          |
-| usage          | settlement capture mix                                                                                               | count per `capture_method`                                    | **settlements with `kind='settled'`**                                    | `control.applied_facts`                      | **yes**                                                                          |
-| reconciliation | open findings                                                                                                        | count where `status='open'`                                   | open findings — **not** a rate                                           | `control.reconciliation_findings`            | **yes**                                                                          |
-| reconciliation | facts quarantined                                                                                                    | count                                                         | applied + quarantined facts                                              | `control.quarantined_facts`                  | **yes**                                                                          |
-| request        | **attempts, latency, error classes, retries, per-model spend, token counts, routing outcomes, provider mix, egress** | —                                                             | —                                                                        | `public.requests`, `public.request_attempts` | **NO — no cross-plane read path.** Recorded as exclusions, not shipped as zeros. |
-| request        | **rejection rate, admission rate**                                                                                   | —                                                             | admitted requests                                                        | —                                            | **NO — the denominator is not derivable here. See §10.1.**                       |
+| Area           | Metric                                                                                                 | Numerator                                                     | Denominator / population                                                 | Source                                       | v1?                                                                                      |
+| -------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------- | ------------------------------------------------------------------------ | -------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| request        | requests with usage facts                                                                              | count of distinct `request_id` in `analytics_fact_dimensions` | the requests whose usage reached the account's capacity and was recorded | `control.analytics_fact_dimensions`          | **yes**                                                                                  |
+| request        | requests settled                                                                                       | count of `settlements`                                        | requests with usage facts                                                | `control.settlements`                        | **yes**                                                                                  |
+| request        | requests released / expired                                                                            | count of `applied_facts.kind`                                 | requests with usage facts                                                | `control.applied_facts`                      | **yes**                                                                                  |
+| financial      | settled amount                                                                                         | `SUM(settlements.settled_total)`                              | — (absolute, not a rate)                                                 | `control.settlements`                        | **yes**                                                                                  |
+| financial      | settled at zero                                                                                        | count of settlements where `settled_total = 0`                | **settlements** (not requests)                                           | `control.settlements`                        | **yes**                                                                                  |
+| financial      | settlement rate                                                                                        | settled requests                                              | **requests with usage facts**                                            | derived                                      | **yes**                                                                                  |
+| usage          | released amount                                                                                        | `SUM(ledger_entries.amount) WHERE kind='release'`             | —                                                                        | `control.ledger_entries`                     | **yes**                                                                                  |
+| financial      | held (unconsumed)                                                                                      | `SUM(funding_buckets.held_amount)`                            | —                                                                        | `control.funding_buckets`                    | **yes**                                                                                  |
+| financial      | available                                                                                              | `SUM(funding_buckets.available_amount)`                       | —                                                                        | `control.funding_buckets`                    | **yes**                                                                                  |
+| commerce       | funds added                                                                                            | `SUM(amount) WHERE kind IN ('grant','topup')`                 | —                                                                        | `control.ledger_entries`                     | **yes**                                                                                  |
+| usage          | settlement capture mix                                                                                 | count per `capture_method`                                    | **settlements with `kind='settled'`**                                    | `control.applied_facts`                      | **yes**                                                                                  |
+| reconciliation | open findings                                                                                          | count where `status='open'`                                   | open findings — **not** a rate                                           | `control.reconciliation_findings`            | **yes**                                                                                  |
+| reconciliation | facts quarantined                                                                                      | count                                                         | applied + quarantined facts                                              | `control.quarantined_facts`                  | **yes**                                                                                  |
+| request        | **attempts, latency, error classes, retries, per-model spend, routing outcomes, provider mix, egress** | —                                                             | —                                                                        | `public.requests`, `public.request_attempts` | **NO — no cross-plane read path.** Recorded as exclusions, not shipped as zeros.         |
+| request        | **token counts**                                                                                       | —                                                             | —                                                                        | `control.applied_facts` (they DO arrive)     | **NO — the counters are byte lengths, and the two families differ in width. See §10.2.** |
+| request        | **rejection rate, admission rate**                                                                     | —                                                             | admitted requests                                                        | —                                            | **NO — the denominator is not derivable here. See §10.1.**                               |
 
 **The denominators are the point.** A "rejection rate" whose denominator is
 attempts is wrong (requests are admitted before any attempt exists); one whose
@@ -130,7 +138,7 @@ capture method and book no charge; the population is **settlements**. A
 "quarantine rate" whose denominator is applied facts only is a rate of nothing;
 the population is **applied ∪ quarantined**.
 
-**Zero is a value, not an absence.** `internal/domain/accounting/money.go:49-52`
+**Zero is a value, not an absence.** `internal/domain/accounting/money.go:46-48`
 already draws the line: _"a zero-priced model books a hold of nothing, settles
 for nothing, and is still a settlement of record."_ Every metric with a
 monetary or counting answer therefore returns a real `0` and never a null,
@@ -155,15 +163,27 @@ a failure, contradicting `errors.yaml:14-20` ("a code exists in the contract
 before it can be returned") and the single error-translation point in
 `server.go`.
 
-`not_available` is an **answer, not a failure**: the Control Plane holds no rows
-for the range. It is distinct from a range that is simply quiet, and a caller
-renders it as an empty series and asks for a later range.
+`not_available` is an **answer, not a failure**: the Control Plane holds no
+derived rows for that ACCOUNT at all — none in the queried range and none in any
+other. It is distinct from a range that is simply quiet, which is `available`
+with every bucket zero, and a caller renders it as an empty series and asks for
+a later range.
+
+The axis is the account's coverage and not the range's, and the mechanism is why:
+the series statement LEFT-joins its bucket bounds, so every requested bucket
+returns a row whether or not a fact landed in it — a range this plane has no rows
+for and a range the account was quiet in are the same shape. Only a read of the
+account's own derived rows can tell them apart, and the adapter makes that read
+in the same statement and the same snapshot as the freshness instant
+(`readFreshness`, where the position paragraph explains why the two ride
+together).
 
 ---
 
 ## 4. Freshness — stated honestly, computed from the wrong thing
 
-The honest watermark is _not available to this plane_: `reconciliation.go:1196-1205`
+The honest watermark is _not available to this plane_:
+`internal/application/reconciliation.go:1196-1205`
 records that the cursor-lag check is deferred "to the day the feed contract
 exposes a watermark", and the Data Plane does expose the number
 (`usage_events_stream.last_seq`) but does not send it. The cursor itself is an
@@ -236,7 +256,7 @@ vocabulary is fixed at `(granularity × metric)` in v1 and grows by adding a
 statement and a contract row.
 
 **A read pool.** `console-api`'s pool is `MaxOpenConns = 10`
-(`internal/config/config.go:55`) and the projection, ingestion and
+(`internal/config/config.go:56`) and the projection, ingestion and
 reconciliation loops plus `/readyz` all share it. Five concurrent 30-day
 dashboard queries would starve the **settlement path**. Analytics therefore get
 a **separately-configured read pool** with its own sizing and its own
@@ -284,7 +304,7 @@ account_id)`: one row per (fact, account), and a redelivery still converges
   A request attributed to an account whose bucket was not its own, or a
   settlement visible to the dimensions whose buckets belonged to someone else,
   would show up as a settled amount no flow supports.
-- **The `Converged` page-stop becomes unreachable.** `factapplier.go:200-211`
+- **The `Converged` page-stop becomes unreachable.** `factapplier.go:306-316`
   stops the page when the ledger already holds a settlement; a rebuild that
   never calls `Settle` cannot reach it. Any design routing rebuild through the
   settlement use case is broken on day one.
@@ -337,7 +357,7 @@ because three of them change a number's name and one changes a bound.
 The first draft published `requests_admitted` and used it as the denominator of
 `requests_settled`. That figure is **not derivable in this plane**, and the
 argument is not the cross-plane read gap — it is this plane's own schema.
-`reconciliation.go:1263-1288` records it in the B13 pass:
+`internal/application/reconciliation.go:1263-1288` records it in the B13 pass:
 
 > "A request this plane has no usage fact for" is undecidable from this plane's
 > own rows, and the only request-id population derivable here is
@@ -379,10 +399,13 @@ func CountDeliveredTokens(delivered []byte) int64 { return int64(len(delivered))
 ```
 
 `apps/dataplane/internal/domain/catalog/tokenize.go:39` and
-`apps/dataplane/internal/domain/accounting/deliver.go:15`. They are **byte
+`apps/dataplane/internal/domain/accounting/deliver.go:16`. They are **byte
 lengths** with a temporary tokenizer's signature, documented as such at
-`tokenize.go:30-36` ("A real tokenizer, when one arrives, replaces the bodies of
-both counters"). Publishing them under the name `token_count` would be a
+`tokenize.go:28-30` (the canonical rule, "shared with the delivery counter in
+the accounting package: byte length now, a real tokenizer later") and at
+`deliver.go:11-13` ("A real tokenizer, when one arrives, replaces the bodies of
+both counters with their signatures unchanged"). Publishing them under the name
+`token_count` would be a
 category error that is _invisible in the output_ — an integer is an integer.
 
 Compounding it: the counters' two families have **different widths in the
@@ -403,11 +426,12 @@ play and only two of them are this plane's:
 
 | Instant                                                | Whose clock                                  | Use                                                            |
 | ------------------------------------------------------ | -------------------------------------------- | -------------------------------------------------------------- |
-| `usage_events.occurred_at`                             | the Data Plane process                       | **telemetry only, never a key** (`fact.go:93-95`)              |
+| `usage_events.occurred_at`                             | the Data Plane process                       | **telemetry only, never a key** (`fact.go:94-95`)              |
 | `applied_facts.applied_at`                             | this plane's ingestion                       | dispositions (`requests_with_usage_facts`, `requests_settled`) |
 | `settlements.created_at` / `ledger_entries.created_at` | **the database** (`transaction_timestamp()`) | money                                                          |
 
-B13 settled the general rule in its own words at `reconciliation.go:567-573`:
+B13 settled the general rule in its own words at
+`internal/adapters/outbound/postgres/reconciliation.go:567-573`:
 _"The bound is applied_at — when this plane recorded the derivation — and not
 the fact's occurred_at, which is the Data Plane's clock: ordering one plane's
 records by another plane's timestamps is how a modest clock skew becomes a fact
@@ -449,7 +473,7 @@ construction.
 
 `control.settlements.settled_total` is exempt because it is the sum of that
 settlement's own consume legs, written **once** at creation by the builder that
-wrote them (`settlement.go:175`, migration comment `:198-200`). Summing
+wrote them (`settlement.go:175`, migration comment `:199-200`). Summing
 integers is exact and associative, so the aggregate-of-aggregates equals the
 aggregate-of-originals. The same argument is what makes `held`/`available`
 publishable from the **cached** balances: a balance is a running exact
@@ -461,6 +485,31 @@ One is a sum of exact integers; the other is a sum of point-in-time balances
 with the opposite bucketing semantics (a flow is bucketed, a balance is not). A
 reader who "helpfully" unifies them introduces a factor-of-N error into the
 money.
+
+### 10.5 The balances are read at the read, not at the range's end
+
+§2 shipped `held` and `available` as point-in-time figures and said "as at the
+range's end", which was wrong in a way a caller could act on. The accounting
+projection **caches the account's present balance and keeps no history**, so a
+range that ended in June is answered with the balance the account holds today.
+There is no as-of read that could answer anything else: the legs are
+append-only, but the balance columns are a mutable cache of the present, and
+reconstructing a past balance would mean re-deriving from the leg stream — a
+rebuild, which this plane refuses (§7).
+
+The correction is a change of vocabulary in three places and a change of
+meaning in none of the code. The field docs in the contract
+(`api/openapi/shared/analytics.yaml`), the domain type
+(`internal/domain/analytics/usage.go`) and the port
+(`internal/ports/outbound/persistence/analytics.go`) now say "as at the moment
+the READ ran". The consequence the old wording hid is the one a caller has to
+be told: **two historical ranges compared side by side are one balance read
+twice**, and a report that presents them as a trend is presenting the read
+clock rather than the money.
+
+It is also why the balances are reported once, beside the series rather than on
+every point. A per-point balance would have implied it was true of each bucket;
+it is true of none of them.
 
 ---
 
@@ -487,7 +536,7 @@ bound, report latency grows without limit against a fixed `statement_timeout`
 `applied_facts` already has `applied_facts_applied_at_idx` (`000009:307`), so
 the disposition axis is covered; the two money axes are the gap.
 
-**`verify.sh` co-edit.** The script pins the control schema to exactly 21 tables
-with an exact alphabetical list (`verify.sh:496-500`). A new table requires
+**`verify.sh` co-edit.** The script pins the control schema to exactly 23 tables
+with an exact alphabetical list (`verify.sh:507-511`). A new table requires
 that list and its count to be updated in the same diff, or the lane verify
 fails. That is the point of the pin, and this is the change it is asking for.

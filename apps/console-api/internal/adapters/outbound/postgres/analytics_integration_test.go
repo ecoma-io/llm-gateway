@@ -790,6 +790,80 @@ func TestAFreshnessOfNeverIsNotAFreshnessOfZero(t *testing.T) {
 	}
 }
 
+// TestTheCoverageAnswersForThisAccountAndNotForThisRange is the read the
+// answer's availability turns on, and the one fact the series cannot supply.
+//
+// Three properties, and none of them is checkable without a database:
+//
+//   - the flag is FALSE for an account this plane has no derived row for,
+//     which is the state a fresh tenant is in;
+//   - it becomes TRUE once a fact of this account's is applied, so it is driven
+//     by the attribution the ingestion path writes rather than by the account's
+//     existence (the fixture's account and bucket exist from the first read);
+//   - it stays FALSE for a DIFFERENT account while the plane holds rows for the
+//     first — which is the whole reason the probe is scoped to the account. A
+//     plane-wide EXISTS would answer TRUE here and would make one tenant's
+//     availability depend on another tenant's traffic.
+//
+// The last assertion is the mechanism the use case depends on: the uncovered
+// account's range still comes back with a row per bucket, every figure zero.
+// That is what a quiet range looks like too, and it is why the decision cannot
+// be made on the series — the two states are the same shape.
+func TestTheCoverageAnswersForThisAccountAndNotForThisRange(t *testing.T) {
+	a := integrationAnalytics(t)
+	covered, bucket := a.newAccountWithBucket(t, "coverage covered")
+	uncovered, _ := a.newAccountWithBucket(t, "coverage uncovered")
+	now := time.Now().UTC()
+
+	from := now.Add(-2 * time.Hour).Truncate(time.Hour)
+	to := from.Add(3 * time.Hour)
+	buckets := a.hourlyBuckets(from, 3)
+	query := func(account string) persistence.UsageQuery {
+		return persistence.UsageQuery{AccountID: account, From: from, To: to, Buckets: buckets}
+	}
+
+	before, _, err := a.repo.Usage(t.Context(), query(uncovered))
+	if err != nil {
+		t.Fatalf("Usage() before any fact = %v", err)
+	}
+	if before.AccountHasDerivations {
+		t.Error("the coverage says this plane holds a derived row for an account it has never ingested — the flag would then be a property of the plane rather than of the account")
+	}
+
+	// A settlement books this account's first derived row. The account and its
+	// bucket already existed, so what moves the flag is the ATTRIBUTION and not
+	// the fixture.
+	a.settleRequest(t, covered, bucket, 900, "reported")
+
+	after, _, err := a.repo.Usage(t.Context(), query(covered))
+	if err != nil {
+		t.Fatalf("Usage() after a settlement = %v", err)
+	}
+	if !after.AccountHasDerivations {
+		t.Error("the coverage still says this plane holds nothing for an account whose settlement it has just applied — the read would answer not_available for every account it HAS ingested")
+	}
+
+	other, _, err := a.repo.Usage(t.Context(), query(uncovered))
+	if err != nil {
+		t.Fatalf("Usage() for the neighbour = %v", err)
+	}
+	if other.AccountHasDerivations {
+		t.Error("the coverage for one account moved when another account's fact was applied — the probe is not scoped to the account, and one tenant's report would then depend on another tenant's traffic")
+	}
+
+	// The shape that makes the flag necessary: the same zero-filled,
+	// gap-free series a genuinely quiet range produces.
+	if len(other.Series) != len(buckets) {
+		t.Fatalf("the uncovered account's series carries %d buckets, want %d — the series is gap-free for an account this plane holds nothing for, which is the whole reason the coverage cannot be read off it:\n%s",
+			len(other.Series), len(buckets), renderSeries(other.Series, buckets))
+	}
+	for i, point := range other.Series {
+		if point.WithUsageFacts != 0 || point.Settled != 0 {
+			t.Errorf("the uncovered account's bucket %d = (with_facts %d, settled %d), want (0, 0)", i, point.WithUsageFacts, point.Settled)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the bound
 // ---------------------------------------------------------------------------

@@ -21,6 +21,30 @@ type RequestScope struct {
 	AccountID identity.AccountID
 }
 
+// ScopeFor is the one way a resolver builds a scope from the account
+// identifier it resolved, and it exists so that a resolver does not have to
+// name the identity grammar to do it.
+//
+// The conversion is trivial and that is not the point. The account id is a
+// DOMAIN value with a canonical form the grammar owns, and the packages that
+// may speak the grammar are enumerated in the dependency rule
+// (internal/arch/imports_test.go). A bearer-token resolver is a transport
+// concern — it reads a header, compares a digest in constant time and answers
+// with the account it names — and a transport that could name the identity
+// grammar directly would be one allow-list entry away from naming the
+// credential's own type, whose one secret-bearing form is the digest. So the
+// conversion lives here, in the vocabulary both sides already speak, and the
+// transport passes a plain string across the port.
+//
+// It validates nothing beyond that, and deliberately: a resolver is the layer
+// that decides what a malformed identifier means (this deployment refuses one
+// at construction), and a constructor that silently accepted or replaced an
+// empty account would be the default account this package's Scoper doc
+// forbids.
+func ScopeFor(accountID string) RequestScope {
+	return RequestScope{AccountID: identity.AccountID(accountID)}
+}
+
 // Scoper turns a presented bearer token into the account it speaks for.
 //
 // It exists as a PORT and not as a function in the application because the

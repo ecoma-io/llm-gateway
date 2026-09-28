@@ -46,14 +46,24 @@ components:
         - available
         - not_available
       description: >-
-        Whether this plane holds a derivation for the queried range.
+        Whether this plane holds a derivation for the account it answered
+        for.
 
         `available` means the figures below ARE the answer to the range
         asked of, and it is what a run that legitimately found nothing
-        reports. `not_available` means this plane holds no derived rows for
-        the range at all: the usage it names has not been ingested, or it
-        predates this surface. It is an ANSWER, not a failure — a caller
-        renders it as an empty series and asks for a later range.
+        reports: an account this plane has ingested, in a range that was
+        quiet, comes back available with every bucket zero. `not_available`
+        means this plane holds no derived rows for that ACCOUNT at all —
+        none in the queried range and none in any other: the usage it names
+        has not been ingested, or it predates this surface. It is an ANSWER,
+        not a failure — a caller renders it as an empty series and asks for
+        a later range.
+
+        The axis is the account's coverage and not the range's, because
+        every range can be answered: a bucket this plane found nothing for
+        is a bucket with a zero in it, so a range that was simply quiet is
+        the same shape as a range this plane has no rows for, and only the
+        coverage of the account tells the two apart.
 
         It is never a stand-in for a failed derivation. A failure is a
         non-2xx status carrying the ErrorEnvelope, and no value of this enum
@@ -148,8 +158,10 @@ components:
           type: string
           maxLength: 64
           description: >-
-            The IANA zone the bucket boundaries in this answer are rendered
-            in.
+            The IANA zone the bucket boundaries in this answer were CUT in.
+            It is not how the instants are written — every instant in this
+            document is an absolute one in UTC — it is the calendar the cuts
+            were made against.
 
             The STORAGE of every figure in this contract is UTC and always
             will be: a wall-clock reading in some operator's zone must never
@@ -189,11 +201,18 @@ components:
         bucket_start:
           type: string
           format: date-time
-          description: The inclusive start of this bucket, in the range's zone.
+          description: >-
+            The inclusive start of this bucket, as an absolute instant in RFC
+            3339 with a `Z` offset. The range's zone decides where the EDGE
+            falls and never how it is written: an instant is an instant, and a
+            client renders it in whatever zone it displays.
         bucket_end:
           type: string
           format: date-time
-          description: The exclusive end of this bucket, in the range's zone.
+          description: >-
+            The exclusive end of this bucket, an absolute instant written the
+            same way `bucket_start` is. Half-open with it, so two consecutive
+            buckets tile the timeline with neither overlap nor gap.
         requests_with_usage_facts:
           type: integer
           format: int64
@@ -412,8 +431,20 @@ components:
           minimum: 0
           description: >-
             Capacity the account was credited across the range — entitlement
-            grants and operator top-ups alike, from the ledger's two
-            crediting leg kinds. BUCKETED BY `ledger_entries.created_at`.
+            grants and operator top-ups alike. BUCKETED BY
+            `ledger_entries.created_at`.
+
+            The population is exactly the ledger's two crediting leg kinds,
+            `grant` and `topup`, summed over their `amount`. The ledger has
+            four other kinds and none of them is a credit: `hold`, `release`
+            and `consume` move capacity the account already has, and
+            `adjustment` is an operator CORRECTION whose stated deltas are
+            free values, one of which may be negative — its `amount` column
+            is the magnitude of whichever delta moved, so adding it to this
+            figure would book the size of a downward correction as capacity
+            credited, and it arrives as a compensating pair besides. A
+            correction fixes records; it never adds capacity, and this figure
+            counts only what does.
 
             Keyed on the ledger's own leg kinds rather than on a payment
             concept, because the ledger already HAS both kinds and a payment
@@ -429,21 +460,26 @@ components:
           format: int64
           minimum: 0
           description: >-
-            Capacity reserved and not yet consumed, as at the range's end.
+            Capacity reserved and not yet consumed, as at the moment this
+            read ran.
         available_minor_units:
           type: integer
           format: int64
           minimum: 0
           description: >-
-            Capacity settled and unspent, as at the range's end: the settled
-            balance less the held balance.
+            Capacity settled and unspent, as at the moment this read ran: the
+            settled balance less the held balance.
 
             `held_minor_units` and `available_minor_units` are POINT-IN-TIME
-            balances and are NOT bucketed: they are the account's balance as
-            at the range's end, reported on every point of the series
-            because a caller that received them once had no way to know they
-            were true only of the end. `available` is `settled - held` and
-            both terms are non-negative by construction.
+            balances and are NOT bucketed, and the instant they are true of is
+            the READ's and not the range's: the accounting projection caches
+            the account's present balance and keeps no history, so a range
+            that ended in June is answered with the balance the account holds
+            today, and there is no as-of read that could answer anything else.
+            They are reported once, beside the series rather than on every
+            point, because a caller that received them per point had no way to
+            know they were true of none of them. `available` is
+            `settled - held` and both terms are non-negative by construction.
 
             They are the CACHED balances the accounting projection already
             maintains, read and never re-derived — and they are exact in a
@@ -458,6 +494,36 @@ components:
             - gateway_observed
             - reservation_floor
           additionalProperties: false
+          properties:
+            reported:
+              type: integer
+              format: int64
+              minimum: 0
+              description: >-
+                Settlements priced as the provider's own report of its
+                usage.
+            gateway_observed:
+              type: integer
+              format: int64
+              minimum: 0
+              description: >-
+                Settlements priced as the gateway's own count of what it
+                received. Delivery is always the gateway's count by
+                construction, and it never decides the label — a figure the
+                gateways observed that arrived beside a provider's report is
+                priced as the report.
+            reservation_floor:
+              type: integer
+              format: int64
+              minimum: 0
+              description: >-
+                Settlements whose figure was the reservation's own: a clamp
+                that bound, or the basis fall-through when neither the
+                provider's report nor the gateway's count arrived. This is a
+                measure of PRICING CONFIDENCE — it is biased upward against a
+                report that would have arrived, so a rising floor is a
+                statement about the upstream's usage reporting and not about
+                this account.
           description: >-
             How the SETTLEMENTS in this range captured their usage, split by
             the three methods the fact grammar admits.

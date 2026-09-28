@@ -60,7 +60,7 @@ import (
 // columns would have refused the scan exactly as PostgreSQL would have.
 type shape []driver.Value
 
-// The shapes the five reads project, in order. A driver.Value of a type
+// The shapes the read's six statements project. A driver.Value of a type
 // converts to anything compatible, so int64 covers the counts and the bigint
 // casts, time.Time the timestamps and the freshness instant, and string the
 // account the resolution returns.
@@ -69,20 +69,30 @@ var (
 	shapeSeries = shape{int64(0), time.Time{}, time.Time{}, int64(0), int64(0)}
 	// COALESCE(SUM(...), 0)::bigint
 	shapeScalar = shape{int64(0)}
-	// two FILTERed sums
+	// two bigint columns: the ledger's release and credit legs in one
+	// statement, and the funding buckets' held and available in another. One
+	// shape serves both because the arity is the property this tier pins and
+	// the two statements agree on it.
 	shapePair = shape{int64(0), int64(0)}
 	// three FILTERed counts
 	shapeTriple = shape{int64(0), int64(0), int64(0)}
-	// the cursor's own updated_at. The value is a real instant and not the
-	// zero time, because the read refuses a zero — and that refusal is one of
-	// the properties this tier pins, so a script that answered with a zero
-	// would be testing the refusal rather than the read.
-	shapeInstant = shape{time.Unix(1, 0).UTC()}
+	// the cursor's own updated_at, and the EXISTS that says whether this
+	// account appears in the plane's derived rows at all. The instant is a real
+	// one and not the zero time, because the read refuses a zero — and that
+	// refusal is one of the properties this tier pins, so a script that
+	// answered with a zero would be testing the refusal rather than the read.
+	// The coverage column is a bool and not an int64, because the statement's
+	// EXISTS is a boolean and a driver.Value that scanned into one would not
+	// discover an arity that had drifted.
+	shapeInstant = shape{time.Unix(1, 0).UTC(), false}
 	// the resolved account
 	shapeAccount = shape{""}
 )
 
-// readShape is the five reads the answer is made of, in order.
+// readShape is the read's six statements, in the order it asks them: the
+// series, the settled header, the ledger flows, the balances, the capture
+// split and the freshness cursor. Six and not five because readMoney asks two
+// — the two money routes are separate axes and separate statements.
 var readShape = []shape{shapeSeries, shapeScalar, shapePair, shapePair, shapeTriple, shapeInstant}
 
 // scriptedDriver answers every statement from a script and records the

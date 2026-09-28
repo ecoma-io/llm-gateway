@@ -54,7 +54,8 @@ var bucketIDForm = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89
 //     against nothing.
 //   - It does not mix flows and balances. The three money figures are sums
 //     over a window; held and available come from the projection's cached
-//     columns as at the range's end and are never re-derived from the legs.
+//     columns as at the moment the read ran — the cached present, since the
+//     projection keeps no history — and are never re-derived from the legs.
 //     A third figure beside the cache and the legs is a number ADR 0011 has
 //     no reconciliation check for, which is the last thing a read model
 //     should introduce.
@@ -85,7 +86,21 @@ const (
 )
 
 var (
-	errAnalyticsReadExceeded      = errors.New("postgres: analytics read exceeded its bound")
+	// errAnalyticsReadExceeded is what every bound this read can reach is
+	// reported as, whichever side reached it: the caller's own deadline, the
+	// database's `statement_timeout`, an administrator's shutdown.
+	//
+	// It WRAPS context.DeadlineExceeded rather than standing alone, and that
+	// wrapping is the whole of how the answer is chosen. The two layers above
+	// this one ask whether the error IS a deadline — the use case to decide
+	// that the read is a failure rather than a zero, the transport to decide
+	// that the failure is 503 `service_unavailable` rather than 500 — and a
+	// plain sentinel answers neither question. It would be classified as an
+	// unclassifiable failure and answered with a server fault, which is a
+	// caller retrying a report forever instead of a console retrying it
+	// later. The bound is not a defect in this plane, so it must not be
+	// reported as one.
+	errAnalyticsReadExceeded      = fmt.Errorf("the analytics read exceeded its bound: %w", context.DeadlineExceeded)
 	errAnalyticsOutsideUnitOfWork = errors.New("postgres: analytics fact attribution requires a unit of work")
 	errInvalidBucketReference     = errors.New("invalid funding bucket reference")
 )
@@ -411,17 +426,25 @@ const analyticsReadBound = "5s"
 //     bound is the reason a report that cannot finish releases its
 //     connection rather than pinning one, and the pool this surface shares
 //     with the settlement path is ten connections wide.
-//   - The five reads are ONE snapshot. A transaction alone does not give
-//     that: this plane's units of work run at READ COMMITTED, deliberately,
-//     because the port's concurrency model is a single guarded statement per
-//     write and no read-modify-write spans statements (persistence.go,
-//     WithinTx). Under READ COMMITTED each of the five statements takes a
-//     fresh snapshot when it reaches the server, so a settlement committing
-//     between the series read and the money read would produce an answer that
-//     is internally inconsistent: a bucket saying "settled" beside a settled
-//     amount that does not include that settlement. Five statements about one
-//     question must be one moment, so this read asks for its unit at
-//     REPEATABLE READ.
+//
+//   - The read's six statements are ONE snapshot. A transaction alone does not
+//     give that: this plane's units of work run at READ COMMITTED,
+//     deliberately, because the port's concurrency model is a single guarded
+//     statement per write and no read-modify-write spans statements
+//     (persistence.go, WithinTx). Under READ COMMITTED each of the six
+//     statements takes a fresh snapshot when it reaches the server, so a
+//     settlement committing between the series read and the money read would
+//     produce an answer that is internally inconsistent: a bucket saying
+//     "settled" beside a settled amount that does not include that settlement.
+//     Six statements about one question must be one moment, so this read asks
+//     for its unit at REPEATABLE READ.
+//
+//     Six and not five because the count is of STATEMENTS and not of the five
+//     read helpers below: readMoney issues two, the settled header and the
+//     ledger flows, and the two are separate statements precisely because they
+//     are separate axes (readMoney's own header). A reader who counts the
+//     helpers and writes five here would understate what the isolation is
+//     holding together.
 //
 // The unit is read-only, and that costs the stronger level nothing: a
 // repeatable-read unit that takes no row locks cannot block a writer and
@@ -462,7 +485,17 @@ func (r *analyticsRepo) Usage(ctx context.Context, query persistence.UsageQuery)
 			return fmt.Errorf("postgres: set the analytics read bound: %w", err)
 		}
 
-		var err error
+		// hasDerivations is declared here rather than at its `:=` below, and
+		// the reason is the one every Go reader of this file has been bitten
+		// by: `freshness, hasDerivations, err := ...` inside the closure would
+		// declare a NEW freshness that shadows the answer's, assign the store's
+		// instant to it, and return the zero time to the caller. The coverage
+		// column is what this statement gained; the freshness it already
+		// returned must stay bound to the variable the read returns.
+		var (
+			err            error
+			hasDerivations bool
+		)
 		usage, err = r.readSeries(txCtx, query)
 		if err != nil {
 			return err
@@ -479,10 +512,11 @@ func (r *analyticsRepo) Usage(ctx context.Context, query persistence.UsageQuery)
 		if err != nil {
 			return err
 		}
-		freshness, err = r.readFreshness(txCtx)
+		freshness, hasDerivations, err = r.readFreshness(txCtx, query.AccountID)
 		if err != nil {
 			return err
 		}
+		usage.AccountHasDerivations = hasDerivations
 
 		usage.SettledMinorUnits = money.Settled
 		usage.ReleasedMinorUnits = money.Released
@@ -543,7 +577,13 @@ func (r *analyticsRepo) readSeries(ctx context.Context, query persistence.UsageQ
 //     figure today, independent of any future refund.
 //   - funds added: the SUM of grant and topup legs, the two crediting kinds
 //     the ledger already has. This is capacity credited, not revenue: nothing
-//     in this plane has ever received a payment.
+//     in this plane has ever received a payment. The other four kinds are
+//     deliberately outside the population and the schema is the reason —
+//     hold/release/consume move capacity the account already has, and an
+//     adjustment's deltas are STATED rather than pinned to its amount
+//     (`ledger_entries_leg_algebra`), so its amount is a correction's
+//     magnitude and may describe a downward move. Summing it here would book
+//     the size of a correction as a credit.
 //
 // Every SUM carries a ::bigint cast. SUM over bigint widens to numeric in
 // PostgreSQL, and without the cast the value arrives as an arbitrary-precision
@@ -652,7 +692,9 @@ func (r *analyticsRepo) readCapture(ctx context.Context, query persistence.Usage
 	return capture, nil
 }
 
-// readFreshness reads the ingestion cursor's own last-pass instant.
+// readFreshness reads the ingestion cursor's own last-pass instant and, in the
+// same row of the same statement, whether this plane holds a derived row for
+// the account the read is about at all.
 //
 // The cursor's POSITION is never parsed and never compared to anything. It is
 // an opaque string the Data Plane issued, the Control Plane is forbidden to
@@ -661,7 +703,28 @@ func (r *analyticsRepo) readCapture(ctx context.Context, query persistence.Usage
 // record time. What that instant does and does not prove is the contract's
 // sentence, not this query's: it is a liveness signal, never a completeness
 // one, because the feed's high-water mark is the Data Plane's to publish.
-func (r *analyticsRepo) readFreshness(ctx context.Context) (persistence.Freshness, error) {
+//
+// The coverage column rides on THIS statement rather than opening one of its
+// own, and that is the unit of work's rule applied to a fact the answer turns
+// on: a sixth statement is a sixth snapshot, and two facts read at two instants
+// can disagree — here the disagreement would be an answer saying "this plane
+// holds nothing for you" beside a freshness instant from after that account's
+// first pass. One row, one statement, one moment.
+//
+// The coverage costs nothing for that, and it is measured rather than assumed:
+// the predicate is an equality on the leading column of
+// analytics_fact_dimensions_account_applied_idx, and the plan answers it with
+// `Index Only Scan using analytics_fact_dimensions_account_applied_idx` /
+// `Index Cond: (account_id = ...)` — a probe that stops at the first row, not a
+// scan of the table.
+//
+// The EXISTS is scoped to the ACCOUNT and not to the range. A range-scoped
+// probe would be the series over again — the series already reports a fact per
+// bucket — and it would answer "was this range quiet", which is exactly the
+// question whose answer must NOT be not_available: a caller told "nothing is
+// available" for a range in which the account genuinely did nothing would have
+// no way to tell that from the account having never been ingested.
+func (r *analyticsRepo) readFreshness(ctx context.Context, accountID string) (persistence.Freshness, bool, error) {
 	// Scanned into a plain time.Time, NOT a sql.NullTime. The column is
 	// `updated_at timestamptz NOT NULL DEFAULT now()` (migrations/control/
 	// 000008:74), so a NULL instant is not a state this row can be in — a
@@ -677,26 +740,35 @@ func (r *analyticsRepo) readFreshness(ctx context.Context) (persistence.Freshnes
 	// "never" as a time would be a caller drawing a chart from a statement
 	// about nothing, and the cursor is a seeded singleton that 000001 inserts,
 	// so its absence means the schema was not applied as it ships.
-	var updatedAt time.Time
+	var (
+		updatedAt      time.Time
+		hasDerivations bool
+	)
 	row := r.store.Querier(ctx).QueryRowContext(ctx,
-		`SELECT updated_at FROM control.ingestion_cursor WHERE id = 1`)
-	switch err := row.Scan(&updatedAt); {
+		`SELECT c.updated_at,
+		        EXISTS (
+		            SELECT 1 FROM control.analytics_fact_dimensions d
+		            WHERE d.account_id = $1
+		        )
+		   FROM control.ingestion_cursor c
+		  WHERE c.id = 1`, accountID)
+	switch err := row.Scan(&updatedAt, &hasDerivations); {
 	case errors.Is(err, sql.ErrNoRows):
-		return persistence.Freshness{}, errors.New("postgres: read the ingestion cursor: the singleton row is absent, and the schema seeds it in 000001")
+		return persistence.Freshness{}, false, errors.New("postgres: read the ingestion cursor: the singleton row is absent, and the schema seeds it in 000001")
 	case err != nil:
-		return persistence.Freshness{}, r.classifyRead("read the ingestion cursor", err)
+		return persistence.Freshness{}, false, r.classifyRead("read the ingestion cursor", err)
 	}
 	if updatedAt.IsZero() {
 		// Unreachable while the column is NOT NULL, and kept because a future
 		// migration that relaxed the column would otherwise turn a missing
 		// freshness into a plausible-looking epoch time — the year 1, which a
 		// chart would draw as "no data, a very long time ago".
-		return persistence.Freshness{}, errors.New("postgres: read the ingestion cursor: the singleton row carries no instant")
+		return persistence.Freshness{}, false, errors.New("postgres: read the ingestion cursor: the singleton row carries no instant")
 	}
 	return persistence.Freshness{
 		DataThrough: updatedAt.UTC(),
 		Basis:       analytics.FreshnessFactFeedPass,
-	}, nil
+	}, hasDerivations, nil
 }
 
 // classifyRead separates a read that ran out of time from a read that failed.
@@ -705,6 +777,15 @@ func (r *analyticsRepo) readFreshness(ctx context.Context) (persistence.Freshnes
 // failure, and it is why this file does not fold every error into one: a
 // caller told a slow report had failed would page an operator for a database
 // that is answering.
+//
+// The database's own bounds are the ones that need the classification most,
+// because they are the ones the caller's context does not cover: a
+// `statement_timeout` that fires at the same five seconds races the Go
+// deadline, but a shutdown or a terminated backend arrives with a context
+// that is still perfectly alive. That is why the sentinel WRAPS the deadline
+// rather than the classification being a branch in this function — the two
+// layers above read the same predicate for both sides of the race, so a
+// server-side bound is answered exactly as a client-side one is.
 func (r *analyticsRepo) classifyRead(what string, err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {

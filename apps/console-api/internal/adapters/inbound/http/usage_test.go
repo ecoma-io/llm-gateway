@@ -12,15 +12,15 @@ import (
 	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/application"
-	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/analytics"
-	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
 // The tests below are the ones a caller meets: a real request, over the real
-// handler, on the real use case, with only the STORE standing in. Everything
-// above the store is the production composition, so a defect at any of the four
-// layers between the wire and a bucket is a red test here rather than a review
-// argument nobody repeats.
+// handler, on the real envelope, with only the usage SEAM standing in. That is
+// the same line the ten reads' tests draw, and it is drawn in the same place
+// for the same reason: everything the transport owns is the production one, and
+// the composition below the seam — the domain's walk, the store's statements,
+// the use case's attribution and the credential's resolution — is covered where
+// it lives rather than through a second implementation of it here.
 //
 // The corpus is fixed — three hour-buckets over a three-hour range — rather than
 // generated, because a generated expectation re-implements the marshaller it
@@ -56,13 +56,32 @@ var (
 	usageDataThrough = time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
 )
 
-// usageServer mounts the product surface over a store the test controls. The
-// store is the ONLY substitution: the credential resolution is the package's
-// own stub, which is the production wiring's shape, because a resolver that
-// accepted whatever account a test asked for would let every other assertion
-// pass while the one property the surface has was never under test.
-func usageServer(readModel persistence.Analytics) stdhttp.Handler {
-	return New(application.New("v0.1.0"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), application.NewUsageUseCase(readModel, stubScoper{}))
+// usageServer mounts the product surface over the usage seam a case controls.
+// The seam is the ONLY substitution: the readiness probe, the session surface
+// and the ten reads are the package's own fakes, and the handler, the envelope
+// and every mapping between them are the production ones.
+func usageServer(useCases UsageUseCases) stdhttp.Handler {
+	return New(application.New("v0.1.0"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), useCases)
+}
+
+// emptyUsageAnswer is the answer a read produces for an account this plane holds
+// no derivation for: the range that was asked for, no buckets, and every figure
+// zero. The availability is `not_available` because that is the contract's own
+// word for it, and the zone is UTC because an absent timezone parameter names
+// the store's own zone.
+//
+// It is the shape the mount tests and the refusal tables need — an answer that
+// is valid, unremarkable and never the subject of the case — so that a case
+// about a credential or a query string is not also a case about figures.
+func emptyUsageAnswer() UsageAnswer {
+	return UsageAnswer{
+		Availability: "not_available",
+		Granularity:  "hour",
+		From:         usageFrom,
+		To:           usageTo,
+		Timezone:     "UTC",
+		Freshness:    UsageAnswerFreshness{DataThrough: usageDataThrough, Basis: "fact_feed_pass"},
+	}
 }
 
 // issueUsage is one request against a mounted surface, returning the recorded
@@ -94,53 +113,6 @@ func errorEnvelopeOf(t *testing.T, rec *httptest.ResponseRecorder) errorEnvelope
 	return envelope
 }
 
-// recordingUsage is the store a case controls, and it RECORDS the queries it was
-// asked. The recording is not bookkeeping: two of the cases below are about the
-// store not being asked at all, and "the store was never called" is a claim only
-// a counter can make.
-type recordingUsage struct {
-	answer    persistence.Usage
-	freshness persistence.Freshness
-	err       error
-
-	calls []persistence.UsageQuery
-}
-
-// Usage implements persistence.Analytics.
-func (s *recordingUsage) Usage(_ context.Context, query persistence.UsageQuery) (persistence.Usage, persistence.Freshness, error) {
-	s.calls = append(s.calls, query)
-	return s.answer, s.freshness, s.err
-}
-
-// boundsUsage answers with one empty bucket per bucket the query asked for, cut
-// in the query's own zone.
-//
-// It exists so a case can read WHERE THE BUCKETS WERE CUT without this file
-// recomputing the walk to find out. Recomputing it would make the test a second
-// implementation of the domain's arithmetic, and a second implementation that
-// agreed with the first would tell the reader nothing and a second that
-// disagreed would make the test wrong.
-type boundsUsage struct{}
-
-// Usage implements persistence.Analytics.
-func (boundsUsage) Usage(_ context.Context, query persistence.UsageQuery) (persistence.Usage, persistence.Freshness, error) {
-	series := make([]persistence.Bucket, 0, len(query.Buckets))
-	for _, bucket := range query.Buckets {
-		series = append(series, persistence.Bucket{Start: bucket.Start, End: bucket.End})
-	}
-	return persistence.Usage{Series: series},
-		persistence.Freshness{Basis: analytics.FreshnessFactFeedPass},
-		nil
-}
-
-// Compile-time proofs that the two stand in for the port and not for something
-// wider, so a port that grew a member would fail here rather than in a case that
-// quietly stopped covering it.
-var (
-	_ persistence.Analytics = (*recordingUsage)(nil)
-	_ persistence.Analytics = boundsUsage{}
-)
-
 // TestTheUsageSurfaceRefusesEveryCredentialItCannotResolve is the half of the
 // credential story that is a TRANSPORT question, because the credential is
 // extracted here and nothing else about it is.
@@ -154,15 +126,10 @@ var (
 // not a refusal is a credential the surface ACCEPTS, and it is here because a
 // table of refusals alone would pass over a handler that refused everything.
 func TestTheUsageSurfaceRefusesEveryCredentialItCannotResolve(t *testing.T) {
-	// The store answers; a refusal that reached it would be a different
+	// The seam answers; a request refused before it would be a different
 	// defect, asserted separately below.
-	store := &recordingUsage{
-		answer: persistence.Usage{
-			Series: []persistence.Bucket{{Start: usageFrom, End: usageTo, WithUsageFacts: 1, Settled: 1}},
-		},
-		freshness: persistence.Freshness{DataThrough: usageDataThrough, Basis: analytics.FreshnessFactFeedPass},
-	}
-	handler := usageServer(store)
+	useCases := &fakeUsageUseCases{answer: emptyUsageAnswer()}
+	handler := usageServer(useCases)
 
 	tests := []struct {
 		name          string
@@ -193,8 +160,8 @@ func TestTheUsageSurfaceRefusesEveryCredentialItCannotResolve(t *testing.T) {
 		},
 		{
 			// A header carrying a scheme this surface does not read. The
-			// credential itself resolves — the store answers for it, and the
-			// use case would reach the read model — so what is refused is the
+			// credential itself resolves — the seam answers for it, and the use
+			// case would reach the read model — so what is refused is the
 			// credential's TRANSPORT, before the credential is interpreted at
 			// all. A handler that understood more schemes than the contract
 			// declares would be answering over an interface a caller generated
@@ -256,27 +223,42 @@ func TestTheUsageSurfaceRefusesEveryCredentialItCannotResolve(t *testing.T) {
 		})
 	}
 
-	// Exactly one call, and it is the accepting case's: every refusal above
-	// belongs before the read model, and a refusal that reached the store would
-	// have spent a database round trip on a request that could not be answered.
-	if len(store.calls) != 1 {
-		t.Errorf("the store was asked %d times by %d requests carrying no credential the surface accepts; a refusal belongs before the read model, not inside it", len(store.calls), len(tests)-1)
+	// The read was reached by exactly the two credentials it could have been
+	// reached by, and by neither of the rest: a request with no credential the
+	// transport could read never became a read at all, while a well-formed
+	// credential this deployment never issued DID — the seam is where resolution
+	// happens, and the case above is about the refusal surviving the way back.
+	//
+	// Both tokens arrived exactly as presented, because extracting a credential
+	// and handing it over whole is the whole of what this package does with one.
+	tokens := make([]string, 0, len(useCases.calls))
+	for _, call := range useCases.calls {
+		tokens = append(tokens, call.token)
+	}
+	// In the order the cases above present them: the credential the deployment
+	// never issued, then the one it did.
+	want := []string{"a-token-this-deployment-did-not-issue", stubToken}
+	if len(tokens) != len(want) || tokens[0] != want[0] || tokens[1] != want[1] {
+		t.Errorf("the read was asked about %q by %d requests, want exactly %q — a credential the transport could not read belongs refused before the read, and one it could read belongs handed over whole",
+			tokens, len(tests), want)
 	}
 }
 
-// TestTheUsageSurfaceRefusesBeforeTheStoreAnswers is the same 401 arrived at
-// through the RESOLVER rather than through the handler, and it is its own case
+// TestTheUsageSurfaceRefusesBeforeTheReadAnswers is the same 401 arrived at
+// through the SEAM rather than through the handler, and it is its own case
 // because the two paths are different code: this one has a credential the
-// transport could read and could not resolve, and the store is reached only
-// because the use case resolved the scope and asked for the figures.
+// transport could read and could not resolve, so the refusal is produced below
+// the transport and has to survive the mapping back.
 //
-// The scope is derived, so an unresolved credential is refused before any
-// statement is built. A handler that resolved the scope itself would have
-// reversed that order, and a caller could have learned the difference from a
-// response time.
-func TestTheUsageSurfaceRefusesBeforeTheStoreAnswers(t *testing.T) {
-	store := &recordingUsage{answer: persistence.Usage{Series: []persistence.Bucket{{Start: usageFrom, End: usageTo}}}}
-	handler := usageServer(store)
+// The distinction the two paths draw is which layer decides, not which layer
+// answers: the handler refuses what it cannot read, and the seam refuses what it
+// cannot resolve. Both reach the caller as the same 401, because the caller
+// cannot act on the difference — and the token the seam refused on is the one the
+// caller presented, which is what keeps this a claim about the transport rather
+// than about the resolver's own table.
+func TestTheUsageSurfaceRefusesBeforeTheReadAnswers(t *testing.T) {
+	useCases := &fakeUsageUseCases{answer: emptyUsageAnswer()}
+	handler := usageServer(useCases)
 
 	rec := issueUsage(t, handler, usageQuery, "Bearer not-a-configured-token")
 
@@ -286,25 +268,33 @@ func TestTheUsageSurfaceRefusesBeforeTheStoreAnswers(t *testing.T) {
 	if code := errorEnvelopeOf(t, rec).Error.Code; code != string(application.CodeUnauthenticated) {
 		t.Errorf("code = %q, want %q; body = %q", code, application.CodeUnauthenticated, rec.Body.String())
 	}
-	if len(store.calls) != 0 {
-		t.Errorf("an unresolved credential reached the store %d times; the scope is the first thing a statement must carry, and a statement with no scope is never built", len(store.calls))
+	if len(useCases.calls) != 1 {
+		t.Fatalf("the read was asked %d times, want once: the refusal comes from the read, and this case is about it surviving the mapping", len(useCases.calls))
+	}
+	if got, want := useCases.calls[0].token, "not-a-configured-token"; got != want {
+		t.Errorf("the read was asked about %q, want %q", got, want)
 	}
 }
 
 // TestTheUsageSurfaceRefusesEveryUnanswerableQuestion is the 400 half of the
-// surface, and each case is a question the contract names as a refusal rather
-// than a clamp.
+// surface, and every case here is a question the TRANSPORT refuses: a parameter
+// it cannot parse, an unknown one, or one given twice.
 //
-// The two refusals this file owns outright are the malformed instant and the
-// unknown parameter; the rest belong to the use case and the domain and are here
-// because the HANDLER's half is the same in all of them: one status, one code,
-// and a message that names what to change. A caller sent back with a generic
-// "invalid request" would send the same request again.
+// The refusals that belong to the domain and the use case — a grain outside the
+// vocabulary, a zone with no calendar, a range that is not a range — are NOT
+// here, and that is a line rather than an omission: they are decided below the
+// seam this file fakes, and they are pinned where they live
+// (internal/domain/analytics/query_test.go and TestUsageRefusesInvalidRequest).
+// A copy of one here would be a test of the fake.
+//
+// What the handler owns in all of these is the same: one status, one code, and a
+// message that names what to change. A caller sent back with a generic "invalid
+// request" would send the same request again.
 func TestTheUsageSurfaceRefusesEveryUnanswerableQuestion(t *testing.T) {
-	// A malformed request is refused before the store, so the store here holds
-	// a valid answer that must never be served to any of these.
-	store := &recordingUsage{answer: persistence.Usage{Series: []persistence.Bucket{{Start: usageFrom, End: usageTo}}}}
-	handler := usageServer(store)
+	// A malformed request is refused before the read, so the seam here holds a
+	// valid answer that must never be served to any of these.
+	useCases := &fakeUsageUseCases{answer: emptyUsageAnswer()}
+	handler := usageServer(useCases)
 
 	tests := []struct {
 		name    string
@@ -333,6 +323,10 @@ func TestTheUsageSurfaceRefusesEveryUnanswerableQuestion(t *testing.T) {
 			// caller asking for `group_by=model` would otherwise receive a
 			// correct answer about the wrong thing. This is the mutation that
 			// silently widens the surface's question set, so it is a case.
+			//
+			// `account_id` is the same claim with the surface's own tenancy
+			// behind it: the account is the credential's, and a parameter that
+			// could name one would be a parameter a caller could tamper with.
 			name:    "a query parameter this surface does not answer",
 			query:   usageQuery + "&account_id=018f0000-0000-7000-8000-000000000009",
 			wantSay: []string{"unknown query parameter account_id", "misspelled"},
@@ -341,11 +335,6 @@ func TestTheUsageSurfaceRefusesEveryUnanswerableQuestion(t *testing.T) {
 			name:    "two query parameters this surface does not answer, named in a deterministic order",
 			query:   usageQuery + "&group_by=model&account_id=018f0000-0000-7000-8000-000000000009",
 			wantSay: []string{"account_id, group_by"},
-		},
-		{
-			name:    "a timezone with no calendar behind it",
-			query:   usageQuery + "&timezone=Mars/Olympus_Mons",
-			wantSay: []string{"timezone", "resolve"},
 		},
 		{
 			// A zone that was asked for and named nothing is not the same as no
@@ -358,23 +347,13 @@ func TestTheUsageSurfaceRefusesEveryUnanswerableQuestion(t *testing.T) {
 			wantSay: []string{"timezone", "empty"},
 		},
 		{
-			// The contract's own maxLength. This zone is 64 characters and
-			// resolvable, so the only bound it can break is the octet count —
-			// which makes it a case about the length check rather than about the
-			// calendar, and one character longer makes the two indistinguishable.
+			// The contract's own maxLength. This zone is 65 characters, so the
+			// only bound it can break is the octet count — which makes it a case
+			// about the length check rather than about the calendar, and one
+			// character shorter makes the two indistinguishable.
 			name:    "a timezone longer than the octets the contract accepts",
 			query:   usageQuery + "&timezone=" + strings.Repeat("a", 65),
 			wantSay: []string{"64", "octets"},
-		},
-		{
-			name:    "a grain outside the enumeration",
-			query:   "from=2026-09-01T00:00:00Z&to=2026-09-01T03:00:00Z&granularity=fortnight",
-			wantSay: []string{"fortnight", "hour", "calendar_month"},
-		},
-		{
-			name:    "a range that is not a range",
-			query:   "from=2026-09-01T03:00:00Z&to=2026-09-01T00:00:00Z&granularity=hour",
-			wantSay: []string{"from must be strictly before to"},
 		},
 		{
 			name:    "a from that is missing",
@@ -410,8 +389,8 @@ func TestTheUsageSurfaceRefusesEveryUnanswerableQuestion(t *testing.T) {
 		})
 	}
 
-	if len(store.calls) != 0 {
-		t.Errorf("the store was asked %d times by requests the surface refuses before it can ask anything; a bound broken in the query string costs a caller nothing to be told about", len(store.calls))
+	if len(useCases.calls) != 0 {
+		t.Errorf("the read was asked %d times by requests the surface refuses before it can ask anything; a bound broken in the query string costs a caller nothing to be told about", len(useCases.calls))
 	}
 }
 
@@ -426,11 +405,7 @@ func TestTheUsageSurfaceRefusesEveryUnanswerableQuestion(t *testing.T) {
 // sentence about the same empty data. The figures are zero because zero is a
 // value on this surface, not an absence.
 func TestTheUsageSurfaceAnswersAReadModelThatHoldsNothing(t *testing.T) {
-	store := &recordingUsage{freshness: persistence.Freshness{
-		DataThrough: usageDataThrough,
-		Basis:       analytics.FreshnessFactFeedPass,
-	}}
-	handler := usageServer(store)
+	handler := usageServer(&fakeUsageUseCases{answer: emptyUsageAnswer()})
 
 	rec := issueUsage(t, handler, usageQuery, "Bearer "+stubToken)
 
@@ -450,16 +425,6 @@ func TestTheUsageSurfaceAnswersAReadModelThatHoldsNothing(t *testing.T) {
 	if got := rec.Body.String(); got != want {
 		t.Errorf("the not_available envelope is\n got %s\nwant %s", got, want)
 	}
-
-	// The query reached the store carrying the derived scope. Nothing in the
-	// request named an account, so a store that was asked without one would be
-	// a store about to answer for every account at once.
-	if len(store.calls) != 1 {
-		t.Fatalf("the store was asked %d times, want once", len(store.calls))
-	}
-	if got, want := store.calls[0].AccountID, stubAccount; got != want {
-		t.Errorf("the query reached the store scoped to %q, want %q; the scope is derived from the credential and from nowhere else", got, want)
-	}
 }
 
 // TestTheUsageSurfaceRendersTheContractedEnvelope is the case that would catch a
@@ -471,35 +436,36 @@ func TestTheUsageSurfaceAnswersAReadModelThatHoldsNothing(t *testing.T) {
 // figure is a distinct value, so a field swapped with its neighbour cannot
 // match, and the two request counts are not equal in either the series or the
 // totals, so a mix-up between the two populations a caller must not confuse is a
-// different number. One bucket settles for nothing — a free-model hour is a
-// real answer rather than a missing one — and the envelope's totals are the sum
-// of the series, so the store's per-bucket figures and the repeated totals are
-// two readings of one thing: the answer's own claim is that they agree, and
-// here it is checked rather than assumed.
+// different number. One bucket holds no settlements — a free-model hour is a
+// real answer rather than a missing one — and the two lists must not be confused
+// with the two figures in the answer that are BALANCES as at the read's own
+// instant rather than sums over the range.
 func TestTheUsageSurfaceRendersTheContractedEnvelope(t *testing.T) {
-	store := &recordingUsage{
-		answer: persistence.Usage{
-			Series: []persistence.Bucket{
-				{Start: usageFrom, End: usageFrom.Add(time.Hour), WithUsageFacts: 412, Settled: 410},
-				// A bucket with no settlements in it is still a bucket, and zero
-				// is what it holds: a free-model hour is a real answer, not a
-				// missing one, and a series that omitted it would leave the
-				// caller inventing a rule for which gaps to fill.
-				{Start: usageFrom.Add(time.Hour), End: usageFrom.Add(2 * time.Hour), WithUsageFacts: 3, Settled: 0},
-				{Start: usageFrom.Add(2 * time.Hour), End: usageFrom.Add(3 * time.Hour), WithUsageFacts: 7, Settled: 7},
-			},
-			SettledMinorUnits:    4321,
-			ReleasedMinorUnits:   654,
-			FundsAddedMinorUnits: 100000,
-			Balances:             persistence.Balances{Held: 5000, Available: 97500},
-			Capture:              analytics.Capture{Reported: 11, GatewayObserved: 12, ReservationFloor: 13},
+	handler := usageServer(&fakeUsageUseCases{answer: UsageAnswer{
+		Availability: "available",
+		Granularity:  "hour",
+		From:         usageFrom,
+		To:           usageTo,
+		Timezone:     "UTC",
+		Series: []UsageAnswerBucket{
+			{Start: usageFrom, End: usageFrom.Add(time.Hour), RequestsWithUsageFacts: 412, RequestsSettled: 410},
+			// A bucket with no settlements in it is still a bucket, and zero
+			// is what it holds: a free-model hour is a real answer, not a
+			// missing one, and a series that omitted it would leave the
+			// caller inventing a rule for which gaps to fill.
+			{Start: usageFrom.Add(time.Hour), End: usageFrom.Add(2 * time.Hour), RequestsWithUsageFacts: 3, RequestsSettled: 0},
+			{Start: usageFrom.Add(2 * time.Hour), End: usageFrom.Add(3 * time.Hour), RequestsWithUsageFacts: 7, RequestsSettled: 7},
 		},
-		freshness: persistence.Freshness{
-			DataThrough: usageDataThrough,
-			Basis:       analytics.FreshnessFactFeedPass,
-		},
-	}
-	handler := usageServer(store)
+		RequestsWithUsageFacts: 422,
+		RequestsSettled:        417,
+		SettledMinorUnits:      4321,
+		ReleasedMinorUnits:     654,
+		FundsAddedMinorUnits:   100000,
+		HeldMinorUnits:         5000,
+		AvailableMinorUnits:    97500,
+		Capture:                UsageAnswerCapture{Reported: 11, GatewayObserved: 12, ReservationFloor: 13},
+		Freshness:              UsageAnswerFreshness{DataThrough: usageDataThrough, Basis: "fact_feed_pass"},
+	}})
 
 	rec := issueUsage(t, handler, usageQuery, "Bearer "+stubToken)
 
@@ -535,15 +501,16 @@ func TestTheUsageSurfaceRendersTheContractedEnvelope(t *testing.T) {
 // a scope parameter — and a caller that could read its scope back would have a
 // second source of truth about which account it was answered for, which is the
 // one thing the derivation exists to avoid.
+//
+// The answer is the one a read produces, because it is the ANSWER that would
+// have to carry an account for it to reach the wire: the seam has no account to
+// put in it either (usage.go).
 func TestTheUsageEnvelopeCarriesNoAccount(t *testing.T) {
-	store := &recordingUsage{
-		answer: persistence.Usage{
-			Series: []persistence.Bucket{{Start: usageFrom, End: usageTo, WithUsageFacts: 1, Settled: 1}},
-		},
-		freshness: persistence.Freshness{DataThrough: usageDataThrough, Basis: analytics.FreshnessFactFeedPass},
-	}
+	answer := emptyUsageAnswer()
+	answer.Availability = "available"
+	answer.Series = []UsageAnswerBucket{{Start: usageFrom, End: usageTo, RequestsWithUsageFacts: 1, RequestsSettled: 1}}
 
-	rec := issueUsage(t, usageServer(store), usageQuery, "Bearer "+stubToken)
+	rec := issueUsage(t, usageServer(&fakeUsageUseCases{answer: answer}), usageQuery, "Bearer "+stubToken)
 
 	if rec.Code != stdhttp.StatusOK {
 		t.Fatalf("status = %d, want %d; body = %q", rec.Code, stdhttp.StatusOK, rec.Body.String())
@@ -557,14 +524,22 @@ func TestTheUsageEnvelopeCarriesNoAccount(t *testing.T) {
 }
 
 // TestTheUsageEnvelopeFollowsTheZoneItWasCutIn is the transport's half of the
-// zone contract, and it is two claims rather than one.
+// zone contract, and the answer it is handed is the shape the use case produces
+// for a caller who asked in a zone whose offset is not a whole number of hours:
+// the same three-hour range cut into four buckets, the outer two of them
+// partial, with the display zone travelling beside the instants.
 //
-// The first is that the zone MOVES THE EDGES and nothing else: a zone with a
-// non-integral offset cuts this same range at local half hours, and the instants
-// that go out are the UTC readings of those edges — a chart labelled in the
-// caller's zone, drawn from instants nobody has to re-derive. The second is
-// that the response ECHOES the zone by the caller's own spelling, so a caller
-// who asked for a zone is told which one its buckets were cut in.
+// Two claims are the transport's and no one else's. The first is that the
+// response ECHOES the zone as the answer named it, so a caller who asked for a
+// zone is told which one its buckets were cut in without the transport
+// re-deriving a name from the offsets. The second is that every instant goes out
+// as a UTC reading: this answer's instants are located in the display zone, and
+// a marshaller that formatted them where they stood would write
+// `2026-09-01T05:30:00+05:30` — a correct instant that a caller comparing two
+// responses from two zones could not compare, and that a client in a third zone
+// would have to re-derive. The contract's `timezone` parameter says every figure
+// it stores is UTC and that only the labels move; this is the line where that
+// stops being a convention and becomes a property of the response.
 //
 // The range's end falls inside the last bucket here rather than on its edge,
 // which is what almost every real range looks like: `final_bucket_partial` is a
@@ -572,8 +547,35 @@ func TestTheUsageEnvelopeCarriesNoAccount(t *testing.T) {
 // is still a partial bucket. A caller drawing it as a complete zero would be
 // drawing a number this plane never claimed.
 func TestTheUsageEnvelopeFollowsTheZoneItWasCutIn(t *testing.T) {
-	rec := issueUsage(t, usageServer(boundsUsage{}),
-		usageQuery+"&timezone=Asia/Kolkata", "Bearer "+stubToken)
+	kolkata, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		t.Fatalf("the test's own fixture zone Asia/Kolkata did not load: %v", err)
+	}
+	// The hour containing 00:00Z begins at 23:30Z the previous day, and the
+	// range's end falls inside the hour containing 03:00Z — so the walk yields
+	// FOUR buckets for a three-hour range: the first is a partial at the bottom
+	// and the last is a partial at the top.
+	handler := usageServer(&fakeUsageUseCases{answer: UsageAnswer{
+		Availability:       "available",
+		Granularity:        "hour",
+		From:               usageFrom,
+		To:                 usageTo,
+		Timezone:           "Asia/Kolkata",
+		FinalBucketPartial: true,
+		Series: []UsageAnswerBucket{
+			{Start: time.Date(2026, time.August, 31, 23, 30, 0, 0, time.UTC), End: time.Date(2026, time.September, 1, 0, 30, 0, 0, time.UTC)},
+			{Start: time.Date(2026, time.September, 1, 0, 30, 0, 0, time.UTC), End: time.Date(2026, time.September, 1, 1, 30, 0, 0, time.UTC)},
+			{Start: time.Date(2026, time.September, 1, 1, 30, 0, 0, time.UTC), End: time.Date(2026, time.September, 1, 2, 30, 0, 0, time.UTC)},
+			// The last bucket, spelled in the DISPLAY zone rather than in UTC,
+			// so a marshaller that formatted the instant where it stood would
+			// answer the caller with an offset. Both spellings are one instant;
+			// only one of them is the contract's.
+			{Start: time.Date(2026, time.September, 1, 8, 0, 0, 0, kolkata), End: time.Date(2026, time.September, 1, 9, 0, 0, 0, kolkata)},
+		},
+		Freshness: UsageAnswerFreshness{DataThrough: usageDataThrough, Basis: "fact_feed_pass"},
+	}})
+
+	rec := issueUsage(t, handler, usageQuery+"&timezone=Asia/Kolkata", "Bearer "+stubToken)
 
 	if rec.Code != stdhttp.StatusOK {
 		t.Fatalf("status = %d, want %d; body = %q", rec.Code, stdhttp.StatusOK, rec.Body.String())
@@ -585,19 +587,19 @@ func TestTheUsageEnvelopeFollowsTheZoneItWasCutIn(t *testing.T) {
 	}
 
 	if envelope.Range.Timezone != "Asia/Kolkata" {
-		t.Errorf("range.timezone = %q, want the caller's own spelling %q", envelope.Range.Timezone, "Asia/Kolkata")
+		t.Errorf("range.timezone = %q, want the zone the answer named, %q", envelope.Range.Timezone, "Asia/Kolkata")
 	}
 	if envelope.Metric != "usage" {
 		t.Errorf("metric = %q, want %q; a caller binds a renderer to a family rather than to a field that happens to be present today", envelope.Metric, "usage")
 	}
-	if envelope.Availability != string(analytics.AvailabilityAvailable) {
-		t.Errorf("availability = %q, want %q; a store that returned buckets has answered the range asked of", envelope.Availability, analytics.AvailabilityAvailable)
+	if envelope.Availability != "available" {
+		t.Errorf("availability = %q, want %q; an answer carrying buckets has answered the range asked of", envelope.Availability, "available")
 	}
-	// The grain is carried inside the range the envelope echoes, because a
-	// figure cannot be re-aggregated without re-deriving what a bucket meant —
-	// and a report mixing grains is a defect rather than a wide sheet.
-	if envelope.Granularity != string(analytics.GranularityHour) {
-		t.Errorf("range.granularity = %q, want %q", envelope.Granularity, analytics.GranularityHour)
+	// The grain travels beside the range, because a figure cannot be
+	// re-aggregated without re-deriving what a bucket meant — and a report
+	// mixing grains is a defect rather than a wide sheet.
+	if envelope.Granularity != "hour" {
+		t.Errorf("granularity = %q, want %q", envelope.Granularity, "hour")
 	}
 	if envelope.Range.StartAt != "2026-09-01T00:00:00Z" || envelope.Range.EndAt != "2026-09-01T03:00:00Z" {
 		t.Errorf("the range came back as [%s, %s), want the range asked for; a zone moves where a bucket begins, not where the range is",
@@ -606,19 +608,18 @@ func TestTheUsageEnvelopeFollowsTheZoneItWasCutIn(t *testing.T) {
 	if !envelope.FinalBucketPartial {
 		t.Error("final_bucket_partial = false, want true; the range's end falls inside the last bucket, and that is a fact about the range rather than about the data")
 	}
-	// The hour containing 00:00Z begins at 23:30Z the previous day, and the
-	// range's end falls inside the hour containing 03:00Z — so the walk
-	// yields FOUR buckets for a three-hour range: the first is a partial at
-	// the bottom and the last is a partial at the top. A series that began
-	// at 00:00Z would be a chart whose bars are in the wrong place with
-	// nothing to say so, and one of three would be a series that renumbered
-	// the range against the calendar.
 	if len(envelope.Series) != 4 {
 		t.Fatalf("the series has %d points, want 4; the first bucket is the one CONTAINING the range's start, so an unaligned start yields one more than the hours it spans: %+v",
 			len(envelope.Series), envelope.Series)
 	}
 	if got, want := envelope.Series[0].Start, "2026-08-31T23:30:00Z"; got != want {
 		t.Errorf("the first bucket begins at %s, want %s — a zone whose offset is not a whole number of hours moves the edge to the half hour", got, want)
+	}
+	if got, want := envelope.Series[3].Start, "2026-09-01T02:30:00Z"; got != want {
+		t.Errorf("the last bucket begins at %s, want %s; an instant located in the display zone is still the caller's UTC reading of that edge", got, want)
+	}
+	if got, want := envelope.Series[3].End, "2026-09-01T03:30:00Z"; got != want {
+		t.Errorf("the last bucket ends at %s, want %s", got, want)
 	}
 }
 
@@ -627,16 +628,19 @@ func TestTheUsageEnvelopeFollowsTheZoneItWasCutIn(t *testing.T) {
 // that a 500 would read as a defect in this service rather than as a load shape
 // it would answer a moment later.
 //
-// The store's deadline is exercised in the form the port can surface it: the
-// context's own context.DeadlineExceeded, carried through the use case's
-// Internal, whose Unwrap chain is the only thing the transport can read. A
-// driver that returns its own "canceling statement due to statement timeout"
-// instead is translated by the store adapter to a sentinel the same chain
-// carries, and the mapping above is the same either way — which is the reason
-// this case asserts the status and the code rather than the cause.
+// The deadline is exercised in the form the port can surface it: the context's
+// own context.DeadlineExceeded, carried through the use case's Internal, whose
+// Unwrap chain is the only thing this mapping can read. A driver that returns
+// its own "canceling statement due to statement timeout" instead is translated
+// by the store adapter to a sentinel the same chain carries, and the mapping is
+// the same either way — which is the reason this case asserts the status and the
+// code rather than the cause.
 func TestAReadThatOutranItsBudgetIsARetryLaterAnswer(t *testing.T) {
-	store := &recordingUsage{err: context.DeadlineExceeded}
-	handler := usageServer(store)
+	// Wrapped rather than bare, because that is how it arrives: the use case
+	// names the budget it broke and keeps the cause, and the transport's whole
+	// job here is to read through the wrapping.
+	useCases := &fakeUsageUseCases{err: fmt.Errorf("the analytics read exceeded its %s budget: %w", application.AnalyticsReadTimeout, context.DeadlineExceeded)}
+	handler := usageServer(useCases)
 
 	rec := issueUsage(t, handler, usageQuery, "Bearer "+stubToken)
 
@@ -657,15 +661,14 @@ func TestAReadThatOutranItsBudgetIsARetryLaterAnswer(t *testing.T) {
 	if strings.Contains(rec.Body.String(), `"series"`) {
 		t.Errorf("a read that ran out of time still reported a series: %q", rec.Body.String())
 	}
-	if len(store.calls) != 1 {
-		t.Errorf("the store was asked %d times, want once", len(store.calls))
+	if len(useCases.calls) != 1 {
+		t.Errorf("the read was asked %d times, want once", len(useCases.calls))
 	}
 }
 
 // TestAFailedReadIsAnInternalErrorAndNotAPartialAnswer is the other half of the
-// same pair: a store that fails for a reason that is not the deadline is a
-// 500, not a 503, because the condition is not one a retry is expected to
-// clear.
+// same pair: a read that fails for a reason that is not the deadline is a 500,
+// not a 503, because the condition is not one a retry is expected to clear.
 //
 // The two statuses mean opposite things to a caller, which is why they cannot
 // both be 503: a retry-later answer tells the console to try the same report
@@ -673,9 +676,9 @@ func TestAReadThatOutranItsBudgetIsARetryLaterAnswer(t *testing.T) {
 // caller spinning on a defect. The cause never reaches the body either way.
 func TestAFailedReadIsAnInternalErrorAndNotAPartialAnswer(t *testing.T) {
 	secret := "postgres://usage:super-secret@database.example/gateway?sslmode=disable"
-	store := &recordingUsage{err: fmt.Errorf("read the analytics usage: %w", errors.New(secret))}
+	useCases := &fakeUsageUseCases{err: fmt.Errorf("read the analytics usage: %w", errors.New(secret))}
 
-	rec := issueUsage(t, usageServer(store), usageQuery, "Bearer "+stubToken)
+	rec := issueUsage(t, usageServer(useCases), usageQuery, "Bearer "+stubToken)
 
 	if rec.Code != stdhttp.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d; body = %q", rec.Code, stdhttp.StatusInternalServerError, rec.Body.String())
@@ -701,7 +704,7 @@ func TestAFailedReadIsAnInternalErrorAndNotAPartialAnswer(t *testing.T) {
 // methods the path does take. ServeMux's own 405 is a plain-text one, which is
 // a response shape this contract does not have.
 func TestTheUsageSurfaceRefusesEveryMethodItDoesNotServe(t *testing.T) {
-	handler := usageServer(&recordingUsage{})
+	handler := usageServer(&fakeUsageUseCases{answer: emptyUsageAnswer()})
 
 	for _, method := range []string{stdhttp.MethodPost, stdhttp.MethodPut, stdhttp.MethodDelete, stdhttp.MethodPatch} {
 		t.Run(method, func(t *testing.T) {

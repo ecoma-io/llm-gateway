@@ -699,15 +699,19 @@ const (
 // ping, and the probe wants the port itself, so the constructor receives the
 // store beside the application rather than an application carrying it.
 //
-// BOTH the session use cases and the ten console reads are required, and a
-// failure to build EITHER fails the process. That is a change from the state
+// The session use cases, the ten console reads and the usage read's own are all
+// required, and a failure to build ANY of them fails the process. That is a
+// change from the state
 // this function used to be in, and the change is the point: the two stand-ins
 // it held (unwiredSessionUseCases, unwiredConsoleReadUseCases) existed because
 // a session surface had no implementation, and every read behind a session that
 // could not resolve was refusing on purpose. With the session surface in
 // place, the reads are authorized against it, and a console that served
 // account data over a boundary that did not exist is no longer a
-// fail-closed state to be proud of — it is a screen behind a 500.
+// fail-closed state to be proud of — it is a screen behind a 500. The usage
+// read joins them on the same terms, and it is the one surface here that
+// authenticates with a credential of its own rather than with a session; see
+// newConsoleUsage.
 //
 // A screen that half-loads is worse than one that does not: the shell renders,
 // the navigation works, and only the data is missing. So the process refuses
@@ -732,7 +736,16 @@ func newHandler(
 		log.Printf("console-api analytics: the scope table cannot be used: %v", err)
 		os.Exit(1)
 	}
-	return http.New(application.New(version), readiness, sessions, reads, application.NewUsageUseCase(analytics, resolver))
+	// The use case is built here and handed over as the transport's own seam,
+	// never as itself: the answer it produces is a domain aggregate, and the
+	// conversion into the fields a response declares belongs at this boundary —
+	// see consoleusage.go.
+	usage, err := newConsoleUsage(application.NewUsageUseCase(analytics, resolver))
+	if err != nil {
+		log.Printf("console-api analytics: the usage surface cannot be mounted: %v", err)
+		os.Exit(1)
+	}
+	return http.New(application.New(version), readiness, sessions, reads, usage)
 }
 
 // buildConsoleSurface is the wiring newHandler refuses to do for itself: it

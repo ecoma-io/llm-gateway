@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/identity"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
@@ -131,7 +130,7 @@ func TestTheStaticScoperResolvesTheAccountTheDeploymentConfigured(t *testing.T) 
 			if err != nil {
 				t.Fatalf("ScopeOf(%q) error = %v, want nil", token, err)
 			}
-			if scope.AccountID != identity.AccountID(want) {
+			if scope != persistence.ScopeFor(want) {
 				t.Errorf("ScopeOf(%q) resolved to %q, want %q", token, scope.AccountID, want)
 			}
 		})
@@ -209,7 +208,7 @@ func TestTheStaticScopeAnswersTheSameAccountWhateverOrderTheTableHolds(t *testin
 		if err != nil {
 			t.Fatalf("round %d: ScopeOf(%q) error = %v, want nil", round, err, presented)
 		}
-		if scope.AccountID != identity.AccountID(scopeAccount) {
+		if scope != persistence.ScopeFor(scopeAccount) {
 			t.Fatalf("round %d: ScopeOf(%q) resolved to %q, want %q; the answer cannot depend on which candidate the deployment's table happened to hold first",
 				round, presented, scope.AccountID, scopeAccount)
 		}
@@ -346,7 +345,7 @@ func TestTheStaticScopeIgnoresTheContextItWasCalledWith(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScopeOf() on a cancelled context error = %v, want nil; the resolution is a table lookup and the context is the use case's to apply", err)
 	}
-	if scope.AccountID != identity.AccountID(scopeAccount) {
+	if scope != persistence.ScopeFor(scopeAccount) {
 		t.Errorf("ScopeOf() on a cancelled context resolved to %q, want %q", scope.AccountID, scopeAccount)
 	}
 }

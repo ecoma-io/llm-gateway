@@ -180,7 +180,6 @@ func TestTheFiveReadsShareOneSnapshot(t *testing.T) {
 type boundRecorder struct {
 	mu         sync.Mutex
 	statements []string
-	args       [][]driver.Value
 	// begun records what each transaction was started with. The isolation a
 	// unit of work runs at is carried on the BEGIN and on nothing else, so a
 	// recorder that kept only statement text would have nothing to assert the
@@ -219,15 +218,14 @@ func (r *boundRecorder) seen() []string {
 	return append([]string(nil), r.statements...)
 }
 
-func (r *boundRecorder) record(text string, args []driver.NamedValue) {
+// record keeps the statement TEXT and drops the arguments, which is the whole
+// of what this recorder is for: every assertion in this file is about which
+// statements the read issues and in what order, and a driver that collected the
+// arguments would be keeping values nothing here reads.
+func (r *boundRecorder) record(text string, _ []driver.NamedValue) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	values := make([]driver.Value, 0, len(args))
-	for _, a := range args {
-		values = append(values, a.Value)
-	}
 	r.statements = append(r.statements, text)
-	r.args = append(r.args, values)
 }
 
 func (r *boundRecorder) Open(string) (driver.Conn, error) { return &boundConn{recorder: r}, nil }

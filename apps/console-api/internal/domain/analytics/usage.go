@@ -5,8 +5,8 @@ import (
 	"time"
 )
 
-// Availability says whether this plane holds a derivation for the queried
-// range, on two axes that are deliberately separate from failure.
+// Availability says whether this plane holds a derivation for the ACCOUNT it
+// answered for, on two axes that are deliberately separate from failure.
 //
 // The two-axis shape is the whole design: there IS an answer or there is not,
 // and separately the answer is a failure or it is not. Collapsing them into a
@@ -16,16 +16,32 @@ import (
 // settlement of record" (`accounting/money.go:49-52`). So `available` is what a
 // run that legitimately found nothing reports, and a failure is a non-2xx
 // carrying the ErrorEnvelope rather than a third member of this type.
+//
+// The axis is the ACCOUNT's coverage and not the range's, and that is the
+// distinction the type exists for: every requested range is answered with a row
+// per bucket whether or not anything happened in it, so a range can always be
+// answered — "nothing happened in these three hours" is a figure. What cannot
+// be answered for is an account this plane has never ingested, and a member
+// that meant "this range was quiet" would be the same member as "there is
+// nothing to report", which is the collapse this type refuses.
 type Availability string
 
 const (
 	// AvailabilityAvailable: the figures ARE the answer to the range asked
-	// of, including when the answer is that nothing happened in it.
+	// of, including when the answer is that nothing happened in it. The
+	// account is in this plane's derived rows; the range may be empty of
+	// them.
 	AvailabilityAvailable Availability = "available"
-	// AvailabilityNotAvailable: this plane holds no derived rows for the
-	// range — the usage has not been ingested, or it predates this surface.
-	// It is an ANSWER, not a failure, and a caller renders it as an empty
+	// AvailabilityNotAvailable: this plane holds no derived rows for this
+	// account at all — none in the queried range and none in any other. The
+	// usage it names has not been ingested, or it predates this surface. It
+	// is an ANSWER, not a failure, and a caller renders it as an empty
 	// series and asks for a later range.
+	//
+	// It is NOT what a quiet range reports. A range the account simply did
+	// nothing in is available, with zeros, because the account is one this
+	// plane can answer for — and a caller that could not tell those apart
+	// would read "no data" as "nothing happened".
 	AvailabilityNotAvailable Availability = "not_available"
 )
 
@@ -139,12 +155,20 @@ type Usage struct {
 	// once and summed.
 	//
 	// Held and Available are POINT-IN-TIME balances and are not bucketed:
-	// they are the account's balance as at the range's end, carried on
-	// every point because a caller that received them once had no way to
-	// know they were true only of the end. They are the accounting
-	// projection's CACHED balances, read and never re-derived — exact,
-	// because a balance is a running accumulation of signed leg deltas and
-	// never a sum of rounded per-request figures.
+	// they are the account's capacity as at the moment the READ ran, carried
+	// once rather than on every point because a caller that received them per
+	// point had no way to know they were true of none of them.
+	//
+	// The instant is the read's and NOT the range's, and that is a correction
+	// rather than a nuance: a range that ended in June is answered with the
+	// balance the account holds today, and it cannot be answered with
+	// anything else — the projection caches the present and keeps no history,
+	// so there is no as-of read to make. A caller comparing two historical
+	// ranges is comparing one balance read twice.
+	//
+	// They are the accounting projection's CACHED balances, read and never
+	// re-derived — exact, because a balance is a running accumulation of
+	// signed leg deltas and never a sum of rounded per-request figures.
 	SettledMinorUnits    int64
 	ReleasedMinorUnits   int64
 	FundsAddedMinorUnits int64
@@ -175,10 +199,10 @@ type Usage struct {
 // would be the one way the two halves could be summed separately.
 //
 // The balances are NOT summed here. They are point-in-time figures as at the
-// range's end and belong to exactly one place in the answer, so adding them to
-// the series would mean the same number appeared once per point with the
+// read's own instant and belong to exactly one place in the answer, so adding
+// them to the series would mean the same number appeared once per point with the
 // implication that it was true of each — a per-bucket reading of a per-account
-// end-of-range figure, which is the most likely way a caller would misread one.
+// figure read once, which is the most likely way a caller would misread one.
 func NewUsage(query Query, series []Point, capture Capture, freshness Freshness) Usage {
 	var withFacts, settled int64
 	for _, point := range series {
@@ -197,11 +221,14 @@ func NewUsage(query Query, series []Point, capture Capture, freshness Freshness)
 	}
 }
 
-// NotAvailable is the answer for a range this plane holds no derived rows for.
+// NotAvailable is the answer for an account this plane holds no derived rows
+// for.
 //
 // It is a complete answer, not an error and not an empty successful one: the
 // series is empty, every count is zero, and Availability says why. A caller can
-// tell it from a range that was simply quiet, and that difference is the whole
+// tell it from a range that was simply quiet — which is an AVAILABLE answer
+// whose buckets are zero, because the account is one this plane can answer for
+// and the range is one it found nothing in — and that difference is the whole
 // reason the field exists rather than the absence of the figures.
 func NotAvailable(query Query, freshness Freshness) Usage {
 	return Usage{

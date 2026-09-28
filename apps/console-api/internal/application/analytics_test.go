@@ -57,8 +57,14 @@ var errUnresolvedCredential = errors.New("the credential does not resolve to an 
 // it may not lie about what it was handed.
 type scriptedStore struct {
 	// stored and fresh are the two halves the read is assembled from: the
-	// series with the money beside it, and the freshness statement to read it
-	// with.
+	// series with the money beside the coverage it was read with, and the
+	// freshness statement to read it with.
+	//
+	// A fixture that reports figures and no coverage, or a coverage and no
+	// series, is a state the adapter cannot produce — the two are columns of
+	// one statement read at one instant — so a case that means to exercise
+	// not_available says so the way the adapter really would: a zero-filled
+	// series and no derivations for the account.
 	stored persistence.Usage
 	fresh  persistence.Freshness
 	err    error
@@ -92,12 +98,16 @@ func (s *scriptedStore) Usage(ctx context.Context, query persistence.UsageQuery)
 // would let every other assertion in this file pass while the one property
 // that matters — the account is derived from the credential and from nowhere
 // else — was never under test.
+//
+// The account it answers with is the STRUCT'S and not a package variable, so
+// the alphabet of every case below is one chain and not two: credential →
+// resolver → scope → statement. A field the resolver ignored and a variable it
+// read instead would leave the cases' `account:` a decoration, and the chain
+// under test would start one link further down than the cases' own text says.
 type scriptedScoper struct {
 	account identity.AccountID
 	asked   []string
 }
-
-var scoped = persistence.RequestScope{AccountID: analyticsAccount}
 
 // ScopeOf implements persistence.Scoper.
 func (s *scriptedScoper) ScopeOf(_ context.Context, presented string) (persistence.RequestScope, error) {
@@ -105,7 +115,7 @@ func (s *scriptedScoper) ScopeOf(_ context.Context, presented string) (persisten
 	if presented != analyticsToken {
 		return persistence.RequestScope{}, errUnresolvedCredential
 	}
-	return scoped, nil
+	return persistence.RequestScope{AccountID: s.account}, nil
 }
 
 // The compile-time proofs that the two fakes stand in for the PORTS and not for
@@ -234,6 +244,18 @@ func TestUsageRefusesInvalidRequest(t *testing.T) {
 			request: func() UsageRequest { r := usageRange(); r.Timezone = "Mars/Olympus_Mons"; return r },
 			names:   "timezone",
 		},
+		{
+			// Two bounds that are each a perfectly good instant and together
+			// are not a range. The half-open interval [from, to) is empty when
+			// they cross, and an empty interval can be answered two ways — no
+			// buckets, or one inverted bucket — so it is refused rather than
+			// resolved. The order is checked here and not in the domain,
+			// because the domain is handed instants that already came through
+			// this: the request's own shape is this layer's.
+			name:    "an end that precedes its start",
+			request: func() UsageRequest { r := usageRange(); r.From, r.To = r.To, r.From; return r },
+			names:   "strictly before",
+		},
 	}
 
 	for _, tt := range tests {
@@ -312,20 +334,38 @@ func TestUsageRefusesInternalOnDeadline(t *testing.T) {
 	}
 }
 
-// TestUsageReturnsNotAvailableForEmptySeries is the decision the use case owns
-// and the store does not, and the case that separates it from an empty success.
+// quietBuckets is the store's own series for a range the account did nothing
+// in: a row per bucket, every figure zero. It is what a quiet range REALLY
+// looks like over the wire — the adapter LEFT-joins the bucket bounds, so an
+// empty bucket comes back as a row of zeros rather than as a gap — and that is
+// why the two cases below share it: the decision between them is not made on
+// the series, and a case whose fixture differed in the series could not say so.
+func quietBuckets() []persistence.Bucket {
+	bounds := hourBuckets()
+	quiet := make([]persistence.Bucket, 0, len(bounds))
+	for _, bucket := range bounds {
+		quiet = append(quiet, persistence.Bucket{Start: bucket.Start, End: bucket.End})
+	}
+	return quiet
+}
+
+// TestUsageReturnsNotAvailableForAnAccountThisPlaneHasNoDerivationsFor is the
+// decision the use case owns and the store does not, and the case that
+// separates it from a quiet range.
 //
-// A store that returned no buckets at all is one that holds no derived rows for
-// that account over that range, which is an ANSWER with a domain type behind it
-// and not a failure. The check is on the COUNT and not on the figures, and it
-// is made here rather than in the adapter, so "this plane holds nothing for
-// that range" is never a bare empty slice a caller has to guess the meaning of.
+// The fixture is the point: the series is a FULL, zero-filled one, which is
+// exactly what the adapter returns for a range it holds no rows for — every
+// bucket comes back as a row whether or not a fact landed in it — so a use case
+// that tried to decide on the series would answer `available` here and would
+// have no way to answer `not_available` at all. The store's own coverage column
+// is the only fact that tells the two apart, and it is read beside the freshness
+// instant in the same statement and the same snapshot.
 //
 // The freshness still rides along: a caller told "not available" must know how
 // far this plane has got, or its next question cannot be a later one.
-func TestUsageReturnsNotAvailableForEmptySeries(t *testing.T) {
+func TestUsageReturnsNotAvailableForAnAccountThisPlaneHasNoDerivationsFor(t *testing.T) {
 	store := &scriptedStore{
-		stored: persistence.Usage{Series: nil},
+		stored: persistence.Usage{Series: quietBuckets()},
 		fresh:  persistence.Freshness{DataThrough: dataThrough},
 	}
 	scoper := &scriptedScoper{account: analyticsAccount}
@@ -334,17 +374,17 @@ func TestUsageReturnsNotAvailableForEmptySeries(t *testing.T) {
 	answer, err := use.Usage(t.Context(), analyticsToken, usageRange())
 
 	if err != nil {
-		t.Fatalf("Usage() error = %v, want nil — a range this plane holds no derived rows for is an answer, not a failure", err)
+		t.Fatalf("Usage() error = %v, want nil — an account this plane holds no derived rows for is an answer, not a failure", err)
 	}
 	if answer.Availability != analytics.AvailabilityNotAvailable {
-		t.Errorf("Availability = %q, want %q — a caller cannot tell a range this plane holds nothing for from one that was simply quiet unless the field says so",
+		t.Errorf("Availability = %q, want %q — the store reported a zero-filled series and no derivations for this account, and a caller cannot tell this plane holding nothing from a range that was simply quiet unless the field says so",
 			answer.Availability, analytics.AvailabilityNotAvailable)
 	}
 	if answer.Series == nil {
 		t.Error("Series is nil, want an empty series: the contract declares an array, and a nil slice is a null in every encoding of it")
 	}
 	if len(answer.Series) != 0 {
-		t.Errorf("Series carries %d points, want none", len(answer.Series))
+		t.Errorf("Series carries %d points, want none: the store's zero-filled series is a statement about the range, and the answer is a statement about the account", len(answer.Series))
 	}
 	if answer.RequestsWithUsageFacts != 0 || answer.RequestsSettled != 0 {
 		t.Errorf("the not-available answer counts %d requests with usage facts and %d settled, want zero: the absence of derived rows is not a count of nothing having happened",
@@ -357,6 +397,47 @@ func TestUsageReturnsNotAvailableForEmptySeries(t *testing.T) {
 	// above do not apply and the read has to have happened.
 	if store.calls != 1 {
 		t.Errorf("the read reached the store %d times, want 1", store.calls)
+	}
+	assertScopeCarried(t, store, scoper)
+}
+
+// TestUsageReturnsAvailableForARangeThatWasQuiet is the other side of the same
+// fixture, and it is the case that would notice a use case testing the figures
+// instead of the coverage.
+//
+// The store's answer is the SAME zero-filled series as the case above; the one
+// difference is that this plane holds a derived row for the account somewhere.
+// A range the account did nothing in is an available answer with zeros in it —
+// "nothing happened" is a figure — and a caller told `not_available` for it
+// would read this plane's ignorance into a report of absence. That is the whole
+// reason availability is the account's coverage rather than the range's.
+func TestUsageReturnsAvailableForARangeThatWasQuiet(t *testing.T) {
+	store := &scriptedStore{
+		stored: persistence.Usage{Series: quietBuckets(), AccountHasDerivations: true},
+		fresh:  persistence.Freshness{DataThrough: dataThrough},
+	}
+	scoper := &scriptedScoper{account: analyticsAccount}
+	use := NewUsageUseCase(store, scoper)
+
+	answer, err := use.Usage(t.Context(), analyticsToken, usageRange())
+
+	if err != nil {
+		t.Fatalf("Usage() error = %v, want nil", err)
+	}
+	if answer.Availability != analytics.AvailabilityAvailable {
+		t.Fatalf("Availability = %q, want %q — the figures ARE the answer to a range the account did nothing in, and calling it not_available would report this plane's coverage as the account's activity",
+			answer.Availability, analytics.AvailabilityAvailable)
+	}
+	if len(answer.Series) != len(hourBuckets()) {
+		t.Fatalf("Series carries %d points, want %d: a quiet range is a series of zeros and not an empty one", len(answer.Series), len(hourBuckets()))
+	}
+	for i, point := range answer.Series {
+		if point.WithUsageFacts != 0 || point.Settled != 0 {
+			t.Errorf("point %d counts %d with usage facts and %d settled, want zero for both", i, point.WithUsageFacts, point.Settled)
+		}
+	}
+	if answer.RequestsWithUsageFacts != 0 || answer.RequestsSettled != 0 {
+		t.Errorf("the quiet answer counts %d requests with usage facts and %d settled, want zero", answer.RequestsWithUsageFacts, answer.RequestsSettled)
 	}
 	assertScopeCarried(t, store, scoper)
 }
@@ -375,10 +456,15 @@ func TestUsageReturnsNotAvailableForEmptySeries(t *testing.T) {
 func TestUsageReturnsAvailableForNonEmptySeries(t *testing.T) {
 	store := &scriptedStore{
 		stored: persistence.Usage{
-			Series:               hourBuckets(),
-			SettledMinorUnits:    4200,
-			ReleasedMinorUnits:   700,
-			FundsAddedMinorUnits: 100000,
+			Series: hourBuckets(),
+			// The coverage that must accompany figures: a series with counts
+			// in it is a store that holds derived rows for this account, and a
+			// fixture that reported the counts without the coverage would be a
+			// state no deployment can serve.
+			AccountHasDerivations: true,
+			SettledMinorUnits:     4200,
+			ReleasedMinorUnits:    700,
+			FundsAddedMinorUnits:  100000,
 			// Point-in-time, and read rather than re-derived: a balance is a
 			// running accumulation of signed leg deltas and never a sum of
 			// rounded per-request figures.

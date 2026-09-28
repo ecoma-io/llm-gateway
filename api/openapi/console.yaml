@@ -32,15 +32,19 @@ info:
     Plane's own dependencies are not answering returns HTTP 503 and the
     `service_unavailable` code.
 
-    The surface has two halves that meet at the session cookie. The
+    The surface has two halves that meet at the credential on the request. The
     **session surface** — sign-in, the current principal, sign-out — is the
     only part reachable without one, and the only part that writes nothing but
     the session itself. The **product surface** is everything else, and every
-    operation on it requires a session and authorizes against the account that
-    session names.
+    operation on it authorizes against the account the request's credential
+    names. That credential is the session cookie for all of them but one: the
+    usage operation accepts `consoleCredential` instead, a bearer credential for
+    the caller that has no browser at all — a script, a scheduled report, an
+    operator's tooling — because a session is a thing a browser holds and this
+    surface is not only read by browsers.
 
     The account is never a path segment and never a query parameter the
-    caller sets. It comes from the session, always; a resource the session's
+    caller sets. It comes from the credential, always; a resource the caller's
     account does not own is a 404 the query did not return, not a 403 a filter
     turned into one. Unsafe methods additionally require a same-origin
     `Origin` and a JSON content type, which no cross-site HTML form can
@@ -70,7 +74,9 @@ tags:
       The session surface. Sign-in, the current principal and sign-out — the
       three operations reachable without a session, and the only three that
       do. Sign-in is the sole unauthenticated write on this surface: it
-      creates the session cookie every other operation requires.
+      creates the session cookie every other BROWSER operation requires — the
+      usage operation is the one that takes a bearer credential instead
+      (`consoleCredential`), for the caller that holds no cookie at all.
   - name: account
     description: >-
       The session's own account: its dashboard, its plan catalogue, and the
@@ -112,9 +118,14 @@ tags:
 
       Deliberately absent, and named so their absence reads as a decision
       rather than an oversight: attempts, latency, per-model and per-provider
-      spend, routing outcomes, egress and token counts. Those are the Data
-      Plane's facts, no cross-plane read path to them exists yet, and a figure
-      this surface cannot source honestly is one it does not serve.
+      spend, routing outcomes and egress — the Data Plane's operational facts,
+      which no read path imports here at all — and token counts, which DO
+      travel this plane's fact feed and are excluded for a different reason:
+      the counters are byte lengths under a tokenizer's name, so a figure
+      published from them as a token count would be a category error that is
+      invisible in the output, an integer being an integer regardless of what
+      the field is called (docs/architecture/analytics.md §10.2). A figure this
+      surface cannot source honestly is one it does not serve.
 
 paths:
   /healthz:
@@ -1125,11 +1136,18 @@ paths:
         side.
 
         Requests, latency, attempts, per-model and per-provider spend, routing
-        outcomes, egress and token counts are NOT served, and their absence
-        is a decision rather than a gap. They are the Data Plane's facts, no
-        cross-plane read path to them exists, and a figure this surface
-        cannot source honestly is one it will not serve — not at zero, which
-        would be a false statement about a customer, and not as an empty
+        outcomes and egress are NOT served: they are the Data Plane's
+        operational facts and no read path imports them here at all. Token
+        counts are NOT served either, and for a different reason — the counters
+        DO travel this plane's fact feed, and they are byte lengths under a
+        tokenizer's name, so a figure published from them as a token count
+        would be a category error invisible in the output, an integer being an
+        integer regardless of what the field is called
+        (docs/architecture/analytics.md §10.2).
+
+        Their absence is a decision rather than a gap, and a figure this
+        surface cannot source honestly is one it will not serve — not at zero,
+        which would be a false statement about a customer, and not as an empty
         series, which would render as a quiet month.
 
         NOTHING HERE IS CLOSED. No period is closed anywhere in this system:
@@ -1211,21 +1229,55 @@ paths:
       responses:
         "200":
           description: >-
-            The account's usage over the range. A range this plane holds no
-            derivation for is a 200 with `availability: not_available` and an
-            empty series — an answer, not a failure, and distinct from a
-            range that is simply quiet.
+            The account's usage over the range. An account this plane holds no
+            derived rows for is a 200 with `availability: not_available` and an
+            empty series — an answer, not a failure, and distinct from a range
+            that is simply quiet.
           headers:
             X-Request-Id:
               $ref: "./shared/probes.yaml#/components/headers/RequestId"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
           content:
             application/json:
               schema:
                 $ref: "./shared/analytics.yaml#/components/schemas/AnalyticsUsageResponse"
         "400":
-          $ref: "./shared/errors.yaml#/components/responses/InvalidRequest"
+          description: >-
+            A bound does not satisfy the contract: a range longer than 90 days,
+            a `from` at or after `to`, a granularity outside the enumeration, an
+            instant that is not RFC 3339, or an unknown query parameter.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
         "401":
-          $ref: "./shared/errors.yaml#/components/responses/Unauthenticated"
+          description: >-
+            The request carried no credential this deployment resolves. This is
+            the one operation on this surface that does not identify its caller
+            by a session — `consoleCredential` is a bearer credential a script
+            or an operator's tooling presents, and there is nothing to sign in
+            to — so the answer says the credential did not resolve and says
+            nothing about which of absent, unknown or retired it was. One answer
+            for every cause, deliberately: a difference is a disclosure to
+            anyone willing to present tokens. The account these figures are
+            about is derived from the credential and is never named by the
+            request, so a caller that cannot tell it was refused would be the
+            caller that draws a chart of someone else's spend.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
         "404":
           $ref: "./shared/errors.yaml#/components/responses/NotFound"
         "405":

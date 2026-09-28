@@ -41,11 +41,11 @@ import (
 //   - Flows and balances never share a statement, a helper, or an
 //     accumulator. The settled, released and funds-added figures are SUMS OF
 //     FLOWS over a window and are bucketed; the held and available figures
-//     are POINT-IN-TIME BALANCES as at the range's end and are not, and they
-//     come from the projection's cached columns rather than from the legs.
-//     They have opposite bucketing semantics and opposite overflow profiles,
-//     and a reader who "helpfully" unified them would put a factor-of-N
-//     error into the money.
+//     are POINT-IN-TIME BALANCES as at the instant the read ran and are not,
+//     and they come from the projection's cached columns rather than from the
+//     legs. They have opposite bucketing semantics and opposite overflow
+//     profiles, and a reader who "helpfully" unified them would put a
+//     factor-of-N error into the money.
 //   - The capture split is over SETTLEMENTS, never over facts. A release or
 //     an expiry captures nothing, and a fact claiming no usage while being
 //     disclaimed carries a capture method and books no charge, so the
@@ -187,6 +187,19 @@ type Usage struct {
 	// Series is one entry per requested bucket, in the order the buckets
 	// were given, with no bucket omitted.
 	Series []Bucket
+	// AccountHasDerivations is whether this plane holds AT LEAST ONE derived
+	// usage fact for this account — anywhere in this plane's history, not
+	// merely inside the queried range, which is a question the series already
+	// answers bucket by bucket.
+	//
+	// It is here because the series cannot answer it: an empty bucket is still
+	// a bucket, so a zero-filled series has the same shape whether the account
+	// was quiet for the range or has never reached this plane at all, and the
+	// two are what a caller has to be able to tell apart. Rows PRESENT prove
+	// nothing — the feed's high-water mark is the Data Plane's to publish — but
+	// no rows at all is a fact about tables this plane owns, and it is the
+	// difference between a report about nothing and a report of nothing.
+	AccountHasDerivations bool
 	// SettledMinorUnits, ReleasedMinorUnits and FundsAddedMinorUnits are
 	// sums of exact integers over the range. They are NOT the sum of a
 	// re-derived per-request amount (see the header) and they are never
@@ -196,8 +209,11 @@ type Usage struct {
 	SettledMinorUnits    int64
 	ReleasedMinorUnits   int64
 	FundsAddedMinorUnits int64
-	// Balances is the account's cached capacity as at the range's end, and
-	// the only point-in-time figures in the answer.
+	// Balances is the account's cached capacity as at the instant the read
+	// ran, and the only point-in-time figures in the answer. It is NOT a
+	// figure for the range: the projection caches the present and keeps no
+	// history, so a read of a past range returns the balance the account holds
+	// now.
 	Balances Balances
 	// Capture splits the settlements that captured, by the method each used.
 	// The population is settlements of kind 'settled'; a release and an
@@ -233,5 +249,11 @@ type Analytics interface {
 	// with no activity is present with zero figures, because a caller
 	// rendering a gap-free series has no way to invent a rule for which
 	// gaps to fill.
+	//
+	// An implementation must also report Usage.AccountHasDerivations, and it
+	// must report it from a read of this account rather than infer it from the
+	// series: the series has the same shape for an account that was quiet and
+	// for one this plane has never ingested, and only the store can tell the
+	// two apart.
 	Usage(ctx context.Context, query UsageQuery) (Usage, Freshness, error)
 }

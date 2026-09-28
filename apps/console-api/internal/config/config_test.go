@@ -205,6 +205,57 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			wantErr: "CONSOLE_API_DATAPLANE_URL must carry no query or fragment",
 		},
 		{
+			// The scope is DELETED rather than set empty, because those are two
+			// different refusals: an unset variable is a deployment that never
+			// configured access control, and an empty one is a deployment that
+			// configured it to nothing. The error text says which.
+			name:    "rejects a missing analytics scope",
+			env:     without(requiredEnv(), "CONSOLE_API_ANALYTICS_SCOPE"),
+			wantErr: "CONSOLE_API_ANALYTICS_SCOPE must be set",
+		},
+		{
+			name: "rejects an explicitly empty analytics scope",
+			env: merge(requiredEnv(), map[string]string{
+				"CONSOLE_API_ANALYTICS_SCOPE": "",
+			}),
+			wantErr: "CONSOLE_API_ANALYTICS_SCOPE must not be empty",
+		},
+		{
+			name: "rejects an analytics scope that is not an object",
+			env: merge(requiredEnv(), map[string]string{
+				"CONSOLE_API_ANALYTICS_SCOPE": `"console-test-token"`,
+			}),
+			wantErr: "must be a JSON object of credential to account id",
+		},
+		{
+			name: "rejects an analytics scope that is not JSON",
+			env: merge(requiredEnv(), map[string]string{
+				"CONSOLE_API_ANALYTICS_SCOPE": `{"console-test-token":"018f0000-0000-7000-8000-000000000001"`,
+			}),
+			wantErr: "must be a JSON object of credential to account id",
+		},
+		{
+			name: "rejects an analytics scope with no entries",
+			env: merge(requiredEnv(), map[string]string{
+				"CONSOLE_API_ANALYTICS_SCOPE": "{}",
+			}),
+			wantErr: "must name at least one credential",
+		},
+		{
+			name: "rejects an analytics scope with an empty credential",
+			env: merge(requiredEnv(), map[string]string{
+				"CONSOLE_API_ANALYTICS_SCOPE": `{"":"018f0000-0000-7000-8000-000000000001"}`,
+			}),
+			wantErr: "carries an empty credential",
+		},
+		{
+			name: "rejects an analytics scope with an empty account id",
+			env: merge(requiredEnv(), map[string]string{
+				"CONSOLE_API_ANALYTICS_SCOPE": `{"console-test-token":""}`,
+			}),
+			wantErr: "maps a credential to an empty account id",
+		},
+		{
 			name: "rejects a zero projection interval",
 			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_PROJECTION_INTERVAL": "0s",
@@ -538,7 +589,7 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			if !reflect.DeepEqual(got, tt.want) {
 				// Redacted, not %#v-raw: a dumped Config carries Postgres.DSN,
 				// and a test failure is CI output the whole world can read.
-				t.Errorf("Load() = %s, want %s", redactDSN(got), redactDSN(tt.want))
+				t.Errorf("Load() = %s, want %s", redact(got), redact(tt.want))
 			}
 		})
 	}
@@ -591,6 +642,21 @@ func merge(base, extra map[string]string) map[string]string {
 	return merged
 }
 
+// without is merge's complement: the base with one variable REMOVED rather
+// than overridden. A case about a variable that is not set at all cannot be
+// written with merge — setting it to the empty string is a different refusal,
+// and the two are exactly the pair the scope cases above distinguish.
+func without(base map[string]string, name string) map[string]string {
+	trimmed := make(map[string]string, len(base))
+	for key, value := range base {
+		if key == name {
+			continue
+		}
+		trimmed[key] = value
+	}
+	return trimmed
+}
+
 func TestDataPlaneLogValueRedactsTheCredential(t *testing.T) {
 	dataPlane := DataPlane{
 		URL:                testDataplaneURL,
@@ -612,6 +678,29 @@ func TestDataPlaneLogValueRedactsTheCredential(t *testing.T) {
 		if !strings.Contains(value, want) {
 			t.Errorf("LogValue() = %q, want it to name %s", value, want)
 		}
+	}
+}
+
+func TestAnalyticsLogValueRendersTheTableSizeAndRedactsEveryCredential(t *testing.T) {
+	// Two entries, so the count is a real count rather than "there is a table".
+	// The tokens here are shaped like the ones a deployment supplies and are
+	// assembled from parts for the same reason the fixture credential is: a
+	// literal that looks like a live token is a push-protection refusal.
+	first := "console" + "-scope-" + "credential-one"
+	second := "console" + "-scope-" + "credential-two"
+	analytics := Analytics{Scope: map[string]string{
+		first:  "018f0000-0000-7000-8000-000000000001",
+		second: "018f0000-0000-7000-8000-000000000002",
+	}}
+
+	value := analytics.LogValue().String()
+	for _, credential := range []string{first, second} {
+		if strings.Contains(value, credential) {
+			t.Errorf("LogValue() = %q, must not carry a scope credential; the table is the deployment's access control and a log line is not a place it may be read from", value)
+		}
+	}
+	if !strings.Contains(value, "scopes=2") {
+		t.Errorf("LogValue() = %q, want the table's size: an operator needs to know the surface has scopes at all, and the size is the whole of what may be said about it", value)
 	}
 }
 
@@ -692,9 +781,19 @@ func lookup(values map[string]string) func(string) (string, bool) {
 	}
 }
 
-// redactDSN renders a Config for a test-failure message with the DSN struck
-// out: a raw %#v of the struct would quote Postgres.DSN, and a test failure
+// redact renders a Config for a test-failure message with every secret in it
+// struck out. A raw %#v of the struct would quote the DSN, the management
+// credential and every credential in the analytics scope — and a test failure
 // is CI output the whole world can read.
-func redactDSN(c Config) string {
-	return strings.ReplaceAll(fmt.Sprintf("%#v", c), c.Postgres.DSN, "<redacted dsn>")
+//
+// It walks the scope's KEYS rather than its whole rendering, because the keys
+// ARE the credentials and the values are account ids that appear in the
+// expectation beside them.
+func redact(c Config) string {
+	rendered := strings.ReplaceAll(fmt.Sprintf("%#v", c), c.Postgres.DSN, "<redacted dsn>")
+	rendered = strings.ReplaceAll(rendered, c.DataPlane.Credential, "<redacted credential>")
+	for credential := range c.Analytics.Scope {
+		rendered = strings.ReplaceAll(rendered, credential, "<redacted scope credential>")
+	}
+	return rendered
 }

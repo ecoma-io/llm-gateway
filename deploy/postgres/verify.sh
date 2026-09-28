@@ -498,8 +498,8 @@ assert_equals "the namespace carries the ownership comment, byte for byte" \
 	"Control Plane ownership namespace (ADR 0006 §7); owned by apps/console-api."
 # The list is an EXACT equality and stays one, and that is the whole point of
 # the assertion rather than an incidental strictness: relaxed to a containment
-# or LIKE check it would silently unconstrain the twenty-one tables already in
-# it, and a table that appears without anybody reading the diff is precisely
+# or LIKE check it would silently unconstrain the twenty-three tables already
+# in it, and a table that appears without anybody reading the diff is precisely
 # the failure a control-plane schema change can least afford. ADR 0012's
 # Consequences names this by name. `sessions` and `analytics_fact_dimensions`
 # each extend the list in the change that creates the table, and the count

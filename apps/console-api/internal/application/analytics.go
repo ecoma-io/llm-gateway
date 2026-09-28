@@ -43,10 +43,12 @@ const AnalyticsReadTimeout = 5 * time.Second
 //   - THE STORE'S TWO HALVES BECOME ONE ANSWER. The store returns a series of
 //     counts and a set of money figures; the domain's constructor is the only
 //     place that sums them, so the envelope and the series cannot disagree.
-//   - A READ THAT FINDS NO DERIVED ROWS IS NOT_AVAILABLE, and is assembled
-//     here rather than by the store, so "this plane holds nothing for that
-//     range" is a domain answer with a domain type and never an empty slice
-//     that a caller has to guess the meaning of.
+//   - A READ FOR AN ACCOUNT THIS PLANE HOLDS NO DERIVED ROW FOR IS
+//     NOT_AVAILABLE, and is assembled here rather than by the store, so "this
+//     plane has never ingested this account" is a domain answer with a domain
+//     type and never a zero-filled series that a caller has to guess the
+//     meaning of. What makes it possible is that the store reports its own
+//     coverage beside the freshness instant; see the decision in Usage.
 type Usage struct {
 	analytics persistence.Analytics
 	scoper    persistence.Scoper
@@ -151,13 +153,24 @@ func (use *Usage) Usage(ctx context.Context, token string, request UsageRequest)
 		})
 	}
 
-	// No derived rows for this account over this range is an ANSWER, not a
-	// failure and not an empty success: the two are what a caller has to tell
-	// apart, and only the first can say which one it got. It is decided on the
-	// count rather than on the series' length, because a store that returned
-	// no buckets at all is a store that could not be asked — a different
-	// failure, and one the store reports rather than this.
-	if len(stored.Series) == 0 {
+	// The coverage decision, and the only thing that makes not_available
+	// reachable at all.
+	//
+	// It is NOT decided on the series, and that is the point of the store's
+	// coverage column: the series holds one row per requested bucket whether or
+	// not anything happened in it (the store's LATERAL join is a LEFT one, so a
+	// bucket with no facts comes back as a zero rather than as a gap), which
+	// means a zero-filled series is the same shape for an account that was
+	// quiet and for one this plane has never ingested. Deciding on the series
+	// would answer not_available for every quiet range — the collapse the
+	// domain's NotAvailable doc rules out — and deciding on the range would be
+	// a second way to compute what the series already reports.
+	//
+	// So the question this branch asks is the account's, not the range's: has
+	// this plane EVER ingested a derived fact for it? If it has not, the answer
+	// is an ANSWER rather than a failure — the nothing is the figure — and the
+	// freshness rides along so the caller's next question can be a later range.
+	if !stored.AccountHasDerivations {
 		return analytics.NotAvailable(query, freshnessOf(freshness)), nil
 	}
 

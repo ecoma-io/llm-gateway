@@ -199,6 +199,13 @@ func TestNewRefusesAServerWithNothingToGateOn(t *testing.T) {
 // origin, content-type and double-submit guards all passing, that is exactly the
 // state a cross-site request is trying to reach. The only honest answer to one
 // is a construction failure.
+//
+// The OTHER four arguments are the real ones, and that is what makes this a
+// test of the session guard rather than a second copy of the readiness one
+// above it: New checks its dependencies in the order it states them, so a nil
+// readiness here would panic on the FIRST guard and this case would pass while
+// naming a guard it never reached. The nil is therefore in the third position
+// and nowhere else.
 func TestNewRefusesAServerWithNoSessionSurface(t *testing.T) {
 	defer func() {
 		if recover() == nil {
@@ -206,7 +213,7 @@ func TestNewRefusesAServerWithNoSessionSurface(t *testing.T) {
 		}
 	}()
 
-	New(application.New("test"), nil, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), stubUsage())
+	New(application.New("test"), &answeringPinger{}, nil, newFakeConsoleReadUseCases(), stubUsage())
 }
 
 // TestNewRefusesAServerWithNoProductSurface is the same door on the other

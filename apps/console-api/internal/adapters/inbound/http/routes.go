@@ -47,13 +47,14 @@ type route struct {
 // package from reaching internal/domain, so the seam speaks in the plain fields
 // the wire itself needs. The ten read use cases travel as their own seam beside
 // them rather than as members of the session one, because the two have
-//
-// readModel is the fourth, and the only product use case the table carries as
-// a concrete type: it is authenticated by a CREDENTIAL rather than by a
-// session cookie, so it does not go through resolveSession and belongs to
-// neither seam above.
 // different consequences when they are absent — see ConsoleReadUseCases.
-func routes(app *application.App, readiness persistence.Pinger, sessions SessionUseCases, reads ConsoleReadUseCases, readModel *application.Usage) []route {
+//
+// usage is the fourth and the same shape as the two above: it is authenticated
+// by a CREDENTIAL rather than by a session cookie, so it does not go through
+// resolveSession and belongs to neither seam, and it is a seam of its own rather
+// than a member of either because it is wired from a different port — see
+// UsageUseCases.
+func routes(app *application.App, readiness persistence.Pinger, sessions SessionUseCases, reads ConsoleReadUseCases, usage UsageUseCases) []route {
 	product := []route{
 		// Sign-in: the only unauthenticated write, and the only way a session
 		// comes into existence. It carries the origin, content-type and
@@ -205,7 +206,7 @@ func routes(app *application.App, readiness persistence.Pinger, sessions Session
 		{
 			method:  stdhttp.MethodGet,
 			path:    "/usage",
-			handler: usage(readModel),
+			handler: handleUsage(usage),
 		},
 	}
 	product = append(product, readsOnly...)

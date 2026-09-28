@@ -34,7 +34,8 @@ package postgres
 // rather than into a limit the caller could be told about. It is also worth
 // saying where the memory goes — 3 MB for the widest series is the argument
 // being built and the rows being scanned, and it is the reason the read opens
-// ONE unit of work for all five statements rather than five.
+// ONE unit of work for all six statements rather than six units, one per
+// statement.
 
 import (
 	"testing"
@@ -104,7 +105,7 @@ func BenchmarkWalkBounds(b *testing.B) {
 	}
 }
 
-// BenchmarkUsageRead is the composed number: five statements inside one unit of
+// BenchmarkUsageRead is the composed number: six statements inside one unit of
 // work against a real database, for the widest series the surface builds.
 //
 // The account is a well-formed id that names no row, and that is deliberate.

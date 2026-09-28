@@ -110,14 +110,16 @@ func TestNewUsageSumsSeriesIntoTopLevelFields(t *testing.T) {
 // TestNewUsageKeepsTheBalancesOutOfTheSeries is the half of the design a
 // "helpful" arithmetic change breaks.
 //
-// Held and Available are POINT-IN-TIME balances as at the range's end, and
-// Point carries no field for either. That omission IS the claim: a constructor
-// that grew a per-bucket balance, or that multiplied the account's total across
-// the points, would put the same end-of-range figure on every bucket with the
-// implication that it was true of each — a per-bucket reading of a per-account
-// figure, and the most likely way a caller would misread one. So the point's
-// own shape is pinned: it is two instants and two counts, and a fifth money
-// field would be invisible to every assertion above.
+// Held and Available are POINT-IN-TIME balances as at the instant the READ
+// ran, and Point carries no field for either. That omission IS the claim: a
+// constructor that grew a per-bucket balance, or that multiplied the account's
+// total across the points, would put the same as-at-the-read figure on every
+// bucket with the implication that it was true of each — a per-bucket reading
+// of a per-account figure, and the most likely way a caller would misread one
+// (the instant is the read's and not the range's, which is §10.5 of the
+// architecture note: the projection caches the present and keeps no history).
+// So the point's own shape is pinned: it is two instants and two counts, and a
+// fifth money field would be invisible to every assertion above.
 func TestNewUsageKeepsTheBalancesOutOfTheSeries(t *testing.T) {
 	answer := NewUsage(usageQuery(t), hourPoints(), hourCapture, hourFreshness)
 
@@ -136,7 +138,7 @@ func TestNewUsageKeepsTheBalancesOutOfTheSeries(t *testing.T) {
 		names = append(names, fields.Field(i).Name)
 	}
 	if got, want := len(names), 4; got != want {
-		t.Errorf("analytics.Point carries %d fields (%v), want %d (Start, End, WithUsageFacts, Settled): the balances are point-in-time figures as at the range's end and belong in exactly one place in the answer, so a per-bucket copy of them is the misreading the type exists to prevent",
+		t.Errorf("analytics.Point carries %d fields (%v), want %d (Start, End, WithUsageFacts, Settled): the balances are point-in-time figures as at the read's own instant and belong in exactly one place in the answer, so a per-bucket copy of them is the misreading the type exists to prevent",
 			got, names, want)
 	}
 }
