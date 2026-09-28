@@ -42,6 +42,15 @@ import (
 // the reason the migration header gives: every writer is one of this plane's
 // own checks, never a provider blob, never a raw prompt, never a fact payload.
 type Finding struct {
+	// ID is the row's own identity, allocated by the store. The port states
+	// that a finding's DEDUP identity is (CheckKind, SubjectKind, SubjectID)
+	// and not this — a row has both, and the keyset below pages on this one
+	// because it is unique and, being a GENERATED ALWAYS AS IDENTITY column,
+	// in allocation order. Ordering by DetectedAt instead would be two
+	// passes' clocks colliding on one divergence, which is the non-total key
+	// this plane refuses to page on everywhere else.
+	ID int64
+
 	// CheckKind names the invariant that was violated. It is part of the
 	// finding's identity, so it is a closed vocabulary this plane owns rather
 	// than free text, and two checks with different names are different
@@ -77,6 +86,18 @@ type Finding struct {
 	// window to the microsecond — and neither is part of the identity.
 	DetectedAt time.Time
 	LastSeenAt time.Time
+
+	// Status and ResolvedAt are the row's lifecycle, written by Restatus and
+	// by nothing else. A read returns both as they stand rather than
+	// normalising them: a pass that started and never finished has no
+	// ResolvedAt, and so does an open finding, and a reader that filled the
+	// gap with a zero instant would be presenting an absence as a date.
+	//
+	// A finding written through Open carries neither — the schema's defaults
+	// are status 'open' and a NULL resolution, and the port says so — so
+	// these are read-side fields in every sense.
+	Status     string
+	ResolvedAt *time.Time
 }
 
 // ReconciliationFindings is where a detected divergence is recorded, and it is

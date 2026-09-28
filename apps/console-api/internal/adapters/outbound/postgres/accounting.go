@@ -710,7 +710,11 @@ func (r *ledgerRepo) ByBucketReservationAndKind(ctx context.Context, bucketID ac
 
 // scanLedgerEntry scans one leg row out of any single-row result, reassembling
 // the optional columns the insert spread across NULLs.
-func scanLedgerEntry(row *sql.Row) (accounting.LedgerEntry, error) {
+// scanLedgerEntry reads one leg out of a result set. It takes the rowScanner
+// shape both *sql.Row and *sql.Rows satisfy rather than *sql.Row alone, so
+// the console's per-bucket list and the single-row convergence reads above
+// share ONE projection of the ledger row instead of two that can drift.
+func scanLedgerEntry(row rowScanner) (accounting.LedgerEntry, error) {
 	var e accounting.LedgerEntry
 	var id, bucketID, kind string
 	var settlementID, reservationID, commandKey sql.NullString
