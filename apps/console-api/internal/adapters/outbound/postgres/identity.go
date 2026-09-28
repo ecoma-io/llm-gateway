@@ -163,6 +163,20 @@ SELECT id, account_id, email, state, created_at, updated_at
 FROM control.users
 WHERE id = $1`
 
+// The live-filtered, keyed read (ADR 0008 §1 and §3). The `state <> 'removed'`
+// predicate and the `(account_id, email)` key are both load-bearing and both
+// come from the same partial unique index, `users_account_live_email_key`, that
+// makes the result total — the query asks for the rows the index says may exist,
+// and the index says there are at most one. There is no LIMIT and no ORDER BY
+// here on purpose: a first-match would be a choice the engine never had to
+// offer, and the case it would get wrong is the removed row and the live user
+// who later re-invited its address, which an unfiltered predicate matches
+// twice.
+const selectUserByAccountAndEmail = `
+SELECT id, account_id, email, state, created_at, updated_at
+FROM control.users
+WHERE account_id = $1 AND email = $2 AND state <> 'removed'`
+
 const transitionUser = `
 UPDATE control.users
 SET state = $3, updated_at = $4
@@ -211,6 +225,26 @@ func (r *userRepo) TransitionState(ctx context.Context, id identity.UserID, from
 		return false, fmt.Errorf("postgres: transition user %s: read rows affected: %w", id, err)
 	}
 	return n == 1, nil
+}
+
+func (r *userRepo) ByAccountAndEmail(ctx context.Context, accountID identity.AccountID, email string) (identity.User, error) {
+	var u identity.User
+	var account, state string
+	// QueryRowContext is the totality check in one call: the key is total by
+	// the index, so a second row cannot exist and a first row is never
+	// chosen — the driver reports zero rows as sql.ErrNoRows and the
+	// translator below turns that into the port's one miss sentinel.
+	err := r.store.Querier(ctx).QueryRowContext(ctx, selectUserByAccountAndEmail, string(accountID), email).
+		Scan(&u.ID, &account, &u.Email, &state, &u.CreatedAt, &u.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return identity.User{}, fmt.Errorf("postgres: user %s/%s: %w", accountID, email, persistence.ErrNotFound)
+		}
+		return identity.User{}, fmt.Errorf("postgres: user %s/%s: %w", accountID, email, err)
+	}
+	u.AccountID = identity.AccountID(account)
+	u.State = identity.UserState(state)
+	return u, nil
 }
 
 // ---------------------------------------------------------------------------

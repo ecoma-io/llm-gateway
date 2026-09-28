@@ -149,6 +149,22 @@ func (f *fakeUsers) TransitionState(_ context.Context, id identity.UserID, from,
 	return true, nil
 }
 
+// ByAccountAndEmail mirrors the port's totality rule rather than its query:
+// it filters live rows and, on a live match, returns that one row. A removed
+// row resolves to nothing even when its address is still in the table, which
+// is the trap ADR 0008 §Context-2 names — and the fake can be made to
+// return TWO rows for one pair only if a test deliberately builds the
+// unfiltered situation the index prevents, which it cannot, because the
+// live filter is applied here rather than assumed away.
+func (f *fakeUsers) ByAccountAndEmail(_ context.Context, accountID identity.AccountID, email string) (identity.User, error) {
+	for _, u := range f.rows {
+		if u.AccountID == accountID && u.Email == email && u.State != identity.UserRemoved {
+			return u, nil
+		}
+	}
+	return identity.User{}, fmt.Errorf("fake: user %s/%s: %w", accountID, email, persistence.ErrNotFound)
+}
+
 // fakeKeys keeps the API-key ownership records, counts its swaps, and can
 // lose a revoke swap to a simulated racing revoker.
 type fakeKeys struct {
