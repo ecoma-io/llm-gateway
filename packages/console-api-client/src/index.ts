@@ -94,6 +94,7 @@ export type {
   ListUsersResponse,
   MintApiKeyData,
   MintApiKeyResponse,
+  MintedApiKey,
   Money,
   Options,
   Plan,

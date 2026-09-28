@@ -13,12 +13,23 @@ import { nextTick } from "vue";
 
 import { createApiKey } from "@/lib/api";
 import OneTimeSecret from "@/modules/session/OneTimeSecret.vue";
+import type { MintedApiKey } from "@ecoma-io/llm-gateway-console-api-client";
 
 vi.mock("@/lib/api", () => ({
   createApiKey: vi.fn(),
 }));
 
 const TOKEN = ["gw", "bGl2ZS1hMWIyYzNkNGU1ZjY3ODlhYmNkZWY"].join("_");
+
+const MINTED: MintedApiKey = {
+  id: "d1000000-0000-4000-8000-0000000000d1",
+  account_id: "a0000000-0000-4000-8000-0000000000a1",
+  display_name: "ci key",
+  prefix: "Gk_d1000000",
+  state: "active",
+  created_at: "2026-09-28T00:00:00Z",
+  token: TOKEN,
+};
 
 /** Mint successfully and leave the reveal panel on screen. */
 async function mountRevealed() {
@@ -32,10 +43,7 @@ async function mountRevealed() {
 
 describe("the one-time secret", () => {
   beforeEach(() => {
-    vi.mocked(createApiKey).mockResolvedValue({
-      ok: true,
-      data: { token: TOKEN, ...({} as never) },
-    } as never);
+    vi.mocked(createApiKey).mockResolvedValue({ ok: true, data: MINTED });
   });
 
   afterEach(() => {
@@ -108,7 +116,7 @@ describe("the one-time secret", () => {
     vi.mocked(createApiKey).mockResolvedValue({
       ok: false,
       failure: { kind: "transport", error: new Error(TOKEN) },
-    } as never);
+    });
     await wrapper.get("button").trigger("click");
     await nextTick();
     for (const line of logged) {
