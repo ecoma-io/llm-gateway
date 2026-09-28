@@ -112,6 +112,38 @@ type FundingBuckets interface {
 	Sweep(ctx context.Context, after accounting.FundingBucketID, limit int) ([]accounting.Bucket, error)
 }
 
+// AccountBuckets is the console's read of where the account's money is, and
+// it is a separate interface from FundingBuckets for the same reason
+// AccountUsers stands beside Users: the ownership file is being extended for
+// the session surface in parallel with this one, and two agents editing one
+// interface is a merge a reviewer has to unpick. The rows are the same rows
+// ByID returns, read through the same columns.
+//
+// The three balances it returns are the CACHED columns the database already
+// maintains — settled, held, and available, which funding_buckets_balance_projection
+// pins to available = settled − held at write time. They come back as
+// stored. There is deliberately no member here that sums legs, and one must
+// never be added: a Σ amount across grant/topup/hold/release/consume/
+// adjustment is not a number any of those kinds means, and a balance
+// derived from a page of the ledger is a balance derived from a page.
+type AccountBuckets interface {
+	// ListForAccount returns at most page.Limit of the account's buckets —
+	// its entitlement cycles and its PAYG balance alike — keyed on id, with
+	// the account predicate in the WHERE clause.
+	//
+	// The predicate is on funding_buckets.account_id, which is the column
+	// that names an owner directly. An entitlement bucket's owning account
+	// is present in that column too, so one predicate covers both kinds and
+	// no join to entitlements is needed to evaluate it.
+	ListForAccount(ctx context.Context, accountID accounting.AccountID, page FundingBucketPage) ([]accounting.Bucket, error)
+}
+
+// FundingBucketPage is the buckets list's request.
+type FundingBucketPage struct {
+	After accounting.FundingBucketID
+	Limit int
+}
+
 // FundingLedger appends legs and reads a bucket's history. Every write goes
 // through Append; every read is a read.
 type FundingLedger interface {
@@ -144,6 +176,56 @@ type FundingLedger interface {
 	// release booked on the bucket, or ErrNotFound — the convergence read a
 	// redelivered movement compares its amount against.
 	ByBucketReservationAndKind(ctx context.Context, bucketID accounting.FundingBucketID, reservationID accounting.ReservationID, kind accounting.Kind) (accounting.LedgerEntry, error)
+}
+
+// AccountLedger is the console's read of ONE bucket's history, and the
+// per-bucket shape is the feature rather than a limitation of this
+// implementation.
+//
+// The keyset is (funding_bucket_id, sequence) and the schema's
+// ledger_entries_bucket_sequence_key is exactly that pair, so a page is a
+// direct range scan on an index that already exists — no migration, no new
+// index, and on a table this lane builds with plain CREATE INDEX rather than
+// CONCURRENTLY. A cross-bucket timeline keyed on created_at instead would
+// need an index that does not exist, built non-concurrently on the fastest-
+// growing table in the plane, which is a multi-hour exclusive lock bought to
+// answer a question a ledger should never be asked as one whole: a ledger is
+// a fact about where money went for ONE owner of that money.
+//
+// Kind is an optional filter because operators read a ledger for two
+// different questions — what came in, and what went out — and the two are not
+// the same read.
+type AccountLedger interface {
+	// ListForBucket returns at most page.Limit of the bucket's legs, oldest
+	// first, keyed on the bucket's own allocated sequence.
+	//
+	// The account predicate is in the WHERE clause and is the first argument,
+	// evaluated against the bucket's account_id rather than through a join to
+	// funding_buckets — the ledger table carries no account column, and the
+	// account that owns a bucket is the account the bucket names. A bucket
+	// belonging to another account is therefore a bucket the statement's
+	// first predicate does not match, and the answer is an empty page at the
+	// cost of an empty page: a 404 the query did not return, and never a 403.
+	//
+	// It returns legs, not a balance. A Σ over the returned deltas is not
+	// one of the three balances the bucket caches, and this member must never
+	// grow a sibling that computes one from a page.
+	ListForBucket(ctx context.Context, accountID accounting.AccountID, bucketID accounting.FundingBucketID, page LedgerPage) ([]accounting.LedgerEntry, error)
+}
+
+// LedgerPage is the ledger list's request: an optional leg-kind filter, the
+// exclusive lower bound on the sequence, and a page size.
+type LedgerPage struct {
+	// Kind is one leg kind, or empty for the whole history.
+	Kind string
+
+	// AfterSequence is the exclusive lower bound on the leg's sequence. The
+	// zero value is the beginning of the bucket's history, not a cursor that
+	// matches nothing — a bucket's first leg is sequence 1.
+	AfterSequence int64
+
+	// Limit is the number of rows wanted; the adapter asks for one more.
+	Limit int
 }
 
 // Settlements persists the settlement headers — the exactly-once edge for a

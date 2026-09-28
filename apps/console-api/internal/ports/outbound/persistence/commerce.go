@@ -249,6 +249,81 @@ type Entitlements interface {
 	ActiveCandidates(ctx context.Context, accountID commerce.AccountID) ([]commerce.CandidateGrant, error)
 }
 
+// The console's three commerce screens, read side. The account predicate
+// lives in each statement's WHERE clause and is each statement's first
+// argument, the keyset is a unique sort key, and no member counts anything —
+// the rules and why they are these are stated once, above AccountUsers in
+// persistence.go, and they are not restated per method.
+
+// AccountPlans is the plan catalogue's read. It is the ONE list on the
+// console's surface with no account predicate, and that is the contract's
+// reasoning rather than an omission: a plan is not account-scoped — it is
+// the catalogue every account buys from — so the operation returns the whole
+// thing. "The plans this account uses" is a different question, and the
+// subscriptions list is where it is answered.
+//
+// A read, and not a writer: publishing, retiring and adding a grant
+// definition are commercial acts with their own review, and a console that
+// could publish a plan would be a second place a price becomes real.
+type AccountPlans interface {
+	// List returns at most page.Limit plans, keyed on id. A plan is a root
+	// that never changes after creation, so id order is the only order the
+	// table has.
+	List(ctx context.Context, page PlanPage) ([]commerce.Plan, error)
+}
+
+// PlanPage is the catalogue list's request: a keyset position and a page
+// size, and nothing else.
+type PlanPage struct {
+	After commerce.PlanID
+	Limit int
+}
+
+// AccountSubscriptions is the console's read of what the account has bought.
+//
+// A subscription's state and its cancel_at are separate here as they are in
+// the schema: a scheduled cancellation is DATA, NOT A STATE — the
+// subscription stays active and usable until that instant passes — so a row
+// carrying a future cancel_at is active, and one that renders "cancelled"
+// for it describes a decision that has not taken effect yet.
+type AccountSubscriptions interface {
+	// ListForAccount returns at most page.Limit of the account's
+	// subscriptions, keyed on id, with the account predicate in the WHERE
+	// clause. Id order is mint order: ids are uuid v7.
+	ListForAccount(ctx context.Context, accountID commerce.AccountID, page SubscriptionPage) ([]commerce.Subscription, error)
+}
+
+// SubscriptionPage is the subscriptions list's request.
+type SubscriptionPage struct {
+	After commerce.SubscriptionID
+	Limit int
+}
+
+// AccountEntitlements is the console's read of the grants each roll
+// materialised.
+//
+// An entitlement is a GRANT, not a balance, and this port is why the
+// distinction survives to the wire: there is no remaining/available column
+// anywhere in this read, and a third copy of a number with no rebuild story
+// is how two consoles start disagreeing about what a customer bought. What
+// remains of a grant is drawn on a funding bucket, and FundingAccountBuckets
+// is the separate read for that.
+type AccountEntitlements interface {
+	// ListForAccount returns at most page.Limit of the account's
+	// entitlements, keyed on id. The account predicate is in the WHERE
+	// clause; it is the one statement here, because a join to the
+	// subscription that owns a grant is a cross-aggregate read this port
+	// refuses (see the package header) and the entitlements table carries no
+	// account column of its own.
+	ListForAccount(ctx context.Context, accountID commerce.AccountID, page EntitlementPage) ([]commerce.Entitlement, error)
+}
+
+// EntitlementPage is the entitlements list's request.
+type EntitlementPage struct {
+	After commerce.EntitlementID
+	Limit int
+}
+
 // PaygAccounts persists the per-account PAYG commercial state — the flag
 // commerce owns and the bucket reference Accounting's choreography assigns.
 type PaygAccounts interface {
