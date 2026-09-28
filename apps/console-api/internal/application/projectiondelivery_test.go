@@ -282,12 +282,83 @@ func newDeliveryHarness(epoch string, headRevision uint64, position dataplane.Pr
 
 func (h *deliveryHarness) run(t *testing.T) error {
 	t.Helper()
-	return h.producer.Reconcile(context.Background(), false)
+	_, err := h.producer.Reconcile(context.Background(), false)
+	return err
 }
 
 // ack is shorthand for a scripted answer that accepts at rev.
 func ack(rev uint64) snapshotScript {
 	return snapshotScript{ack: dataplane.ProjectionAck{AppliedRevision: rev}}
+}
+
+// The cycle's returned position is what the process logs on every pass, and
+// /readyz gates on the database alone — so this number is the only thing that
+// makes a wedged producer visible. A cycle that delivered something reports
+// where it got to; a cycle that delivered nothing reports the revision the
+// mirror already stood at, which is a number and not a silence. A cycle that
+// failed part-way reports the last revision it actually delivered, not zero,
+// because the mirror did move and the next cycle resumes from it.
+func TestACycleReportsTheRevisionTheMirrorReached(t *testing.T) {
+	epoch := timeline(1)
+	joined := dataplane.ProjectionPosition{
+		Bootstrapped: true, Epoch: epoch, AppliedRevision: 3,
+	}
+	h := newDeliveryHarness(epoch, 6, joined)
+	h.log.pages = [][]projection.Change{logChanges(t, 3, 3)}
+	h.mirror.changeCalls = []changeScript{changeAck(6)}
+
+	reached, err := h.producer.Reconcile(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Reconcile returned %v, want a clean cycle", err)
+	}
+	if reached != 6 {
+		t.Fatalf("cycle reported revision %d, want 6 — the revision the mirror's own acknowledgement named", reached)
+	}
+}
+
+func TestAnIdleCycleStillReportsWhereTheMirrorStands(t *testing.T) {
+	epoch := timeline(1)
+	joined := dataplane.ProjectionPosition{
+		Bootstrapped: true, Epoch: epoch, AppliedRevision: 7,
+	}
+	// The head is at 7 and the mirror is at 7: there is nothing to deliver,
+	// and the cycle must still answer with the revision it reached. A loop
+	// that logs a count cannot tell a stopped cycle from an idle one unless
+	// the idle one is reported too.
+	h := newDeliveryHarness(epoch, 7, joined)
+
+	reached, err := h.producer.Reconcile(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Reconcile returned %v, want a clean cycle", err)
+	}
+	if reached != 7 {
+		t.Fatalf("an idle cycle reported revision %d, want 7 — where the mirror already stood", reached)
+	}
+	if h.mirror.deliveries != 0 {
+		t.Fatalf("the mirror was written %d time(s) on an idle cycle, want none", h.mirror.deliveries)
+	}
+}
+
+func TestAFailedCycleReportsWhereItGotToRatherThanZero(t *testing.T) {
+	epoch := timeline(1)
+	joined := dataplane.ProjectionPosition{
+		Bootstrapped: true, Epoch: epoch, AppliedRevision: 0,
+	}
+	cycle, cancel := context.WithCancel(context.Background())
+	h := newDeliveryHarness(epoch, 6, joined)
+	h.log.pages = [][]projection.Change{logChanges(t, 0, 3), logChanges(t, 3, 3)}
+	h.mirror.changeCalls = []changeScript{
+		{ack: dataplane.ProjectionAck{AppliedRevision: 3}, cancelAfter: cancel},
+		changeAck(6),
+	}
+
+	reached, err := h.producer.Reconcile(cycle, false)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want an error wrapping context.Canceled", err)
+	}
+	if reached != 3 {
+		t.Fatalf("a failed cycle reported revision %d, want 3 — the last revision the mirror actually acknowledged", reached)
+	}
 }
 
 // changeAck is the same shorthand for a batch delivery.
@@ -448,7 +519,7 @@ func TestAForcedCycleSnapshotsEvenAJoinedPosition(t *testing.T) {
 	h.log.snapshotAt = 10
 	h.mirror.snapshotCalls = []snapshotScript{ack(10)}
 
-	if err := h.producer.Reconcile(context.Background(), true); err != nil {
+	if _, err := h.producer.Reconcile(context.Background(), true); err != nil {
 		t.Fatalf("forced Reconcile returned %v, want a forced snapshot cycle", err)
 	}
 	if h.mirror.snapshots != 1 {
@@ -815,7 +886,7 @@ func TestACancelledContextStopsTheDrainBeforeItsNextPage(t *testing.T) {
 	h.log.pages = [][]projection.Change{logChanges(t, 0, 3), logChanges(t, 3, 3), nil}
 	h.mirror.changeCalls = []changeScript{{ack: dataplane.ProjectionAck{AppliedRevision: 3}, cancelAfter: cancel}, changeAck(6)}
 
-	err := h.producer.Reconcile(ctx, false)
+	_, err := h.producer.Reconcile(ctx, false)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v, want an error wrapping context.Canceled — a cancelled cycle reports its cancellation", err)
 	}

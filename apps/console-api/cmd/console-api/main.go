@@ -91,14 +91,23 @@ var reconciliationWG sync.WaitGroup
 // Control Plane's projection log until the process is asked to stop: one
 // Reconcile per interval, each under its own deadline, the first immediately.
 //
-// Every failure is a log line and nothing more. The loop deliberately does
-// not crash the process on a refused delivery or an unreachable peer — the
-// mirror's freshness is a management-plane concern and the protocol's answer
-// to a failed cycle is the next one — and it deliberately does not swallow
-// repeated failure either: the line is written every interval, so a producer
-// that cannot deliver is a log an operator cannot miss. A context
-// cancellation is not a failure: it is the stop signal arriving mid-cycle,
-// and it ends the loop quietly.
+// Every cycle is a log line, and every failure is a log line and nothing more.
+// The loop deliberately does not crash the process on a refused delivery or
+// an unreachable peer — the mirror's freshness is a management-plane concern
+// and the protocol's answer to a failed cycle is the next one — and it
+// deliberately does not swallow repeated failure either: the line is written
+// every interval, so a producer that cannot deliver is a log an operator
+// cannot miss. A context cancellation is not a failure: it is the stop signal
+// arriving mid-cycle, and it ends the loop quietly.
+//
+// The success line is load-bearing, not decoration. `/readyz` gates on the
+// database alone, so a loop that has stopped turning produces no error, no
+// exit, no readiness change and — before this line existed — no output at
+// all: the mirror's staleness is invisible until someone asks the Data Plane
+// why a key it published has not taken effect. The revision the cycle reached
+// is what makes that visible, because "the loop is turning" and "the loop is
+// turning and stuck at revision 41" are different problems and only the second
+// one has a number in it.
 func runProjectionLoop(ctx context.Context, producer *application.ProjectionDelivery, interval, timeout time.Duration) {
 	defer projectionWG.Done()
 
@@ -108,8 +117,13 @@ func runProjectionLoop(ctx context.Context, producer *application.ProjectionDeli
 	runOnce := func() {
 		cycleCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		if err := producer.Reconcile(cycleCtx, false); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("console-api projection cycle failed: %v", err)
+		applied, err := producer.Reconcile(cycleCtx, false)
+		switch {
+		case err == nil:
+			log.Printf("console-api projection cycle delivered the mirror to revision %d", applied)
+		case errors.Is(err, context.Canceled):
+		default:
+			log.Printf("console-api projection cycle failed after revision %d: %v", applied, err)
 		}
 	}
 
@@ -131,17 +145,26 @@ func runProjectionLoop(ctx context.Context, producer *application.ProjectionDeli
 // anyone, and this loop is what moves the Control Plane's position through
 // them.
 //
-// Every failure is a log line and nothing more, for the projection loop's
-// reason turned around: the feed is durable and replay is the delivery model,
-// so a failed pass loses nothing and the next pass re-reads the same page —
-// the applier's idempotency is what makes that free. The line is written
-// every interval, so a consumer that cannot apply a page is a log an operator
-// cannot miss. One failure has a remedy the next tick cannot supply and gets
-// its own sentence: an expired position means the Data Plane can no longer
-// replay from where this process stands, and the pass the loop wants is the
-// one only an operator can bring about — the loop keeps polling (the position
-// never moves but so does nothing else), and the repeated line is the state
-// staying visible until someone resolves it.
+// Every pass is a log line, and every failure is a log line and nothing more,
+// for the projection loop's reason turned around: the feed is durable and
+// replay is the delivery model, so a failed pass loses nothing and the next
+// pass re-reads the same page — the applier's idempotency is what makes that
+// free. The line is written every pass, so a consumer that cannot apply a page
+// is a log an operator cannot miss. One failure has a remedy the next tick
+// cannot supply and gets its own sentence: an expired position means the Data
+// Plane can no longer replay from where this process stands, and the pass the
+// loop wants is the one only an operator can bring about — the loop keeps
+// polling (the position never moves but so does nothing else), and the
+// repeated line is the state staying visible until someone resolves it.
+//
+// The success line is load-bearing, and this loop is the one it matters most
+// for. This is the consumer that books settlements and releases holds, so a
+// loop that has stopped turning stops money moving — the account is admitted
+// and charged nothing, the holds accumulate, and every check in the plane
+// reads green because the only thing that is wrong is that nothing is
+// arriving. `/readyz` gates on the database, which is answering perfectly. The
+// count is what turns that from invisible into a number an operator can watch
+// stop moving.
 //
 // A context cancellation is not a failure: it is the stop signal arriving
 // mid-pass, and it ends the loop quietly — the pass the signal interrupts is
@@ -168,6 +191,7 @@ func runIngestionLoop(ctx context.Context, ingestion *application.FactIngestion,
 			result, err := ingestion.Replay(cycleCtx)
 			switch {
 			case err == nil:
+				log.Printf("console-api ingestion pass applied %d facts", result.Applied)
 			case errors.Is(err, dataplaneport.ErrCursorExpired):
 				log.Printf("console-api ingestion position is no longer replayable; the feed holds until an operator resolves the position: %v", err)
 			case errors.Is(err, context.Canceled):
