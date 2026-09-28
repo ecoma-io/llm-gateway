@@ -236,6 +236,40 @@ func TestTheSeriesCountsRequestsAndNotFactRows(t *testing.T) {
 	if strings.Contains(series, "COUNT(*)") {
 		t.Errorf("the series statement carries a bare COUNT(*):\n%s\nthe counts are of requests, and a fact class is not a request", series)
 	}
+
+	// The counts are not merely two spellings of the same DISTINCT. The
+	// settled population is the one the settlements join can prove: a
+	// request with an unbillable orphan has a dimension row and no settlement
+	// header, so it belongs to the first count and not the second. Dropping
+	// this FILTER leaves the two bare DISTINCT substrings above intact, which
+	// is why the projection line itself is read here.
+	settled := projectionLine(series, "settled")
+	if settled == "" {
+		t.Fatalf("the series statement projects no settled count:\n%s", series)
+	}
+	if !strings.Contains(settled, "COUNT(DISTINCT d.request_id)") ||
+		!strings.Contains(settled, "FILTER") ||
+		!strings.Contains(settled, "s.id IS NOT NULL") {
+		t.Errorf("the settled count is not a distinct count restricted to a settlement of record:\n%s\nit is %q — without the FILTER every orphan is reported as a settlement", series, settled)
+	}
+}
+
+// projectionLine returns the COUNT projection line bearing alias, excluding
+// the alias itself. The series also spells `settled` in an outer COALESCE that
+// gives the aggregate a zero; the count is the projection the claim is about,
+// so the COALESCE is deliberately skipped. The series writes each projection
+// on one line, and the claim here is about that expression — not a golden
+// statement shape, nor a substring whose second occurrence can accidentally
+// satisfy the first count's assertion.
+func projectionLine(statement, alias string) string {
+	marker := "AS " + alias
+	for _, line := range strings.Split(statement, "\n") {
+		at := strings.Index(line, marker)
+		if at >= 0 && strings.Contains(line[:at], "COUNT(") {
+			return strings.TrimSpace(line[:at])
+		}
+	}
+	return ""
 }
 
 // TestTheAttributionStampsItsOwnInstant is the column with no default.

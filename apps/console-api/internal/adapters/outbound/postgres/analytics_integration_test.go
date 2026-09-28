@@ -135,6 +135,15 @@ func TestTheSeriesIsGapFreeAndKeepsTheBoundsItWasGiven(t *testing.T) {
 // applied alongside the settlement, and it is attributed to the same account.
 // A count that grouped by request_id would see one request here; a count that
 // counted rows would see two, and only the first is a count of requests.
+//
+// The fixture carries BOTH shapes of orphan, because the two test different
+// counts. An orphan under the settled request's OWN id is the dedup case: two
+// dimension rows, one request, and the with-facts count must not double. An
+// orphan under a request id of its OWN is the FILTER case: one more request
+// with a usage fact, and it has no settlement behind it, so the settled count
+// must not move. With only the first, the two counts are one count and
+// dropping the settled count's FILTER leaves both at one — the assertion below
+// would hold under the very defect it exists to catch.
 func TestTheSeriesCountsARequestOnceAcrossItsOwnFactClasses(t *testing.T) {
 	a := integrationAnalytics(t)
 	account, bucket := a.newAccountWithBucket(t, "series orphan")
@@ -143,9 +152,14 @@ func TestTheSeriesCountsARequestOnceAcrossItsOwnFactClasses(t *testing.T) {
 	// The orphan is a second fact of the SAME request under the other class,
 	// which is exactly the pair a naive join would count twice. It carries the
 	// settled request's own id, because "one request with two classes" is the
-	// only shape that makes the count claim testable — two requests in one
+	// only shape that makes the dedup claim testable — two requests in one
 	// bucket is two requests, and a count that said one would be wrong.
 	a.orphanRequest(t, account, requestID)
+	// And a second orphan, under a request id of its own. It moves the
+	// with-facts count and must leave the settled count alone, which is the
+	// only shape that makes the FILTER claim testable: under the first orphan
+	// alone, a settled count with no filter at all still reads one.
+	a.orphanRequest(t, account, acctRequestID(t))
 
 	now := time.Now().UTC()
 	usage, _, err := a.repo.Usage(t.Context(), persistence.UsageQuery{
@@ -154,12 +168,12 @@ func TestTheSeriesCountsARequestOnceAcrossItsOwnFactClasses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Usage() error = %v", err)
 	}
-	if usage.Series[0].WithUsageFacts != 1 {
-		t.Errorf("the bucket counts %d requests with usage facts, want 1 — the request is one request, and the count is of requests rather than of fact rows",
+	if usage.Series[0].WithUsageFacts != 2 {
+		t.Errorf("the bucket counts %d requests with usage facts, want 2 — the settled request and the orphan of its own are two requests, and the one carrying both classes is a single request rather than two",
 			usage.Series[0].WithUsageFacts)
 	}
 	if usage.Series[0].Settled != 1 {
-		t.Errorf("the bucket counts %d settled requests, want 1 — the orphan carries a capture method but books no charge, and it is not a settlement of record",
+		t.Errorf("the bucket counts %d settled requests, want 1 — the orphan carries a capture method but books no charge, and it is not a settlement of record; two here means the settled count is not reading the settlements join at all",
 			usage.Series[0].Settled)
 	}
 	if usage.Capture.Total() != 1 {

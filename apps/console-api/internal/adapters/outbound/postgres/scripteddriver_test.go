@@ -92,12 +92,70 @@ type scriptedDriver struct {
 	queries []recordedQuery
 	shapes  []shape
 	cursor  int
+	// failures answers the statement at the given position — counting the
+	// statements the read ASKS, in the order it asks them, and not the
+	// statements it sets — with an error instead of a row. A shape says what a
+	// statement RETURNS, and there is no shape for the statement that raised:
+	// the read's own classification of a failure is a claim about the text of
+	// the error rather than about the columns behind it, and a driver that
+	// could only ever answer would have no way to pose it.
+	failures map[int]error
+	// walkFailures answers the statement at the given position with rows the
+	// WALK then fails, which is how a driver reports an error that arrives
+	// after the statement was accepted. A statement_timeout raises a few
+	// hundred milliseconds into a read rather than at the moment it was issued,
+	// so a read whose classification is only ever asked of the query has never
+	// been asked about the half of the time it spends with rows in hand.
+	walkFailures map[int]error
+	// statementsRead counts the statements the read ASKED, as opposed to the
+	// ones it set. A position is a place in the read's SEQUENCE OF QUESTIONS,
+	// and a statement a read does not ask is not one of them — the bound is
+	// set, and setting it is not a question.
+	statementsRead int
 	// begun records the options every transaction was started with. The
 	// isolation level a unit of work runs at is carried HERE and nowhere
 	// else — PostgreSQL refuses both SET TRANSACTION and set_config once the
 	// transaction has issued a query — so a tier that cannot see this cannot
 	// assert that a multi-statement read shared one snapshot.
 	begun []driver.TxOptions
+}
+
+// failAt makes the statement at the zero-based position answer with err. It is
+// set before the read runs, because the driver counts statements as they
+// arrive and a failure armed afterwards would land on the next read.
+func (s *scriptedDriver) failAt(position int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failures == nil {
+		s.failures = map[int]error{}
+	}
+	s.failures[position] = err
+}
+
+// failWalkAt makes the statement at the zero-based position answer with rows
+// and then fail while they are being read.
+func (s *scriptedDriver) failWalkAt(position int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.walkFailures == nil {
+		s.walkFailures = map[int]error{}
+	}
+	s.walkFailures[position] = err
+}
+
+// takeFailure is the error the statement at the current position owes, if one
+// was armed for it.
+func (s *scriptedDriver) takeFailure() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	position := s.statementsRead
+	s.statementsRead++
+	err, ok := s.failures[position]
+	if !ok {
+		return nil
+	}
+	delete(s.failures, position)
+	return err
 }
 
 // isolations returns the isolation every unit of work was begun at, in order.
@@ -215,7 +273,13 @@ func (c *scriptedConn) QueryContext(_ context.Context, query string, args []driv
 		values = append(values, a.Value)
 	}
 	c.s.record(recordedQuery{text: query, args: values})
-	return c.s.result(c.s.shape()), nil
+	if err := c.s.takeFailure(); err != nil {
+		return nil, err
+	}
+	// The shape is taken before the walk failure is read, because takeFailure
+	// is what advances the position both are counted against.
+	shaped := c.s.shape()
+	return c.s.result(shaped, c.s.walkFailure(shaped)), nil
 }
 
 // shape is the row shape the statement at the cursor answers with, from the
@@ -227,6 +291,11 @@ func (c *scriptedConn) QueryContext(_ context.Context, query string, args []driv
 // every read" rather than "on the first". A script that ran dry would have to
 // guess a shape, and a guess that happened to be wide enough would let an
 // arity defect through.
+//
+// It is the CLOSING edge that is walked first: takeFailure advances the same
+// cursor, so whichever runs first must leave the position to the other. A
+// failing statement is scripted out of the question, not answered with a shape
+// it never gets as far as scanning.
 func (s *scriptedDriver) shape() shape {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -244,6 +313,11 @@ func (c *scriptedConn) ExecContext(_ context.Context, query string, args []drive
 		values = append(values, a.Value)
 	}
 	c.s.record(recordedQuery{text: query, args: values})
+	// Not armed with failures and not counted: the bound is a statement this
+	// read sets rather than one it asks, so a position a test arms is a
+	// position in the read's SEQUENCE OF QUESTIONS and the bound is not one of
+	// them. Letting it consume a position would make every armed failure land
+	// one statement later than the test said.
 	return driver.RowsAffected(0), nil
 }
 
@@ -288,9 +362,30 @@ func (s *scriptedDriver) theStatementNamed(fragment string) string {
 }
 
 // result is the row the current statement answers with: the script's shape,
-// as one row.
-func (s *scriptedDriver) result(shaped shape) driver.Rows {
-	return &scriptedRows{values: append(shape(nil), shaped...)}
+// as one row, and a walk that fails if a failure was armed for this position.
+func (s *scriptedDriver) result(shaped shape, walkErr error) driver.Rows {
+	return &scriptedRows{values: append(shape(nil), shaped...), walkErr: walkErr}
+}
+
+// walkFailure is the error the statement's rows owe once the read has begun
+// walking them, and consumes the armed failure for that statement's position.
+//
+// A statement that failed rather than answered owes no walk at all, so the
+// empty shape skips the lookup: the position has already been consumed by the
+// failure that produced it.
+func (s *scriptedDriver) walkFailure(shaped shape) error {
+	if len(shaped) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	position := s.statementsRead - 1
+	err, ok := s.walkFailures[position]
+	if !ok {
+		return nil
+	}
+	delete(s.walkFailures, position)
+	return err
 }
 
 type scriptedTx struct{}
@@ -299,8 +394,9 @@ func (scriptedTx) Commit() error   { return nil }
 func (scriptedTx) Rollback() error { return nil }
 
 type scriptedRows struct {
-	values []driver.Value
-	served bool
+	values  []driver.Value
+	served  bool
+	walkErr error
 }
 
 func (r *scriptedRows) Columns() []string {
@@ -314,6 +410,14 @@ func (r *scriptedRows) Columns() []string {
 func (r *scriptedRows) Close() error { return nil }
 
 func (r *scriptedRows) Next(dest []driver.Value) error {
+	if r.walkErr != nil {
+		// Once, and then the walk is over: a driver that failed every call
+		// would let a caller that ignored the error spin, and the callers under
+		// test stop at the first one.
+		err := r.walkErr
+		r.walkErr = nil
+		return err
+	}
 	if r.served {
 		return io.EOF
 	}
