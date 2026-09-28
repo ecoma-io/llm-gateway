@@ -30,7 +30,7 @@ import (
 // reason at the top of wire.go — the transport renders its own shapes, and a
 // handler holding an aggregate would be holding the plane's grammar to decide
 // what a client should see.
-type consoleReadUseCases interface {
+type ConsoleReadUseCases interface {
 	// AccountOverview is the dashboard's one server-side composition: figures
 	// that live in three bounded contexts, assembled by the application with
 	// one account scope, so a client is not reimplementing a join in the

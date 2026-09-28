@@ -147,21 +147,12 @@ type userRecord struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
-// apiKeyRecord mirrors the contract's APIKey, the ownership record every read
-// but the mint returns. The credential is absent, not null: this plane stores
-// no plaintext and no digest, and the record the mint returns is the only
-// place a credential exists.
-type apiKeyRecord struct {
-	ID          string      `json:"id"`
-	AccountID   string      `json:"account_id"`
-	CreatedBy   string      `json:"created_by,omitempty"`
-	DisplayName string      `json:"display_name"`
-	Prefix      string      `json:"prefix"`
-	State       apiKeyState `json:"state"`
-	CreatedAt   string      `json:"created_at"`
-	UpdatedAt   string      `json:"updated_at,omitempty"`
-	RevokedAt   string      `json:"revoked_at,omitempty"`
-}
+// apiKeyRecord is NOT declared here: wire.go already holds it, as the contract's
+// APIKey shape, for the mint's response to join. Declaring a second one here
+// would be two spellings of one schema, and a field added to one and forgotten
+// on the other would compile and be silently absent from the wire. The read
+// side reuses that single type — renderAPIKey in readhandlers.go converts into
+// it — so the key shape exists once on this side of the boundary.
 
 // planRecord mirrors the contract's Plan.
 //
@@ -186,16 +177,16 @@ type planRecord struct {
 // and usable until that instant passes — so a row carrying a future cancel_at
 // renders as active with a cancellation date, and never as `cancelled`.
 type subscriptionRecord struct {
-	ID                  string  `json:"id"`
-	AccountID           string  `json:"account_id"`
-	PlanVersionID       string  `json:"plan_version_id"`
-	State               string  `json:"state"`
-	StartsAt            string  `json:"starts_at,omitempty"`
-	CurrentPeriodStart  *string `json:"current_period_start"`
-	CurrentPeriodEnd    *string `json:"current_period_end"`
-	CancelAt            *string `json:"cancel_at"`
-	CreatedAt           string  `json:"created_at"`
-	UpdatedAt           string  `json:"updated_at,omitempty"`
+	ID                 string  `json:"id"`
+	AccountID          string  `json:"account_id"`
+	PlanVersionID      string  `json:"plan_version_id"`
+	State              string  `json:"state"`
+	StartsAt           string  `json:"starts_at,omitempty"`
+	CurrentPeriodStart *string `json:"current_period_start"`
+	CurrentPeriodEnd   *string `json:"current_period_end"`
+	CancelAt           *string `json:"cancel_at"`
+	CreatedAt          string  `json:"created_at"`
+	UpdatedAt          string  `json:"updated_at,omitempty"`
 }
 
 // entitlementRecord mirrors the contract's Entitlement.
@@ -206,19 +197,19 @@ type subscriptionRecord struct {
 // how two consoles start disagreeing about what a customer bought. The bucket
 // list is where what remains is read.
 type entitlementRecord struct {
-	ID                  string `json:"id"`
-	SubscriptionID      string `json:"subscription_id"`
-	GrantDefinitionID   string `json:"grant_definition_id,omitempty"`
-	Cycle               int    `json:"cycle"`
-	Scope               string `json:"scope,omitempty"`
-	Dimension           string `json:"dimension,omitempty"`
-	GrantedMinorUnits   int64  `json:"granted_minor_units,omitempty"`
-	ScopeVersionID      string `json:"scope_version_id,omitempty"`
-	State               string `json:"state"`
-	PeriodStart         string `json:"period_start"`
-	PeriodEnd           string `json:"period_end"`
-	CreatedAt           string `json:"created_at"`
-	UpdatedAt           string `json:"updated_at,omitempty"`
+	ID                string `json:"id"`
+	SubscriptionID    string `json:"subscription_id"`
+	GrantDefinitionID string `json:"grant_definition_id,omitempty"`
+	Cycle             int    `json:"cycle"`
+	Scope             string `json:"scope,omitempty"`
+	Dimension         string `json:"dimension,omitempty"`
+	GrantedMinorUnits int64  `json:"granted_minor_units,omitempty"`
+	ScopeVersionID    string `json:"scope_version_id,omitempty"`
+	State             string `json:"state"`
+	PeriodStart       string `json:"period_start"`
+	PeriodEnd         string `json:"period_end"`
+	CreatedAt         string `json:"created_at"`
+	UpdatedAt         string `json:"updated_at,omitempty"`
 }
 
 // fundingBucketRecord mirrors the contract's FundingBucket.
@@ -304,16 +295,16 @@ type findingRecord struct {
 // inclusive pair is one an operator cannot tell from one that overlapped the
 // last.
 type reconciliationRunRecord struct {
-	ID               int64   `json:"id"`
-	Scope            string  `json:"scope"`
-	Status           string  `json:"status"`
-	WindowFrom       string  `json:"window_from"`
-	WindowTo         string  `json:"window_to"`
-	StartedAt        string  `json:"started_at"`
-	FinishedAt       *string `json:"finished_at"`
-	BucketsScanned   int64   `json:"buckets_scanned"`
-	FindingsOpened   int64   `json:"findings_opened"`
-	FindingsUnchanged int64  `json:"findings_unchanged"`
+	ID                int64   `json:"id"`
+	Scope             string  `json:"scope"`
+	Status            string  `json:"status"`
+	WindowFrom        string  `json:"window_from"`
+	WindowTo          string  `json:"window_to"`
+	StartedAt         string  `json:"started_at"`
+	FinishedAt        *string `json:"finished_at"`
+	BucketsScanned    int64   `json:"buckets_scanned"`
+	FindingsOpened    int64   `json:"findings_opened"`
+	FindingsUnchanged int64   `json:"findings_unchanged"`
 }
 
 // accountOverviewResponse mirrors the contract's AccountOverview, the
@@ -329,10 +320,10 @@ type reconciliationRunRecord struct {
 // application read them; `open_finding_count` is the one number here that is
 // not the account's alone.
 type accountOverviewResponse struct {
-	Account           accountRecord          `json:"account"`
-	UserCount         int                    `json:"user_count,omitempty"`
-	ActiveAPIKeyCount int                    `json:"active_api_key_count,omitempty"`
-	Subscriptions     []subscriptionRecord   `json:"subscriptions"`
-	PAYGBalances      []fundingBucketRecord  `json:"payg_balances"`
-	OpenFindingCount  int                    `json:"open_finding_count,omitempty"`
+	Account           accountRecord         `json:"account"`
+	UserCount         int                   `json:"user_count,omitempty"`
+	ActiveAPIKeyCount int                   `json:"active_api_key_count,omitempty"`
+	Subscriptions     []subscriptionRecord  `json:"subscriptions"`
+	PAYGBalances      []fundingBucketRecord `json:"payg_balances"`
+	OpenFindingCount  int                   `json:"open_finding_count,omitempty"`
 }

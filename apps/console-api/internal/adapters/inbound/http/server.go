@@ -80,7 +80,7 @@ const (
 // The surface itself is declared in routes.go and mounted here; this function
 // owns everything around it — the middleware, the two fallbacks below, and the
 // order they are composed in.
-func New(app *application.App, readiness persistence.Pinger, sessions sessionUseCases, reads consoleReadUseCases) stdhttp.Handler {
+func New(app *application.App, readiness persistence.Pinger, sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.Handler {
 	if readiness == nil {
 		panic("http: New requires a readiness Pinger; /readyz has nothing to gate on without one")
 	}

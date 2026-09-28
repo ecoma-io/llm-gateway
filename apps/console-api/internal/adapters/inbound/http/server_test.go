@@ -20,7 +20,7 @@ const statusBody = "{\"status\":\"ok\"}\n"
 func TestServerServesTheContractedRoutes(t *testing.T) {
 	// The store answers: the route table is under test here, not the
 	// readiness gate, which readyz_test.go drives through both answers.
-	handler := New(application.New("v0.1.0"), &answeringPinger{}, newFakeSessionUseCases())
+	handler := New(application.New("v0.1.0"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
 	tests := []struct {
 		name       string
 		method     string

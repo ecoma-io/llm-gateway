@@ -45,6 +45,21 @@ func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 		"GET /auth/session",
 		"DELETE /auth/session",
 		"POST /api-keys",
+		// The ten reads. Seven are account-scoped and take their account from
+		// the session, never from the path; three — the plan catalogue, the
+		// findings and the reconciliation runs — are whole-plane and are
+		// account-scoped by nothing, which is the contract's own statement
+		// about them rather than an omission here.
+		"GET /account/overview",
+		"GET /users",
+		"GET /api-keys",
+		"GET /plans",
+		"GET /subscriptions",
+		"GET /entitlements",
+		"GET /funding-buckets",
+		"GET /funding-buckets/{funding_bucket_id}/ledger",
+		"GET /reconciliation/findings",
+		"GET /reconciliation/runs",
 	}
 	sort.Strings(want)
 
@@ -124,11 +139,26 @@ func TestTheGuardCoversEveryUnsafeMethodTheSurfaceDeclares(t *testing.T) {
 // rule would fail a path the contract deliberately promises. An account is the
 // one identifier that must never appear in a path on this surface, so that is
 // the one this names.
+//
+// The predicate matches a segment that CARRIES an account identifier, not one
+// that merely contains the word. Those are different things, and the first
+// draft of this test conflated them: `strings.Contains(segment, "account")`
+// fails `GET /account/overview`, whose "account" is a fixed word in a
+// parameterless path that identifies no customer and appears in no log as
+// one. A rule that fires on a path the contract requires is a rule that gets
+// deleted rather than fixed, which loses the check entirely.
+//
+// What must not exist is a segment that could hold a value: a brace
+// placeholder, or a literal value standing where a placeholder belongs. A
+// path carrying one is the defect; a path whose segment is a constant noun is
+// not, however unfortunate the noun.
 func TestNoRouteCarriesAnAccountID(t *testing.T) {
 	for _, rt := range routeTableForTest() {
 		for _, segment := range strings.Split(strings.Trim(rt.path, "/"), "/") {
-			if strings.Contains(segment, "account") {
-				t.Errorf("%s %s: the segment %q names an account in a path, where every proxy access log and every outbound Referer will record it",
+			holdsAValue := strings.Contains(segment, "{")
+			namesAnAccount := strings.Contains(strings.ToLower(segment), "account")
+			if holdsAValue && namesAnAccount {
+				t.Errorf("%s %s: the segment %q puts an account identifier in a path, where every proxy access log and every outbound Referer will record it",
 					rt.method, rt.path, segment)
 			}
 		}

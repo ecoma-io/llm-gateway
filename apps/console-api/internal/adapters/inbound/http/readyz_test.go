@@ -68,7 +68,7 @@ func TestReadyzGatesOnTheStoreAnswering(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := New(application.New("test"), &answeringPinger{pingErr: tt.pingErr}, newFakeSessionUseCases())
+			handler := New(application.New("test"), &answeringPinger{pingErr: tt.pingErr}, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(stdhttp.MethodGet, "/readyz", nil)
@@ -98,7 +98,7 @@ func TestReadyzGatesOnTheStoreAnswering(t *testing.T) {
 // means to finish, and a lost database turns into a 503 rather than a hang.
 func TestReadyzAsksTheQuestionUnderAShortDeadline(t *testing.T) {
 	pinger := &answeringPinger{}
-	handler := New(application.New("test"), pinger, newFakeSessionUseCases())
+	handler := New(application.New("test"), pinger, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(stdhttp.MethodGet, "/readyz", nil)
@@ -139,7 +139,7 @@ func TestReadyzLogsTheDependencyAndNothingElse(t *testing.T) {
 		log.SetFlags(flags)
 	})
 
-	handler := New(application.New("test"), &answeringPinger{pingErr: errors.New("ping: " + secret)}, newFakeSessionUseCases())
+	handler := New(application.New("test"), &answeringPinger{pingErr: errors.New("ping: " + secret)}, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(stdhttp.MethodGet, "/readyz", nil)
@@ -170,7 +170,7 @@ func TestReadyzLogsTheDependencyAndNothingElse(t *testing.T) {
 // outage it cannot fix, and the 503 that would have pulled it from traffic
 // would never be read.
 func TestHealthzStaysStaticWhileTheStoreIsDown(t *testing.T) {
-	handler := New(application.New("test"), &answeringPinger{pingErr: errors.New("connection refused")}, newFakeSessionUseCases())
+	handler := New(application.New("test"), &answeringPinger{pingErr: errors.New("connection refused")}, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(stdhttp.MethodGet, "/healthz", nil)
@@ -194,7 +194,7 @@ func TestNewRefusesAServerWithNothingToGateOn(t *testing.T) {
 			t.Error("New() built a handler with no readiness Pinger; /readyz would answer ready with nothing behind it")
 		}
 	}()
-	New(application.New("test"), nil, newFakeSessionUseCases())
+	New(application.New("test"), nil, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
 }
 
 // TestNewRefusesAServerWithNoSessionSurface is the same loud door for the
@@ -209,5 +209,5 @@ func TestNewRefusesAServerWithNoSessionSurface(t *testing.T) {
 			t.Error("New() built a handler with no session use cases; the session surface is the authentication boundary")
 		}
 	}()
-	New(application.New("test"), &answeringPinger{}, nil)
+	New(application.New("test"), &answeringPinger{}, nil, newFakeConsoleReadUseCases())
 }

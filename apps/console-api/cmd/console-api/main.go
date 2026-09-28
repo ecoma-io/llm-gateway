@@ -687,8 +687,18 @@ const (
 // exactly as they did before; the four session operations refuse every
 // request, which is the only safe answer from a process that has no session
 // store to resolve a token against.
+//
+// The ten console reads take the same treatment, and for the same reason. The
+// read use cases ARE constructible here — the SQL adapters implement every
+// port NewConsoleReads asks for — and they are still handed over unwired, on
+// purpose. A session this process cannot resolve is the whole of the
+// authentication boundary, and a read surface behind it would be a console
+// serving account data over a boundary that does not exist yet. So the ten
+// reads answer 500 until the session surface is wired, and the first wiring to
+// arrive replaces both stand-ins together: a read screen is unreachable without
+// a session, and neither half is honest on its own.
 func newHandler(version string, readiness persistence.Pinger) stdhttp.Handler {
-	return http.New(application.New(version), readiness, unwiredSessionUseCases{})
+	return http.New(application.New(version), readiness, unwiredSessionUseCases{}, unwiredConsoleReadUseCases{})
 }
 
 // unwiredSessionUseCases is the session surface's answer to a process with no
@@ -722,6 +732,68 @@ func (unwiredSessionUseCases) SignOut(context.Context, http.SessionToken) error 
 
 func (unwiredSessionUseCases) MintAPIKey(context.Context, http.MintAPIKeyInput) (http.MintedAPIKeyResult, error) {
 	return http.MintedAPIKeyResult{}, errSessionUseCasesUnwired
+}
+
+// unwiredConsoleReadUseCases is the ten product reads' answer to a process whose
+// session surface is not wired: every read fails, so each of the ten screens
+// answers 500 and no account data is served over a boundary that does not exist.
+//
+// It is a stand-in rather than a nil for the reason unwiredSessionUseCases is,
+// and it is a NON-nil one for a second reason beyond fail-closedness: a nil seam
+// reaching a handler would nil-dereference on the floor of a request goroutine,
+// where the stack names a request rather than the wiring that caused it. The
+// stand-in makes the mistake answerable at the boundary instead — the same
+// discipline that keeps application.NewConsoleReads panicking rather than
+// returning a half-wired read surface.
+//
+// The real implementation is written and sits in the http package
+// (http.NewConsoleReads): it is ten methods over the ten use cases, and the
+// SQL adapters behind them are constructed in main above. What is missing is
+// not code but the SESSION the reads are authorized against, so the first
+// wiring to land replaces this value — and unwiredSessionUseCases with it —
+// and nothing in the http package changes.
+type unwiredConsoleReadUseCases struct{}
+
+var errConsoleReadUseCasesUnwired = errors.New("console-api: the console read use cases are not wired behind a session surface")
+
+func (unwiredConsoleReadUseCases) AccountOverview(context.Context, string) (http.AccountOverviewResult, error) {
+	return http.AccountOverviewResult{}, errConsoleReadUseCasesUnwired
+}
+
+func (unwiredConsoleReadUseCases) ListUsers(context.Context, string, string, string, int) (http.UserPageResult, error) {
+	return http.UserPageResult{}, errConsoleReadUseCasesUnwired
+}
+
+func (unwiredConsoleReadUseCases) ListAPIKeys(context.Context, string, string, int) (http.APIKeyPageResult, error) {
+	return http.APIKeyPageResult{}, errConsoleReadUseCasesUnwired
+}
+
+func (unwiredConsoleReadUseCases) ListPlans(context.Context, string, int) (http.PlanPageResult, error) {
+	return http.PlanPageResult{}, errConsoleReadUseCasesUnwired
+}
+
+func (unwiredConsoleReadUseCases) ListSubscriptions(context.Context, string, string, int) (http.SubscriptionPageResult, error) {
+	return http.SubscriptionPageResult{}, errConsoleReadUseCasesUnwired
+}
+
+func (unwiredConsoleReadUseCases) ListEntitlements(context.Context, string, string, int) (http.EntitlementPageResult, error) {
+	return http.EntitlementPageResult{}, errConsoleReadUseCasesUnwired
+}
+
+func (unwiredConsoleReadUseCases) ListFundingBuckets(context.Context, string, string, int) (http.FundingBucketPageResult, error) {
+	return http.FundingBucketPageResult{}, errConsoleReadUseCasesUnwired
+}
+
+func (unwiredConsoleReadUseCases) ListLedgerEntries(context.Context, string, string, string, string, int) (http.LedgerEntryPageResult, error) {
+	return http.LedgerEntryPageResult{}, errConsoleReadUseCasesUnwired
+}
+
+func (unwiredConsoleReadUseCases) ListFindings(context.Context, string, string, string, int) (http.FindingPageResult, error) {
+	return http.FindingPageResult{}, errConsoleReadUseCasesUnwired
+}
+
+func (unwiredConsoleReadUseCases) ListReconciliationRuns(context.Context, string, int) (http.ReconciliationRunPageResult, error) {
+	return http.ReconciliationRunPageResult{}, errConsoleReadUseCasesUnwired
 }
 
 // run serves until the process is asked to stop, then drains.

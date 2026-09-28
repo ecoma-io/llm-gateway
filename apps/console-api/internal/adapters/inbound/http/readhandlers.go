@@ -1,10 +1,9 @@
 package http
 
 import (
-	"context"
 	"encoding/json"
-	"strconv"
 	stdhttp "net/http"
+	"strconv"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/application"
 )
@@ -48,11 +47,11 @@ const (
 	pageAfterParam = "after"
 	pageLimitParam = "limit"
 
-	usersStateParam         = "state"
-	ledgerKindParam         = "kind"
-	findingsStatusParam     = "status"
-	findingsSeverityParam   = "severity"
-	fundingBucketPathParam  = "funding_bucket_id"
+	usersStateParam        = "state"
+	ledgerKindParam        = "kind"
+	findingsStatusParam    = "status"
+	findingsSeverityParam  = "severity"
+	fundingBucketPathParam = "funding_bucket_id"
 )
 
 // pageRequest is the paging ask a list handler forwards, parsed from the query
@@ -110,7 +109,7 @@ func optionalQuery(r *stdhttp.Request, name string) string {
 // computed from the buckets, no count derived from a page — and that is the
 // point of the operation existing rather than a client making three requests
 // and joining them in the browser.
-func handleGetAccountOverview(sessions sessionUseCases, reads consoleReadUseCases) stdhttp.HandlerFunc {
+func handleGetAccountOverview(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
@@ -131,7 +130,7 @@ func handleGetAccountOverview(sessions sessionUseCases, reads consoleReadUseCase
 // together, which is what a member list is. The account is the session's and
 // the port's predicate, so a user of another account is a row the statement
 // never returned.
-func handleListUsers(sessions sessionUseCases, reads consoleReadUseCases) stdhttp.HandlerFunc {
+func handleListUsers(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
@@ -156,7 +155,7 @@ func handleListUsers(sessions sessionUseCases, reads consoleReadUseCases) stdhtt
 // Unfiltered, and the page is the only thing a caller learns: there is no total
 // here, so a console that wanted "12 keys" is asking the overview, whose
 // active_api_key_count is a stored figure — not this list, whose page is not.
-func handleListAPIKeys(sessions sessionUseCases, reads consoleReadUseCases) stdhttp.HandlerFunc {
+func handleListAPIKeys(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
@@ -184,7 +183,7 @@ func handleListAPIKeys(sessions sessionUseCases, reads consoleReadUseCases) stdh
 // the session that reached it at all. A session is still required: the
 // catalogue is a product surface read, and nothing here is reachable without
 // one.
-func handleListPlans(sessions sessionUseCases, reads consoleReadUseCases) stdhttp.HandlerFunc {
+func handleListPlans(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if _, ok := resolveSession(w, r, sessions); !ok {
 			return
@@ -208,7 +207,7 @@ func handleListPlans(sessions sessionUseCases, reads consoleReadUseCases) stdhtt
 // A scheduled cancellation renders as a cancel_at beside an unchanged state, so
 // a row carrying a future cancellation reads as active with a date attached —
 // which is what it is.
-func handleListSubscriptions(sessions sessionUseCases, reads consoleReadUseCases) stdhttp.HandlerFunc {
+func handleListSubscriptions(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
@@ -235,7 +234,7 @@ func handleListSubscriptions(sessions sessionUseCases, reads consoleReadUseCases
 // it is drawn on a funding bucket, which is a separate operation with a
 // separate reason. The port's predicate is an EXISTS against the owning
 // subscription, still in the WHERE clause and still before any row is returned.
-func handleListEntitlements(sessions sessionUseCases, reads consoleReadUseCases) stdhttp.HandlerFunc {
+func handleListEntitlements(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
@@ -263,7 +262,7 @@ func handleListEntitlements(sessions sessionUseCases, reads consoleReadUseCases)
 // server maintains, the legs win over them, and a browser's arithmetic has no
 // authority behind it. There is no currency field on any of them and no symbol
 // on any of them — see readwire.go.
-func handleListFundingBuckets(sessions sessionUseCases, reads consoleReadUseCases) stdhttp.HandlerFunc {
+func handleListFundingBuckets(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
@@ -299,7 +298,7 @@ func handleListFundingBuckets(sessions sessionUseCases, reads consoleReadUseCase
 // The kind filter is a real predicate in the same statement, and the cursor
 // carries it and the bucket id, so a cursor earned on one bucket or under one
 // kind cannot be replayed against another.
-func handleListLedgerEntries(sessions sessionUseCases, reads consoleReadUseCases) stdhttp.HandlerFunc {
+func handleListLedgerEntries(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
@@ -339,7 +338,7 @@ func handleListLedgerEntries(sessions sessionUseCases, reads consoleReadUseCases
 // required — this is a product read and nothing here is reachable without one —
 // and the account is not consulted, because a count of it would be a
 // projection the list does not offer.
-func handleListFindings(sessions sessionUseCases, reads consoleReadUseCases) stdhttp.HandlerFunc {
+func handleListFindings(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if _, ok := resolveSession(w, r, sessions); !ok {
 			return
@@ -365,7 +364,7 @@ func handleListFindings(sessions sessionUseCases, reads consoleReadUseCases) std
 // A run whose finished_at is null is rendered as such: a wedged worker and an
 // idle one are otherwise indistinguishable, and the contract says rendering
 // that is worth the trouble.
-func handleListReconciliationRuns(sessions sessionUseCases, reads consoleReadUseCases) stdhttp.HandlerFunc {
+func handleListReconciliationRuns(sessions sessionUseCases, reads ConsoleReadUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if _, ok := resolveSession(w, r, sessions); !ok {
 			return
@@ -491,9 +490,9 @@ func renderFundingBucket(row FundingBucketRecord) fundingBucketRecord {
 		AccountID:     wireInstants(row.AccountID),
 		Status:        row.Status,
 		Balances: balances{
-			Settled:   money{MinorUnits: row.Balances.Settled},
-			Held:      money{MinorUnits: row.Balances.Held},
-			Available: money{MinorUnits: row.Balances.Available},
+			Settled:   money{MinorUnits: row.Settled},
+			Held:      money{MinorUnits: row.Held},
+			Available: money{MinorUnits: row.Available},
 		},
 		Version:   row.Version,
 		OpenedAt:  wireInstants(row.OpenedAt),
