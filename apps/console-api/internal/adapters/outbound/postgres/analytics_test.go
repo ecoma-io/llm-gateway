@@ -3,11 +3,14 @@ package postgres
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/analytics"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
@@ -722,6 +725,90 @@ func TestTheReadNeverWrites(t *testing.T) {
 				t.Errorf("the read issued a %s statement:\n%s\nanalytics is derived; a rebuild is this same read at a later instant and not a second writer to a table the ledger owns", verb, statement)
 			}
 		}
+	}
+}
+
+// TestTheBoundIsRefusedTheSameWayWhereverItIsReached is the one property the
+// read has that a real database cannot be asked for twice, and the reason
+// this file is a driver at all.
+//
+// The read is bounded by SET LOCAL statement_timeout, and a bound is not
+// instantaneous: on a report wide enough to time out, the statement answers
+// with its FIRST rows and the timeout lands while those rows are being read.
+// The two moments are different to the caller in a way that matters — the
+// first is a statement this plane issued, the second is a read of rows the
+// statement had already handed over — and a classifier wired only to the
+// first would report the second as a plain failure. The surface then answers
+// a slow report with an operator's page instead of a retry.
+//
+// So the two are asked separately, because the two go through different code:
+// one raises the error the Query returns, the other raises it from
+// rows.Err() after the scan. A classifier that handled the first and not the
+// second is the exact defect, and it is invisible to an integration run whose
+// statements return one row at a time.
+func TestTheBoundIsRefusedTheSameWayWhereverItIsReached(t *testing.T) {
+	tests := []struct {
+		name string
+		// arm is how the scripted driver is told where the bound will land.
+		arm func(s *scriptedDriver)
+		// wantOverflow is whether the caller is expected to be told the read
+		// exceeded its bound, as opposed to that the read simply failed.
+		wantOverflow bool
+	}{
+		{
+			name: "at the statement",
+			arm: func(s *scriptedDriver) {
+				s.failAt(0, &pgconn.PgError{Code: pgQueryCanceled})
+			},
+			wantOverflow: true,
+		},
+		{
+			name: "while the rows are being read",
+			arm: func(s *scriptedDriver) {
+				s.failWalkAt(0, &pgconn.PgError{Code: pgQueryCanceled})
+			},
+			wantOverflow: true,
+		},
+		{
+			name: "while the rows are being read, at the other SQLSTATE a bound can end on",
+			arm: func(s *scriptedDriver) {
+				s.failWalkAt(0, &pgconn.PgError{Code: pgAdminShutdown})
+			},
+			wantOverflow: true,
+		},
+		{
+			// The control. A query error is a real failure whatever the
+			// statement was, and calling it an overrun would tell a caller to
+			// retry a statement the database is going to refuse identically
+			// every time.
+			name: "on a query error, which is a failure and not an overrun",
+			arm: func(s *scriptedDriver) {
+				s.failWalkAt(0, &pgconn.PgError{Code: "42703"})
+			},
+			wantOverflow: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, db := newScripted(t, readShape...)
+			tt.arm(s)
+
+			_, _, err := NewAnalytics(New(db)).Usage(t.Context(), scriptedQuery("018f0000-0000-7000-8000-000000000001"))
+			if err == nil {
+				t.Fatalf("the read reported success over a statement that failed: %d statements ran", len(s.statements()))
+			}
+			// The exhaustion is reported through the sentinel rather than by
+			// matching text, so a reworded message cannot quietly stop being
+			// the refusal the surface depends on.
+			if got := errors.Is(err, errAnalyticsReadExceeded); got != tt.wantOverflow {
+				if tt.wantOverflow {
+					t.Errorf("the read failed with %v, want the overrun refusal: the surface answers this with a retry rather than a failure, because the database is answering and only this report is slow", err)
+				} else {
+					t.Errorf("the read reported %v as an overrun, want the error itself: a query error is a failure, and telling the caller to retry sends it back to a statement the database refuses identically every time", err)
+				}
+			}
+		})
 	}
 }
 

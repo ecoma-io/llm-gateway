@@ -73,6 +73,17 @@ var bucketIDForm = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89
 // confused with a genuine query error: the surface answers the first with a
 // retry-later refusal and the second with a failure, and a caller that got the
 // wrong one would treat a temporarily slow report as a broken one.
+//
+// The names are constants because the classification is a claim, and a claim
+// expressed as two string literals in a switch is a claim no test can name:
+// this file is the one place a tier can pose "a bound reached mid-walk is the
+// same refusal as a bound reached at the statement", and it can only ask it of
+// values the production code reads.
+const (
+	pgQueryCanceled = "57014"
+	pgAdminShutdown = "57P01"
+)
+
 var (
 	errAnalyticsReadExceeded      = errors.New("postgres: analytics read exceeded its bound")
 	errAnalyticsOutsideUnitOfWork = errors.New("postgres: analytics fact attribution requires a unit of work")
@@ -698,7 +709,7 @@ func (r *analyticsRepo) classifyRead(what string, err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
-		case "57014", "57P01":
+		case pgQueryCanceled, pgAdminShutdown:
 			return fmt.Errorf("postgres: %s: %w", what, errAnalyticsReadExceeded)
 		}
 	}
