@@ -90,7 +90,7 @@ export type AnalyticsUsageResponse = {
   final_bucket_partial: boolean;
   /**
    * One point per bucket in the range, in ascending order, with no bucket omitted. A bucket with no activity is present with zero figures rather than absent, so a caller renders a gap-free series without having to fill holes and invent a rule for which holes to fill.
-   * At the maximum range of 90 days the finest grain yields 2160 buckets, and that is the bound: 90 days at hourly granularity is the longest series this surface will produce, and asking for it is what the maximum range is for. The bound is stated here rather than requested as a parameter because it is a property of the answer, not a preference of the caller.
+   * At the maximum range of 90 days the finest grain yields at most 2161 buckets, and that is the bound: 90 days is 2160 hours, and the first bucket of a range is the bucket CONTAINING its start rather than one clipped to it, so a caller asking for 09:00 on 1 June to 09:00 on 30 August has 2161 of them — the first holding half an hour. A bound of 2160 would refuse that range, and would refuse every unaligned range in the last hour of the maximum window. The bound is stated here rather than requested as a parameter because it is a property of the answer, not a preference of the caller.
    */
   series: Array<AnalyticsSeriesPoint>;
   /**
