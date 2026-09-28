@@ -110,7 +110,7 @@ async function mint() {
 
 <template>
   <Stack gap="md" class="max-w-2xl">
-    <Card title="Create an API key" :description="`Keys are created for this account. ${''}`">
+    <Card title="Create an API key" description="Keys are created for this account.">
       <Stack gap="md">
         <TextField
           v-model="displayName"
