@@ -5,6 +5,142 @@ export type ClientOptions = {
 };
 
 /**
+ * Whether this plane holds a derivation for the queried range.
+ * `available` means the figures below ARE the answer to the range asked of, and it is what a run that legitimately found nothing reports. `not_available` means this plane holds no derived rows for the range at all: the usage it names has not been ingested, or it predates this surface. It is an ANSWER, not a failure — a caller renders it as an empty series and asks for a later range.
+ * It is never a stand-in for a failed derivation. A failure is a non-2xx status carrying the ErrorEnvelope, and no value of this enum is ever returned with one. The distinction is the whole reason this field exists rather than the absence of the figures: "nothing happened" and "we do not know" are different sentences, and a caller that cannot tell them apart will draw a chart of the second and call it the first.
+ */
+export type AnalyticsAvailability = "available" | "not_available";
+
+export type AnalyticsFreshness = {
+  /**
+   * The instant this plane last completed a pass over the usage-fact feed.
+   * Read this field for what it names and nothing more. It is a LIVENESS signal, not a completeness one: it says when the Control Plane last moved through the feed, and it does NOT say that every fact the runtime has emitted is reflected in the figures below. The two are different questions and only the first can be answered from this plane's own state, because the feed's high-water mark is the Data Plane's to publish and this surface does not read it. A figure for a range whose instant is at or after `data_through` may still be missing work; a figure for a range entirely before it is as complete as this plane can make it.
+   * The consequence a caller must design around, and the reason this field is here rather than left implicit: NOTHING IN THIS SYSTEM CLOSES A PERIOD. There is no accounting period, no close, no lock, and no reconciliation window that is a financial period — those are the worker's own sweep windows. So a late fact lands in the bucket it lands in and quietly changes a figure that was already reported, and re-running the same range later may return a different number. A report over a range that ends well before `data_through` is stable in the sense that a later pass will not move it; a report whose end is near or after `data_through` is provisional, and a caller that treats a provisional number as a closed one will restate a customer's bill.
+   */
+  data_through: string;
+  /**
+   * What `data_through` is a statement about, so a caller can tell this from a watermark without the contract having to change when one arrives.
+   * `fact_feed_pass` is a record-time of this plane's own ingestion loop. It is never an event-time of the runtime that produced the usage, and a bucket is never assigned to it. The single-member enumeration is deliberate: it is what makes the absence of a true watermark visible in the contract rather than implied by a field that looks like one.
+   */
+  basis: "fact_feed_pass";
+};
+
+export type AnalyticsRange = {
+  /**
+   * The inclusive lower bound of the range, as an absolute instant.
+   */
+  start_at: string;
+  /**
+   * The EXCLUSIVE upper bound of the range, as an absolute instant.
+   * Half-open by construction — inclusive below, exclusive above — so two consecutive ranges tile the timeline with no overlap and no gap. An inclusive upper bound would make the instant a range ends at belong to two ranges at once, and a recomputed lower bound would skip the band between them.
+   */
+  end_at: string;
+  /**
+   * The IANA zone the bucket boundaries in this answer are rendered in.
+   * The STORAGE of every figure in this contract is UTC and always will be: a wall-clock reading in some operator's zone must never move a commercial boundary, so a day boundary is a UTC instant before it is a local one. This field exists because that is not the same as being what the reader wants to see, and a chart labelled in the wrong zone is wrong in a way no number can defend. The response echoes the zone its buckets were cut on, so a caller renders the instants it was given rather than re-deriving them.
+   * A zone changes where the bucket EDGES fall and nothing else. The monetary figures are sums of UTC instants either way, so the same range costs the same amount at `Asia/Ho_Chi_Minh` as it does at UTC — only the labels move.
+   * Under a daylight-saving transition a `day` bucket is 23 or 25 hours long, and a `calendar_month` is the zone's calendar month. This is why every bucket carries BOTH `bucket_start` and `bucket_end` rather than a start and a nominal width: a reader can tell how long the bucket actually was, and an export can be re-aggregated without re-deriving what a bucket meant.
+   */
+  timezone: string;
+};
+
+export type AnalyticsSeriesPoint = {
+  /**
+   * The inclusive start of this bucket, in the range's zone.
+   */
+  bucket_start: string;
+  /**
+   * The exclusive end of this bucket, in the range's zone.
+   */
+  bucket_end: string;
+  /**
+   * Requests this plane holds a usage FACT for, whose fact names at least one of the account's funding buckets, and whose fact this plane applied inside this bucket.
+   * The name is the definition, and it is deliberately not "requests". The runtime's ADMITTED-request population is not derivable here: a request that produced no fact leaves no row in this plane's fact tables at all, so counting the requests a query can see and calling them the requests admitted measures the set of requests this plane knows about. This figure is that set, honestly named — requests whose usage reached the account's capacity and was recorded.
+   * It is the denominator of `requests_settled`, and that is a real rate with a real meaning: the share of this account's fact-producing requests that reached a charge. It is NOT the denominator of a rejection or an error rate, because this plane holds no population a rejected request could belong to.
+   * It is scoped to the account, so it counts only requests this account's own funding buckets paid for. A fact whose allocation tail named no bucket of this account — a zero-priced settle, whose tail is empty by construction — belongs to no account and is counted in none.
+   */
+  requests_with_usage_facts: number;
+  /**
+   * Requests that reached a settlement of record AND were attributed to this account, in this bucket. A zero-priced settle settles for nothing and is a settlement of record, but it names no funding bucket — the account is derived from the allocation tail, and an empty tail derives no account. Such a request is therefore counted in a platform-wide view and in no account's report, which is the tenancy rule stated in §5 applied literally: a fact that draws on no bucket of an account belongs to no account. A caller needing free-model traffic counted needs a platform-scoped view, which this endpoint deliberately is not.
+   */
+  requests_settled: number;
+};
+
+/**
+ * One account's usage over one range, at one grain.
+ * EVERY MONETARY FIGURE HERE IS AN INTEGER NUMBER OF MINOR UNITS. No field in this response carries a currency, and that is the contract rather than a field deferred: the money domain holds no currency value either, because the settlement currency is configuration that lives above the domain and no per-row currency column exists anywhere to contradict it. A consumer takes the deployment's own currency from its configuration; one that guesses has invented a currency the model never had.
+ */
+export type AnalyticsUsageResponse = {
+  availability: AnalyticsAvailability;
+  /**
+   * The metric family this answer reports, so a client can bind a renderer to a family rather than to a field that happens to be present today. It is an enumeration with one member because the one-member case is still a family, and a second one arriving is a contract review rather than a silent widening.
+   */
+  metric: "usage";
+  range: AnalyticsRange;
+  /**
+   * The width of one point in `series`. A closed enumeration, and the request's `granularity` must be one of these values.
+   * A report mixing grains is a defect rather than a wide sheet: without the grain recorded, a figure cannot be re-aggregated without re-deriving what a bucket meant. `calendar_month` is a CALENDAR month in the range's zone — February, not thirty days — and `day` is a local day, so under a daylight-saving transition one is 23 or 25 hours long, which is what `bucket_end` is for.
+   */
+  granularity: "hour" | "day" | "calendar_month";
+  /**
+   * Whether the range's `end_at` falls INSIDE the last bucket, so that bucket has not finished filling and its figures will grow.
+   * True for any range whose end is not exactly a bucket boundary in the range's zone, which is almost every range — a caller asking for "up to now" gets a bucket that is minutes old. False means the last bucket is complete at the instant the range ended, and with `freshness.data_through` well past that instant, is stable against later passes.
+   * This is a fact about the RANGE, not about the data, which is why it is separate from `availability`: an empty partial bucket is still a partial bucket, and a caller drawing it as a complete zero is drawing a number this plane never claimed.
+   */
+  final_bucket_partial: boolean;
+  /**
+   * One point per bucket in the range, in ascending order, with no bucket omitted. A bucket with no activity is present with zero figures rather than absent, so a caller renders a gap-free series without having to fill holes and invent a rule for which holes to fill.
+   * At the maximum range of 90 days the finest grain yields 2160 buckets, and that is the bound: 90 days at hourly granularity is the longest series this surface will produce, and asking for it is what the maximum range is for. The bound is stated here rather than requested as a parameter because it is a property of the answer, not a preference of the caller.
+   */
+  series: Array<AnalyticsSeriesPoint>;
+  /**
+   * The range total of `series[].requests_with_usage_facts`, repeated on the envelope so a caller that wants one number does not have to sum a series it may not have been sent in full. Read it as the field above says: the requests whose usage this plane recorded, not every request the runtime admitted.
+   */
+  requests_with_usage_facts: number;
+  /**
+   * The range total of `series[].requests_settled`.
+   */
+  requests_settled: number;
+  /**
+   * What the range COST, summed over the settlements of record it contains.
+   * BUCKETED BY `settlements.created_at` — the database clock, at the instant the settlement was booked. Never by the fact's `occurred_at`: that is the runtime's clock, clocks disagree between processes, and ordering one plane's records by another plane's timestamps is how a modest skew becomes a fact filed outside the window it belongs to. This is the one attribution axis a money figure may use, and it is this plane's own.
+   * Summed from settlement headers, never from per-request re-derivations. A re-derived per-request amount is a ROUNDED figure — the derivation applies one ceiling over a request's summed raw cost — and the sum of rounded figures is not the rounded total. Adding one such figure per request overstates the total, and overstates it in proportion to volume: a thousand one-minor-unit requests settle for one minor unit between them, and a naive sum of their per-request ceilings would bill a thousand. The settlement header is the authority here precisely because it is written once and summed, with no rounding anywhere in the aggregate.
+   */
+  settled_amount_minor_units: number;
+  /**
+   * Held capacity RETURNED unused across the range, from the ledger's release legs. BUCKETED BY `ledger_entries.created_at`, the same database clock as the settled figure above.
+   * It is never netted against `settled_amount_minor_units`, and the reason is present tense rather than future: a release moves the HELD axis and a consume moves the SETTLED axis. They are different balances of different legs, so there is no arithmetic today that nets them into one figure — a net number would not be a refund, it would be a subtraction of two unrelated quantities.
+   * (A refund is also a concept this model does not have. One arriving would be a new leg kind, and this field would keep its meaning untouched.)
+   */
+  released_amount_minor_units: number;
+  /**
+   * Capacity the account was credited across the range — entitlement grants and operator top-ups alike, from the ledger's two crediting leg kinds. BUCKETED BY `ledger_entries.created_at`.
+   * Keyed on the ledger's own leg kinds rather than on a payment concept, because the ledger already HAS both kinds and a payment integration adds a WRITER to them rather than new concepts. A figure computed from these kinds is correct today and needs no shape change when an automated top-up starts arriving through one.
+   * This is capacity credited, which is not revenue and not income. Nothing in this plane has ever received a payment.
+   */
+  funds_added_minor_units: number;
+  /**
+   * Capacity reserved and not yet consumed, as at the range's end.
+   */
+  held_minor_units: number;
+  /**
+   * Capacity settled and unspent, as at the range's end: the settled balance less the held balance.
+   * `held_minor_units` and `available_minor_units` are POINT-IN-TIME balances and are NOT bucketed: they are the account's balance as at the range's end, reported on every point of the series because a caller that received them once had no way to know they were true only of the end. `available` is `settled - held` and both terms are non-negative by construction.
+   * They are the CACHED balances the accounting projection already maintains, read and never re-derived — and they are exact in a way a per-request spend is not. A cached balance is a running exact integer accumulation of signed leg deltas, never a sum of rounded per-request figures, which is why these two may be summed and the money above may not be summed from its parts.
+   */
+  available_minor_units: number;
+  /**
+   * How the SETTLEMENTS in this range captured their usage, split by the three methods the fact grammar admits.
+   * The counts are over SETTLEMENTS THAT CAPTURED — `kind = settled` — and a release or an expiry captures nothing, so it is not a settlement that failed to capture but a settlement that is not of this kind. A fact claiming no usage while being disclaimed also carries a capture method and books no charge, which is why the population is the settlements and not the facts. A rate over this object divides by the sum of its three members, never by the number of facts in the range.
+   * `reservation_floor` is the interesting one and the reason this split exists at all: it is the count of settlements whose figure was the reservation's own — a clamp that bound, or the basis fall-through when neither the provider's report nor the gateway's own count arrived. It is a measure of pricing confidence, and a rising floor is a signal about the upstream's usage reporting rather than about this account. A figure derived from it is biased upward against a report that would have arrived, and no average cost computed here mixes the two without saying so.
+   */
+  capture: {
+    [key: string]: never;
+  };
+  freshness: AnalyticsFreshness;
+};
+
+/**
  * A key's ownership record as every read but the mint returns it. The credential is absent, not null: this plane stores no plaintext and no digest, and the Data Plane's credential record is written only by the Data Plane (ADR 0006 §8).
  */
 export type ApiKey = {
@@ -1394,3 +1530,71 @@ export type ListReconciliationRunsResponses = {
 
 export type ListReconciliationRunsResponse =
   ListReconciliationRunsResponses[keyof ListReconciliationRunsResponses];
+
+export type GetUsageData = {
+  body?: never;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path?: never;
+  query: {
+    /**
+     * The inclusive lower bound of the range, as an absolute instant in RFC 3339. Required rather than defaulted: a range that defaults to "the last thirty days" answers a question nobody asked, and a caller cannot tell a default from a choice.
+     */
+    from: string;
+    /**
+     * The EXCLUSIVE upper bound of the range, as an absolute instant in RFC 3339. Half-open with `from`, so two consecutive ranges tile the timeline with neither overlap nor gap.
+     */
+    to: string;
+    /**
+     * The width of one point in the series. A closed enumeration, and the request may name nothing outside it. There is deliberately no `group_by`: the dimensions a caller may slice by are the ones this surface writes a query for, and a caller that named a column would be naming the schema.
+     */
+    granularity: "hour" | "day" | "calendar_month";
+    /**
+     * The IANA zone to cut the buckets in. Optional, and defaults to UTC, which is also where every figure is stored. A local zone changes where the bucket EDGES fall and nothing else: the monetary figures are UTC instants summed either way. A zone that cannot be resolved is HTTP 400, never a silent fallback to UTC — a chart in the wrong zone is wrong in a way no figure defends.
+     */
+    timezone?: string;
+  };
+  url: "/usage";
+};
+
+export type GetUsageErrors = {
+  /**
+   * The request is well-formed HTTP but a parameter does not satisfy this surface's contract — an unparseable value, a value outside its declared bounds, or an unknown parameter the caller cannot be allowed to believe took effect. On the projection operations this response also carries `unsupported_version`: the message was written for a protocol version this surface does not support, so its meaning cannot be vouched for and nothing about it is applied — the sender succeeds unchanged once both ends speak the same version.
+   */
+  400: ErrorEnvelope;
+  /**
+   * The caller did not identify itself as a service this surface accepts. Management surfaces authenticate callers, not users: a browser session and a customer API key are both rejected here, because neither is a service identity (ADR 0006 §9).
+   */
+  401: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+  /**
+   * The service is up and not ready: one of its own dependencies is not answering yet — for the Console API, its database. The condition is expected to clear, so a caller retries later rather than differently, and the code is `service_unavailable`. Which dependency is missing is the operator's fact, logged against the request identifier, never the client's.
+   */
+  503: ErrorEnvelope;
+};
+
+export type GetUsageError = GetUsageErrors[keyof GetUsageErrors];
+
+export type GetUsageResponses = {
+  /**
+   * The account's usage over the range. A range this plane holds no derivation for is a 200 with `availability: not_available` and an empty series — an answer, not a failure, and distinct from a range that is simply quiet.
+   */
+  200: AnalyticsUsageResponse;
+};
+
+export type GetUsageResponse = GetUsageResponses[keyof GetUsageResponses];

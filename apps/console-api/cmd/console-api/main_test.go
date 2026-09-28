@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
 // The lifecycle tests below drive run() against a real listener, because the
@@ -36,7 +38,7 @@ func TestNewHandlerGatesReadinessOnTheStoreItWasGiven(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := newHandler("v0.1.0", answeringStore{pingErr: tt.pingErr}, refuseEverySessionUseCase{}, refuseEveryConsoleRead{})
+			handler := newHandler("v0.1.0", answeringStore{pingErr: tt.pingErr}, refuseEverySessionUseCase{}, refuseEveryConsoleRead{}, stubAnalytics{}, map[string]string{testScopeToken: testScopeAccount})
 
 			rec := httptest.NewRecorder()
 			handler.ServeHTTP(rec, httptest.NewRequest(stdhttp.MethodGet, "/readyz", nil))
@@ -51,7 +53,7 @@ func TestNewHandlerGatesReadinessOnTheStoreItWasGiven(t *testing.T) {
 	// store is a dependency of the probe, not a replacement for the
 	// application.
 	rec := httptest.NewRecorder()
-	newHandler("v0.1.0", answeringStore{}, refuseEverySessionUseCase{}, refuseEveryConsoleRead{}).ServeHTTP(rec, httptest.NewRequest(stdhttp.MethodGet, "/version", nil))
+	newHandler("v0.1.0", answeringStore{}, refuseEverySessionUseCase{}, refuseEveryConsoleRead{}, stubAnalytics{}, map[string]string{testScopeToken: testScopeAccount}).ServeHTTP(rec, httptest.NewRequest(stdhttp.MethodGet, "/version", nil))
 	if got := rec.Body.String(); got != "{\"version\":\"v0.1.0\"}\n" {
 		t.Errorf("GET /version: body = %q, want the stamped version", got)
 	}
@@ -66,6 +68,27 @@ type answeringStore struct {
 
 // Ping implements the readiness port the server constructor is handed.
 func (s answeringStore) Ping(context.Context) error { return s.pingErr }
+
+// The analytics half of the wiring test's construction, in the same spirit as
+// answeringStore: a store that holds no derived rows, and a scope table with
+// exactly one entry. The probes are what this test asserts on, so the product
+// surface needs to be constructible and nothing more — but it does need to be
+// CONSTRUCTED, because a handler mounted without it refuses to build, and a
+// readiness test that started failing on an unrelated panic would be a test
+// that has stopped being about readiness.
+const (
+	testScopeToken   = "console-test-token"
+	testScopeAccount = "018f0000-0000-7000-8000-000000000001"
+)
+
+// stubAnalytics is the read model: no derived rows, so the use case it backs
+// answers NOT_AVAILABLE for whatever account the scope resolved.
+type stubAnalytics struct{}
+
+// Usage implements persistence.Analytics.
+func (stubAnalytics) Usage(context.Context, persistence.UsageQuery) (persistence.Usage, persistence.Freshness, error) {
+	return persistence.Usage{}, persistence.Freshness{}, nil
+}
 
 func TestRunDrainsAnInFlightRequestBeforeReturning(t *testing.T) {
 	listener := listenForTest(t)

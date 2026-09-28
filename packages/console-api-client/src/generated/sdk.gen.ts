@@ -15,6 +15,9 @@ import type {
   GetSessionData,
   GetSessionErrors,
   GetSessionResponses,
+  GetUsageData,
+  GetUsageErrors,
+  GetUsageResponses,
   GetVersionData,
   GetVersionErrors,
   GetVersionResponses,
@@ -317,3 +320,25 @@ export const listReconciliationRuns = <ThrowOnError extends boolean = false>(
     ListReconciliationRunsErrors,
     ThrowOnError
   >({ url: "/reconciliation/runs", ...options });
+
+/**
+ * The caller's account usage over a range
+ *
+ * Returns one account's usage figures over a half-open range `[from, to)`, cut into buckets of the requested granularity.
+ * SCOPE IS DERIVED, NEVER REQUESTED. There is no account parameter on this operation and no other way for a caller to name the account these figures are about. The scope comes from the credential on the request, resolved on the server, and it is applied inside the statement that produces the numbers rather than after it. A caller therefore has nothing to tamper with: there is no filter on the request to tamper with, and a caller that presents a scope it was not granted is refused rather than silently answered for its own.
+ * WHAT THIS SERVES, AND WHAT IT DELIBERATELY DOES NOT. Every figure is derived from the Control Plane's own state — the settlement headers of record, the usage-fact ledger, and the accounting projection's cached balances — and every one of them is reconstructable from that state. None is an authority, and the ledger remains the money record: a usage figure and the ledger disagreeing is a defect in the figure.
+ * THE POPULATION IS NAMED, NOT ASSUMED. This plane cannot derive the requests the runtime ADMITTED: a request that produced no usage fact leaves no row here at all, so any "requests admitted" figure it published would measure the set of requests it knows about and call it the set of requests. The counts here are therefore named for what they count — `requests_with_usage_facts` — and the absence of the operational metrics below is the same finding seen from the other side.
+ * Requests, latency, attempts, per-model and per-provider spend, routing outcomes, egress and token counts are NOT served, and their absence is a decision rather than a gap. They are the Data Plane's facts, no cross-plane read path to them exists, and a figure this surface cannot source honestly is one it will not serve — not at zero, which would be a false statement about a customer, and not as an empty series, which would render as a quiet month.
+ * NOTHING HERE IS CLOSED. No period is closed anywhere in this system: no accounting period, no close, no lock. A late usage fact lands in the bucket it lands in and changes a figure that was already reported, so a range ending near `freshness.data_through` is provisional, and `final_bucket_partial` says so structurally. Read the freshness object before treating any of this as a bill.
+ * SERVED AT `/usage`, like every product operation here: this document's server base is `/`, so the path a caller calls is the path declared above. The runtime's namespace prefix is `/v1/` and nothing on this surface is served under it (ADR 0006 §5).
+ * BOUNDS ARE REFUSALS. A range longer than 90 days, a `from` at or after `to`, a granularity outside the enumeration, or an unknown query parameter is HTTP 400 with `invalid_request`. Nothing is clamped: a silently shortened range is indistinguishable from the range that was asked for, and a caller could not learn of the mismatch anywhere.
+ * The answer is subject to a per-request deadline. A caller that exceeds it receives HTTP 503 with `service_unavailable`, which is a retry-later answer rather than a differently-shaped one.
+ */
+export const getUsage = <ThrowOnError extends boolean = false>(
+  options: Options<GetUsageData, ThrowOnError>,
+): RequestResult<GetUsageResponses, GetUsageErrors, ThrowOnError> =>
+  (options.client ?? client).get<GetUsageResponses, GetUsageErrors, ThrowOnError>({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/usage",
+    ...options,
+  });

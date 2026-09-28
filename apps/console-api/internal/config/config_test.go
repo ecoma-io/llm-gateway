@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,21 @@ import (
 // secret-bearing nature demands: no error out of Load ever carries it.
 const dsnPassword = "gateway-dev-only"
 
+// testAnalyticsScope is the scope table every case below starts from: one
+// credential naming one account. It is a secret-bearing test value in the same
+// way the DSN password is, and the assertion that no error out of Load ever
+// carries it is the same one.
+const testAnalyticsScope = `{"console-test-token":"018f0000-0000-7000-8000-000000000001"}`
+
+// testAnalytics is that same table once parsed, which is what every case below
+// that succeeds expects. It is a function rather than a var because the map is
+// shared: a case that wrote to it would change what every later case sees.
+func testAnalytics() Analytics {
+	return Analytics{Scope: map[string]string{
+		"console-test-token": "018f0000-0000-7000-8000-000000000001",
+	}}
+}
+
 func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -22,7 +38,7 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 	}{
 		{
 			name: "uses explicit defaults when no variables are set",
-			env:  requiredDataPlaneEnv(),
+			env:  requiredEnv(),
 			want: Config{
 				Addr:              DefaultAddr,
 				ShutdownTimeout:   DefaultShutdownTimeout,
@@ -43,11 +59,12 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					IngestionTimeout:   DefaultIngestionTimeout,
 				},
 				Reconciliation: defaultReconciliation(),
+				Analytics:      testAnalytics(),
 			},
 		},
 		{
 			name: "uses supplied environment values",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_ADDR":                "127.0.0.1:9090",
 				"CONSOLE_API_SHUTDOWN_TIMEOUT":    "15s",
 				"CONSOLE_API_READ_HEADER_TIMEOUT": "3s",
@@ -72,11 +89,12 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					IngestionTimeout:   DefaultIngestionTimeout,
 				},
 				Reconciliation: defaultReconciliation(),
+				Analytics:      testAnalytics(),
 			},
 		},
 		{
 			name: "uses supplied postgres values",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_DSN":                "postgres://gateway:console-secret@db.internal:5433/control?sslmode=require",
 				"CONSOLE_API_POSTGRES_MAX_OPEN_CONNS":     "25",
 				"CONSOLE_API_POSTGRES_MAX_IDLE_CONNS":     "5",
@@ -103,11 +121,12 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					IngestionTimeout:   DefaultIngestionTimeout,
 				},
 				Reconciliation: defaultReconciliation(),
+				Analytics:      testAnalytics(),
 			},
 		},
 		{
 			name: "uses supplied data plane values",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_DATAPLANE_URL":        "https://mgmt.internal.example/gateway",
 				"CONSOLE_API_DATAPLANE_CREDENTIAL": "production-management-credential",
 				"CONSOLE_API_PROJECTION_INTERVAL":  "500ms",
@@ -135,81 +154,87 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					IngestionTimeout:   45 * time.Second,
 				},
 				Reconciliation: defaultReconciliation(),
+				Analytics:      testAnalytics(),
 			},
 		},
 		{
-			name:    "rejects a missing data plane URL",
-			env:     map[string]string{"CONSOLE_API_DATAPLANE_CREDENTIAL": testDataplaneCredential},
+			name: "rejects a missing data plane URL",
+			// WITHOUT the base: the whole point of this case is a variable that
+			// is not set at all, so it cannot be merged over a table that sets
+			// it. The scope table is present because the case is about the Data
+			// Plane URL, and a case that failed on the missing scope instead
+			// would not be about the thing it names.
+			env:     map[string]string{"CONSOLE_API_ANALYTICS_SCOPE": testAnalyticsScope, "CONSOLE_API_DATAPLANE_CREDENTIAL": testDataplaneCredential},
 			wantErr: "CONSOLE_API_DATAPLANE_URL must be set",
 		},
 		{
 			name:    "rejects a missing data plane credential",
-			env:     map[string]string{"CONSOLE_API_DATAPLANE_URL": testDataplaneURL},
+			env:     map[string]string{"CONSOLE_API_ANALYTICS_SCOPE": testAnalyticsScope, "CONSOLE_API_DATAPLANE_URL": testDataplaneURL},
 			wantErr: "CONSOLE_API_DATAPLANE_CREDENTIAL must be set",
 		},
 		{
 			name: "rejects an explicitly empty data plane credential",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_DATAPLANE_URL":        testDataplaneURL,
 				"CONSOLE_API_DATAPLANE_CREDENTIAL": "",
-			},
+			}),
 			wantErr: "CONSOLE_API_DATAPLANE_CREDENTIAL must not be empty",
 		},
 		{
 			name: "rejects a data plane URL of another scheme",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_DATAPLANE_URL":        "ftp://" + testDataplaneURL,
 				"CONSOLE_API_DATAPLANE_CREDENTIAL": testDataplaneCredential,
-			},
+			}),
 			wantErr: "CONSOLE_API_DATAPLANE_URL must use the http or https scheme",
 		},
 		{
 			name: "rejects a data plane URL with no host",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_DATAPLANE_URL":        "http://",
 				"CONSOLE_API_DATAPLANE_CREDENTIAL": testDataplaneCredential,
-			},
+			}),
 			wantErr: "CONSOLE_API_DATAPLANE_URL must name a host",
 		},
 		{
 			name: "rejects a data plane URL carrying a query",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_DATAPLANE_URL":        testDataplaneURL + "?route=management",
 				"CONSOLE_API_DATAPLANE_CREDENTIAL": testDataplaneCredential,
-			},
+			}),
 			wantErr: "CONSOLE_API_DATAPLANE_URL must carry no query or fragment",
 		},
 		{
 			name: "rejects a zero projection interval",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_PROJECTION_INTERVAL": "0s",
 			}),
 			wantErr: "CONSOLE_API_PROJECTION_INTERVAL must be greater than zero",
 		},
 		{
 			name: "rejects a malformed projection timeout",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_PROJECTION_TIMEOUT": "soon",
 			}),
 			wantErr: "CONSOLE_API_PROJECTION_TIMEOUT must be a Go duration",
 		},
 		{
 			name: "rejects a zero ingestion interval",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_INGESTION_INTERVAL": "0s",
 			}),
 			wantErr: "CONSOLE_API_INGESTION_INTERVAL must be greater than zero",
 		},
 		{
 			name: "rejects a malformed ingestion timeout",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_INGESTION_TIMEOUT": "soon",
 			}),
 			wantErr: "CONSOLE_API_INGESTION_TIMEOUT must be a Go duration",
 		},
 		{
 			name: "uses supplied reconciliation values",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_RECONCILIATION_INTERVAL": "90s",
 				"CONSOLE_API_RECONCILIATION_TIMEOUT":  "10m",
 				"CONSOLE_API_RECONCILIATION_BATCH":    "250",
@@ -240,32 +265,33 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					Batch:    250,
 					Lookback: 48 * time.Hour,
 				},
+				Analytics: testAnalytics(),
 			},
 		},
 		{
 			name: "rejects a zero reconciliation interval",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_RECONCILIATION_INTERVAL": "0s",
 			}),
 			wantErr: "CONSOLE_API_RECONCILIATION_INTERVAL must be greater than zero",
 		},
 		{
 			name: "rejects a malformed reconciliation timeout",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_RECONCILIATION_TIMEOUT": "soon",
 			}),
 			wantErr: "CONSOLE_API_RECONCILIATION_TIMEOUT must be a Go duration",
 		},
 		{
 			name: "rejects a zero reconciliation batch",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_RECONCILIATION_BATCH": "0",
 			}),
 			wantErr: "CONSOLE_API_RECONCILIATION_BATCH must be greater than zero",
 		},
 		{
 			name: "rejects a zero reconciliation lookback",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_RECONCILIATION_LOOKBACK": "0s",
 			}),
 			wantErr: "CONSOLE_API_RECONCILIATION_LOOKBACK must be greater than zero",
@@ -280,7 +306,7 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			// "timeout equal to interval" read as a refusal rather than as the
 			// tight loop it is.
 			name: "accepts a reconciliation timeout equal to the interval",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_RECONCILIATION_INTERVAL": "30s",
 				"CONSOLE_API_RECONCILIATION_TIMEOUT":  "30s",
 			}),
@@ -309,11 +335,12 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 					Batch:    DefaultReconciliationBatch,
 					Lookback: DefaultReconciliationLookback,
 				},
+				Analytics: testAnalytics(),
 			},
 		},
 		{
 			name: "rejects a reconciliation timeout below the interval",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_RECONCILIATION_INTERVAL": "1m",
 				"CONSOLE_API_RECONCILIATION_TIMEOUT":  "10s",
 			}),
@@ -325,7 +352,7 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			// this process grants its in-flight work, and a budget past that
 			// tail is a pass whose overrun only SIGKILL can end.
 			name: "rejects a reconciliation timeout past the shutdown tail",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_RECONCILIATION_INTERVAL": "1m",
 				"CONSOLE_API_RECONCILIATION_TIMEOUT":  "24h",
 			}),
@@ -333,7 +360,7 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 		},
 		{
 			name: "rejects a reconciliation lookback narrower than the interval",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_RECONCILIATION_INTERVAL": "10m",
 				"CONSOLE_API_RECONCILIATION_TIMEOUT":  "20m",
 				"CONSOLE_API_RECONCILIATION_LOOKBACK": "5m",
@@ -342,150 +369,150 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 		},
 		{
 			name: "rejects an explicitly empty address",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_ADDR": "",
 			}),
 			wantErr: "CONSOLE_API_ADDR must not be empty",
 		},
 		{
 			name: "rejects an address without a TCP port",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_ADDR": "127.0.0.1",
 			}),
 			wantErr: "CONSOLE_API_ADDR must be a host:port address",
 		},
 		{
 			name: "rejects a named TCP port",
-			env: merge(requiredDataPlaneEnv(), map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_ADDR": ":http",
 			}),
 			wantErr: "CONSOLE_API_ADDR must contain a numeric port",
 		},
 		{
 			name: "rejects an empty shutdown timeout",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_SHUTDOWN_TIMEOUT": "",
-			},
+			}),
 			wantErr: "CONSOLE_API_SHUTDOWN_TIMEOUT must not be empty",
 		},
 		{
 			name: "rejects a zero shutdown timeout",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_SHUTDOWN_TIMEOUT": "0s",
-			},
+			}),
 			wantErr: "CONSOLE_API_SHUTDOWN_TIMEOUT must be greater than zero",
 		},
 		{
 			name: "rejects a negative read header timeout",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_READ_HEADER_TIMEOUT": "-1s",
-			},
+			}),
 			wantErr: "CONSOLE_API_READ_HEADER_TIMEOUT must be greater than zero",
 		},
 		{
 			name: "rejects a malformed duration",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_READ_HEADER_TIMEOUT": "soon",
-			},
+			}),
 			wantErr: "CONSOLE_API_READ_HEADER_TIMEOUT must be a Go duration",
 		},
 		{
 			name: "rejects an explicitly empty postgres DSN",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_DSN": "",
-			},
+			}),
 			wantErr: "CONSOLE_API_POSTGRES_DSN must not be empty",
 		},
 		{
 			name: "rejects an explicitly empty max open conns",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_MAX_OPEN_CONNS": "",
-			},
+			}),
 			wantErr: "CONSOLE_API_POSTGRES_MAX_OPEN_CONNS must not be empty",
 		},
 		{
 			name: "rejects a non-integer max open conns",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_MAX_OPEN_CONNS": "plenty",
-			},
+			}),
 			wantErr: "CONSOLE_API_POSTGRES_MAX_OPEN_CONNS must be an integer",
 		},
 		{
 			name: "rejects a zero max open conns",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_MAX_OPEN_CONNS": "0",
-			},
+			}),
 			wantErr: "CONSOLE_API_POSTGRES_MAX_OPEN_CONNS must be greater than zero",
 		},
 		{
 			name: "rejects a negative max open conns",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_MAX_OPEN_CONNS": "-1",
-			},
+			}),
 			wantErr: "CONSOLE_API_POSTGRES_MAX_OPEN_CONNS must be greater than zero",
 		},
 		{
 			name: "rejects a negative max idle conns",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_MAX_IDLE_CONNS": "-1",
-			},
+			}),
 			wantErr: "CONSOLE_API_POSTGRES_MAX_IDLE_CONNS must not be negative",
 		},
 		{
 			name: "rejects max idle conns above max open conns",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_MAX_OPEN_CONNS": "2",
 				"CONSOLE_API_POSTGRES_MAX_IDLE_CONNS": "5",
-			},
+			}),
 			wantErr: "CONSOLE_API_POSTGRES_MAX_IDLE_CONNS (5) must not exceed CONSOLE_API_POSTGRES_MAX_OPEN_CONNS (2)",
 		},
 		{
 			name: "rejects an explicitly empty conn max lifetime",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_CONN_MAX_LIFETIME": "",
-			},
+			}),
 			wantErr: "CONSOLE_API_POSTGRES_CONN_MAX_LIFETIME must not be empty",
 		},
 		{
 			name: "rejects a zero conn max lifetime",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_CONN_MAX_LIFETIME": "0s",
-			},
+			}),
 			wantErr: "CONSOLE_API_POSTGRES_CONN_MAX_LIFETIME must be greater than zero",
 		},
 		{
 			name: "rejects a malformed conn max idle time",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_CONN_MAX_IDLE_TIME": "soon",
-			},
+			}),
 			wantErr: "CONSOLE_API_POSTGRES_CONN_MAX_IDLE_TIME must be a Go duration",
 		},
 		{
 			name: "rejects a postgres DSN that is not a URL",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_DSN": "postgres://gateway:" + dsnPassword + "@127.0.0.1:5432/contr%zzol",
-			},
+			}),
 			wantErr: "CONSOLE_API_POSTGRES_DSN must be a URL",
 		},
 		{
 			name: "rejects a postgres DSN of another scheme",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_DSN": "mysql://gateway:" + dsnPassword + "@127.0.0.1:3306/control",
-			},
+			}),
 			wantErr: "CONSOLE_API_POSTGRES_DSN must be a postgres:// or postgresql:// URL",
 		},
 		{
 			name: "rejects a postgres DSN with no database in its path",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_DSN": "postgres://gateway:" + dsnPassword + "@127.0.0.1:5432/?sslmode=disable",
-			},
+			}),
 			wantErr: "CONSOLE_API_POSTGRES_DSN must name exactly one database in its path",
 		},
 		{
 			name: "rejects a postgres DSN naming the other plane's database",
-			env: map[string]string{
+			env: merge(requiredEnv(), map[string]string{
 				"CONSOLE_API_POSTGRES_DSN": "postgres://gateway:" + dsnPassword + "@127.0.0.1:5432/dataplane?sslmode=disable",
-			},
+			}),
 			wantErr: "CONSOLE_API_POSTGRES_DSN names database \"dataplane\", but this application owns only the control database",
 		},
 	}
@@ -508,7 +535,7 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Load() error = %v", err)
 			}
-			if got != tt.want {
+			if !reflect.DeepEqual(got, tt.want) {
 				// Redacted, not %#v-raw: a dumped Config carries Postgres.DSN,
 				// and a test failure is CI output the whole world can read.
 				t.Errorf("Load() = %s, want %s", redactDSN(got), redactDSN(tt.want))
@@ -530,10 +557,26 @@ const (
 
 // requiredDataPlaneEnv is the smallest environment Load accepts: the two
 // required data plane values, everything else defaulted.
-func requiredDataPlaneEnv() map[string]string {
+// requiredEnv is every variable Load refuses to start without, so that a case
+// written about something else does not have to repeat them — and so that a new
+// required variable is one edit here rather than one per case.
+//
+// All three are the same kind of requirement: a process with no reachable Data
+// Plane façade, no credential to reach it with, or no way to name the account a
+// caller speaks for has nothing to serve, and none of the three is a value this
+// process is entitled to invent. A default for the scope table in particular
+// would be an access control that guesses an account, which is worse than none
+// because the guess reads as an authorization.
+//
+// The scope table is a JSON object because a bearer token is not a value any
+// other variable type carries without quoting rules a token does not obey, and
+// because the alternative — a table spread over indexed variables — would let a
+// deployment set the last entry and silently lose the first four.
+func requiredEnv() map[string]string {
 	return map[string]string{
 		"CONSOLE_API_DATAPLANE_URL":        testDataplaneURL,
 		"CONSOLE_API_DATAPLANE_CREDENTIAL": testDataplaneCredential,
+		"CONSOLE_API_ANALYTICS_SCOPE":      testAnalyticsScope,
 	}
 }
 

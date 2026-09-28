@@ -134,6 +134,16 @@ type seamStore struct {
 	world *seamWorld
 }
 
+// WithinTxAt runs the work at the level asked for, which this seam's store
+// records but does not act on. The seam is about the pipeline's shape — what
+// runs inside the page's unit of work and in what order — and the one read
+// that asks for a stronger level is the analytics read, which this seam does
+// not make. The level is still honoured in the log rather than dropped, so a
+// caller that did start asking through this store would show it here.
+func (s seamStore) WithinTxAt(ctx context.Context, isolation persistence.Isolation, fn func(context.Context) error) error {
+	return s.WithinTx(ctx, fn)
+}
+
 func (s seamStore) WithinTx(ctx context.Context, fn func(context.Context) error) error {
 	s.world.mu.Lock()
 	s.world.log = append(s.world.log, "begin")

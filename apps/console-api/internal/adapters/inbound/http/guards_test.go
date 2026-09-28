@@ -128,7 +128,7 @@ const formBody = "display_name=ci"
 // Nothing in the guard tests is about the use cases — they are about the
 // transport refusing — so the fake is the permissive one.
 func call(method, path, body string, options requestOptions) *httptest.ResponseRecorder {
-	return callOn(New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases()), method, path, body, options)
+	return callOn(New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), stubUsage()), method, path, body, options)
 }
 
 // callOn is call against an already-built handler, for a test that needs its own
@@ -449,7 +449,7 @@ func TestASessionIsUnauthenticatedWhateverTheReason(t *testing.T) {
 			}
 			req.Header.Set(RequestIDHeader, "unauthenticated-request")
 			rec := httptest.NewRecorder()
-			New(application.New("test"), &answeringPinger{}, useCases, newFakeConsoleReadUseCases()).ServeHTTP(rec, req)
+			New(application.New("test"), &answeringPinger{}, useCases, newFakeConsoleReadUseCases(), stubUsage()).ServeHTTP(rec, req)
 
 			if rec.Code != stdhttp.StatusUnauthorized {
 				t.Fatalf("a %s session: status = %d, want 401 (body %q)", tt.name, rec.Code, rec.Body.String())
@@ -476,7 +476,7 @@ func TestASessionIsUnauthenticatedWhateverTheReason(t *testing.T) {
 // it appears and it appears once.
 func TestTheMintCarriesItsCredentialExactlyOnce(t *testing.T) {
 	useCases := newFakeSessionUseCases()
-	rec := callOn(New(application.New("test"), &answeringPinger{}, useCases, newFakeConsoleReadUseCases()),
+	rec := callOn(New(application.New("test"), &answeringPinger{}, useCases, newFakeConsoleReadUseCases(), stubUsage()),
 		stdhttp.MethodPost, "/api-keys", mintBody, requestOptions{})
 
 	if rec.Code != stdhttp.StatusCreated {
@@ -523,7 +523,7 @@ func TestAMintedKeyStillRefusesSerialisation(t *testing.T) {
 // back-forward cache, in a corporate proxy's store — and there is no way to
 // revoke a copy nobody told the server about.
 func TestTheProductResponseIsUncacheable(t *testing.T) {
-	handler := New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
+	handler := New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), stubUsage())
 
 	// A successful product response, and a refused one: an error body carries a
 	// request id, and a cached error is a way to replay a request a caller
@@ -567,7 +567,7 @@ func TestTheProductResponseIsUncacheable(t *testing.T) {
 // from a bug. The exemption is pinned to exactly those paths here, so a fourth
 // path cannot inherit it by accident.
 func TestTheProbesAreTheDocumentedExemption(t *testing.T) {
-	handler := New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
+	handler := New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), stubUsage())
 	for _, path := range []string{"/healthz", "/readyz", "/version"} {
 		req := httptest.NewRequest(stdhttp.MethodGet, path, nil)
 		req.Header.Set(RequestIDHeader, "probe-request")
@@ -606,7 +606,7 @@ func TestSignInRefusalsAreByteIdentical(t *testing.T) {
 		t.Run(cause.Error(), func(t *testing.T) {
 			useCases := newFakeSessionUseCases()
 			useCases.signInErr = cause
-			rec := callOn(New(application.New("test"), &answeringPinger{}, useCases, newFakeConsoleReadUseCases()),
+			rec := callOn(New(application.New("test"), &answeringPinger{}, useCases, newFakeConsoleReadUseCases(), stubUsage()),
 				stdhttp.MethodPost, "/auth/sign-in", signInBody, requestOptions{})
 
 			if rec.Code != stdhttp.StatusUnauthorized {
@@ -682,7 +682,7 @@ func TestACrossAccountResourceIs404Not403(t *testing.T) {
 			useCases := newFakeSessionUseCases()
 			useCases.mintErr = crossAccount
 
-			rec := callOn(New(application.New("test"), &answeringPinger{}, useCases, newFakeConsoleReadUseCases()),
+			rec := callOn(New(application.New("test"), &answeringPinger{}, useCases, newFakeConsoleReadUseCases(), stubUsage()),
 				stdhttp.MethodPost, "/api-keys", mintBody, tt.options)
 
 			if rec.Code == stdhttp.StatusForbidden {

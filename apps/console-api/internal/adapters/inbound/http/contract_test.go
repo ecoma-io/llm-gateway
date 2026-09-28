@@ -41,7 +41,7 @@ const contractPath = "../../../../../../api/openapi/console.yaml"
 // The whole table is read, the handlers are never called, so the fake's answers
 // are irrelevant; it is here to satisfy the signature.
 func routeTableForTest() []route {
-	return routes(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
+	return routes(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), stubUsage())
 }
 
 // TestTheRouteTableIsTheContract is the closure between what this application

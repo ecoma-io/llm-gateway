@@ -282,6 +282,51 @@ func (s *store) InUnitOfWork(ctx context.Context) bool {
 // call answers ErrTxDone without touching the driver — the no-op Rollback
 // the standard library exists to make safe.
 func (s *store) WithinTx(ctx context.Context, fn func(context.Context) error) error {
+	return s.WithinTxAt(ctx, persistence.IsolationReadCommitted, fn)
+}
+
+// txOptionsFor translates the port's isolation into the driver's own constants,
+// and REFUSES a level it does not have rather than falling back to the
+// default.
+//
+// The refusal is the whole point of the function. sql.LevelDefault means "the
+// driver's choice", which for this driver is read committed — so a caller
+// asking for repeatable read and silently receiving read committed would get a
+// report whose five statements each see a different moment, and nothing in the
+// result would say so. An adapter that quietly substituted one isolation for
+// another would make the port's promise unkeepable at the exact place it
+// matters, and a name the port invented is a name this adapter is the only
+// reader of, so there is nowhere else for the mismatch to be caught.
+func txOptionsFor(isolation persistence.Isolation) (*sql.TxOptions, error) {
+	switch isolation {
+	case persistence.IsolationReadCommitted:
+		// nil, and nil means the driver's default — which is this level. See
+		// WithinTxAt for why naming it would be a downgrade.
+		return nil, nil
+	case persistence.IsolationRepeatableRead:
+		return &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}, nil
+	default:
+		return nil, fmt.Errorf("postgres: unknown isolation %q: the port names read committed and repeatable read, and this adapter will not substitute one for the other", isolation)
+	}
+}
+
+// WithinTxAt opens the unit of work at the level the caller asked for, which
+// is the only place the level can be stated: PostgreSQL takes the isolation on
+// the BEGIN, and refuses both SET TRANSACTION and set_config('transaction_
+// isolation') once the transaction has issued a query. A caller that had to
+// keep its first statement reserved for the setting would be relying on an
+// ordering nothing enforces, which is a worse guarantee than the one this
+// gives.
+//
+// The join-or-begin decision is WithinTx's, unchanged and for the same reason:
+// a transaction already in flight on this store's own pool owns the scope, and
+// the level the OWNER began at is the level this scope runs at. A caller asking
+// for repeatable read inside a read-committed unit gets read committed, and that
+// is deliberate — a nested scope cannot raise the level of the transaction it
+// joined, and pretending otherwise would hand back a snapshot the database is
+// not providing. The caller that needs the stronger level is the one that must
+// ask for it outermost.
+func (s *store) WithinTxAt(ctx context.Context, isolation persistence.Isolation, fn func(context.Context) error) error {
 	if _, ok := ctx.Value(txKey{db: s.db}).(*sql.Tx); ok {
 		// A transaction is already in flight on this store's own pool: this
 		// scope belongs to it, and the owner of that transaction is the one
@@ -295,9 +340,19 @@ func (s *store) WithinTx(ctx context.Context, fn func(context.Context) error) er
 		return fn(ctx)
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	// nil options for READ COMMITTED, and that is not a shortcut. The driver
+	// rejects a non-default isolation level from a connection that does not
+	// implement ConnBeginTx, so a store handed one of those connections would
+	// REFUSE every unit of work — including the overwhelmingly common one that
+	// asks for nothing in particular. The default already is read committed, so
+	// naming it changes nothing at the server and buys a failure at the client.
+	options, err := txOptionsFor(isolation)
 	if err != nil {
-		return fmt.Errorf("postgres: begin transaction: %w", err)
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, options)
+	if err != nil {
+		return fmt.Errorf("postgres: begin transaction at %s: %w", isolation, err)
 	}
 	defer func() { _ = tx.Rollback() }()
 

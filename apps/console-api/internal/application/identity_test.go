@@ -40,6 +40,14 @@ func (s *identityStore) Ping(context.Context) error { return nil }
 func (s *identityStore) Querier(context.Context) persistence.Querier {
 	return unusedQuerier{}
 }
+
+// WithinTxAt counts the unit and runs it, at the level asked for or not: the
+// identity use case's own units are all read-committed, and the one repository
+// that asks for more does so against the real store, not this fake.
+func (s *identityStore) WithinTxAt(ctx context.Context, isolation persistence.Isolation, fn func(context.Context) error) error {
+	return s.WithinTx(ctx, fn)
+}
+
 func (s *identityStore) WithinTx(ctx context.Context, fn func(context.Context) error) error {
 	s.units++
 	return fn(ctx)

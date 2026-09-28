@@ -124,7 +124,7 @@ func newFakeConsoleReadUseCases() *fakeConsoleReadUseCases {
 // is the live one: the reads' account comes from the session, and a test that
 // wanted the two to disagree would set its own Principal.
 func newFakeSessionWithReadUseCases(reads *fakeConsoleReadUseCases) stdhttp.Handler {
-	return New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), reads)
+	return New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), reads, stubUsage())
 }
 
 func (f *fakeConsoleReadUseCases) AccountOverview(_ context.Context, accountID string) (AccountOverviewResult, error) {

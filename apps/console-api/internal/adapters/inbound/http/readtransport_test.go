@@ -100,7 +100,7 @@ func TestEveryReadRequiresALiveSession(t *testing.T) {
 			req := httptest.NewRequest(stdhttp.MethodGet, path, nil)
 			req.Header.Set(RequestIDHeader, "unauthenticated-read")
 			rec := httptest.NewRecorder()
-			New(newTestApp(), &answeringPinger{}, newFakeSessionUseCases(), reads).ServeHTTP(rec, req)
+			New(newTestApp(), &answeringPinger{}, newFakeSessionUseCases(), reads, stubUsage()).ServeHTTP(rec, req)
 
 			if rec.Code != stdhttp.StatusUnauthorized {
 				t.Errorf("GET %s with no session: status = %d, want 401 (body %q)", path, rec.Code, rec.Body.String())
@@ -118,7 +118,7 @@ func TestEveryReadRequiresALiveSession(t *testing.T) {
 	req.AddCookie(signedInCookie())
 	req.Header.Set(RequestIDHeader, "dead-session-read")
 	rec := httptest.NewRecorder()
-	New(newTestApp(), &answeringPinger{}, dead, reads).ServeHTTP(rec, req)
+	New(newTestApp(), &answeringPinger{}, dead, reads, stubUsage()).ServeHTTP(rec, req)
 	if rec.Code != stdhttp.StatusUnauthorized {
 		t.Errorf("GET /account/overview with a dead session: status = %d, want 401", rec.Code)
 	}

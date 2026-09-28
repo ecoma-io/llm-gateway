@@ -501,13 +501,14 @@ assert_equals "the namespace carries the ownership comment, byte for byte" \
 # or LIKE check it would silently unconstrain the twenty-one tables already in
 # it, and a table that appears without anybody reading the diff is precisely
 # the failure a control-plane schema change can least afford. ADR 0012's
-# Consequences names this by name. `sessions` extends the list in the same
-# change that creates the table, and the count moves with it.
-assert_equals "the namespace holds exactly the identity, commerce, projection, accounting, ingestion, reconciliation and session schemas' twenty-two tables" \
-	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "22"
-assert_equals "the control tables are the identity, commerce, projection, accounting, ingestion, reconciliation and session foundations' set" \
+# Consequences names this by name. `sessions` and `analytics_fact_dimensions`
+# each extend the list in the change that creates the table, and the count
+# moves with them.
+assert_equals "the namespace holds exactly the identity, commerce, projection, accounting, ingestion, reconciliation, session and analytics schemas' twenty-three tables" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "23"
+assert_equals "the control tables are the identity, commerce, projection, accounting, ingestion, reconciliation, session and analytics foundations' set" \
 	"$(psql_scalar "$control_db" "SELECT string_agg(tablename, ',' ORDER BY tablename COLLATE \"C\") FROM pg_tables WHERE schemaname = 'control'")" \
-	"account_payg,accounts,api_keys,applied_facts,entitlements,funding_buckets,ingestion_cursor,ledger_entries,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,quarantined_facts,reconciliation_findings,reconciliation_runs,sessions,settlements,subscriptions,users"
+	"account_payg,accounts,analytics_fact_dimensions,api_keys,applied_facts,entitlements,funding_buckets,ingestion_cursor,ledger_entries,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,quarantined_facts,reconciliation_findings,reconciliation_runs,sessions,settlements,subscriptions,users"
 assert_equals "the projection counter is a seeded singleton with a timeline epoch" \
 	"$(psql_scalar "$control_db" "SELECT count(*) FROM control.projection_revision WHERE id = 1 AND last_revision = (SELECT count(*) FROM control.accounts) AND epoch IS NOT NULL")" \
 	"1"

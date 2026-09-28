@@ -276,6 +276,7 @@ func main() {
 	applier := application.NewFactApplier(accounting,
 		postgres.NewAppliedFacts(store),
 		postgres.NewQuarantinedFacts(store),
+		postgres.NewFactDimensions(store),
 	)
 	ingestion := application.NewFactIngestion(consumer, store, postgres.NewIngestionCursor(store), applier)
 
@@ -350,7 +351,7 @@ func main() {
 	defer stop()
 
 	server := &stdhttp.Server{
-		Handler: newHandler(version, store, sessions, reads),
+		Handler: newHandler(version, store, sessions, reads, postgres.NewAnalytics(store), cfg.Analytics.Scope),
 		// ReadHeaderTimeout guards against a peer that connects and says
 		// nothing — a slowloris costs a goroutine forever without it. The
 		// read/write body and idle timeouts wait until there is real traffic
@@ -717,8 +718,21 @@ func newHandler(
 	readiness persistence.Pinger,
 	sessions http.SessionUseCases,
 	reads http.ConsoleReadUseCases,
+	analytics persistence.Analytics,
+	scopes map[string]string,
 ) stdhttp.Handler {
-	return http.New(application.New(version), readiness, sessions, reads)
+	// The scope table is the wiring of the usage surface and nothing else's.
+	// The table came out of config.Load, which has already refused an empty
+	// one, so the error below is unreachable through main — it is handled
+	// rather than unwrapped because a resolver that does not resolve is not
+	// something a handler should be built on, and a control plane that answers
+	// every report for the wrong reason is worse than one that does not start.
+	resolver, err := http.NewStaticScoper(scopes)
+	if err != nil {
+		log.Printf("console-api analytics: the scope table cannot be used: %v", err)
+		os.Exit(1)
+	}
+	return http.New(application.New(version), readiness, sessions, reads, application.NewUsageUseCase(analytics, resolver))
 }
 
 // buildConsoleSurface is the wiring newHandler refuses to do for itself: it

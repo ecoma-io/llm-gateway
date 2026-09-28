@@ -102,9 +102,16 @@ func newPipelineWorld(t *testing.T) *pipelineWorld {
 		postgres.NewPaygAccounts(store),
 		postgres.NewClock(store),
 	)
+	// The analytics attribution is the applier's fourth dependency, and it is
+	// wired here exactly as the composition root wires it. The reason it is a
+	// dependency of the APPLIER and not of the read path is the whole design:
+	// a fact is attributed in the same unit of work that settles it, so a
+	// settlement can never be committed without the analytics row that scopes
+	// it — and no repair job can be the thing that remembers.
 	applier := application.NewFactApplier(accounting,
 		postgres.NewAppliedFacts(store),
 		postgres.NewQuarantinedFacts(store),
+		postgres.NewFactDimensions(store),
 	)
 
 	world := &pipelineWorld{
@@ -282,12 +289,72 @@ func (w *pipelineWorld) quarantinedReason(t *testing.T, requestID string, append
 	return reason, true
 }
 
+// attributionOf reads the analytics row a pass wrote for one fact: the class it
+// was filed under, the account it was scoped to, and when this plane applied
+// it. It reads the table directly, because the port the read model speaks
+// through is the aggregate one — there is no Find for a single dimension row,
+// and adding one would give the write path a way to be called that the read
+// model does not actually use.
+//
+// The class is a parameter rather than a constant because the two tests that
+// call this need opposite postures. One asks "is the settlement's row there,"
+// which a row filed under the wrong class must fail — a settlement counted as
+// an unbillable orphan is a report wrong in a way no aggregate read surfaces.
+// The other asks "is there anything at all for this request," which is the
+// question a rollback has to answer yes to.
+func (w *pipelineWorld) attributionOf(t *testing.T, requestID, kindClass string) (accountID string, appliedAt time.Time, found bool) {
+	t.Helper()
+	err := w.store.Querier(t.Context()).QueryRowContext(t.Context(),
+		`SELECT account_id, applied_at
+		   FROM control.analytics_fact_dimensions
+		  WHERE request_id = $1 AND kind_class = $2`,
+		requestID, kindClass).Scan(&accountID, &appliedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", time.Time{}, false
+	}
+	if err != nil {
+		t.Fatalf("read the analytics attribution for %s/%s: %v", requestID, kindClass, err)
+	}
+	return accountID, appliedAt, true
+}
+
+// attributionsOf lists every attribution a request carries, in any class. It
+// exists because the negative assertion it serves is the one a class-scoped
+// read cannot make: asking "is there no row under this class" is answered yes
+// just as readily by a row filed under the other one, and that is exactly the
+// defect a rollback assertion would wave through — an attribution that
+// survived a rollback under a class nobody thought to look for.
+func (w *pipelineWorld) attributionsOf(t *testing.T, requestID string) []string {
+	t.Helper()
+	rows, err := w.store.Querier(t.Context()).QueryContext(t.Context(),
+		`SELECT kind_class FROM control.analytics_fact_dimensions
+		  WHERE request_id = $1 ORDER BY kind_class`, requestID)
+	if err != nil {
+		t.Fatalf("read the analytics attributions for %s: %v", requestID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var classes []string
+	for rows.Next() {
+		var class string
+		if err := rows.Scan(&class); err != nil {
+			t.Fatalf("scan the class for %s: %v", requestID, err)
+		}
+		classes = append(classes, class)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate the classes for %s: %v", requestID, err)
+	}
+	return classes
+}
+
 // TestAReplayPassSettlesAppliesAndAdvancesAsOneUnit drives the whole
 // pipeline through the happy path and then through the same page again. The
-// first pass must leave settlement, ledger legs, applied row and position in
-// one committed state; the second must re-read the same range, book nothing,
-// and leave every number where the first pass left it — replay is a read
-// before it is ever a second write, on the real engine and not a fake of it.
+// first pass must leave settlement, ledger legs, applied row, analytics
+// attribution and position in one committed state; the second must re-read
+// the same range, book nothing, and leave every number where the first pass
+// left it — replay is a read before it is ever a second write, on the real
+// engine and not a fake of it.
 func TestAReplayPassSettlesAppliesAndAdvancesAsOneUnit(t *testing.T) {
 	world := newPipelineWorld(t)
 	ctx := t.Context()
@@ -308,8 +375,9 @@ func TestAReplayPassSettlesAppliesAndAdvancesAsOneUnit(t *testing.T) {
 		t.Fatalf("Replay() = %+v, want one applied fact and no more", result)
 	}
 
-	// The settlement of record, with its lineage row and the position that
-	// claims it: the three durable halves of one derivation.
+	// The settlement of record, with its lineage row, the account it was
+	// attributed to, and the position that claims it: the four durable halves
+	// of one derivation.
 	settlement, err := postgres.NewSettlements(world.store).ByRequestID(ctx, accounting.RequestID(requestID))
 	if err != nil {
 		t.Fatalf("ByRequestID() error = %v, want the settled fact's settlement", err)
@@ -326,6 +394,23 @@ func TestAReplayPassSettlesAppliesAndAdvancesAsOneUnit(t *testing.T) {
 	}
 	if applied.SettledAmount == nil || *applied.SettledAmount != 13_500 {
 		t.Errorf("applied row settled amount = %v, want 13_500", applied.SettledAmount)
+	}
+	// The fourth half, and the one whose absence is invisible from every other
+	// assertion here. The settlement can be right, the applied row can be
+	// right, the position can advance — and a read model scoped to this account
+	// still shows nothing, because the fact was never told which account it
+	// belonged to. That is the failure the attribution exists to make
+	// impossible, and it is why the row is written on the pass's own context
+	// rather than after the commit.
+	account, appliedAt, attributed := world.attributionOf(t, requestID, ingestion.ClassSettlement)
+	if !attributed {
+		t.Fatalf("the fact settled and was applied, and nothing says which account it belonged to — the money is real and the read model is blind to it")
+	}
+	if account != string(bucket.AccountID) {
+		t.Errorf("the fact was attributed to account %q, want the account that owns its bucket %q — the account rides the funding bucket, so a mis-attribution is a tenancy error", account, bucket.AccountID)
+	}
+	if appliedAt.IsZero() {
+		t.Errorf("the attribution has no instant; the range predicate reads this column, and a zero would file the fact outside every window")
 	}
 	if position, err := postgres.NewIngestionCursor(world.store).Position(ctx); err != nil || position != "cursor-pipeline-2" {
 		t.Fatalf("Position() = (%q, %v), want the page's own next_cursor — the pass committed its claim", position, err)
@@ -360,6 +445,19 @@ func TestAReplayPassSettlesAppliesAndAdvancesAsOneUnit(t *testing.T) {
 	if settled, held, available := world.readBalances(t, bucket.ID); settled != 36_500 || held != 0 || available != 36_500 {
 		t.Errorf("balances after the replay = (settled %d, held %d, available %d), want the first pass's — a replay moves no money", settled, held, available)
 	}
+	// The redelivery is where an attribution defect would double a chart's
+	// bars rather than lose them, which is the harder failure to notice: a
+	// dropped request is a gap, and a counted one twice is a lie. The table's
+	// primary key is the same (request_id, kind_class) applied_facts enforces,
+	// so the second pass must find its own row already there.
+	afterReplay, replayAt, replayedAttribution := world.attributionOf(t, requestID, ingestion.ClassSettlement)
+	if !replayedAttribution {
+		t.Fatalf("the attribution present after the first pass is gone after the replay; deliveries are not effects, and neither is an attribution")
+	}
+	if afterReplay != account || !replayAt.Equal(appliedAt) {
+		t.Errorf("the replayed pass wrote a different attribution = (account %q, applied at %s), want the first pass's (%q, %s) — a second row is a second count of one request",
+			afterReplay, replayAt, account, appliedAt)
+	}
 
 	// The two reads bracket the advance: the first pass asked from wherever
 	// the singleton stood before it — the fixture is shared, so the seed is
@@ -377,10 +475,10 @@ func TestAReplayPassSettlesAppliesAndAdvancesAsOneUnit(t *testing.T) {
 // TestAPageThatFailsHalfwayLeavesNothingBehind is the whole-page law on the
 // real engine: the page's first fact books a full settlement, its second
 // names a bucket the ledger does not know, and the pass must come back as an
-// error with nothing committed — not the settlement, not its applied row,
-// not the position. The next pass re-reads both facts; what the first one
-// derived is free to derive again, and what the second one refused is still
-// there for a human.
+// error with nothing committed — not the settlement, not its applied row, not
+// the account the fact belonged to, not the position. The next pass re-reads
+// both facts; what the first one derived is free to derive again, and what the
+// second one refused is still there for a human.
 func TestAPageThatFailsHalfwayLeavesNothingBehind(t *testing.T) {
 	world := newPipelineWorld(t)
 	ctx := t.Context()
@@ -423,6 +521,29 @@ func TestAPageThatFailsHalfwayLeavesNothingBehind(t *testing.T) {
 	}
 	if reason, quarantined := world.quarantinedReason(t, bad, 7); quarantined {
 		t.Errorf("the refused fact was quarantined with %q; an accounting refusal is a state of the plane, not the fact's disposition", reason)
+	}
+	// The fourth half, and the one a rollback must be able to undo. An
+	// attribution committed while its settlement rolled back would be the
+	// worst of the three failure shapes available here: the request would
+	// appear on a usage chart with money that no settlement ever booked, and
+	// the chart's own reconciliation against the ledger would be the only
+	// thing that could say so.
+	if _, _, attributed := world.attributionOf(t, good, ingestion.ClassSettlement); attributed {
+		t.Errorf("the rolled-back fact is still scoped to an account; a read model showing a request whose settlement never committed is a figure no ledger row supports")
+	}
+	if _, _, attributed := world.attributionOf(t, bad, ingestion.ClassSettlement); attributed {
+		t.Errorf("the refused fact was attributed anyway; a fact the accounting layer rejected named no account, so it can belong to none")
+	}
+	// In ANY class, which is the only form of the question that catches an
+	// attribution that survived the rollback filed under the class the check
+	// above did not ask for. A row the page should never have produced, found
+	// by a test that only looked under one name, is the defect a class-scoped
+	// negative assertion waves through.
+	if classes := world.attributionsOf(t, good); len(classes) != 0 {
+		t.Errorf("the rolled-back fact carries attributions %v, want none — the page committed an account for a settlement it rolled back", classes)
+	}
+	if classes := world.attributionsOf(t, bad); len(classes) != 0 {
+		t.Errorf("the refused fact carries attributions %v, want none — a fact that derived no legs belongs to no account", classes)
 	}
 	if position, err := postgres.NewIngestionCursor(world.store).Position(ctx); err != nil || position != before {
 		t.Fatalf("Position() = (%q, %v), want %q — nothing moved", position, err, before)

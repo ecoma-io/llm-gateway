@@ -279,6 +279,64 @@ func (a *accountingRepos) newEntitlementBucket(t *testing.T, name string) accoun
 // appendCommitted runs one append in its own committed unit of work and
 // returns the stamped leg and the bucket as the echo left it — the
 // fixture's way of moving the world through the port and never around it.
+// heldConsumeCommitted books one charge: the settlement header, the hold that
+// reserves capacity and the consume that spends it, the last two in one unit
+// of work.
+//
+// Two refusals are avoided rather than worked around. A consume with no
+// matching held reservation is refused — `insufficient held balance` — because
+// the ledger's algebra has no overdraw, so a bare consume is not a shape the
+// system can produce. And a consume names its settlement, which is a RESTRICT
+// foreign key, so the header has to exist: the helper mints both rather than
+// taking a settlement id from its caller, because a caller-supplied id is one
+// more thing a fixture can get wrong in a way that reads as a ledger bug.
+func (a *accountingRepos) heldConsumeCommitted(t *testing.T, bucketID accounting.FundingBucketID, raw int64) {
+	t.Helper()
+	settlementID := acctSettlementID(t)
+	if _, err := a.settlements.Create(t.Context(), accounting.Settlement{
+		ID:           settlementID,
+		RequestID:    acctRequestID(t),
+		SettledTotal: acctAmount(t, raw),
+		CreatedAt:    time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create the settlement: %v", err)
+	}
+	reservation := acctReservation(t)
+	err := a.store.WithinTx(t.Context(), func(ctx context.Context) error {
+		if _, _, err := a.ledger.Append(ctx, a.holdEntry(t, bucketID, raw, reservation)); err != nil {
+			return err
+		}
+		_, _, err := a.ledger.Append(ctx, a.consumeEntry(t, bucketID, raw, settlementID))
+		return err
+	})
+	if err != nil {
+		t.Fatalf("hold and consume %d on bucket %s: %v", raw, bucketID, err)
+	}
+}
+
+// heldThenReleased books a reservation of held and gives back part of it: a
+// hold leg, a settlement header for the released part, and a release leg
+// against the SAME reservation and that header. This is the shape a request
+// that reserved capacity and then let it go produces, and it is the pair a
+// test about released money needs — a release names both the hold it is
+// releasing and a settlement, and either one named without a row behind it is
+// refused by the schema rather than by the domain.
+func (a *accountingRepos) heldThenReleased(t *testing.T, bucketID accounting.FundingBucketID, held, released int64) {
+	t.Helper()
+	reservation := acctReservation(t)
+	settlementID := acctSettlementID(t)
+	if _, err := a.settlements.Create(t.Context(), accounting.Settlement{
+		ID:           settlementID,
+		RequestID:    acctRequestID(t),
+		SettledTotal: acctAmount(t, released),
+		CreatedAt:    time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create the released settlement: %v", err)
+	}
+	a.appendCommitted(t, a.holdEntry(t, bucketID, held, reservation))
+	a.appendCommitted(t, a.releaseEntry(t, bucketID, released, reservation, settlementID))
+}
+
 func (a *accountingRepos) appendCommitted(t *testing.T, entry accounting.LedgerEntry) (accounting.LedgerEntry, accounting.Bucket) {
 	t.Helper()
 	var stamped accounting.LedgerEntry

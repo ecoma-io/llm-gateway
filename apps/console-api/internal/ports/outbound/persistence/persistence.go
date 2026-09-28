@@ -104,6 +104,26 @@ type Querier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// Isolation is the level a unit of work runs at, as the port names it.
+//
+// It is a port type rather than the driver's so that a caller asking for a
+// level is asking the port, and the adapter is the only thing that knows which
+// driver constant that is. Two levels and no more, because the two are the two
+// answers to two questions: ReadCommitted for a unit that WRITES, where the
+// plane's guarded-statement model is the concurrency control, and RepeatableRead
+// for a unit that READS several statements to answer one question and must see
+// one moment. A caller wanting SERIALIZABLE is asking for a retry policy as
+// well, and the port makes that a conversation rather than a constant.
+type Isolation string
+
+const (
+	// IsolationReadCommitted is the default every write runs at.
+	IsolationReadCommitted Isolation = "read committed"
+	// IsolationRepeatableRead makes every statement in the unit see the
+	// snapshot the unit's first statement saw.
+	IsolationRepeatableRead Isolation = "repeatable read"
+)
+
 // Store is everything the application layer may ask of the Control Plane
 // database.
 type Store interface {
@@ -159,6 +179,27 @@ type Store interface {
 	// (`SELECT set_config(...)`) and owns the retry policy that level
 	// demands; the port neither hides nor automates that choice.
 	WithinTx(ctx context.Context, fn func(ctx context.Context) error) error
+
+	// WithinTxAt runs fn as one unit of work at a stated isolation, and is
+	// the port's answer to the read that runs SEVERAL statements about ONE
+	// question.
+	//
+	// It exists because the sentence above cannot be acted on for this case.
+	// Raising the level with `set_config` as the first statement does not
+	// work: PostgreSQL refuses it with 25001 the moment the transaction has
+	// issued any query, and it refuses SET TRANSACTION for the same reason, so
+	// a caller relying on that route has to keep its first statement reserved
+	// for the setting and be right about it every time. The level belongs on
+	// the BEGIN, where the database takes it before anything can contradict
+	// it.
+	//
+	// A repeatable-read unit can fail with a serialization failure where a
+	// read-committed one would not, and the retry policy for that belongs to
+	// the caller — the same rule the sentence above states for the set_config
+	// route, and for the same reason. A read that must not be retried, and a
+	// read that can, are both expressible here; the port does not choose for
+	// the caller which one it is.
+	WithinTxAt(ctx context.Context, isolation Isolation, fn func(ctx context.Context) error) error
 
 	// InUnitOfWork reports whether ctx carries a unit of work this store
 	// opened or joined — the same lookup Querier and WithinTx make, so the

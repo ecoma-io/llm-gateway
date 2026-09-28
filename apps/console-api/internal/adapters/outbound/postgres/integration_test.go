@@ -37,7 +37,7 @@ import (
 // adminDSN returns the environment's admin DSN, failing the test with the fix
 // when the variable is absent — the same contract the moon test-integration
 // gate states before go test is even invoked.
-func adminDSN(t *testing.T) string {
+func adminDSN(t testing.TB) string {
 	t.Helper()
 	dsn := os.Getenv("POSTGRES_TEST_ADMIN_DSN")
 	if dsn == "" {
@@ -59,7 +59,7 @@ func adminDSN(t *testing.T) string {
 // A role without CREATEDB makes the fallback fail loudly; the fix is creating
 // the database once by hand (the command is in the failure message), and the
 // suite then only ever verifies.
-func planeDSN(t *testing.T) string {
+func planeDSN(t testing.TB) string {
 	t.Helper()
 
 	admin, err := sql.Open("pgx", adminDSN(t))
@@ -96,7 +96,7 @@ func planeDSN(t *testing.T) string {
 // the same call the process makes at startup, plane binding included — and
 // closes the pool at cleanup. The store is handed back beside the pool
 // because the port is what the behaviour tests speak through.
-func integrationPool(t *testing.T) (*sql.DB, persistence.Store) {
+func integrationPool(t testing.TB) (*sql.DB, persistence.Store) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
