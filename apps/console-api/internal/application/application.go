@@ -26,6 +26,21 @@ const (
 	// CodeNotFound says a requested application resource does not exist.
 	CodeNotFound Code = "not_found"
 
+	// CodeInvalidRequest says a request is well-formed HTTP and its inputs do
+	// not satisfy the contract: a page size outside the contract's bounds, a
+	// cursor this surface cannot place, a cursor minted under filters the
+	// request no longer makes, a filter value outside its closed vocabulary.
+	// It is a refusal rather than a correction in every one of those cases — a
+	// page the caller did not ask for is one it cannot tell apart from a page
+	// the collection capped itself.
+	CodeInvalidRequest Code = "invalid_request"
+
+	// CodeUnauthenticated says the caller did not identify itself as a service
+	// this surface accepts: neither a live session nor a service credential.
+	// It is named here because every product operation is behind it, but the
+	// refusal itself is the session surface's to make.
+	CodeUnauthenticated Code = "unauthenticated"
+
 	// CodeInternal says the application cannot complete a request safely.
 	// Its public representation is deliberately generic at the transport edge.
 	CodeInternal Code = "internal"
@@ -61,6 +76,25 @@ func (err *Error) Unwrap() error {
 // Callers supply a message that is already safe to show to a client.
 func NotFound(message string) *Error {
 	return &Error{Code: CodeNotFound, Message: message}
+}
+
+// InvalidRequest returns an error for a request whose inputs do not satisfy
+// the contract. The message names the offending parameter and never whether
+// the resource behind it exists.
+func InvalidRequest(message string) *Error {
+	return &Error{Code: CodeInvalidRequest, Message: message}
+}
+
+// invalidRequest is InvalidRequest for this package's own refusals, where the
+// message is written at the point that knows what was wrong with the input.
+func invalidRequest(message string) *Error {
+	return &Error{Code: CodeInvalidRequest, Message: message}
+}
+
+// Unauthenticated returns an error for a caller that did not identify itself
+// as a service this surface accepts.
+func Unauthenticated(message string) *Error {
+	return &Error{Code: CodeUnauthenticated, Message: message}
 }
 
 // Internal returns an error for an implementation failure. Its cause remains
