@@ -233,7 +233,14 @@ export const PAYMENT_STATE_PRESENTATION = {
     icon: TriangleAlert,
     tone: "warning",
   },
-  succeeded: { label: "Funded", icon: CircleCheck, tone: "success" },
+  // NOT "Funded". The provider confirmed the payment, and this platform's
+  // provider said the money — but the credit is a separate write that runs
+  // after the confirmation and can be refused: a bucket that closed between
+  // the two leaves a payment that says `succeeded` with the credit unlanded and
+  // a quarantine naming why. Nothing on the wire tells the console which of the
+  // two it is looking at, so the label has to be the one thing both cases are
+  // true of. "Paid" is the provider's word; "Funded" would be this console's.
+  succeeded: { label: "Paid", icon: CircleCheck, tone: "success" },
   failed: { label: "Not funded", icon: CircleX, tone: "destructive" },
   cancelled: { label: "Not funded — cancelled", icon: CircleSlash, tone: "neutral" },
   // Deliberately NOT "not funded": see the note above. This platform stopped
@@ -265,7 +272,8 @@ export const PAYMENT_STATE_EXPLANATION = {
     "The provider's checkout is open and the payment is not finished. If you have just come back from it, we are still waiting for the provider to confirm — coming back does not mark anything paid.",
   requires_action:
     "Your provider has asked for one more step before this payment can complete. Nothing is charged until the provider reports it.",
-  succeeded: "Your provider confirmed this payment, and the amount was credited to this account.",
+  succeeded:
+    "Your provider confirmed this payment. The amount is credited to this account unless a delivery we could not apply needs an operator's attention — the balance is the answer to how much is there, and it is the only thing that states it.",
   failed: "Your provider reported that this payment did not go through. Nothing was credited.",
   cancelled: "This payment was cancelled before it completed. Nothing was credited.",
   expired:

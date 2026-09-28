@@ -118,7 +118,35 @@ const (
 	// provider_event_id) unique constraint: the dedup key, and the reason a
 	// redelivery is a duplicate rather than a second credit.
 	paymentEventsDeliveryKey = "payment_events_delivery_key"
+	// paymentIntentsProviderPaymentRefKey is the unique constraint on
+	// provider_payment_ref. It is not translated into a domain sentinel
+	// because it is not a CONVERGENCE: unlike the two above, a second payment
+	// naming one provider payment is a fault in the world rather than a
+	// concurrent click, and no sentinel would make it one. RecordCapture
+	// answers it as a lost state race instead, so the delivery is quarantined
+	// and an operator sees it — see that member's comment.
+	paymentIntentsProviderPaymentRefKey = "payment_intents_provider_payment_ref_key"
 )
+
+// recordedDisposition is what every row this adapter inserts carries, and the
+// name is not a shorthand: `event.Disposition` is NOT written here.
+//
+// The delivery path cannot know the verdict when the row is inserted — the
+// insert is the arbiter of the race between two concurrent deliveries of one
+// event id, and it has to happen before the payment is resolved — so a row is
+// written provisional and then settled by the admitted UPDATE. Trusting the
+// caller's disposition here instead would let a caller write a row straight to
+// `applied` with no effect behind it, which is the one thing an operator reads
+// this table to rule out. The provisional value is therefore this file's own,
+// it is the one the engine guard admits a transition away from, and no
+// argument reaches the column at insert time.
+//
+// The cost is stated rather than hidden: a row that is written and never
+// settled would stay provisional, and a reader that counted dispositions would
+// be counting one. The engine guard is what makes that impossible from outside
+// this file — a settle of a settled row is refused — and inside it, Settle is
+// the only caller and the use case always reaches it or rolls the insert back.
+const recordedDisposition = string(payments.DispositionRecorded)
 
 // nullText maps the domain's empty string onto SQL NULL and everything else
 // onto itself.
@@ -130,6 +158,15 @@ const (
 // ledgerEntryArgs gives: an empty string is not NULL, and a column that
 // conflated them would make "this delivery reported no currency" and "this
 // delivery reported an empty currency" the same row.
+//
+// `kind` is one of these nullable columns, and it has to be. A delivery whose
+// event type is absent, non-string or longer than the column admits is a real
+// delivery that this build cannot interpret, and the adapter's answer for it is
+// a quarantine with reason unknown-kind — a path that only runs if the row
+// carrying it can be written. Stored raw, the empty string would fail
+// payment_events_kind_grammar instead, which is a check violation nothing
+// translates, so the whole delivery would roll back as a 500 and the provider
+// would retry the same unstorable bytes forever.
 func nullText(value string) any {
 	if value == "" {
 		return nil
@@ -489,6 +526,21 @@ func (r *paymentIntentsRepo) MoveStatus(ctx context.Context, id payments.IntentI
 // that reached succeeded without one is a payment whose credit cannot be
 // re-derived, so a redelivery of the same capture could not converge on the leg
 // it already wrote.
+//
+// WHAT KEEPS A REDELIVERY OFF `payment_intents_provider_payment_ref_key` IS THE
+// FROM-LIST, and not the index, which is worth stating because the reasoning
+// runs the other way from what a reader expects. The partial unique index would
+// NOT fire on a redelivery: this statement writes the value the row already
+// holds, and a row updated to its own value produces one index entry, which the
+// index is satisfied by. So `succeeded` is excluded from the caller's from-list
+// not because re-writing the reference would raise, but because re-writing it
+// would SUCCEED — moving a funded payment's state_version forward a second time
+// and re-deriving the funding command key from a reference nothing has since
+// agreed to. The index is the second line of defence and it answers a different
+// question: a DIFFERENT payment claiming the same capture, which is a
+// contradiction rather than a retry. The arm below translates that one into a
+// verdict, and the from-list is what keeps the ordinary redelivery from ever
+// reaching it.
 const recordPaymentCapture = `
 UPDATE control.payment_intents
 SET provider_payment_ref = $2,
@@ -506,6 +558,21 @@ func (r *paymentIntentsRepo) RecordCapture(ctx context.Context, id payments.Inte
 	intent, err := scanPaymentIntent(r.store.Querier(ctx).QueryRowContext(ctx, recordPaymentCapture,
 		string(id), providerPaymentRef, now, statusStrings(from)))
 	if errors.Is(err, sql.ErrNoRows) {
+		return payments.Intent{}, false, nil
+	}
+	if constraint, ok := constraintOfUniqueViolation(err); ok && constraint == paymentIntentsProviderPaymentRefKey {
+		// TWO OF OUR OWN PAYMENTS NOW NAME THE SAME PROVIDER PAYMENT, and the
+		// honest answer is `moved = false` rather than an error. The caller's
+		// vocabulary for a `false` is a state conflict, which it quarantines and
+		// answers 2xx; wrapped as an error instead, `conflictOf` does not map
+		// 23505 and the delivery answers 500, the provider retries, the retry
+		// answers 500, and there is no quarantine row anywhere for a human —
+		// the exact shape the ceiling in RecordRefund below is written to avoid.
+		//
+		// Refusing to CONCEAL it is the other half: the transaction is rolled
+		// back rather than continued, and the caller's re-read finds its own
+		// payment still waiting for a capture, so the delivery is answered as a
+		// conflict and the operator has the event id to look up.
 		return payments.Intent{}, false, nil
 	}
 	if err != nil {
@@ -811,8 +878,8 @@ func (r *paymentEventsRepo) Record(ctx context.Context, event payments.ProviderE
 	}
 	if _, err := q.ExecContext(ctx, insertPaymentEvent,
 		event.Provider, event.ProviderAccountKey, event.EventID, nullText(event.ProviderPaymentRef),
-		nullText(string(event.IntentID)), event.Kind, nullAmount(event.AmountMinorUnits),
-		nullText(event.Currency), string(event.Disposition), nullTime(event.OccurredAt),
+		nullText(string(event.IntentID)), nullText(event.Kind), nullAmount(event.AmountMinorUnits),
+		nullText(event.Currency), recordedDisposition, nullTime(event.OccurredAt),
 		nullTime(event.RecordedAt)); err != nil {
 		if _, rollbackErr := q.ExecContext(ctx, `ROLLBACK TO SAVEPOINT payment_event_record`); rollbackErr != nil {
 			return fmt.Errorf("postgres: record provider delivery %s: roll back to savepoint after %v: %w", event.EventID, err, rollbackErr)
@@ -869,12 +936,12 @@ func (r *paymentEventsRepo) ByIntent(ctx context.Context, intentID payments.Inte
 // comparing a fact with a non-fact.
 func scanPaymentEvent(row rowScanner) (payments.ProviderEventRecord, error) {
 	var (
-		event                               payments.ProviderEventRecord
-		provider, accountKey, eventID, kind string
-		disposition                         string
-		paymentRef, intentID, currency      sql.NullString
-		amount                              sql.NullInt64
-		occurred                            sql.NullTime
+		event                                payments.ProviderEventRecord
+		provider, accountKey, eventID        string
+		disposition                          string
+		kind, paymentRef, intentID, currency sql.NullString
+		amount                               sql.NullInt64
+		occurred                             sql.NullTime
 	)
 	if err := row.Scan(&provider, &accountKey, &eventID, &paymentRef,
 		&intentID, &kind, &amount, &currency, &disposition, &occurred, &event.RecordedAt); err != nil {
@@ -886,7 +953,7 @@ func scanPaymentEvent(row rowScanner) (payments.ProviderEventRecord, error) {
 	event.EventID = eventID
 	event.ProviderPaymentRef = paymentRef.String
 	event.IntentID = payments.IntentID(intentID.String)
-	event.Kind = kind
+	event.Kind = kind.String
 	if amount.Valid {
 		value := amount.Int64
 		event.AmountMinorUnits = &value

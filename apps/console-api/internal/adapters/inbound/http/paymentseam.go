@@ -553,14 +553,16 @@ func renderPaymentIntent(intent PaymentIntentRecord) paymentIntentRecord {
 // placed here, no amount is scaled, and the currency is rendered as the
 // deployment spelled it: a client that needs to place a decimal point does it
 // with minor_unit_exponent, which is why that field travels.
+// The two structs are field-for-field identical in name, order and type, which
+// is what lets the conversion below be a type conversion rather than a
+// field-by-field copy. A copy here would be a second place to forget a field:
+// the first version of this function was a literal, and it went stale the moment
+// a sixth field was added to one type and not the other — which is a wire
+// contract silently losing a field, the worst shape this file could fail in.
+// The conversion fails to COMPILE the moment the two drift, which is the
+// outcome worth having, and the drift this file's own contract test is about.
 func renderTopUpOffer(offer TopUpOfferRecord) topUpOfferRecord {
-	return topUpOfferRecord{
-		ID:                offer.ID,
-		AmountMinorUnits:  offer.AmountMinorUnits,
-		Currency:          offer.Currency,
-		MinorUnitExponent: offer.MinorUnitExponent,
-		Label:             offer.Label,
-	}
+	return topUpOfferRecord(offer)
 }
 
 // renderTopUpOfferList renders the whole price list in the order the application

@@ -593,9 +593,36 @@ func TestApplyProviderEventAppliesACaptureAsOneUnitOfWork(t *testing.T) {
 	// that is first: a credit that committed before the insert would leave this
 	// plane unable to say which delivery produced it, and an insert that
 	// committed before the credit would swallow the credit's own redelivery.
-	wantOrder := []string{"begin", "record-event", "record-capture", "topup", "commit"}
+	//
+	// `settle-event` comes LAST and is in the expected order on purpose. The
+	// insert writes the provisional disposition, so a delivery that credits a
+	// customer and stops there leaves its row saying `recorded` — the one value
+	// the schema says no reader may ever see. The settle is the last statement
+	// of the unit of work, which is exactly where the real one is: a verdict
+	// written before the effect it describes would survive a rollback and claim
+	// an effect that never happened.
+	wantOrder := []string{"begin", "record-event", "record-capture", "topup", "settle-event", "commit"}
 	if got := strings.Join(w.order, " "); got != strings.Join(wantOrder, " ") {
 		t.Errorf("the unit of work ran as %q, want %q", got, strings.Join(wantOrder, " "))
+	}
+
+	// And the row says what the outcome says. Before the settle was there, this
+	// pair agreed by construction — the fake stored the caller's disposition
+	// verbatim while the SQL adapter discarded it — so the application could
+	// return `applied` over a row reading `recorded`, with no test able to see
+	// it. The two answers are the same delivery, and one of them survives a
+	// restart.
+	stored, ok := w.events[paymentsEventKey(payments.ProviderEventRecord{
+		EventID:            delivery.Event.EventID,
+		ProviderAccountKey: newPayments(w).providerAccountKey(),
+		Provider:           newPayments(w).providerName(),
+	})]
+	if !ok {
+		t.Fatalf("the delivery left no row behind, so nothing records which delivery produced the credit")
+	}
+	if stored.Disposition != outcome.Disposition {
+		t.Errorf("the stored row says %q while the outcome says %q: a reader reconciling this payment against its evidence would read the other one after a restart",
+			stored.Disposition, outcome.Disposition)
 	}
 
 	// The credit took the TRANSACTION's context, not the one the call arrived
@@ -1233,8 +1260,8 @@ func TestARefundResolvesByThePaymentReferenceItNames(t *testing.T) {
 // the customer to be made whole.
 //
 // Both deliveries below report what a real charge-level refund delivery reports
-// — `amount_refunded` for the charge as a whole — so the second one says 800
-// after the first said 400. Handed to the DOMAIN as a total, the second adds 800
+// — the charge's cumulative refunded total, not one refund's amount — so the
+// second one says 800 after the first said 400. Handed to the DOMAIN as a total, the second adds 800
 // to a total of 400 and breaches the 1000 ceiling, and a real,
 // provider-acknowledged refund is quarantined as an over-refund that no operator
 // can resolve, because both figures in front of them are correct. Handed to the
@@ -1437,13 +1464,105 @@ func TestARedeliveredRefundConvergesInsteadOfQuarantining(t *testing.T) {
 	}
 }
 
+// TestARedeliveredRefundInAFoldedCurrencyStillConverges pins the refund
+// currency check's CASE FOLDING, which is the half of the rule that is easy to
+// leave out.
+//
+// The check above the convergence branch exists to catch a refund stated in a
+// different unit, and the one that is not in this payment's unit is a different
+// CURRENCY — not a differently spelled one. A provider that reports "usd" for a
+// payment this plane denominated "USD" is saying the same thing, and comparing
+// the two strings raw would quarantine a real customer's real refund for its
+// capitalisation. This is the same fold the CAPTURE path's comparator applies,
+// and the reason is the same: the adapter's own vocabulary normalises a code
+// before this plane ever sees it, and a comparison that skipped the fold would
+// be stricter about the unit than about the code.
+//
+// The delivery below is a re-notification of a total already recognised, so
+// what the fold decides is convergence against a figure this platform holds —
+// the case where being wrong is quiet, because the delivery is still answered
+// 2xx either way and only the reason differs.
+func TestARedeliveredRefundInAFoldedCurrencyStillConverges(t *testing.T) {
+	w := newPaymentsWorld(t)
+	w.seedIntent(t, func(intent *payments.Intent) {
+		intent.Status = payments.StatusSucceeded
+		intent.ProviderPaymentRef = "pi_1"
+	})
+	p := newPayments(w)
+
+	first, err := p.ApplyProviderEvent(t.Context(), w.delivery("evt_refund_a", paymentprovider.KindRefunded, "", "pi_1", 400, "USD"))
+	if err != nil {
+		t.Fatalf("the first refund: %v", err)
+	}
+	if first.Disposition != payments.DispositionApplied {
+		t.Fatalf("the first refund was answered %q/%q, want it applied", first.Disposition, first.Reason)
+	}
+
+	folded, err := p.ApplyProviderEvent(t.Context(), w.delivery("evt_refund_b", paymentprovider.KindRefunded, "", "pi_1", 400, "usd"))
+	if err != nil {
+		t.Fatalf("the refund whose currency is folded: %v", err)
+	}
+	if folded.Disposition != payments.DispositionApplied {
+		t.Errorf("a refund naming the same currency in lower case was answered %q/%q, want it applied: a code's spelling is not a disagreement about the unit",
+			folded.Disposition, folded.Reason)
+	}
+	if len(w.quarantines) != 0 {
+		t.Errorf("the folded delivery left %d quarantine rows, want none", len(w.quarantines))
+	}
+}
+
+// TestARefundInAnotherCurrencyIsNotACeiling pins the OTHER half of the rule: a
+// genuinely different unit is refused BEFORE the convergence branch, and the
+// reason it carries is the currency rather than the ceiling.
+//
+// This is the case the check was added for, and the reason it sits above the
+// convergence branch rather than inside the domain call. A total at or below
+// what the row holds converges — the platform's record already agrees with the
+// provider's — and that reading is sound only for a figure in the payment's own
+// unit. A EUR 250.00 refund against a USD payment that has already been
+// refunded says nothing this payment can agree with, and answering "applied"
+// for it would put a delivery with no agreement behind it into the ledger as
+// one that was.
+//
+// The reason is asserted rather than only the disposition, because both a
+// currency mismatch and a ceiling are quarantines and a 2xx: an operator reads
+// the reason, and a ceiling here would send them to reconcile two figures that
+// are not in the same unit — a reconciliation that cannot be performed.
+func TestARefundInAnotherCurrencyIsNotACeiling(t *testing.T) {
+	w := newPaymentsWorld(t)
+	intent := w.seedIntent(t, func(intent *payments.Intent) {
+		intent.Status = payments.StatusSucceeded
+		intent.ProviderPaymentRef = "pi_1"
+		intent.RefundedMinorUnits = 1000
+	})
+	p := newPayments(w)
+
+	// 25000 is far above the 1000 already recognised, so this is NOT the
+	// convergence branch doing its job: the currency is what refuses it, and a
+	// check placed below the branch would have reached the ceiling instead.
+	outcome, err := p.ApplyProviderEvent(t.Context(), w.delivery("evt_refund_eur", paymentprovider.KindRefunded, "", "pi_1", 25000, "EUR"))
+	if err != nil {
+		t.Fatalf("the foreign-currency refund: %v", err)
+	}
+	if outcome.Disposition != payments.DispositionQuarantined {
+		t.Fatalf("a refund in another currency was answered %q, want it quarantined", outcome.Disposition)
+	}
+	if outcome.Reason != payments.ReasonCurrencyMismatch {
+		t.Errorf("a refund in another currency is filed as %q, want %q: the two figures are not in the same unit, which is not a ceiling",
+			outcome.Reason, payments.ReasonCurrencyMismatch)
+	}
+	if after := w.storedIntent(t, intent.ID); after.RefundedMinorUnits != 1000 {
+		t.Errorf("the payment records %d refunded minor units, want the 1000 it already held", after.RefundedMinorUnits)
+	}
+}
+
 // TestAnOlderRefundReportConvergesInsteadOfQuarantining covers the delivery
 // that quotes a total BELOW what this platform already holds: an older report
 // arriving after a newer one.
 //
 // Delivery order is not guaranteed and providers retry for days, so a
-// charge.refunded for a 400 refund can land after the delivery of the 800 total
-// that includes it. The claim it makes is already satisfied — the row holds
+// refund notification for a 400 refund can land after the delivery of the 800
+// total that includes it. The claim it makes is already satisfied — the row holds
 // more than it asks for — and the answer is applied rather than a quarantine,
 // because there is no reconciliation for a human to do: the platform's record
 // already agrees with, and exceeds, the provider's own older figure. Filling the

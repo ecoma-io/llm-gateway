@@ -571,12 +571,18 @@ type RefundRecord struct {
 // provider's reference for the payment this claim is about.
 //
 // It refuses rather than returning a record for an over-refund, an unknown
-// refund reference, a non-positive amount, or a payment that was never
-// captured. The state it moves to is decided HERE and not left to the caller,
+// refund reference, a non-positive amount, a payment that was never
+// captured, or a refund reported in a currency other than the payment's own.
+// The state it moves to is decided HERE and not left to the caller,
 // because "partially" versus "fully" is a comparison against the ceiling and a
 // caller that recomputed it could disagree with the arithmetic the ceiling
 // check just performed.
-func (i Intent) RecordRefund(refundRef string, amount *int64) (RefundRecord, error) {
+//
+// `currency` is the provider's reported code for the refund, and it is checked
+// the way MatchCapture checks it and for the reason that check's comment gives.
+// The refund path has a sharper reason of its own on top of that, which is
+// stated at the check itself.
+func (i Intent) RecordRefund(refundRef string, amount *int64, currency string) (RefundRecord, error) {
 	if !validProviderReference(refundRef) {
 		return RefundRecord{}, fmt.Errorf("%w: %q is not a refund reference this build carries", ErrInvalidReference, refundRef)
 	}
@@ -592,6 +598,22 @@ func (i Intent) RecordRefund(refundRef string, amount *int64) (RefundRecord, err
 	}
 	if !canMove(i.Status, StatusPartiallyRefunded) {
 		return RefundRecord{}, fmt.Errorf("%w: a payment at %s cannot be refunded", ErrInvalidTransition, i.Status)
+	}
+	// The CURRENCY, checked before the amount and for MatchCapture's reason: an
+	// amount is not a figure until the unit it counts in is known, and 1000 is a
+	// thousand yen or ten dollars depending entirely on which was meant.
+	//
+	// A refund path without this check has a sharper failure than the capture
+	// path's. The capture path is the only one that moves money, so a capture in
+	// the wrong currency is at least loud about it. A refund books nothing — the
+	// refusal here is the whole of its effect — so a refund reported in the wrong
+	// currency would be recognised as a refund OF THIS PAYMENT and its
+	// `uncovered_refund_minor_units` would be measured in units the payment was
+	// never denominated in, which is a figure no operator can reconcile against
+	// the capture sitting in the row beside it.
+	if currencyCodeUpper(currency) != i.Currency {
+		return RefundRecord{}, fmt.Errorf("%w: a refund in %q is not a payment denominated in %q",
+			ErrInvalidReference, currency, i.Currency)
 	}
 	requested, err := CanRefund(i.RefundedMinorUnits, *amount, i.AmountMinorUnits)
 	if err != nil {

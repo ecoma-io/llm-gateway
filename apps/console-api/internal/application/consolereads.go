@@ -156,7 +156,7 @@ func (reads *ConsoleReads) ListUsers(ctx context.Context, accountID identity.Acc
 	if err != nil {
 		return UserPage{}, Internal(err)
 	}
-	items, hasMore, next := PageOf(rows, pageSize, func(u identity.User) string { return string(u.ID) }, collectionUsers, filters)
+	items, hasMore, next := PageOf(rows, pageSize, func(u identity.User) string { return string(u.ID) }, collectionUsers, filters, after)
 	return UserPage{Items: items, HasMore: hasMore, NextCursor: next}, nil
 }
 
@@ -205,7 +205,7 @@ func (reads *ConsoleReads) ListAPIKeys(ctx context.Context, accountID identity.A
 	if err != nil {
 		return APIKeyPage{}, Internal(err)
 	}
-	items, hasMore, next := PageOf(rows, pageSize, func(k identity.APIKey) string { return string(k.ID) }, collectionAPIKeys, filters)
+	items, hasMore, next := PageOf(rows, pageSize, func(k identity.APIKey) string { return string(k.ID) }, collectionAPIKeys, filters, after)
 	return APIKeyPage{Items: items, HasMore: hasMore, NextCursor: next}, nil
 }
 
@@ -236,7 +236,7 @@ func (reads *ConsoleReads) ListPlans(ctx context.Context, cursor string, limit i
 	if err != nil {
 		return PlanPage{}, Internal(err)
 	}
-	items, hasMore, next := PageOf(rows, pageSize, func(p commerce.Plan) string { return string(p.ID) }, collectionPlans, filters)
+	items, hasMore, next := PageOf(rows, pageSize, func(p commerce.Plan) string { return string(p.ID) }, collectionPlans, filters, after)
 	return PlanPage{Items: items, HasMore: hasMore, NextCursor: next}, nil
 }
 
@@ -270,7 +270,7 @@ func (reads *ConsoleReads) ListSubscriptions(ctx context.Context, accountID comm
 	if err != nil {
 		return SubscriptionPage{}, Internal(err)
 	}
-	items, hasMore, next := PageOf(rows, pageSize, func(s commerce.Subscription) string { return string(s.ID) }, collectionSubscriptions, filters)
+	items, hasMore, next := PageOf(rows, pageSize, func(s commerce.Subscription) string { return string(s.ID) }, collectionSubscriptions, filters, after)
 	return SubscriptionPage{Items: items, HasMore: hasMore, NextCursor: next}, nil
 }
 
@@ -308,7 +308,7 @@ func (reads *ConsoleReads) ListEntitlements(ctx context.Context, accountID comme
 	if err != nil {
 		return EntitlementPage{}, Internal(err)
 	}
-	items, hasMore, next := PageOf(rows, pageSize, func(e commerce.Entitlement) string { return string(e.ID) }, collectionEntitlements, filters)
+	items, hasMore, next := PageOf(rows, pageSize, func(e commerce.Entitlement) string { return string(e.ID) }, collectionEntitlements, filters, after)
 	return EntitlementPage{Items: items, HasMore: hasMore, NextCursor: next}, nil
 }
 
@@ -346,7 +346,7 @@ func (reads *ConsoleReads) ListFundingBuckets(ctx context.Context, accountID acc
 	if err != nil {
 		return FundingBucketPage{}, Internal(err)
 	}
-	items, hasMore, next := PageOf(rows, pageSize, func(b accounting.Bucket) string { return string(b.ID) }, collectionBuckets, filters)
+	items, hasMore, next := PageOf(rows, pageSize, func(b accounting.Bucket) string { return string(b.ID) }, collectionBuckets, filters, after)
 	return FundingBucketPage{Items: items, HasMore: hasMore, NextCursor: next}, nil
 }
 
@@ -406,7 +406,7 @@ func (reads *ConsoleReads) ListLedgerEntries(ctx context.Context, accountID acco
 	}
 	items, hasMore, next := PageOf(rows, pageSize, func(e accounting.LedgerEntry) string {
 		return strconv.FormatInt(e.Sequence, 10)
-	}, collectionLedger, filters)
+	}, collectionLedger, filters, after)
 	return LedgerEntryPage{Items: items, HasMore: hasMore, NextCursor: next}, nil
 }
 
@@ -497,7 +497,7 @@ func (reads *ConsoleReads) ListFindings(ctx context.Context, status, severity, c
 	}
 	items, hasMore, next := PageOf(rows, pageSize, func(f persistence.Finding) string {
 		return strconv.FormatInt(f.ID, 10)
-	}, collectionFindings, filters)
+	}, collectionFindings, filters, after)
 	return FindingPage{Items: items, HasMore: hasMore, NextCursor: next}, nil
 }
 
@@ -547,6 +547,6 @@ func (reads *ConsoleReads) ListReconciliationRuns(ctx context.Context, cursor st
 	}
 	items, hasMore, next := PageOf(rows, pageSize, func(r persistence.Run) string {
 		return strconv.FormatInt(r.ID, 10)
-	}, collectionRuns, filters)
+	}, collectionRuns, filters, after)
 	return ReconciliationRunPage{Items: items, HasMore: hasMore, NextCursor: next}, nil
 }

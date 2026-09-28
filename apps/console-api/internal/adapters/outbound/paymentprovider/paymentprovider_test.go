@@ -32,6 +32,42 @@ func testSigningSecret() string { return "sig-" + strings.Repeat("w", 32) }
 
 func testAPIKey() string { return "console-api-" + strings.Repeat("k", 32) }
 
+// newTLSServer stands up the fake provider over TLS, and the scheme is not
+// incidental: `New` refuses an `http` base URL because every request it makes
+// carries the deployment's API secret as a bearer credential, so a test that
+// pointed a client at a cleartext `httptest.NewServer` would be asserting against
+// a wiring the constructor deliberately refuses to accept. Running the fake
+// provider over TLS lets these tests exercise the real request path — the
+// form encoding, the Authorization header, the status handling — against a
+// client the production composition root could actually construct.
+func newTLSServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	server := httptest.NewTLSServer(handler)
+	t.Cleanup(server.Close)
+	return server
+}
+
+// The fake provider's own URL is already the `https://` one `New` requires —
+// httptest's StartTLS sets it — so the fixtures hand `server.URL` straight over.
+// What they have to add is the trust store, and trustServerTLS is the only
+// place in this package that does.
+//
+// trustServerTLS points a client at httptest's self-signed certificate, and it
+// MUTATES the transport on the client `New` built rather than replacing the
+// client.
+//
+// The mutation is the whole point. `New` sets a Timeout and a CheckRedirect that
+// refuses to follow a payment redirect, and a fixture that swapped in a fresh
+// &http.Client{} would silently drop the second — which is precisely what
+// happened the first time this file was written: the redirect test started
+// failing because the client had started following redirects, and the only
+// correct fix was in the fixture. A test helper that can quietly remove the
+// behaviour it was not asked to test is a defect in the helper.
+func trustServerTLS(t *testing.T, server *httptest.Server, client *Client) {
+	t.Helper()
+	client.httpClient.Transport = server.Client().Transport
+}
+
 // testNow is the instant every verifier in this file believes it is. Staleness
 // is a comparison against a clock, and a test that read the real one would be
 // asserting how long the machine took to get there.
@@ -840,7 +876,7 @@ func TestOpenCheckoutSendsTheProviderItsOwnRequest(t *testing.T) {
 		contentType   string
 		form          url.Values
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got.method = r.Method
 		got.path = r.URL.Path
 		got.idempotency = r.Header.Get(idempotencyHeader)
@@ -857,9 +893,9 @@ func TestOpenCheckoutSendsTheProviderItsOwnRequest(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"id":"`+sessionID+`","url":"`+sessionURL+`"}`)
 	}))
-	defer server.Close()
 
 	client := New(server.URL, testAPIKey(), 5*time.Second)
+	trustServerTLS(t, server, client)
 	session, err := client.OpenCheckout(context.Background(), payments.CheckoutRequest{
 		IdempotencyKey:   idempotency,
 		AmountMinorUnits: sessionAmount,
@@ -927,13 +963,13 @@ func TestOpenCheckoutSendsTheProviderItsOwnRequest(t *testing.T) {
 
 func TestOpenCheckoutRefusesWhatWouldNotBeTheAgreedCharge(t *testing.T) {
 	called := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		_, _ = io.WriteString(w, `{"id":"cs_test_session_reference","url":"https://checkout.example/c/pay"}`)
 	}))
-	defer server.Close()
 
 	client := New(server.URL, testAPIKey(), 5*time.Second)
+	trustServerTLS(t, server, client)
 	request := payments.CheckoutRequest{
 		IdempotencyKey:   "topup-intent-0001",
 		AmountMinorUnits: 2500,
@@ -992,17 +1028,23 @@ func TestOpenCheckoutRefusesWhatWouldNotBeTheAgreedCharge(t *testing.T) {
 // second charge impossible.
 func TestOpenCheckoutDoesNotFollowARedirect(t *testing.T) {
 	followed := false
+	// The redirect TARGET is a plain-http server deliberately. Nothing reaches
+	// it, and that is the assertion: a followed redirect would carry the API
+	// secret and the idempotency key to a host no operator configured, over
+	// cleartext, to a URL the client would have refused as a base. Pointing the
+	// target at a scheme the client rejects is the second line of defence
+	// showing itself — the first is that no redirect is followed at all.
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		followed = true
 	}))
 	defer target.Close()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, target.URL+checkoutSessionsPath, http.StatusTemporaryRedirect)
 	}))
-	defer server.Close()
 
 	client := New(server.URL, testAPIKey(), 5*time.Second)
+	trustServerTLS(t, server, client)
 	_, err := client.OpenCheckout(context.Background(), payments.CheckoutRequest{
 		IdempotencyKey:   "topup-intent-0001",
 		AmountMinorUnits: 2500,
@@ -1035,13 +1077,13 @@ func TestOpenCheckoutErrorsCarryNeitherTheEndpointNorTheSecret(t *testing.T) {
 
 	// A refusal that echoes the credential in its body, which is what the
 	// provider's own error wording does, must still not put it in our error.
-	refusing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	refusing := newTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusPaymentRequired)
 		_, _ = io.WriteString(w, `{"error":{"message":"Invalid API Key provided: `+testAPIKey()+`"}}`)
 	}))
-	defer refusing.Close()
 
 	client := New(refusing.URL, testAPIKey(), 5*time.Second)
+	trustServerTLS(t, refusing, client)
 	_, err := client.OpenCheckout(context.Background(), request)
 	if err == nil {
 		t.Fatal("OpenCheckout() error = nil, want the refusal reported")
@@ -1054,7 +1096,14 @@ func TestOpenCheckoutErrorsCarryNeitherTheEndpointNorTheSecret(t *testing.T) {
 	// And the transport failure: http.Client wraps it in a *url.Error whose
 	// text embeds the whole request URL, which is the value this adapter
 	// strips.
-	unreachable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	//
+	// The server is TLS for the same reason every other fake provider here is:
+	// `New` refuses a cleartext base URL, so an `http://` endpoint could not
+	// reach this client at all and a test that used one would be asserting
+	// against a wiring the constructor rejects. It is closed before the client
+	// is built, so the port is bound and nothing is listening on it — the
+	// connection is refused, which is the transport failure being tested.
+	unreachable := newTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	endpoint := unreachable.URL
 	unreachable.Close()
 
@@ -1087,6 +1136,15 @@ func TestNewRefusesWiringDefects(t *testing.T) {
 	}{
 		{name: "an empty API base URL", call: func() { New("", testAPIKey(), time.Second) }},
 		{name: "a base URL that is not absolute", call: func() { New("api.stripe.com", testAPIKey(), time.Second) }},
+		// Cleartext is refused, and the case is a LOCALHOST one so that the
+		// refusal cannot be confused with a network question: nothing about
+		// 127.0.0.1 is unsafe, and the rule still applies because the URL is
+		// where the secret is sent rather than what it is sent to. A
+		// constructor that exempted loopback would be a constructor a
+		// deployment could be misconfigured past in staging and not in
+		// production — or worse, the other way round.
+		{name: "a cleartext API base URL", call: func() { New("http://127.0.0.1:8080", testAPIKey(), time.Second) }},
+		{name: "a base URL that is not a URL at all", call: func() { New("https://api.stripe.com\x7f", testAPIKey(), time.Second) }},
 		{name: "a base URL with userinfo", call: func() { New("https://user:pass@api.stripe.com", testAPIKey(), time.Second) }},
 		{name: "a base URL with a query", call: func() { New("https://api.stripe.com?v=1", testAPIKey(), time.Second) }},
 		{name: "a base URL with a fragment", call: func() { New("https://api.stripe.com#v1", testAPIKey(), time.Second) }},

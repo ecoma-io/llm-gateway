@@ -450,9 +450,20 @@ CREATE TABLE control.payment_events (
     -- The provider's own vocabulary for the delivery, carried through as the
     -- provider wrote it so a later reconciliation can show a customer what the
     -- provider said rather than this platform's paraphrase of it.
-    kind text NOT NULL
+    --
+    -- NULLABLE, and the same bound and the same grammar as the sibling column on
+    -- payment_quarantine because it is the same value. A delivery whose event
+    -- type is absent, is not a string, or is longer than 128 bytes is a real
+    -- delivery this build cannot interpret, and the answer for it is a
+    -- quarantine with reason unknown-kind. That answer needs a row to live on,
+    -- and a NOT NULL column would make the one delivery most worth recording the
+    -- one that cannot be recorded — a check violation nothing translates, a
+    -- rolled-back transaction, and a provider retrying the same bytes forever.
+    -- NULL says "the provider named no type we could read", which is a fact
+    -- about the delivery rather than a gap in the row.
+    kind text
         CONSTRAINT payment_events_kind_grammar
-        CHECK (char_length(kind) BETWEEN 1 AND 128),
+        CHECK (kind IS NULL OR char_length(kind) BETWEEN 1 AND 128),
     -- Absent is NOT zero. The port's money fields are pointers for exactly
     -- this reason: a delivery that reports no amount and a delivery that
     -- reports an amount of zero are different sentences, and only one of them
@@ -462,27 +473,38 @@ CREATE TABLE control.payment_events (
     currency text
         CONSTRAINT payment_events_currency_grammar
         CHECK (currency IS NULL OR currency ~ '^[A-Z]{3}$'),
-    -- What this plane did with the delivery. The three values are genuinely
-    -- different states of the world rather than three spellings of success,
-    -- and a single boolean would lose the distinction an operator needs: an
-    -- applied delivery carried its claim out, a duplicate was already recorded
-    -- and its effect, if any, is already durable, and a quarantined one was
-    -- authenticated and recorded but deliberately NOT acted on — its reason
+    -- What this plane did with the delivery. The three settled values are
+    -- genuinely different states of the world rather than three spellings of
+    -- success, and a single boolean would lose the distinction an operator
+    -- needs: an applied delivery carried its claim out, a duplicate was already
+    -- recorded and its effect, if any, is already durable, and a quarantined one
+    -- was authenticated and recorded but deliberately NOT acted on — its reason
     -- and the bytes it arrived with are on control.payment_quarantine.
     --
-    -- The third value is written by an UPDATE in the same transaction as the
-    -- INSERT below, and the two-statement shape is forced by the order the
-    -- delivery path has to run in. The insert is the arbiter of the race
-    -- between two concurrent deliveries of one event id, so it must happen
-    -- before this plane knows what the payment will turn out to be, and a
-    -- delivery that claims its dedup key and is then refused is a real row
-    -- with a real verdict. Nothing outside the transaction can observe the
-    -- provisional value: no other session sees the row until the commit, and
-    -- the commit carries the verdict. A later transaction cannot revise it —
-    -- the application settles only the delivery its own unit of work recorded.
+    -- The FOURTH value is the provisional one this row is INSERTed with, and it
+    -- is the only value a reader can never see. It exists because the shape of
+    -- the delivery path forces the row to be written before this plane knows
+    -- what the payment will turn out to be: the insert is the arbiter of the
+    -- race between two concurrent deliveries of one event id, so it must
+    -- happen first, and a delivery that claims its dedup key and is then
+    -- refused is a real row with a real verdict. Nothing outside the
+    -- transaction can observe the provisional value — no other session sees the
+    -- row until the commit, and the commit carries the verdict.
+    --
+    -- It is in the CHECK rather than left to a DEFAULT, deliberately. A DEFAULT
+    -- would let the admitted UPDATE move a settled row BACK to 'recorded' —
+    -- 'recorded' to 'recorded' is a change, so the guard's disposition
+    -- comparison alone would wave it through — and it would let an INSERT
+    -- written without the column sit permanently provisional. With the value
+    -- in the CHECK there is one closed vocabulary of five, the guard branches
+    -- on the same literal, and a row is either a claim or a verdict.
+    --
+    -- A later transaction cannot revise a verdict: the admitted UPDATE is
+    -- refused on any row that already carries one, so the application settles
+    -- only the delivery its own unit of work recorded.
     disposition text NOT NULL
         CONSTRAINT payment_events_disposition_valid
-        CHECK (disposition IN ('applied', 'duplicate', 'quarantined')),
+        CHECK (disposition IN ('recorded', 'applied', 'duplicate', 'quarantined')),
     -- When the PROVIDER observed the outcome, as the signed bytes stated it —
     -- or NULL when the delivery stated no such instant. Nullable for the same
     -- reason payment_quarantine.occurred_at is, and the two must agree: the
@@ -840,20 +862,70 @@ COMMENT ON FUNCTION control.reject_payment_intent_delete() IS
 -- ---------------------------------------------------------------------------
 -- Both triggers are stated in the two places the lane states an append-only
 -- rule. The row-level one is the speaking guard: it names the operation and
--- the table when an UPDATE touches a row, which is the write these tables
--- actually refuse in practice. The statement-level one is the DELETE refusal,
--- and it is the one that fires first — a statement-level BEFORE trigger runs
--- before any row-level one — so on the delete path the row-level guard never
--- runs at all. The arm is stated rather than omitted so each trigger is
--- complete in itself and a reader does not have to reconstruct the firing
--- order to know what this table refuses.
+-- the table when an UPDATE touches a row. The statement-level one is the
+-- DELETE refusal, and it is the one that fires first — a statement-level
+-- BEFORE trigger runs before any row-level one — so on the delete path the
+-- row-level guard never runs at all. The arm is stated rather than omitted so
+-- each trigger is complete in itself and a reader does not have to
+-- reconstruct the firing order to know what this table refuses.
+--
+-- THE ONE UPDATE THIS TABLE ADMITS IS WRITTEN HERE, AND IT IS NOT A LOOPHOLE.
+-- The rule this guard enforces is "recorded once, never revised ACROSS
+-- TRANSACTIONS", and the amendment that states it in the function's own
+-- DETAIL text — admitted, refused, and what a refusal must look like. Without
+-- the function it admits anything, and a caller could revise a verdict or
+-- rewrite a delivery's payload; with the function, the only UPDATE that can
+-- touch this table sets `disposition`, and only from a recorded default to the
+-- outcome the recording unit of work then reached.
+--
+-- `OLD.disposition = 'recorded'` is what makes it a claim rather than an
+-- edit: a verdict is written once, and a row that already carries a verdict is
+-- refused even by the admitted UPDATE. So a second settlement, a settlement of
+-- somebody else's recorded delivery, and a settlement arriving in a later
+-- transaction are all the same refusal, and none of them can leave a row
+-- claiming an effect the ledger does not show.
+--
+-- Why the predicate is stated here rather than trusted to the caller. A
+-- `WHEN` clause on the trigger was tried and dropped: the guard is a
+-- `BEFORE UPDATE` trigger, so a statement whose WHERE excludes the row raises
+-- nothing and a statement that includes it raises unless this function
+-- branches. The branch has to live in the function, and a predicate on the
+-- trigger could only have hidden the branch from the one place the rule is
+-- written down.
+--
+-- What this costs is stated rather than hidden. This is the one guard in the
+-- lane that runs PL/pgSQL on the hot path of a provider delivery, where the
+-- fast path is an aborted statement and a rollback; the alternative shapes
+-- named in ADR 0013 §7 (an append-only column, or a separate verdict table)
+-- were rejected as a second source of truth for the same fact.
 CREATE FUNCTION control.payment_events_append_only() RETURNS trigger
     LANGUAGE plpgsql
     SET search_path = pg_catalog
-    AS $payment_events_append_only$ BEGIN
+    AS $payment_events_append_only$
+DECLARE
+    amendment constant text :=
+        'This is the one UPDATE control.payment_events admits. It writes the verdict of a delivery that was recorded in this same unit of work, and it cannot change anything else: any other column of NEW differing from OLD, a row that already carries a verdict, or a second settlement, are all refused by the same branch.';
+BEGIN
+    -- A DELETE arrives here when the row-level trigger beats the statement-level
+    -- one (the statement-level guard refuses it first in practice, so this arm
+    -- exists to make the function complete rather than because it is reached).
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'control.payment_events is append-only: ' || TG_OP || ' is refused',
+            DETAIL = 'a recorded delivery is the evidence that a redelivery is a duplicate and of which payment it funded. The effect it had is already durable, so nothing here is removed and nothing is revised across transactions: a correction is a new delivery''s business, and a delivery that was recorded and then edited by some later transaction could not answer whether a customer was funded once or twice. ' || amendment,
+            ERRCODE = 'integrity_constraint_violation';
+        RETURN NULL;
+    END IF;
+
+    IF OLD.disposition = 'recorded'
+       AND NEW.disposition <> OLD.disposition
+       AND (to_jsonb(NEW) - 'disposition') = (to_jsonb(OLD) - 'disposition') THEN
+        RETURN NEW;
+    END IF;
+
     RAISE EXCEPTION USING
         MESSAGE = 'control.payment_events is append-only: ' || TG_OP || ' is refused',
-        DETAIL = 'a recorded delivery is the evidence that a redelivery is a duplicate and of which payment it funded. The effect it had is already durable, so nothing here is removed and nothing is revised across transactions: a correction is a new delivery''s business, and a delivery that was recorded and then edited by some later transaction could not answer whether a customer was funded once or twice. The one UPDATE this table admits runs inside the recording transaction and writes only the verdict, before any reader can see the row',
+        DETAIL = 'a recorded delivery is the evidence that a redelivery is a duplicate and of which payment it funded. The effect it had is already durable, so nothing here is removed and nothing is revised across transactions: a correction is a new delivery''s business, and a delivery that was recorded and then edited by some later transaction could not answer whether a customer was funded once or twice. ' || amendment,
         ERRCODE = 'integrity_constraint_violation';
     RETURN NULL;
 END;

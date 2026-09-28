@@ -1742,20 +1742,30 @@ paths:
         that.
 
         400 has exactly one meaning, and the sentence above is what keeps it
-        narrow: this delivery may not be acted on, and never will be. Two
-        things make a delivery permanently unusable, and both are facts about
-        the delivery rather than about its contents. The signature header is
-        absent, appears more than once, or does not equal what this deployment
-        computes over these exact bytes — the delivery did not authenticate.
-        Or the signature is correct and the delivery is STALE: it arrived
-        outside the freshness tolerance this deployment allows between the
-        moment the provider signed it and the moment it was received, which is
-        a replay rather than a delivery, and this plane refuses it for the
-        same reason it refuses a forged one — a signature proves who sent a
-        message, and the tolerance is what makes it proof about a MOMENT. A
-        redelivery of a stale event carries the same signed timestamp, so a
-        retry could only repeat the refusal, which is why neither case belongs
-        in the provider's retry budget.
+        narrow: this delivery may not be acted on, and never will be. Five
+        things earn it, and every one of them is a fact about the DELIVERY
+        rather than a verdict on its contents — which is the property that
+        makes the status safe to hand a provider, because a 4xx says "do not
+        send this again" and the provider's next attempt carries these same
+        bytes. In the order the branches run: the body declared a
+        Content-Encoding this endpoint will not decode, because a compressed
+        body is not the body that was signed; it declared a Content-Type that
+        cannot carry the JSON this endpoint verifies; it is larger than the
+        read bound, and the bound is what an operator is told rather than the
+        size that arrived, because producing that figure would mean reading a
+        body precisely because it is too large to read; the delivery did not
+        authenticate — the signature header absent, appearing more than once,
+        or unequal to what this deployment computes over these exact bytes;
+        or it authenticated and is STALE, arriving outside the freshness
+        tolerance this deployment allows between the moment the provider signed
+        it and the moment it was received, which is a replay rather than a
+        delivery, and this plane refuses it for the same reason it refuses a
+        forged one — a signature proves who sent a message, and the tolerance
+        is what makes it proof about a MOMENT. A redelivery of a stale event
+        carries the same signed timestamp, so a retry could only repeat the
+        refusal, which is why none of the five belongs in the provider's retry
+        budget. Each has its own log line, so an operator can tell a malformed
+        delivery from a forged one from a replayed one.
 
         It is NOT the answer to a delivery this build authenticated and cannot
         read — that is a 200, and the two must not share a status. A refusal
@@ -1918,15 +1928,20 @@ paths:
         "400":
           description: >-
             This delivery may not be acted on, and never will be. The code is
-            `invalid_request`, and there are exactly two ways to earn it: the
+            `invalid_request`, and there are exactly five ways to earn it. In
+            the order the branches run: the body declared a Content-Encoding
+            this endpoint will not decode — a compressed body is not the body
+            that was signed; it declared a Content-Type that cannot carry the
+            JSON this endpoint verifies; it is larger than the read bound; the
             delivery did not authenticate — the signature header is absent,
             appears more than once, or does not equal what this deployment
-            computes over these exact bytes — or it authenticated but is
-            STALE, arriving outside the freshness tolerance this deployment
-            allows between the moment the provider signed it and the moment it
-            was received, which is a replay rather than a delivery. Neither
-            becomes usable on a second attempt: a wrong signature will be
-            wrong again, and a redelivery re-sends the same signed timestamp.
+            computes over these exact bytes; or it authenticated but is STALE,
+            arriving outside the freshness tolerance this deployment allows
+            between the moment the provider signed it and the moment it was
+            received, which is a replay rather than a delivery. None becomes
+            usable on a second attempt: a malformed body carries its own
+            defect, a wrong signature will be wrong again, and a redelivery
+            re-sends the same signed timestamp.
 
             The one thing this response deliberately does NOT cover is a body
             this build cannot read. An authenticated delivery whose event is

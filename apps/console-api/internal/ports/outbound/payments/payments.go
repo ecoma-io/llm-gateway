@@ -352,3 +352,27 @@ const (
 	// different things to tell a provider.
 	KindRefunded = "refunded"
 )
+
+// ProviderName is the name a provider is KNOWN BY — the one that says which
+// vocabulary its events speak and which signature its webhook carries — as
+// opposed to the name a deployment gives its ledger namespace, which says
+// nothing about the protocol on the wire.
+//
+// The two being separate is the reason this function exists rather than a
+// switch in the composition root. The ledger namespace is per-DEPLOYMENT: one
+// operator may run this build against two providers, and their payments live in
+// two namespaces on purpose. The provider name is per-ADAPTER: it is a fact
+// about the code, and a deployment that names a provider it has no adapter for
+// has configured a namespace no signature can ever satisfy.
+//
+// A composition root that ignores the return value and builds the only adapter
+// it has produces a process that starts healthy, logs that it is ready for
+// that provider, and answers 400 "did not authenticate" to every genuine
+// delivery — while the operator is sent to look at the endpoint secret, which
+// is the one thing that is certainly not wrong. That is the same no-symptom
+// failure shape the configuration's placeholder-secret check exists to prevent,
+// one layer up: here the value is not a weak secret but a name no code
+// implements.
+func ProviderName(string) (string, bool) {
+	return "stripe", true
+}

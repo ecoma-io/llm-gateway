@@ -802,6 +802,24 @@ func (p *Payments) ApplyProviderEvent(ctx context.Context, delivery ProviderDeli
 			return p.quarantineRecord(txCtx, now, event, delivery.RawBody, intent.ID, reason)
 		}
 		outcome = EventOutcome{Disposition: payments.DispositionApplied, IntentID: intent.ID}
+		// THE APPLIED PATH SETTLES ITS ROW TOO. This is the last statement in the
+		// function and the easy one to leave off, because `applied` is what the
+		// caller reads from `outcome` and the row is not obviously the same
+		// thing. They are: `outcome` is what this process returns to the
+		// handler, and the row is what survives a restart. A delivery that
+		// credits a customer and leaves its row saying `recorded` has recorded
+		// a state the schema's own comment says no reader may ever see — and the
+		// row is the evidence an operator reconciles a payment against, so the
+		// one delivery class that matters most is the one that would be unreadable.
+		//
+		// The duplicate path above is the exception, and it is not an oversight:
+		// there the row was written by an EARLIER delivery, which settled it, and
+		// a second settle would be the second UPDATE the append-only guard
+		// refuses — turning an ordinary redelivery into a 500 and a retry storm
+		// against a payment that has already been credited.
+		if err := p.events.Settle(txCtx, record.DeliveryKey(), payments.DispositionApplied); err != nil {
+			return fmt.Errorf("settle provider delivery %s: %w", event.EventID, err)
+		}
 		return nil
 	})
 	if err != nil {
@@ -1036,8 +1054,8 @@ func (p *Payments) applyRefund(txCtx context.Context, intent payments.Intent, ev
 	// THE PROVIDER REPORTS A CUMULATIVE TOTAL AND THE DOMAIN WANTS AN
 	// INCREMENT, and the two figures travel to different places rather than one
 	// being converted into the other. The delivery this build consumes is a
-	// `charge.refunded`, whose `amount_refunded` is everything that has gone back
-	// on the charge over its whole life, not what this delivery added. The domain
+	// refund notification, whose amount is everything that has gone back on the
+	// charge over its whole life, not what this delivery added. The domain
 	// needs the increment to decide which status the payment has reached; the
 	// PORT needs the total, because that is what it writes and what a concurrent
 	// writer must be measured against.
@@ -1060,6 +1078,63 @@ func (p *Payments) applyRefund(txCtx context.Context, intent payments.Intent, ev
 		// not a ceiling: this platform cannot tell how much went back, and the
 		// honest classification is a figure that disagrees with the one stored —
 		// which is absent here rather than different.
+		return false, payments.ReasonAmountMismatch, nil
+	}
+
+	// THE CURRENCY IS CHECKED BEFORE THE CONVERGENCE BRANCH BELOW, and putting
+	// it here rather than inside the domain call is the whole of the fix. The
+	// branch under it treats any total at or below what is already stored as a
+	// re-notification of a state this platform already agrees with, and that is
+	// a sound reading of a figure expressed in the payment's own unit. It is not
+	// a sound reading of one expressed in another: a refund notification in a
+	// different currency is a claim about a different sum of money, and letting
+	// it converge would be answering "applied" for a delivery that says nothing
+	// this payment can agree with. A refund reported in the wrong currency is
+	// rare enough that it will not be recognised by eye, and the domain's
+	// ceiling arithmetic is in no position to notice.
+	//
+	// THE COMPARISON FOLDS CASE through the domain's own CurrencyCode, for the
+	// reason the capture path's comparator folds it: a provider that reports
+	// "usd" against a payment denominated "USD" is not disagreeing about the
+	// unit, and refusing that delivery would quarantine a real customer's real
+	// refund over its spelling. Compared with `!=` raw, this check would be
+	// stricter about CURRENCY and looser about case, which is the wrong way
+	// round for a rule whose only job is to catch a sum in another unit.
+	//
+	// NO `!= ""` GUARD, and the absence is the fix rather than an oversight —
+	// the same absence reasonForClaimRefusal's comment gives. The adapter's
+	// answer to a `null`, non-string or over-long currency is the empty string,
+	// which is the one value this payment's own currency can never hold. A
+	// refund that states no currency is therefore a mismatch, and saying so is
+	// the finding: a delivery whose figure cannot be tied to a unit has nothing
+	// to converge against, and a guard would let it converge on a bare number.
+	if payments.CurrencyCode(event.Currency) != payments.CurrencyCode(intent.Currency) {
+		return false, payments.ReasonCurrencyMismatch, nil
+	}
+
+	// A NON-POSITIVE TOTAL IS REFUSED, and it is refused HERE — above the
+	// convergence branch and above the domain's own `requested <= 0` guard, both
+	// of which sit below a payment that already holds 0.
+	//
+	// The convergence branch answers "applied" to any total at or below what is
+	// stored, on the reasoning that a cumulative figure only goes up and so a
+	// lower one is an older report. That reasoning assumes the figure is a
+	// plausible one. Zero and negative are not: a payment that has never been
+	// refunded holds 0, so a signed refund notification reporting a cumulative
+	// total of -400 satisfies `-400 <= 0` and converges — a delivery that credits
+	// nothing, books nothing and raises nothing, answered 200, with the
+	// idempotency ledger recording it as applied and no quarantine row anywhere
+	// for a human to find. The ledger would then say a refund happened while the
+	// payment's own projection says none did, and the two are reconciled by an
+	// operator who has no way to learn which is right.
+	//
+	// The negative figure is well-formed and parses: `readableAmount` accepts any
+	// int64 the provider states, and refusing it here rather than in the adapter
+	// keeps the refusal in domain words, where an operator reads it beside the
+	// payment. A provider that reports a negative cumulative refund is reporting
+	// something this build cannot interpret, and `amount_mismatch` says exactly
+	// that: the figure disagrees with the one stored, and it is not any figure.
+	if *event.AmountMinorUnits <= 0 {
 		return false, payments.ReasonAmountMismatch, nil
 	}
 	reported := *event.AmountMinorUnits
@@ -1102,7 +1177,7 @@ func (p *Payments) applyRefund(txCtx context.Context, intent payments.Intent, ev
 	// finest identity it carries is the payment. The command key derived from it
 	// also carries the resulting total, which is what keeps two partial refunds
 	// from sharing one key — see payments.RefundCommandKey.
-	record, err := intent.RecordRefund(claimedPaymentRef(event), &increment)
+	record, err := intent.RecordRefund(claimedPaymentRef(event), &increment, event.Currency)
 	if err != nil {
 		if errors.Is(err, payments.ErrRefundAheadOfCapture) {
 			return false, payments.ReasonRefundAheadOfCapture, nil
@@ -1110,8 +1185,38 @@ func (p *Payments) applyRefund(txCtx context.Context, intent payments.Intent, ev
 		if errors.Is(err, payments.ErrInvalidTransition) {
 			return false, payments.ReasonStateConflict, nil
 		}
-		// Everything else here is the ceiling: the refund, taken together with
-		// what came before it, exceeds what the capture took.
+		if errors.Is(err, payments.ErrRefundCeiling) {
+			return false, payments.ReasonRefundCeiling, nil
+		}
+		if errors.Is(err, payments.ErrInvalidReference) {
+			// A figure this plane cannot credit, named rather than folded into
+			// the ceiling above. The ceiling has its own sentinel precisely so
+			// that this arm is reachable: the amount and the currency were
+			// both checked above, and the domain refuses nothing else about a
+			// refund it has agreed to recognise, so what is left is a payment
+			// this build cannot refund — and an operator told "refund ceiling"
+			// for that is sent to reconcile two figures that agree perfectly.
+			return false, payments.ReasonStateConflict, nil
+		}
+		// The last refusal, and it is deliberately mapped to the ceiling rather
+		// than raised as an error. Two reasons, and the second is the one that
+		// decides it.
+		//
+		// First, an error here reaches the provider as a 5xx and the provider
+		// retries the same bytes forever. Every other refusal in this chain is
+		// a reason precisely so that it cannot.
+		//
+		// Second — and this is why the chain does not grow an arm for a case
+		// the domain has not produced — an exhaustive arm is a PROMISE that
+		// the code is driven by the enum, and this chain is not. The domain is
+		// free to add a refusal tomorrow, and an arm written for each would go
+		// stale silently, with a new refusal falling through to whatever sits
+		// last here. That is the failure this shape is chosen against: the
+		// fallback IS the contract, and it is the most conservative reason this
+		// function can name. When a future refusal deserves a better answer
+		// than the ceiling, the change to make is a sentinel for it in the
+		// domain — as ErrRefundCeiling is — rather than a guess about which
+		// enum value fits.
 		return false, payments.ReasonRefundCeiling, nil
 	}
 
@@ -1151,9 +1256,17 @@ func (p *Payments) applyRefund(txCtx context.Context, intent payments.Intent, ev
 	// figure the row now holds, so this re-reads it rather than assuming.
 	//
 	// The read is in this unit of work and after the failed update, so it sees
-	// the concurrent writer's committed-or-issued row; the row lock the update
-	// took is what keeps the answer from moving again before this transaction
-	// ends.
+	// the concurrent writer's row whether it has committed or is still issued.
+	//
+	// IT TAKES NO ROW LOCK, and the reason matters enough to state rather than
+	// assume: an UPDATE that matched zero rows locks zero rows. There is no
+	// second concurrent writer to race here, because a writer that could match
+	// this row would have taken the row lock and this transaction would have
+	// blocked on it rather than observed zero rows. The zero-row result is
+	// therefore itself the evidence that no other writer is in the row, and the
+	// re-read answers about a row that is now exclusively this transaction's to
+	// read. A claim that a lock was held here would be a claim about a guarantee
+	// the database does not give, resting on a mechanism that was never used.
 	stored, err := p.intents.ByID(txCtx, intent.ID)
 	if err != nil {
 		return false, "", fmt.Errorf("re-read payment %s after a refund that moved nothing: %w", intent.ID, err)
@@ -1176,19 +1289,31 @@ func (p *Payments) applyRefund(txCtx context.Context, intent payments.Intent, ev
 // balance once more, and the stored total — which is what the operator resolves
 // the case with — drifts below the truth with each refund.
 //
-// It reads the bucket's available balance and answers the shortfall. The figure
-// is recorded for the operator who has to resolve the case; it is NOT booked,
-// for the reason applyRefund states at length.
+// It reads the bucket's SETTLED balance and answers the shortfall, and the word
+// is the whole of one fix. `Available` is B6's settled-minus-held: a figure that
+// is temporarily lower because a live reservation sits against it, not because
+// the money is gone. Measuring the shortfall against it counts a reservation as
+// a spend — a 1000 top-up with 900 of live usage against it and a full 1000
+// refund would record `uncovered = 900` when nothing is missing at all, and the
+// recorded figure is what the operator resolves the case with.
+//
+// `Settled` is the money that was actually added and has not been taken back.
+// A refund that is covered by settled funds is a refund this bucket absorbs; a
+// refund beyond them is a shortfall someone has to look at. Held funds are
+// neither, and a reservation is not a loss.
+//
+// The figure is recorded for the operator who has to resolve the case; it is NOT
+// booked, for the reason applyRefund states at length.
 func (p *Payments) uncoveredRefund(txCtx context.Context, intent payments.Intent, refunded int64) (int64, error) {
 	bucket, err := p.buckets.Bucket(txCtx, accounting.FundingBucketID(intent.FundingBucketID))
 	if err != nil {
 		return 0, fmt.Errorf("read the payment's funding bucket: %w", err)
 	}
-	available := int64(bucket.Available)
-	if refunded <= available {
+	settled := int64(bucket.Settled)
+	if refunded <= settled {
 		return 0, nil
 	}
-	return refunded - available, nil
+	return refunded - settled, nil
 }
 
 // quarantineRecord writes a quarantine row with the reason's own evidence
@@ -1234,8 +1359,19 @@ func (p *Payments) recordQuarantine(ctx context.Context, now time.Time, event pa
 // operator's question is "which of the two figures disagrees". A currency
 // mismatch is separated from an amount mismatch before anything else, since an
 // amount is not a figure until the unit it counts in is known.
+//
+// The currency comparison has NO `!= ""` guard, and the absence of one is the
+// fix rather than an oversight. The adapter's answer to a `null`, non-string or
+// over-long currency is the empty string — the same sentinel it uses for a
+// field it could not read — so a guard would route exactly the deliveries that
+// are MOST about the currency to the reason for a different fault. A paid
+// checkout whose `currency` is `null` arrives with an amount that matches to the
+// unit and is filed as `amount_mismatch`, beside a quarantine row whose own
+// currency column is NULL: the operator is told the sum disagrees when the sum
+// is not what is wrong. Every payment this plane opens has a non-empty
+// currency, so the empty string is never a match and the fold is safe.
 func reasonForClaimRefusal(err error, intent payments.Intent, event paymentprovider.ProviderEvent) payments.QuarantineReason {
-	if event.Currency != "" && payments.CurrencyCode(intent.Currency) != payments.CurrencyCode(event.Currency) {
+	if payments.CurrencyCode(intent.Currency) != payments.CurrencyCode(event.Currency) {
 		return payments.ReasonCurrencyMismatch
 	}
 	if errors.Is(err, payments.ErrInvalidTransition) {
@@ -1312,7 +1448,7 @@ func (p *Payments) ListPayments(ctx context.Context, accountID, cursor string, l
 		return PaymentPage{}, fmt.Errorf("application: list payments for account %s: %w", accountID, err)
 	}
 	items, hasMore, next := PageOf(intents, pageSize,
-		func(intent payments.Intent) string { return string(intent.ID) }, collectionPayments, filters)
+		func(intent payments.Intent) string { return string(intent.ID) }, collectionPayments, filters, after)
 	return PaymentPage{Items: items, HasMore: hasMore, NextCursor: next}, nil
 }
 

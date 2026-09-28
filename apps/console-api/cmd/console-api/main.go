@@ -51,6 +51,7 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/config"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/accounting"
 	dataplaneport "github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/dataplane"
+	paymentsport "github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/payments"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
@@ -871,6 +872,26 @@ func buildConsoleSurface(store persistence.Store, projectionLog persistence.Proj
 func buildPaymentsSurface(store persistence.Store, accountingUseCases *application.Accounting, cfg config.Payments) (*application.Payments, error) {
 	if cfg.Provider == "" {
 		return nil, nil
+	}
+
+	// The provider a deployment NAMES has to be a provider this build
+	// IMPLEMENTS, and the check is here rather than in config because the
+	// answer is a property of the code, not of the configuration's shape.
+	//
+	// The failure it prevents has no symptom. The only adapter this build
+	// carries speaks one provider's API and verifies one provider's signature
+	// scheme, so a deployment naming another would get them anyway: the
+	// process starts, logs that it is ready for the provider it named, and
+	// answers 400 "did not authenticate" to every genuine delivery from a
+	// provider it was never going to understand. The operator's next move is to
+	// suspect the endpoint secret, which is the one value that is certainly
+	// right — while the payments themselves are filed under a namespace no
+	// delivery can ever reach.
+	adapterName, known := paymentsport.ProviderName(cfg.Provider)
+	if !known {
+		return nil, fmt.Errorf(
+			"CONSOLE_API_PAYMENTS_PROVIDER %q names a provider this build has no adapter for; %q is the one it implements, and a webhook signed with another provider's scheme would be refused as unauthenticated for every delivery",
+			cfg.Provider, adapterName)
 	}
 
 	// The catalogue is built in DECLARATION ORDER, carrying the label, because

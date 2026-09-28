@@ -123,6 +123,25 @@ func TestLoadReadsThePaymentsGroup(t *testing.T) {
 			t.Errorf("Load() error = %q, want it to name the missing required variable", err)
 		}
 	})
+
+	t.Run("accepts a cleartext return URL where an https API base URL stands", func(t *testing.T) {
+		// The API base URL is https-only and the return URL is not, and the pair
+		// has to be asserted TOGETHER: run against two https URLs it would pass
+		// against a build that had dropped the restriction entirely, and run
+		// against a cleartext API URL it would fail against a build that applied
+		// one rule to both. The distinction is which URL carries a secret — the
+		// API one carries the deployment's bearer credential on every request,
+		// and the return one carries nothing but a browser to a console page.
+		cfg, err := Load(lookup(paymentsEnv(merge(validPaymentsEnv(), map[string]string{
+			"CONSOLE_API_PAYMENTS_CHECKOUT_RETURN_URL": "http://localhost:5173/billing/top-up",
+		}))))
+		if err != nil {
+			t.Fatalf("Load() error = %v, want a local console over http accepted: a developer running this on a laptop is doing something reasonable, and nothing secret is sent there", err)
+		}
+		if got := cfg.Payments.CheckoutReturnURL; got != "http://localhost:5173/billing/top-up" {
+			t.Errorf("return URL = %q, want the value as configured", got)
+		}
+	})
 }
 
 func TestLoadRefusesPaymentsSettingsThatCannotWork(t *testing.T) {
@@ -193,6 +212,17 @@ func TestLoadRefusesPaymentsSettingsThatCannotWork(t *testing.T) {
 			name:    "rejects an API base URL carrying a query",
 			env:     map[string]string{"CONSOLE_API_PAYMENTS_API_BASE_URL": "https://api.stripe.com?v=2024"},
 			wantErr: "CONSOLE_API_PAYMENTS_API_BASE_URL must carry no query or fragment",
+		},
+		{
+			// A cleartext API base URL would carry this deployment's payment API
+			// secret as a bearer credential in the clear, on every checkout. The
+			// case is loopback on purpose: nothing about 127.0.0.1 is unsafe, and
+			// the rule still applies because the URL is where the secret is SENT.
+			// An exemption for loopback would be one a deployment could be
+			// misconfigured past in staging and not in production.
+			name:    "rejects a cleartext API base URL",
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_API_BASE_URL": "http://api.stripe.com"},
+			wantErr: "CONSOLE_API_PAYMENTS_API_BASE_URL must use the https scheme",
 		},
 		{
 			name:    "rejects a return URL carrying a fragment",
@@ -316,7 +346,7 @@ func TestTheFmtVerbsCannotPrintEitherSecret(t *testing.T) {
 		render func() string
 	}{
 		{"%v of the group", func() string { return fmt.Sprintf("%v", payments) }},
-		{"%s of the group", func() string { return fmt.Sprintf("%s", payments) }},
+		{"%s of the group", payments.String},
 		{"%+v of the group", func() string { return fmt.Sprintf("%+v", payments) }},
 		{"%#v of the group", func() string { return fmt.Sprintf("%#v", payments) }},
 		{"%#v of a pointer to the group", func() string { return fmt.Sprintf("%#v", &payments) }},
@@ -468,37 +498,41 @@ func TestLoadReadsTheTopUpOffersADeploymentDeclares(t *testing.T) {
 		}
 	})
 
-	t.Run("reads a price past the range a 32-bit integer holds", func(t *testing.T) {
-		// The amount is an int64 because the ledger's is; a parse that went
-		// through int would refuse a large top-up on a 32-bit platform and accept
-		// it on a 64-bit one, which is a price that depends on the build.
-		declared := merge(
-			map[string]string{topUpOfferIDsVariable: "enterprise"},
-			offerEnvFor("enterprise", "4503599627370496", "USD", "2", "Enterprise"),
-		)
-		cfg, err := Load(lookup(offersEnv(declared)))
-		if err != nil {
-			t.Fatalf("Load() error = %v", err)
-		}
-		if got := cfg.Payments.TopUpOffers[0].AmountMinorUnits; got != 4503599627370496 {
-			t.Errorf("amount = %d, want 2^52, which no 32-bit parse reads", got)
+	t.Run("carries a price in the ledger's own integer type", func(t *testing.T) {
+		// There is no ACCEPTED price that needs a 64-bit parse any more, and the
+		// arithmetic says so rather than this comment asserting it: the provider
+		// ceiling is 99,999,999, which is below 2^31-1, so every figure a
+		// deployment can actually sell fits in a 32-bit integer. A case that
+		// loaded 2^52 and expected it accepted would be a test that cannot pass.
+		//
+		// What the int64 parse still buys is on the REFUSAL side, and the case
+		// in the refusal table below carries it: 2^63 is refused as "not a whole
+		// number of minor units" because ParseInt reported an overflow, not
+		// because the ceiling caught a wrapped value. The check is a SIGNED
+		// 64-bit parse for the same reason the ledger's money type is one — a
+		// price is the figure a customer is charged, and it is not carried in a
+		// type that depends on the build it was configured on.
+		if ProviderMaxUnitAmountMinorUnits >= int64(1)<<31-1 {
+			t.Fatalf("the provider ceiling is %d, which no longer sits below 2^31: the two ranges have met, and the accepted price a 32-bit parse could not read has to be tested again here",
+				ProviderMaxUnitAmountMinorUnits)
 		}
 	})
 
-	t.Run("accepts the largest price a client's own parser carries exactly", func(t *testing.T) {
-		// The ceiling is inclusive, so the boundary itself is a price this build
-		// sells: refusing it would be a deployment that cannot charge the one
-		// figure the rule below it is written around.
+	t.Run("accepts a price this build can carry and the provider can charge", func(t *testing.T) {
+		// The ceiling that binds is the SMALLER of two — the provider's — and
+		// the case worth pinning is the boundary that actually applies. A test
+		// that only exercised the 2^53 one would pass against a build that had
+		// forgotten the provider entirely, which is the omission this pins.
 		declared := merge(
 			map[string]string{topUpOfferIDsVariable: "enterprise"},
-			offerEnvFor("enterprise", "9007199254740991", "USD", "2", "Enterprise"),
+			offerEnvFor("enterprise", "99999999", "USD", "2", "Enterprise"),
 		)
 		cfg, err := Load(lookup(offersEnv(declared)))
 		if err != nil {
 			t.Fatalf("Load() error = %v", err)
 		}
-		if got := cfg.Payments.TopUpOffers[0].AmountMinorUnits; got != MaxTopUpOfferAmountMinorUnits {
-			t.Errorf("amount = %d, want the %d ceiling itself accepted", got, MaxTopUpOfferAmountMinorUnits)
+		if got := cfg.Payments.TopUpOffers[0].AmountMinorUnits; got != ProviderMaxUnitAmountMinorUnits {
+			t.Errorf("amount = %d, want the %d provider ceiling itself accepted", got, ProviderMaxUnitAmountMinorUnits)
 		}
 	})
 
@@ -604,6 +638,12 @@ func TestLoadRefusesTopUpOffersThatCannotWork(t *testing.T) {
 			wantErr:  `offer "starter" must be greater than zero, and -1000 is not an offer`,
 		},
 		{
+			// One past the signed 64-bit range. ParseInt reports an OVERFLOW
+			// rather than a syntax error, and the two want the same answer here:
+			// the figure is not a number this build can hold, whichever way it
+			// failed. This is the only case left that needs a 64-bit parse —
+			// every price a deployment can sell is under 2^31, which the
+			// accepted-price case above asserts the shape of.
 			name:     "rejects a price past the range an int64 holds",
 			declared: merge(map[string]string{topUpOfferIDsVariable: "starter"}, offerEnvFor("starter", "9223372036854775808", "USD", "2", "Starter")),
 			wantErr:  "must be an integer number of minor units",
@@ -614,7 +654,18 @@ func TestLoadRefusesTopUpOffersThatCannotWork(t *testing.T) {
 			// operator would raise it.
 			name:     "rejects a price past what the console's own parser carries exactly",
 			declared: merge(map[string]string{topUpOfferIDsVariable: "starter"}, offerEnvFor("starter", "9007199254740992", "USD", "2", "Starter")),
-			wantErr:  `offer "starter" is priced at 9007199254740992 minor units, over the 9007199254740991 this build can carry to a client`,
+			wantErr:  `is priced at 9007199254740992 minor units, over the 9007199254740991 this build can carry to a client`,
+		},
+		{
+			// One past the ceiling that actually binds. A figure inside the 2^53
+			// window and outside the provider's is the one that loads cleanly
+			// here and fails at the provider on every single checkout, so the
+			// refusal has to happen at boot with a message naming the provider —
+			// an operator who read only about the console would raise the wrong
+			// limit and change nothing.
+			name:     "rejects a price past what the payment provider's own API carries",
+			declared: merge(map[string]string{topUpOfferIDsVariable: "starter"}, offerEnvFor("starter", "100000000", "USD", "2", "Starter")),
+			wantErr:  `is priced at 100000000 minor units, over the 99999999 the payment provider's API can carry`,
 		},
 		{
 			name:     "rejects a lowercase currency",

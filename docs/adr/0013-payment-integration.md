@@ -154,11 +154,17 @@ that names what was not done.
 
 ### 4. Credentials never leave the server
 
-`SecretKey`, `WebhookSigningSecret` and `ProviderAccountKey` live in the
-configuration group, are read by the adapter, and appear in no response, no log
-line and no frontend bundle. There is no publishable key in this design, because
-a hosted checkout needs none: the browser is redirected to a URL the server
-obtained, and it presents no provider credential of its own.
+`SecretKey` and `WebhookSigningSecret` live in the configuration group, are read
+by the adapter, and appear in no response, no log line and no frontend bundle.
+`ProviderAccountKey` is the third member of the group and is NOT a credential:
+it is the merchant account's public identifier, it is part of the deduplication
+key, and it is logged deliberately so a delivery can be attributed to a
+merchant. The two secret members are the ones the redaction covers, and they
+are covered in every rendering — `%v`, `%s`, `%+v` and `%#v`, through the
+`LogValue`/`String`/`GoString` trio the group's type implements, so a struct
+that embeds the group cannot reach either. There is no publishable key in this
+design, because a hosted checkout needs none: the browser is redirected to a
+URL the server obtained, and it presents no provider credential of its own.
 
 The adapter is the only package that holds them. Nothing logs a raw signature,
 a full webhook payload, or a bearer token — the payload is stored only when an

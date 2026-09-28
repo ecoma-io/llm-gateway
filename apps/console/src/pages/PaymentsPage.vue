@@ -398,12 +398,15 @@ function paymentsTableState(): "ready" | "loading" | "empty" {
         </template>
         <template #checkout_url="{ row }: { row: PaymentIntent }">
           <a
-            v-if="row.checkout_url !== null"
+            v-if="row.checkout_url !== null && PAYMENT_AWAITING_PROVIDER_STATES.has(row.status)"
             :href="row.checkout_url"
             class="inline-flex min-h-11 items-center rounded-md text-sm text-foreground underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
           >
             Go to checkout
           </a>
+          <span v-else-if="row.checkout_url !== null" class="text-xs text-muted-foreground">
+            Checkout closed
+          </span>
           <span v-else class="text-xs text-muted-foreground">Not open yet</span>
         </template>
       </DataTable>
@@ -411,7 +414,9 @@ function paymentsTableState(): "ready" | "loading" | "empty" {
       <p class="text-xs text-muted-foreground">
         Each row is one payment, rendered from the server's own fields. The checkout link is the
         provider's own URL, handed to the browser as it arrived: this console does not fetch it, and
-        nothing here decides that a payment succeeded.
+        nothing here decides that a payment succeeded. The link is only live while the provider has
+        something left to confirm; on a settled payment it reads as closed, because following it
+        would be sending a customer back to a page that cannot change their payment.
       </p>
     </section>
 

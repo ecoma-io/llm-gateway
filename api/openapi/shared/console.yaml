@@ -46,6 +46,13 @@ components:
         served against the new filter, because a page reached through a
         mismatched cursor is a page whose rows belong to a question the caller
         is no longer asking.
+
+        An empty page's `next_cursor` names the position the page was REQUESTED
+        FROM, so paging past the end holds the walk where it is rather than
+        restarting it: a client that pages once more gets the same empty page
+        and `has_more: false`, and an empty position — the one before the first
+        row — is only ever named by the FIRST page of a walk that is empty from
+        the start.
       schema:
         $ref: "#/components/schemas/Cursor"
     PageLimit:
@@ -1609,6 +1616,13 @@ components:
     # retained history on every page, re-reading the same rows forever behind
     # a position that never moves. The last page's cursor resumes the walk and
     # returns an empty page, which is the honest answer.
+    #
+    # An EMPTY page's `next_cursor` is the one cursor in this surface not
+    # derived from a row: it names the position the page was REQUESTED FROM
+    # (the beginning for a first page). That is the truth about where the walk
+    # stands, and it is what prevents an empty page from being told it is at
+    # the start of the collection — naming the start would be a different
+    # position, and a console that stored it would re-read page one forever.
     # -------------------------------------------------------------------------
 
     PageEnvelope:

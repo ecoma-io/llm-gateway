@@ -578,6 +578,21 @@ func (f fakePaymentIntents) RecordCapture(_ context.Context, id payments.IntentI
 // added it to what the row already held would reproduce the drift the adapter's
 // own comment names — a per-delivery figure summed into a cumulative column,
 // letting every delivery spend the same balance again.
+//
+// The SCHEMA'S OWN CHECKS ARE REPRODUCED HERE, and the absence of them was a
+// real gap rather than a harmless simplification. `payment_intents_uncovered_
+// refund_within_refund` refuses an uncovered figure larger than the refund it
+// is part of, and this fake wrote whatever it was handed: a pair the database
+// would answer 23514 to reached the caller as a successful write, and the test
+// suite could not have noticed. Reproducing the CHECK turns that class of
+// mistake into a visible failure in the unit suite rather than a 5xx against a
+// real delivery, which is where it would otherwise be found.
+//
+// The check is enforced as a PANIC rather than an error, because there is no
+// error this port could return that would be honest: a caller that wrote an
+// uncovered figure exceeding the refund has a defect, and translating it into
+// `moved = false` would file the delivery as a state conflict and hide it. A
+// fake exists to make a defect loud.
 func (f fakePaymentIntents) RecordRefund(_ context.Context, id payments.IntentID, refundRef string, totalRefunded, uncovered int64, from []payments.Status, to payments.Status, now time.Time) (payments.Intent, bool, error) {
 	w := f.world
 	w.record("record-refund")
@@ -593,6 +608,11 @@ func (f fakePaymentIntents) RecordRefund(_ context.Context, id payments.IntentID
 	}
 	if intent.RefundedMinorUnits >= totalRefunded || totalRefunded > intent.AmountMinorUnits {
 		return payments.Intent{}, false, nil
+	}
+	if uncovered < 0 || uncovered > totalRefunded {
+		panic(fmt.Sprintf(
+			"fake: payment %s was written uncovered=%d against a refund of %d: the schema's payment_intents_uncovered_refund_within_refund CHECK refuses this, and a fake that accepted it would let the defect reach a real delivery as a 5xx",
+			id, uncovered, totalRefunded))
 	}
 	intent.RefundedMinorUnits = totalRefunded
 	intent.UncoveredRefundMinorUnits = uncovered
@@ -667,6 +687,17 @@ type fakePaymentEvents struct {
 	world *paymentsWorld
 }
 
+// Record writes the row the way the SQL adapter writes it: with the PROVISIONAL
+// disposition, never the caller's.
+//
+// This is not a detail of the fake. A fake that stored `event.Disposition`
+// verbatim would be MORE PERMISSIVE than the column it stands in for, and the
+// difference is invisible from the application side: a delivery that credits a
+// customer and never calls Settle would pass every unit test here while the real
+// adapter left the row saying `recorded` — the one value the schema says no
+// reader may ever see. Storing `recorded` here makes the fake hold the
+// application to the same contract the database does, and the omission this
+// replaces was invisible precisely because the fake did not.
 func (f fakePaymentEvents) Record(ctx context.Context, event payments.ProviderEventRecord) error {
 	w := f.world
 	if !inTransaction(ctx) {
@@ -677,7 +708,9 @@ func (f fakePaymentEvents) Record(ctx context.Context, event payments.ProviderEv
 	if _, seen := w.events[key]; seen {
 		return payments.ErrDuplicateEvent
 	}
-	w.events[key] = event
+	row := event
+	row.Disposition = payments.DispositionRecorded
+	w.events[key] = row
 	return nil
 }
 

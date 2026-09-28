@@ -366,11 +366,16 @@ const FINDINGS: FindingPage = {
  * The payments are chosen to reach the branches a green audit would otherwise
  * skip: a `checkout_open` row, which renders the provider link AND the
  * waiting-for-confirmation card a customer returning from checkout lands on,
- * and a `succeeded` row, which renders the funded badge. Both carry a
+ * and a `succeeded` row, which renders the paid badge. Both carry a
  * `checkout_url` because the contract keeps it after the payment completes —
  * "a customer returning to a payment they started is sent back to this same
- * URL" — so the link is a live control on a settled row and not only on an open
- * one. The amounts sit well inside the money formatter's exact range on
+ * URL" — and the fixture is deliberately built so the two rows are told apart
+ * by the control they render: the open one by its live link, the settled one
+ * by the closed-checkout text where that link would have been. A screen that
+ * offered the link on both rows would therefore pass this audit while showing
+ * a customer a way back onto a provider page for a payment that is over, and
+ * the settled row is here precisely to catch that.
+ * The amounts sit well inside the money formatter's exact range on
  * purpose: an unrenderable figure puts an `aria-label` on a roleless `<span>`,
  * which is the one `aria-prohibited-attr` judgement this console has made, and
  * a second one here would be a second claim rather than more coverage.

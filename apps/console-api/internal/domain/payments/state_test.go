@@ -218,12 +218,18 @@ func TestTopUpCommandKeysAreDeterministicAndDistinct(t *testing.T) {
 // there is one spelling of it, while a payment reference is the provider's own
 // value and two references differing in case are two references to them.
 func TestCommandKeysFoldTheProviderButNotThePaymentReference(t *testing.T) {
+	// The provider names here are DELIBERATELY case-varied and use no real
+	// provider's name, because the rule under test is that the fold collapses
+	// spelling — case, surrounding space, punctuation — into one scope. Naming a
+	// vendor here would put the provider's identity into a file that must not
+	// have it (see the provider-vocabulary rule in internal/arch) without making
+	// the case any stronger, since the fold sees characters and not a company.
 	cases := []struct{ spelled, canonical string }{
-		{"stripe", "stripe"},
-		{"Stripe", "stripe"},
-		{"  STRIPE  ", "stripe"},
-		{"Stripe Payments", "stripe_payments"},
-		{"str*/pe", "str__pe"},
+		{"acme", "acme"},
+		{"ACME", "acme"},
+		{"  aCmE  ", "acme"},
+		{"Acme Payments", "acme_payments"},
+		{"ac*m*e", "ac_m_e"},
 		{"adyen-2", "adyen-2"},
 		{"42", "42"},
 		{"Über", "_ber"},
@@ -503,8 +509,8 @@ func TestCanRefundAcceptsTheCeilingAndRefusesOneMinorUnitOver(t *testing.T) {
 		t.Errorf("CanRefund(0, 100, 100) = %d, want 100: the ceiling is inclusive", room)
 	}
 	over, err := CanRefund(0, 101, 100)
-	if !errors.Is(err, ErrInvalidReference) {
-		t.Fatalf("CanRefund(0, 101, 100) = %v, want ErrInvalidReference", err)
+	if !errors.Is(err, ErrRefundCeiling) {
+		t.Fatalf("CanRefund(0, 101, 100) = %v, want ErrRefundCeiling", err)
 	}
 	if over != 100 {
 		t.Errorf("a refused refund reported %d refundable, want the 100 still available", over)
@@ -514,8 +520,8 @@ func TestCanRefundAcceptsTheCeilingAndRefusesOneMinorUnitOver(t *testing.T) {
 		t.Errorf("CanRefund(40, 60, 100) = (%d, %v), want (60, nil)", room, err)
 	}
 	// One unit past the REMAINING room is refused too, and reports the room.
-	if room, err = CanRefund(60, 41, 100); !errors.Is(err, ErrInvalidReference) || room != 40 {
-		t.Errorf("CanRefund(60, 41, 100) = (%d, %v), want (40, ErrInvalidReference)", room, err)
+	if room, err = CanRefund(60, 41, 100); !errors.Is(err, ErrRefundCeiling) || room != 40 {
+		t.Errorf("CanRefund(60, 41, 100) = (%d, %v), want (40, ErrRefundCeiling)", room, err)
 	}
 }
 
@@ -582,8 +588,14 @@ func TestCanRefundNeverAcceptsMoreThanWasCaptured(t *testing.T) {
 	}
 	for _, tc := range refused {
 		room, err := CanRefund(tc.already, tc.requested, tc.captured)
-		if !errors.Is(err, ErrInvalidReference) {
-			t.Errorf("CanRefund(%d, %d, %d) = (%d, %v), want ErrInvalidReference: it accepts more than was captured",
+		// ErrRefundCeiling, and NOT the umbrella ErrInvalidReference, is what
+		// these rows earn. The arithmetic is what the table has always pinned
+		// and it is unchanged; what is asserted here is the SENTINEL, because a
+		// caller above this package has to tell a refund that does not fit from
+		// a delivery that named something this payment is not, and one sentinel
+		// for both makes that untellable. See ErrRefundCeiling.
+		if !errors.Is(err, ErrRefundCeiling) {
+			t.Errorf("CanRefund(%d, %d, %d) = (%d, %v), want ErrRefundCeiling: it accepts more than was captured",
 				tc.already, tc.requested, tc.captured, room, err)
 			continue
 		}
@@ -600,7 +612,7 @@ func TestCanRefundNeverAcceptsMoreThanWasCaptured(t *testing.T) {
 	if wrapped >= 0 {
 		t.Fatalf("this test's premise is broken: MaxInt64+1 did not wrap to a negative (%d)", wrapped)
 	}
-	if _, err := CanRefund(math.MaxInt64, 1, math.MaxInt64); !errors.Is(err, ErrInvalidReference) {
+	if _, err := CanRefund(math.MaxInt64, 1, math.MaxInt64); !errors.Is(err, ErrRefundCeiling) {
 		t.Errorf("a refund one unit past a MaxInt64 capture was accepted: an overflowed total is not a ceiling")
 	}
 }

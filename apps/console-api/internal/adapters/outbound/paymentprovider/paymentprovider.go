@@ -126,13 +126,25 @@ type Client struct {
 // New returns the checkout client described by the provider's API base URL, the
 // API secret this process authenticates with, and the bound on one call.
 //
-// It panics on a wiring defect — a base URL that is not an absolute http(s)
+// It panics on a wiring defect — a base URL that is not an absolute https
 // URL, a URL carrying userinfo, a query or a fragment, an empty secret, a
 // non-positive timeout — for the reason postgres.New panics on a nil pool and
 // dataplane.New panics on an empty credential: each is a defect in the
 // composition root that would otherwise appear far from the line that could
 // have said so, as a request to nowhere, a checkout that can only ever be
 // refused, or a client with no bound at all.
+//
+// HTTPS AND NOT HTTP, and this is the second of two refusals rather than a
+// second opinion on the first: the configuration layer holds the same rule, and
+// either alone would leave a path open. Config refuses at Load, so an operator
+// cannot start the process with a cleartext base URL; this refuses at New, so a
+// caller that constructs a client without going through config cannot either.
+// The reason the URL is secret-bearing rather than merely public is the
+// credential: every request this client makes carries the API secret as a bearer
+// token, and over cleartext that token is readable by anything on the path — a
+// key that can open checkouts and read the account's charges, not a
+// per-session token. A checkout that runs against a MITM also returns a
+// MITM's own session URL, which this plane then stores and sends a customer to.
 //
 // No panic message quotes the base URL. url.Parse's own error text quotes the
 // string it rejected, credentials included, and a startup panic is a log line.
@@ -141,8 +153,8 @@ func New(apiBaseURL, secretKey string, requestTimeout time.Duration) *Client {
 	if err != nil {
 		panic("paymentprovider: the API base URL is not a URL")
 	}
-	if base.Scheme != "http" && base.Scheme != "https" {
-		panic("paymentprovider: the API base URL must be http or https")
+	if base.Scheme != "https" {
+		panic("paymentprovider: the API base URL must use the https scheme: every request this client makes carries the deployment's payment API secret as a bearer credential, and over cleartext it is readable by anything on the path")
 	}
 	if base.Host == "" {
 		panic("paymentprovider: the API base URL must name a host")
@@ -333,6 +345,24 @@ type checkoutSessionResponse struct {
 	URL *string `json:"url"`
 }
 
+// The two bounds below are the schema's, not the provider's, and they are here
+// for the same reason the webhook path applies storableProviderText before it
+// records: a provider string that cannot be stored must not be written raw.
+//
+// A URL longer than `payment_intents_checkout_url_evidence` allows would fail a
+// check violation that nothing translates, so the whole checkout would roll back
+// and every later POST for that offer would fail the same way — a permanent
+// 500 against a working provider, discovered by a customer. The same is true of
+// a session id longer than the reference column allows. Neither is a refusal of
+// the payment, so neither is reported as one: a checkout whose answer this
+// build cannot keep is an error the use case surfaces, and the payment stays
+// `created` with no checkout URL for the customer to be sent to, which is the
+// state the contract already describes for a provider that never answered.
+const (
+	maxStorableCheckoutURLLength = 2048
+	maxStorableCheckoutRefLength = 255
+)
+
 // session translates Stripe's answer into the port's, and returns the URL
 // BYTE FOR BYTE.
 //
@@ -349,10 +379,16 @@ func (r checkoutSessionResponse) session() (payments.CheckoutSession, error) {
 		return payments.CheckoutSession{}, errors.New("the checkout answer carried no id, which the provider's contract requires")
 	case *r.ID == "":
 		return payments.CheckoutSession{}, errors.New("the checkout answer carried an empty id, so there is no reference to match a later delivery against")
+	case len(*r.ID) > maxStorableCheckoutRefLength:
+		return payments.CheckoutSession{}, fmt.Errorf("the checkout answer carried a session id of %d bytes, which is longer than the %d this build can record; a truncated reference would be a different reference, and a delivery naming it could not be matched back to this payment",
+			len(*r.ID), maxStorableCheckoutRefLength)
 	case r.URL == nil:
 		return payments.CheckoutSession{}, errors.New("the checkout answer carried no url, which the provider's contract requires")
 	case *r.URL == "":
 		return payments.CheckoutSession{}, errors.New("the checkout answer carried an empty url, so there is nowhere to send the customer")
+	case len(*r.URL) > maxStorableCheckoutURLLength:
+		return payments.CheckoutSession{}, fmt.Errorf("the checkout answer carried a url of %d bytes, which is longer than the %d this build can keep for a customer to visit",
+			len(*r.URL), maxStorableCheckoutURLLength)
 	}
 	return payments.CheckoutSession{URL: *r.URL, ProviderRef: *r.ID}, nil
 }

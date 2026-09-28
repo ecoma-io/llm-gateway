@@ -268,7 +268,17 @@ func ResolvePage(list, cursor string, limit int, filters map[string]string) (aft
 // page pays for and the last one wastes — and either way the number is wrong
 // the moment it is written. A page is a page, a cursor is where to continue,
 // and has_more says whether continuing is worth it.
-func PageOf[T any](rows []T, limit int, keyset func(T) string, list string, filters map[string]string) (items []T, hasMore bool, nextCursor string) {
+//
+// The `after` argument is the position this page was requested FROM — the
+// empty string for a first page. On an EMPTY page it is re-encoded as the
+// page's cursor, which is the one case in this function where the cursor is
+// not derived from a row. A collection can be non-empty when a page is
+// requested, and empty by the time the page is minted — and the two pages of
+// one collection are then not the same page. A cursor naming the last row that
+// WAS here (the old behaviour) would read back as the start of the collection,
+// which is a different position entirely; a cursor naming where this page was
+// asked for is the truth about where the walk stands.
+func PageOf[T any](rows []T, limit int, keyset func(T) string, list string, filters map[string]string, after string) (items []T, hasMore bool, nextCursor string) {
 	items = rows
 	if len(items) > limit {
 		hasMore = true
@@ -281,7 +291,7 @@ func PageOf[T any](rows []T, limit int, keyset func(T) string, list string, filt
 	if items == nil {
 		items = []T{}
 	}
-	last := ""
+	last := after
 	if len(items) > 0 {
 		last = keyset(items[len(items)-1])
 	}

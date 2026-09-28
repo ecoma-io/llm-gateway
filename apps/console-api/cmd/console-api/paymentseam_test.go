@@ -264,9 +264,7 @@ func TestTheWebhookVerifierTreatsAnExtraSignatureHeaderAsSmuggling(t *testing.T)
 	// the hazard: an implementation that picked one would accept a request
 	// carrying a signature this deployment does not honour.
 	lower := strings.ToLower(seamSignatureHeader)
-	for _, value := range headers[seamSignatureHeader] {
-		headers[lower] = append(headers[lower], value)
-	}
+	headers[lower] = append(headers[lower], headers[seamSignatureHeader]...)
 
 	if _, err := seamVerifier().Verify(headers, body); !errors.Is(err, payments.ErrBadSignature) {
 		t.Fatalf("Verify() error = %v, want %v: a delivery that authenticates under more than one signature is smuggling", err, payments.ErrBadSignature)

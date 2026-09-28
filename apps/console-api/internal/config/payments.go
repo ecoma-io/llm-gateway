@@ -45,6 +45,14 @@ const (
 	// downstream use of it can carry.
 	maxPaymentsProviderLength = 64
 
+	// maxPaymentsProviderAccountKeyLength bounds the merchant account
+	// identifier, and it is the SCHEMA's bound rather than this file's: both
+	// payment evidence tables carry it inside the deduplication key, and both
+	// cap the column at this many characters. Stating the schema's number here
+	// is what makes an over-long key a startup refusal rather than a delivery
+	// that fails for the first time when a customer tries to pay.
+	maxPaymentsProviderAccountKeyLength = 128
+
 	// topUpOfferIDsVariable declares this deployment's top-up offers, and each
 	// offer's own settings live in variables spelled from its id beside it. It
 	// is the shape the Data Plane's egress configuration uses for a list of
@@ -100,6 +108,21 @@ const (
 	// offer it names (see the application's openIntent), so one check covers
 	// every figure that can reach a bucket.
 	MaxTopUpOfferAmountMinorUnits = int64(1)<<53 - 1
+
+	// ProviderMaxUnitAmountMinorUnits is the largest amount the payment
+	// provider's API carries in its integer amount field: 99,999,999.99 in a
+	// two-decimal currency. It is the PROVIDER's bound, and this configuration
+	// restates it rather than importing the adapter's copy — configuration
+	// cannot import an adapter, and a bound that only existed one layer down
+	// would be a bound nothing at load time could enforce.
+	//
+	// It is the smaller of the two ceilings a price has to clear, and enforcing
+	// only the larger one is the failure this constant exists to prevent: an
+	// offer priced between the two would pass every check here and then be
+	// refused by the provider on every single attempt, forever, with the
+	// payment left in `created` and a customer told nothing until they
+	// complained.
+	ProviderMaxUnitAmountMinorUnits = int64(99_999_999)
 )
 
 // placeholderWebhookSecrets are the values a deployment must not ship as its
@@ -459,8 +482,31 @@ func validatePayments(cfg Payments) error {
 	if cfg.ProviderAccountKey == "" {
 		return fmt.Errorf("CONSOLE_API_PAYMENTS_PROVIDER_ACCOUNT_KEY must not be empty")
 	}
+	// The length bound is the schema's, and it is checked here because a value
+	// the schema refuses is a value that fails on EVERY delivery, not on an
+	// edge: this key is part of the dedup key of both evidence tables, so an
+	// over-long one would be written into a CHECK-bounded column on the first
+	// provider delivery and refuse it — a check violation nothing translates, a
+	// 500, and a provider retrying forever against an endpoint that could never
+	// record anything. The process would boot cleanly and say nothing about it
+	// until the first customer tried to pay.
+	if len(cfg.ProviderAccountKey) > maxPaymentsProviderAccountKeyLength {
+		return fmt.Errorf("CONSOLE_API_PAYMENTS_PROVIDER_ACCOUNT_KEY must be at most %d characters, got %d: it is part of the deduplication key of both payment evidence tables, and a longer one would be refused by their column check on every delivery",
+			maxPaymentsProviderAccountKeyLength, len(cfg.ProviderAccountKey))
+	}
 
-	if err := validatePaymentsURL("CONSOLE_API_PAYMENTS_API_BASE_URL", cfg.APIBaseURL); err != nil {
+	// THE API BASE URL IS HTTPS-ONLY, and the two URLs below are held to
+	// different rules rather than one shared one. This one carries a Bearer
+	// secret on every request the adapter makes; over cleartext that secret is
+	// readable by anyone on the path, and it is a key that can create and read
+	// charges on a live account. The return URL carries nothing and is the URL
+	// a customer's BROWSER is sent back to, where a plain-http staging
+	// deployment is a reasonable thing to run.
+	//
+	// Refusing here is better than trusting the adapter to refuse, because a
+	// deployment that boots is a deployment whose first customer payment is
+	// the thing that discovers it.
+	if err := validatePaymentsAPIURL("CONSOLE_API_PAYMENTS_API_BASE_URL", cfg.APIBaseURL); err != nil {
 		return err
 	}
 	if err := validatePaymentsURL("CONSOLE_API_PAYMENTS_CHECKOUT_RETURN_URL", cfg.CheckoutReturnURL); err != nil {
@@ -506,6 +552,13 @@ func validatePayments(cfg Payments) error {
 // Like validateDataPlaneURL and validatePostgresDSN, the value is never echoed
 // in a failure: url.Parse quotes the string it rejected, credentials included,
 // so its own text is deliberately not wrapped into these errors.
+// validatePaymentsURL accepts an absolute http(s) URL naming a host, with no
+// userinfo, query or fragment.
+//
+// It is the base rule both payments URLs are held to, and it admits cleartext
+// because the browser-facing return URL legitimately may be plain http on a
+// local deployment. The URL that carries a secret is held to the stricter
+// validatePaymentsAPIURL below.
 func validatePaymentsURL(name, raw string) error {
 	parsed, err := url.Parse(raw)
 	if err != nil {
@@ -522,6 +575,37 @@ func validatePaymentsURL(name, raw string) error {
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("%s must carry no query or fragment", name)
+	}
+	return nil
+}
+
+// validatePaymentsAPIURL is validatePaymentsURL with cleartext removed, and the
+// removal is the whole of it.
+//
+// The URL it guards is the one the outbound adapter sends the Bearer API secret
+// to on every checkout it opens. Over http that secret is readable by anything
+// on the network path, and it is not a per-session token: it is a key that can
+// open checkouts and read the account's charges, held by whoever reads it. The
+// browser return URL needs no such rule — nothing secret travels to it, and a
+// developer running a local deployment over http is doing something reasonable
+// that this should not refuse.
+//
+// The scheme is the only difference. Everything validatePaymentsURL refuses,
+// this refuses, and a caller that wanted a scheme other than https has to say
+// which one and why in a change to this file.
+func validatePaymentsAPIURL(name, raw string) error {
+	if err := validatePaymentsURL(name, raw); err != nil {
+		return err
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		// Unreachable through the call above, which parsed the same string, and
+		// restated rather than ignored so that a change to the base rule cannot
+		// quietly turn into an unparsed value reaching the scheme check.
+		return fmt.Errorf("%s must be an absolute http(s) URL", name)
+	}
+	if parsed.Scheme != "https" {
+		return fmt.Errorf("%s must use the https scheme: the outbound adapter sends this deployment's payment API secret as a bearer credential to this URL, and over cleartext it is readable by anything on the path", name)
 	}
 	return nil
 }
@@ -736,12 +820,18 @@ func readTopUpOffer(lookup LookupEnv, id string) (TopUpOffer, error) {
 // a price whose unit nobody stated, and this is the one figure in the group that
 // a customer is charged.
 //
-// The upper bound is the wire's, not the ledger's. MaxTopUpOfferAmountMinorUnits
-// is the largest integer a JSON number carries through a JavaScript client
-// exactly, and a price above it would not fail: it would arrive at the console
-// as a different figure, with no error on either side. Refusing it here is the
-// only place the mistake is visible, and it is visible while the operator is
-// still editing the deployment template.
+// TWO CEILINGS, NOT ONE, and the smaller of them is the one that binds.
+// MaxTopUpOfferAmountMinorUnits is the largest integer a JSON number carries
+// through a JavaScript client exactly, and a price above it would not fail — it
+// would arrive at the console as a different figure, with no error on either
+// side. ProviderMaxUnitAmountMinorUnits is the largest amount the provider's own
+// integer encoding carries, and it is far smaller: the provider's API refuses
+// anything above it, so an offer priced between the two would load cleanly here
+// and then fail every single checkout at the provider, with the payment left
+// `created` and no checkout URL for a customer to visit. Which of the two is
+// lower is a fact about the provider rather than about this file, so both are
+// checked and each refusal names the one it is about: an operator who read only
+// the other would fix the wrong ceiling.
 func parseTopUpOfferAmount(name, id, value string) (int64, error) {
 	if value == "" {
 		return 0, fmt.Errorf("%s must not be empty: an empty amount is not a price of nothing, it is a price nobody stated", name)
@@ -756,6 +846,10 @@ func parseTopUpOfferAmount(name, id, value string) (int64, error) {
 	if amount > MaxTopUpOfferAmountMinorUnits {
 		return 0, fmt.Errorf("%s: offer %q is priced at %d minor units, over the %d this build can carry to a client: JSON numbers above 2^53-1 lose precision in the console's own parser, so a price there would reach a customer as a different figure with nothing anywhere reporting a problem",
 			name, id, amount, MaxTopUpOfferAmountMinorUnits)
+	}
+	if amount > ProviderMaxUnitAmountMinorUnits {
+		return 0, fmt.Errorf("%s: offer %q is priced at %d minor units, over the %d the payment provider's API can carry: a price above it is refused by the provider itself, so the offer would load here and then fail every checkout at the provider, leaving the payment recorded with no checkout for a customer to visit",
+			name, id, amount, ProviderMaxUnitAmountMinorUnits)
 	}
 	return amount, nil
 }

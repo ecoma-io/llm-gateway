@@ -607,6 +607,57 @@ func TestIntegrationPaymentCaptureWritesTheReferenceAndTheStatusTogether(t *test
 	}
 }
 
+// TestIntegrationPaymentCaptureRedeliveryIsSilent pins the property the unique
+// index exists to buy, which is a NEGATIVE one: the ordinary redelivery must
+// not touch the index at all.
+//
+// The shape a redelivery takes is worth stating because it is the only thing
+// that keeps the index off the hot path. RecordCapture's from-list is four
+// states a capture moves FROM, and `succeeded` is not one of them, so the second
+// delivery of one capture matches zero rows and returns before the index is
+// ever consulted. That is a fact about the from-list, not about the index — and
+// it is worth pinning, because the shape it rules out is not a bug a reviewer
+// would expect to find: re-writing a row's own provider_payment_ref with the
+// value it already holds looks like a self-update, and a self-update does not
+// collide.
+//
+// A self-update really does not collide, and that is exactly why the wrong
+// reading of this path is so expensive. `SET provider_payment_ref = 'cs_1'` on a
+// row that already holds 'cs_1' produces one entry in the index, and the index
+// is satisfied. Adding `succeeded` to the from-list would therefore NOT raise
+// 23505 — it would succeed, and quietly rewrite the funding leg's command key
+// source to a second reference, which is the money bug the index was added to
+// stop. The guard is the from-list; the index is the second line of defence
+// against a different payment claiming the same capture, and that is what the
+// test above asserts, on a second payment rather than on a redelivery.
+func TestIntegrationPaymentCaptureRedeliveryIsSilent(t *testing.T) {
+	p := integrationPayments(t)
+	f := p.newPaymentFixture(t, "payments-redelivery")
+	intent, paymentRef := p.captured(t, f, payKey(t, "redelivery"))
+	before := p.mustByID(t, intent.ID)
+
+	// The redelivery, in the state a retrying provider produces: the same
+	// capture, named by the same reference, arriving once more. The caller is
+	// the application layer, which passes the same four from-states on every
+	// delivery, so this is the statement it really issues.
+	applied := true
+	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
+		var err error
+		_, applied, err = p.intents.RecordCapture(ctx, before.ID, paymentRef,
+			[]payments.Status{payments.StatusCheckoutOpen, payments.StatusRequiresAction,
+				payments.StatusExpired, payments.StatusCancelled}, micros(time.Now().UTC()))
+		return err
+	}); err != nil {
+		t.Fatalf("the redelivered capture returned an error rather than a verdict: %v", err)
+	}
+	if applied {
+		t.Error("a redelivered capture applied = true, want false: the payment is already succeeded and no second leg may be funded from it")
+	}
+	if after := p.mustByID(t, before.ID); !sameIntent(after, before) {
+		t.Errorf("the redelivery changed the row:\n got  %+v\n want %+v", after, before)
+	}
+}
+
 // TestIntegrationPaymentRefundIsWrittenAbsolutely is the projection the port
 // insists is the PROVIDER'S figure rather than a value this caller computed:
 // two refunds in sequence leave the second reported total on the row, and the
@@ -987,6 +1038,20 @@ func TestIntegrationPaymentEventDeliveryKeyIsOneDeliveryPerProviderAccount(t *te
 	// because the two rows are written by two transactions and a page is read
 	// for its contents rather than for the sub-microsecond order the two
 	// statements happened to commit in.
+	//
+	// BOTH ROWS ARE SETTLED BEFORE THEY ARE READ, and that is the shape a real
+	// delivery has: the insert writes the provisional disposition and the use
+	// case settles it in the same unit of work. Reading an un-settled row here
+	// and expecting `applied` would be asserting that the adapter echoes the
+	// fixture's argument — which is precisely the thing it must not do, and the
+	// thing the settle test beside this one pins.
+	for _, delivery := range []payments.ProviderEventRecord{event, elsewhere} {
+		if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
+			return p.events.Settle(ctx, delivery.DeliveryKey(), payments.DispositionApplied)
+		}); err != nil {
+			t.Fatalf("settle %s: %v", delivery.EventID, err)
+		}
+	}
 	recorded, err := p.events.ByIntent(t.Context(), intent.ID, 10)
 	if err != nil {
 		t.Fatalf("ByIntent: %v", err)
@@ -1019,6 +1084,76 @@ func TestIntegrationPaymentEventDeliveryKeyIsOneDeliveryPerProviderAccount(t *te
 	if len(none) != 0 {
 		t.Errorf("ByIntent with no payment returned %d deliveries, want none", len(none))
 	}
+}
+
+// TestIntegrationPaymentEventIsRecordedProvisionalAndSettlesOnce is the pair of
+// rules the delivery path exists to keep, and they can only be proved against a
+// real database: the insert writes the PROVISIONAL disposition whatever the
+// caller passed, and the settle that follows it is the one UPDATE the engine
+// guard admits.
+//
+// The first half is the one that a unit test structurally cannot see. The
+// fixture above asks for `applied` and the adapter must refuse to write it,
+// because a caller could otherwise record a delivery as applied with no effect
+// behind it. Asserting the row reads `recorded` after a Record that REQUESTED
+// `applied` is the only way to show the column is not simply the argument.
+//
+// The second half is what makes that provisional value safe: the settle is
+// admitted, and a SECOND settle is refused. The refusal is the whole of the
+// dedup ledger's integrity — it is what stops a redelivery from rewriting the
+// verdict of the delivery that was actually applied.
+func TestIntegrationPaymentEventIsRecordedProvisionalAndSettlesOnce(t *testing.T) {
+	p := integrationPayments(t)
+	f := p.newPaymentFixture(t, "payments-events-settle")
+	intent := p.openIntent(t, f, payKey(t, "events-settle"), time.Now().UTC())
+	event := p.event(t, f, intent, payRef(t, "evt-settle"), payRef(t, "pi"))
+	if event.Disposition != payments.DispositionApplied {
+		t.Fatalf("the fixture asked for %q, and this test is about the adapter refusing to write it", event.Disposition)
+	}
+
+	settled := p.settleEvent(t, event, payments.DispositionApplied)
+	if settled != payments.DispositionApplied {
+		t.Errorf("after Record and Settle the row reads %q, want %q: the settle is the one UPDATE this table admits and it did not land", settled, event.Disposition)
+	}
+
+	// And the second one is refused by the engine, not by Go. A settle this
+	// adapter merely declined would look identical here and would leave the
+	// guard untested against a writer that did not go through it.
+	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
+		return p.events.Settle(ctx, event.DeliveryKey(), payments.DispositionQuarantined)
+	}); err == nil {
+		t.Error("a second settle of one delivery was accepted, so a redelivery could rewrite the verdict of the delivery that was applied")
+	}
+}
+
+// settleEvent writes one delivery through Record and then through the same unit
+// of work the use case uses, and reads the verdict back.
+//
+// The row is written and read back in SEPARATE units of work, which is what
+// makes the assertion about the column rather than about a value still in memory.
+// A test that recorded and asserted inside one transaction would prove only that
+// Go holds what it just wrote.
+func (p *paymentRepos) settleEvent(t *testing.T, event payments.ProviderEventRecord, verdict payments.EventDisposition) payments.EventDisposition {
+	t.Helper()
+	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
+		if err := p.events.Record(ctx, event); err != nil {
+			return err
+		}
+		return p.events.Settle(ctx, event.DeliveryKey(), verdict)
+	}); err != nil {
+		t.Fatalf("record and settle %s: %v", event.EventID, err)
+	}
+	recorded, err := p.events.ByIntent(t.Context(), event.IntentID, 10)
+	if err != nil {
+		t.Fatalf("ByIntent: %v", err)
+	}
+	for _, got := range recorded {
+		if got.EventID == event.EventID {
+			return got.Disposition
+		}
+	}
+	t.Fatalf("delivery %s was not read back for payment %s", event.EventID, event.IntentID)
+	return ""
 }
 
 // TestIntegrationPaymentEventAmountsRoundTripAbsence is the domain's "absent is

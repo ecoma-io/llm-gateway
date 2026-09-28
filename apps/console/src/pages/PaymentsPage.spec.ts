@@ -243,7 +243,7 @@ describe("PaymentsPage", () => {
     // token: `checkout_open` is not a sentence a customer can act on.
     const statuses = wrapper.findAll("tbody tr").map((row) => row.get('[data-cell$="c3"]').text());
     expect(statuses[0]).toContain("Waiting at your provider");
-    expect(statuses[1]).toContain("Funded");
+    expect(statuses[1]).toContain("Paid");
     expect(statuses[2]).toContain("Checkout not open yet");
     // And the token is nowhere in the CELL that would have shown it. Scanned
     // per cell rather than over the page, because the page's own prose is
@@ -317,13 +317,14 @@ describe("PaymentsPage", () => {
 
     // And the same URL is a real link on the row, so a customer who stays on
     // this screen — or comes back to it — can reach their checkout again. The
-    // contract says a returning customer is sent back to this same URL.
+    // contract says a returning customer is sent back to this same URL. The row
+    // carrying it is the first one, which is `checkout_open`: a link the screen
+    // offers only while the provider still has something to confirm.
     const hrefs = wrapper
       .findAll("a")
       .map((link) => link.attributes("href"))
       .filter((href) => href !== undefined);
     expect(hrefs).toContain(CHECKOUT_URL);
-    expect(hrefs).toContain("https://pay.example.test/checkout/y2");
   });
 
   it("does not send the browser to a checkout the provider has already settled", async () => {
@@ -331,8 +332,10 @@ describe("PaymentsPage", () => {
     // repeated key is answered with the payment it already names, and that
     // payment "may be in any state by then, including one that has already
     // succeeded". A customer who has paid must not be walked back onto a
-    // provider page for a payment that is over — the answer is rendered, and
-    // its URL stays on the row as a link they may still choose.
+    // provider page for a payment that is over — so neither is the browser
+    // sent there automatically NOR is the link left live on the row. It reads
+    // as closed instead, which is the one answer that is true of every settled
+    // state: the provider's page can no longer change this payment.
     seam.createPaymentForOffer.mockResolvedValue(
       ok(payment({ status: "succeeded", checkout_url: "https://pay.example.test/checkout/y2" })),
     );
@@ -342,12 +345,13 @@ describe("PaymentsPage", () => {
     await flushPromises();
 
     expect(checkout.sendToCheckout).not.toHaveBeenCalled();
-    expect(wrapper.text()).toContain("Funded");
+    expect(wrapper.text()).toContain("Paid");
     const hrefs = wrapper
       .findAll("a")
       .map((link) => link.attributes("href"))
       .filter((href) => href !== undefined);
-    expect(hrefs).toContain("https://pay.example.test/checkout/y2");
+    expect(hrefs).not.toContain("https://pay.example.test/checkout/y2");
+    expect(wrapper.text()).toContain("Checkout closed");
   });
 
   it("says 'not open yet' rather than rendering a dead link for a payment with no checkout", async () => {
@@ -579,7 +583,7 @@ describe("PaymentsPage", () => {
       // none of them is on the list — a permanent "we are waiting" banner would
       // teach a customer to doubt a confirmation they have already got.
       expect(wrapper.text()).not.toMatch(/waiting for your provider to confirm/i);
-      expect(wrapper.text()).toContain("Funded");
+      expect(wrapper.text()).toContain("Paid");
       expect(wrapper.text()).toContain("Fully refunded");
     });
 

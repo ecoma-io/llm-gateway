@@ -184,10 +184,10 @@ func currencyCodeUpper(code string) string {
 //
 // Then the PAYMENT, not the event. This is the finding a double credit hides
 // in, and it is worth being exact about: a provider's event id identifies a
-// DELIVERY, and a payment has several. `payment_intent.succeeded` and
-// `charge.succeeded` describe one capture; a re-notification arrives under a
-// fresh delivery id; a partial refund and a charge update are separate
-// deliveries of one economic fact. Keying the credit on the delivery would
+// DELIVERY, and a payment has several. A provider may name one capture under
+// more than one event type, a re-notification arrives under a fresh delivery id,
+// and a partial refund and a charge update are separate deliveries of one
+// economic fact. Keying the credit on the delivery would
 // write one leg per delivery, and each of those legs is individually legitimate
 // — right bucket, right amount, right key scope — so nothing downstream would
 // object. The only thing standing between that and a customer funded four times
@@ -214,11 +214,12 @@ func TopUpCommandKey(provider, providerPaymentRef string) (string, error) {
 	}
 	// provider is folded and the payment ref is not, and the asymmetry is
 	// deliberate. The provider is a configuration value this deployment
-	// chose, so there is exactly one spelling of it and folding only stops
-	// "Stripe" and "stripe" from being two scopes. The payment ref is the
-	// provider's own value and is carried byte for byte: two references that
-	// differ in case are two references to the provider, and this platform is
-	// not entitled to decide they are the same one.
+	// chose, so there is exactly one spelling of it and folding only stops a
+	// name that differs from the declared one by case or spacing from being
+	// two scopes. The payment ref is the provider's own value and is carried
+	// byte for byte: two references that differ in case are two references to
+	// the provider, and this platform is not entitled to decide they are the
+	// same one.
 	return fmt.Sprintf("pay:%s:topup:%s", foldProvider(provider), digestReference(providerPaymentRef)), nil
 }
 
@@ -234,8 +235,8 @@ func TopUpCommandKey(provider, providerPaymentRef string) (string, error) {
 // WHAT THE KEY NAMES is the payment's refunded STATE, not one refund, and that
 // is a statement about the deliveries this platform receives rather than a
 // preference. The refund delivery this build consumes is a charge-level one: its
-// object is a charge, it reports the charge's cumulative `amount_refunded`, and
-// it names NO individual refund — there is no refund identifier in it to key on.
+// object is a charge, it reports the charge's cumulative refunded TOTAL, and it
+// names NO individual refund — there is no refund identifier in it to key on.
 // So the identity a refund leg can be derived from is the payment TOGETHER WITH
 // the total that has gone back, which is exactly the pair this function takes.
 // A payment refunded 400 and then 1000 produces two different keys; a redelivery
@@ -359,11 +360,33 @@ func CanRefund(already, requested, captured int64) (int64, error) {
 	}
 	remaining := ceiling - already
 	if requested > remaining {
+		// A distinct sentinel rather than a bare ErrInvalidReference, and the
+		// reason is that a caller MUST be able to tell the two apart. Both are
+		// refusals, so the umbrella sentinel answers "is this a refusal"; what
+		// the caller above this layer has to report is which figure disagreed
+		// and why, and a ceiling and a reference are told apart by nothing but
+		// the message text if they share one sentinel. A caller that folded
+		// them would file a delivery whose amount exceeded the capture as
+		// "named something this payment is not", which sends an operator to
+		// look at a provider's reference naming when the money is the fault.
 		return remaining, fmt.Errorf("%w: a refund of %d exceeds the %d still refundable of a capture of %d",
-			ErrInvalidReference, requested, remaining, ceiling)
+			ErrRefundCeiling, requested, remaining, ceiling)
 	}
 	return requested, nil
 }
+
+// ErrRefundCeiling reports a refund that, taken together with what the payment
+// has already been refunded, exceeds what the payment captured.
+//
+// It is a distinct sentinel rather than an ErrInvalidReference because the two
+// want different words in an operator's queue. An invalid reference is a
+// delivery that named something this payment is not, and the fault is in the
+// naming. A ceiling is arithmetic: the provider refunded more than it took, and
+// reconciling the two figures is the work. The house rule for the sentinels in
+// this package is that each names a situation the operator can only resolve one
+// way, and folding these two together produces a report whose remedy is
+// ambiguous.
+var ErrRefundCeiling = fmt.Errorf("payments: a refund exceeds what the payment captured")
 
 // RefundableRemaining reports how much of a capture may still be refunded after
 // `refunded` minor units of it have gone back.

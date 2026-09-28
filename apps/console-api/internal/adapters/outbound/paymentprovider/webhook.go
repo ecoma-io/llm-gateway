@@ -718,10 +718,31 @@ func readableAmount(raw json.RawMessage) *int64 {
 // delivery was SENT, a different fact) or this process's clock (which says
 // nothing about the provider at all) would be this adapter composing a fact
 // nobody stated.
+//
+// The RANGE is checked before time.Unix, and the check is not about
+// readability. time.Unix accepts any int64, and a seconds figure past the year
+// 9999 builds an instant whose microsecond count overflows when the driver
+// encodes it, so the database raises a datetime field overflow (SQLSTATE 22008)
+// — which nothing translates, so the whole delivery rolls back and the provider
+// retries the same bytes forever. The number is well inside int64, which is
+// exactly why the parse above would not catch it. A `created` this build cannot
+// place on a calendar is a claim this build cannot record, and the zero time is
+// the same "the provider stated none this build can read" answer the omitted
+// member gets.
 func readableInstant(raw json.RawMessage) time.Time {
 	seconds, err := strconv.ParseInt(string(bytes.TrimSpace(raw)), 10, 64)
-	if err != nil {
+	if err != nil || seconds < minProviderInstantUnix || seconds > maxProviderInstantUnix {
 		return time.Time{}
 	}
 	return time.Unix(seconds, 0).UTC()
 }
+
+// The calendar this build can keep. The bounds are 0001-01-01T00:00:00Z and
+// 9999-12-31T23:59:59Z in Unix seconds — the range PostgreSQL's `timestamptz`
+// holds — and they are constants of the storage, not a policy about the
+// provider: a provider that reported a year outside them would be reporting
+// something the row cannot say.
+const (
+	minProviderInstantUnix int64 = -62135596800
+	maxProviderInstantUnix int64 = 253402300799
+)

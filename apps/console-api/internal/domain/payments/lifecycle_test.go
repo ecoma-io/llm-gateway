@@ -524,7 +524,7 @@ func TestRecordRefundRefusesBeforeAnyCaptureWasRecorded(t *testing.T) {
 	intent.Status = StatusCheckoutOpen
 	amount := int64(500)
 
-	_, err := intent.RecordRefund("re_1", &amount)
+	_, err := intent.RecordRefund("re_1", &amount, "USD")
 	if !errors.Is(err, ErrRefundAheadOfCapture) {
 		t.Fatalf("RecordRefund before a capture = %v, want ErrRefundAheadOfCapture", err)
 	}
@@ -541,7 +541,7 @@ func TestRecordRefundMovesAPartialRefundToPartiallyRefunded(t *testing.T) {
 	intent := intentAt(t, StatusSucceeded)
 	amount := int64(300)
 
-	record, err := intent.RecordRefund("re_1", &amount)
+	record, err := intent.RecordRefund("re_1", &amount, "USD")
 	if err != nil {
 		t.Fatalf("RecordRefund(300 of 1000): %v", err)
 	}
@@ -570,7 +570,7 @@ func TestRecordRefundMovesAPartialRefundToPartiallyRefunded(t *testing.T) {
 	// already booked rather than a second correction for one refund. The intent
 	// is unchanged between the two calls — nothing about the payment moved, and
 	// nothing about the key should.
-	again, err := intent.RecordRefund("re_1", &amount)
+	again, err := intent.RecordRefund("re_1", &amount, "USD")
 	if err != nil {
 		t.Fatalf("RecordRefund of the same refunded state: %v", err)
 	}
@@ -586,7 +586,7 @@ func TestRecordRefundMovesAPartialRefundToPartiallyRefunded(t *testing.T) {
 	more := intentAt(t, StatusPartiallyRefunded)
 	more.RefundedMinorUnits = record.TotalRefunded
 	second := int64(200)
-	other, err := more.RecordRefund("re_2", &second)
+	other, err := more.RecordRefund("re_2", &second, "USD")
 	if err != nil {
 		t.Fatalf("RecordRefund of a second partial refund: %v", err)
 	}
@@ -611,7 +611,7 @@ func TestRecordRefundAcceptsARefundThatReachesTheCaptureExactly(t *testing.T) {
 	// A full refund in one go.
 	intent := intentAt(t, StatusSucceeded)
 	whole := int64(1000)
-	record, err := intent.RecordRefund("re_1", &whole)
+	record, err := intent.RecordRefund("re_1", &whole, "USD")
 	if err != nil {
 		t.Fatalf("RecordRefund(1000 of a 1000 capture) = %v, want it accepted: a full refund is the ordinary case, not a ceiling breach", err)
 	}
@@ -628,7 +628,7 @@ func TestRecordRefundAcceptsARefundThatReachesTheCaptureExactly(t *testing.T) {
 	// this half worth its own lines rather than trusting the first.
 	partial := intentAt(t, StatusSucceeded)
 	first := int64(300)
-	partialRecord, err := partial.RecordRefund("re_1", &first)
+	partialRecord, err := partial.RecordRefund("re_1", &first, "USD")
 	if err != nil {
 		t.Fatalf("the first partial refund was refused: %v", err)
 	}
@@ -636,7 +636,7 @@ func TestRecordRefundAcceptsARefundThatReachesTheCaptureExactly(t *testing.T) {
 	partial.RefundedMinorUnits = partialRecord.TotalRefunded
 
 	remainder := int64(700)
-	topUp, err := partial.RecordRefund("re_2", &remainder)
+	topUp, err := partial.RecordRefund("re_2", &remainder, "USD")
 	if err != nil {
 		t.Fatalf("RecordRefund(700 of the remaining 700) = %v, want it accepted", err)
 	}
@@ -664,7 +664,7 @@ func TestRecordRefundReportsTheRealRemainingRoom(t *testing.T) {
 	intent := intentAt(t, StatusSucceeded)
 	amount := int64(300)
 
-	record, err := intent.RecordRefund("re_1", &amount)
+	record, err := intent.RecordRefund("re_1", &amount, "USD")
 	if err != nil {
 		t.Fatalf("RecordRefund(300 of 1000): %v", err)
 	}
@@ -686,9 +686,9 @@ func TestRecordRefundRefusesAnAmountThatBreaksTheCeiling(t *testing.T) {
 	intent.RefundedMinorUnits = 900
 	over := int64(200)
 
-	_, err := intent.RecordRefund("re_2", &over)
-	if !errors.Is(err, ErrInvalidReference) {
-		t.Fatalf("RecordRefund(200 of the remaining 100) = %v, want ErrInvalidReference", err)
+	_, err := intent.RecordRefund("re_2", &over, "USD")
+	if !errors.Is(err, ErrRefundCeiling) {
+		t.Fatalf("RecordRefund(200 of the remaining 100) = %v, want ErrRefundCeiling", err)
 	}
 	if errors.Is(err, ErrRefundAheadOfCapture) || errors.Is(err, ErrInvalidTransition) {
 		t.Errorf("a ceiling refusal shares a sentinel with a different refusal: %v", err)
@@ -699,8 +699,8 @@ func TestRecordRefundRefusesAnAmountThatBreaksTheCeiling(t *testing.T) {
 
 	// One unit over, not only a large amount over.
 	one := int64(101)
-	if _, err := intent.RecordRefund("re_2", &one); !errors.Is(err, ErrInvalidReference) {
-		t.Errorf("RecordRefund(101 of the remaining 100) = %v, want ErrInvalidReference", err)
+	if _, err := intent.RecordRefund("re_2", &one, "USD"); !errors.Is(err, ErrRefundCeiling) {
+		t.Errorf("RecordRefund(101 of the remaining 100) = %v, want ErrRefundCeiling", err)
 	}
 }
 
@@ -709,7 +709,7 @@ func TestRecordRefundRefusesAnAmountThatBreaksTheCeiling(t *testing.T) {
 func TestRecordRefundRefusesANilAmount(t *testing.T) {
 	intent := intentAt(t, StatusSucceeded)
 
-	_, err := intent.RecordRefund("re_1", nil)
+	_, err := intent.RecordRefund("re_1", nil, "USD")
 	if !errors.Is(err, ErrInvalidReference) {
 		t.Fatalf("RecordRefund(nil) = %v, want ErrInvalidReference", err)
 	}
@@ -743,7 +743,7 @@ func TestRecordRefundRefusesARefundOnAFullyRefundedPayment(t *testing.T) {
 	intent.RefundedMinorUnits = 1000
 	amount := int64(1000)
 
-	_, err := intent.RecordRefund("re_2", &amount)
+	_, err := intent.RecordRefund("re_2", &amount, "USD")
 	if !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("RecordRefund on a fully refunded payment = %v, want ErrInvalidTransition", err)
 	}
@@ -765,10 +765,10 @@ func TestRecordRefundRefusesAReferenceThisBuildWillNotCarry(t *testing.T) {
 	intent := intentAt(t, StatusSucceeded)
 	amount := int64(100)
 
-	if _, err := intent.RecordRefund("", &amount); !errors.Is(err, ErrInvalidReference) {
+	if _, err := intent.RecordRefund("", &amount, "USD"); !errors.Is(err, ErrInvalidReference) {
 		t.Errorf("RecordRefund with no reference = %v, want ErrInvalidReference", err)
 	}
-	if _, err := intent.RecordRefund(refOfLength(maxProviderReferenceLength+1), &amount); !errors.Is(err, ErrInvalidReference) {
+	if _, err := intent.RecordRefund(refOfLength(maxProviderReferenceLength+1), &amount, "USD"); !errors.Is(err, ErrInvalidReference) {
 		t.Errorf("RecordRefund with an oversized reference = %v, want ErrInvalidReference", err)
 	}
 }
@@ -931,7 +931,7 @@ func TestNewIntentMintsAVersionSevenIdentifierThatOrdersByTime(t *testing.T) {
 	if first == later {
 		t.Fatalf("two mints produced one id: %q", first)
 	}
-	if !(string(first) < string(later)) {
+	if string(first) >= string(later) {
 		t.Errorf("ids do not order by mint time: %q then %q", first, later)
 	}
 	again, err := NewIntent(testNow)

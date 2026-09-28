@@ -309,6 +309,10 @@ func Claim(ctx IntentContext, store Intents, id IntentID, from []Status, to Stat
 //     the delivery is kept as evidence, and the REASON lives on
 //     control.payment_quarantine, which is the row an operator resolves — the
 //     verdict alone would not tell them which check refused the delivery.
+//
+// A fourth value, DispositionRecorded, is not among these: it is the absence
+// of a verdict, and the guard against observing it is the transaction rather
+// than the vocabulary. Its own comment says what it is for.
 type EventDisposition string
 
 const (
@@ -322,6 +326,24 @@ const (
 	// but this build could not act on it. The reason it could not is on the
 	// control.payment_quarantine row.
 	DispositionQuarantined EventDisposition = "quarantined"
+	// DispositionRecorded is the PROVISIONAL disposition a delivery row is
+	// written with, and the one value a reader can never observe. It is not a
+	// fourth answer to "what became of this delivery" — it is the absence of an
+	// answer, held for the length of one transaction.
+	//
+	// It has to exist as a stored value because the order of the delivery path
+	// forces it. The row is inserted first, because the insert is the arbiter of
+	// the race between two concurrent deliveries of one event id, and this plane
+	// cannot know the verdict until it has resolved the payment and checked the
+	// claim. So a delivery is recorded and then settled, and something has to be
+	// in the column in between.
+	//
+	// The provisional value is a domain constant rather than a literal in the
+	// adapter, because it is also what the engine guard branches on when it
+	// decides whether an UPDATE is the one it admits. Those two must be the same
+	// word: a row the guard believes is settled must be one the domain would
+	// call settled, or the guard would admit a revision the domain never made.
+	DispositionRecorded EventDisposition = "recorded"
 )
 
 // ProviderEventRecord is one provider delivery as this platform records it.
