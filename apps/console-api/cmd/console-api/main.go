@@ -670,18 +670,58 @@ const (
 )
 
 // newHandler composes the one HTTP surface this process serves: the
-// application over the build stamp, and the store whose answers gate the
-// readiness probe. It is a function rather than an inline field so the
-// composition is a fact a test can drive — the probe's gate is the one piece
-// of wiring whose absence would leave this process answering ready while its
-// database is lost, and a handler rebuilt without the store is exactly the
-// regression nothing else would notice.
+// application over the build stamp, the store whose answers gate the readiness
+// probe, and the session use cases the session surface is written against. It
+// is a function rather than an inline field so the composition is a fact a test
+// can drive — the probe's gate is the one piece of wiring whose absence would
+// leave this process answering ready while its database is lost, and a handler
+// rebuilt without the store is exactly the regression nothing else would notice.
 //
 // Readiness never travels through the application: there is no use case for a
 // ping, and the probe wants the port itself, so the constructor receives the
 // store beside the application rather than an application carrying it.
+//
+// The session use cases are the composition root's to choose and are not wired
+// to a store yet, so this hands the surface a fail-closed stand-in rather than
+// a nil — see unwiredSessionUseCases. The three probes and /version answer
+// exactly as they did before; the four session operations refuse every
+// request, which is the only safe answer from a process that has no session
+// store to resolve a token against.
 func newHandler(version string, readiness persistence.Pinger) stdhttp.Handler {
-	return http.New(application.New(version), readiness)
+	return http.New(application.New(version), readiness, unwiredSessionUseCases{})
+}
+
+// unwiredSessionUseCases is the session surface's answer to a process with no
+// session store wired behind it: every operation fails, so the four session
+// endpoints answer 500 and no caller is ever told it is signed in.
+//
+// It is a refusal rather than a stub that returns a plausible success because
+// the alternative is the failure mode this whole surface exists to prevent —
+// a mint that reports a credential nobody can later revoke, or a session that
+// authenticates on the strength of a token no row is behind. Failing closed
+// costs availability; succeeding falsely costs credentials.
+//
+// Reconciling this is the composition root's job once the application layer
+// lands its SignIn/Session/SignOut/MintAPIKey: it replaces this value with the
+// real use cases, and nothing in the http package changes.
+type unwiredSessionUseCases struct{}
+
+var errSessionUseCasesUnwired = errors.New("console-api: the session use cases are not wired to a store")
+
+func (unwiredSessionUseCases) SignIn(context.Context, http.SignInInput) (http.SessionResult, error) {
+	return http.SessionResult{}, errSessionUseCasesUnwired
+}
+
+func (unwiredSessionUseCases) Session(context.Context, http.SessionToken) (http.SessionResult, error) {
+	return http.SessionResult{}, errSessionUseCasesUnwired
+}
+
+func (unwiredSessionUseCases) SignOut(context.Context, http.SessionToken) error {
+	return errSessionUseCasesUnwired
+}
+
+func (unwiredSessionUseCases) MintAPIKey(context.Context, http.MintAPIKeyInput) (http.MintedAPIKeyResult, error) {
+	return http.MintedAPIKeyResult{}, errSessionUseCasesUnwired
 }
 
 // run serves until the process is asked to stop, then drains.
