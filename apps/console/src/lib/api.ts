@@ -11,6 +11,12 @@
 // read. `credentials: "include"` is therefore not an authentication feature —
 // it is what makes the cookie reach the server at all — and no path in this file
 // reads, stores or re-sends a credential the page can see.
+//
+// The one thing the page does read is the double-submit token, and it is not a
+// credential: it carries no authority without the session cookie, it is read
+// from `document.cookie` and discarded, and it is only ever echoed in a header
+// on an unsafe request. See `csrfHeader` below, which is the only place that
+// touches it.
 // `VITE_API_BASE_URL` remains the optional seam for pointing the console at a
 // Control Plane API on another origin; there is deliberately no such seam for
 // the runtime (ADR 0006 §4).
@@ -301,6 +307,70 @@ async function call<Out>(
   return { ok: false, failure };
 }
 
+// ─── the double-submit token ─────────────────────────────────────────────────
+
+/**
+ * The cookie the server issues the double-submit token in, and the header the
+ * server expects it echoed in. Both names are the SERVER's, spelled here once
+ * rather than at each call site, and the pair is the whole of the CSRF defence
+ * for an unsafe request.
+ *
+ * The session cookie is `HttpOnly` and the page can never read it; this cookie
+ * is the opposite and must NOT be. The page's script reads this value and puts
+ * it in a header, which is what a cross-origin page cannot do: it can cause a
+ * request against this origin but it cannot read a cookie scoped to this
+ * origin, so it never learns the value it would have to echo. Making this
+ * cookie `HttpOnly` would be the fix that breaks sign-in.
+ *
+ * The token is not a credential. It carries no authority on its own, it is
+ * meaningless without the session cookie, and it is not written to storage —
+ * `document.cookie` is read and discarded, and the browser keeps it.
+ */
+const CSRF_COOKIE = "__Host-console_csrf";
+const CSRF_HEADER = "X-Console-Csrf";
+
+/** One cookie's value out of `document.cookie`, or `undefined` when it is absent. */
+function readCookie(name: string): string | undefined {
+  let found: string | undefined;
+  for (const part of document.cookie.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0) continue;
+    if (part.slice(0, separator).trim() !== name) continue;
+    const value = part.slice(separator + 1).trim();
+    // The LAST one wins, and the reason is a browser's not this function's:
+    // `document.cookie` lists duplicates most-specific-path first, and the
+    // server mints this token at `Path=/` — the least specific there is. So a
+    // stale token left at `/` by an earlier session appears FIRST and a parser
+    // that took the first match echoes it over the live one, and every unsafe
+    // request is refused for a reason nothing logs. The server compares what it
+    // reads off the wire against what it minted, so a stale echo is simply a
+    // refusal: a sign-in that can never succeed and says so as "those details
+    // did not sign anyone in".
+    if (value !== "") found = value;
+  }
+  return found;
+}
+
+/**
+ * The header carrying the double-submit token, or nothing at all when the page
+ * has not been issued one.
+ *
+ * A MISSING token sends NO header rather than an empty one, and that is the
+ * server's own rule: a request with a header and no cookie is refused exactly
+ * as firmly as one with a cookie and no header, because a header alone is a
+ * value a cross-origin caller chose for itself. Sending `""` would therefore be
+ * strictly worse than sending nothing — it would be an attempt, and it would
+ * still be refused.
+ *
+ * It is a header rather than a form field because a form field is submittable
+ * from a cross-origin page, and a header set by `fetch()` cannot cross origins
+ * without a preflight.
+ */
+function csrfHeader(): Record<string, string> {
+  const token = readCookie(CSRF_COOKIE);
+  return token === undefined ? {} : { [CSRF_HEADER]: token };
+}
+
 // ─── session ─────────────────────────────────────────────────────────────────
 
 /**
@@ -311,7 +381,7 @@ async function call<Out>(
  * not.
  */
 export async function signInWith(credentials: SignInRequest): Promise<ApiResult<SignInResponse>> {
-  return call<SignInResponse>(() => signIn({ body: credentials }));
+  return call<SignInResponse>(() => signIn({ body: credentials, headers: csrfHeader() }));
 }
 
 export async function getSessionResult(): Promise<ApiResult<GetSessionResponse>> {
@@ -323,7 +393,7 @@ export async function getSessionResult(): Promise<ApiResult<GetSessionResponse>>
  * anything to end, and nothing to render either way.
  */
 export async function signOutOfSession(): Promise<ApiResult<null>> {
-  const result = await call<null>(() => signOut(), { emptyBodyOk: true });
+  const result = await call<null>(() => signOut({ headers: csrfHeader() }), { emptyBodyOk: true });
   return result.ok ? { ok: true, data: null } : result;
 }
 
@@ -356,7 +426,9 @@ export async function fetchApiKeys(
  * scoped to the reveal component and clears it on unmount (ADR 0012 §3).
  */
 export async function createApiKey(displayName: string): Promise<ApiResult<MintApiKeyResponse>> {
-  return call<MintApiKeyResponse>(() => mintApiKey({ body: { display_name: displayName } }));
+  return call<MintApiKeyResponse>(() =>
+    mintApiKey({ body: { display_name: displayName }, headers: csrfHeader() }),
+  );
 }
 
 // ─── commerce ───────────────────────────────────────────────────────────────
