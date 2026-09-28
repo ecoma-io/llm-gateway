@@ -35,7 +35,7 @@ import (
 // instead of quietly downgrading the cookie.
 func TestTheSessionCookieCarriesEveryContractedAttribute(t *testing.T) {
 	useCases := newFakeSessionUseCases()
-	rec := callOn(New(application.New("test"), &answeringPinger{}, useCases, newFakeConsoleReadUseCases()),
+	rec := callOn(New(application.New("test"), &answeringPinger{}, useCases, newFakeConsoleReadUseCases(), stubUsage()),
 		stdhttp.MethodPost, "/auth/sign-in", signInBody, requestOptions{})
 
 	if rec.Code != stdhttp.StatusOK {
@@ -81,7 +81,7 @@ func TestTheSessionCookieCarriesEveryContractedAttribute(t *testing.T) {
 // cookie scoped to this host, so it cannot learn the value it would have to
 // echo.
 func TestTheDoubleSubmitCookieIsReadableAndTheSessionIsNot(t *testing.T) {
-	rec := callOn(New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases()),
+	rec := callOn(New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), stubUsage()),
 		stdhttp.MethodPost, "/auth/sign-in", signInBody, requestOptions{})
 
 	token := findCookie(t, rec, requestTokenCookieName)
@@ -120,7 +120,7 @@ func TestSignOutClearsBothCookiesWhateverItFound(t *testing.T) {
 		{name: "with no session at all", withSession: false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			rec := callOn(New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases()),
+			rec := callOn(New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), stubUsage()),
 				stdhttp.MethodDelete, "/auth/session", "", requestOptions{noSession: !tt.withSession})
 
 			if rec.Code != stdhttp.StatusNoContent {

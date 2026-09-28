@@ -270,6 +270,13 @@ func (s *projectionScriptStore) Ping(ctx context.Context) error { return s.db.Pi
 
 func (s *projectionScriptStore) Querier(context.Context) persistence.Querier { return s.db }
 
+// WithinTxAt is WithinTx here for the same reason WithinTx is: the projection
+// repositories never ask for a level, and the one adapter that does — the
+// analytics read — is not what this file exercises.
+func (s *projectionScriptStore) WithinTxAt(ctx context.Context, isolation persistence.Isolation, fn func(context.Context) error) error {
+	return s.WithinTx(ctx, fn)
+}
+
 func (s *projectionScriptStore) WithinTx(ctx context.Context, fn func(context.Context) error) error {
 	return fn(ctx)
 }

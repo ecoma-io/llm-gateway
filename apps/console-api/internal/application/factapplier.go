@@ -45,6 +45,7 @@ type FactApplier struct {
 	accounting  holdSettler
 	applied     persistence.AppliedFacts
 	quarantined persistence.QuarantinedFacts
+	dimensions  persistence.FactDimensions
 }
 
 // holdSettler is the slice of the accounting use cases a derived outcome
@@ -57,12 +58,19 @@ type holdSettler interface {
 	Settle(ctx context.Context, requestID accounting.RequestID, allocations []accounting.Allocation) (SettlementResult, error)
 }
 
-// NewFactApplier builds the applier around its three ports. It panics on a
+// NewFactApplier builds the applier around its four ports. It panics on a
 // nil port for the reason every constructor in this package does: a port
 // promised and not delivered is a wiring defect, and the middle of a page —
 // after three facts applied and a hold booked — is a strictly worse place
 // to learn about it.
-func NewFactApplier(accounting holdSettler, applied persistence.AppliedFacts, quarantined persistence.QuarantinedFacts) *FactApplier {
+//
+// The dimensions port is not optional and is not a reporting concern bolted on
+// at the edge. It is the only reason an account-scoped report can exist, and it
+// is written here, inside the same unit of work that books the effect: an
+// attribution committed apart from the fact it attributes is a row describing a
+// derivation that rolled back, and a fact whose attribution is missing is a
+// request that has silently vanished from its customer's report.
+func NewFactApplier(accounting holdSettler, applied persistence.AppliedFacts, quarantined persistence.QuarantinedFacts, dimensions persistence.FactDimensions) *FactApplier {
 	switch {
 	case accounting == nil:
 		panic("application: NewFactApplier requires the accounting use cases")
@@ -70,8 +78,10 @@ func NewFactApplier(accounting holdSettler, applied persistence.AppliedFacts, qu
 		panic("application: NewFactApplier requires an applied-facts ledger")
 	case quarantined == nil:
 		panic("application: NewFactApplier requires a quarantine")
+	case dimensions == nil:
+		panic("application: NewFactApplier requires the analytics fact dimensions")
 	}
-	return &FactApplier{accounting: accounting, applied: applied, quarantined: quarantined}
+	return &FactApplier{accounting: accounting, applied: applied, quarantined: quarantined, dimensions: dimensions}
 }
 
 // Apply derives fact and lands its effect, or records the refusal.
@@ -152,6 +162,15 @@ func (applier *FactApplier) Apply(ctx context.Context, fact persistence.Fact) er
 			fact.AppendSeq, fact.RequestID, fact.Kind, err)
 	}
 
+	// The account the fact belongs to, derived from the buckets its own
+	// allocation tail names, recorded inside the same unit of work that booked
+	// the effect above. It comes after the effect and before the applied row
+	// because all three are one transaction and the order is the applier's own:
+	// money first, attribution second, disposition last.
+	if err := applier.attribute(ctx, fact, outcome); err != nil {
+		return err
+	}
+
 	return applier.applied.Record(ctx, persistence.AppliedFact{
 		RequestID:     outcome.RequestID,
 		KindClass:     outcome.Class,
@@ -161,6 +180,92 @@ func (applier *FactApplier) Apply(ctx context.Context, fact persistence.Fact) er
 		CaptureMethod: fact.CaptureMethod,
 		SettlementID:  settlementID,
 	})
+}
+
+// attribute records the accounts a fact's allocation tail draws on, so the
+// analytics read model can scope to an account at all.
+//
+// Three properties of it are decisions, not mechanics:
+//
+//   - THE ACCOUNT IS DERIVED, NEVER SUPPLIED. It comes from the buckets the
+//     fact's own tail names, joined to their owners. The fact contract carries
+//     no account, no plane's usage_events table has an account column, and the
+//     runtime's requests table that does is unreachable from this plane. A
+//     caller-supplied account here would be a caller choosing whose report a
+//     request lands in, and this plane has no caller that could be trusted with
+//     that.
+//
+//   - IT IS A SET, AND EVERY MEMBER IS RECORDED. A settlement can draw on an
+//     entitlement bucket and a PAYG bucket at once, and in the general shape the
+//     schema allows those can belong to more than one account. Recording only
+//     the first would attribute the request to one of the accounts that paid
+//     for it and drop the other, and the dropped account's report would be
+//     short by exactly the requests it funded — a figure wrong in the
+//     direction that looks like good news.
+//
+//   - A FACT THAT DRAWS ON NO BUCKET BELONGS TO NO ACCOUNT. The account is
+//     DERIVED from the buckets the tail names, and a tail of no legs derives
+//     nothing to derive from. So an orphan — a request no bucket could pay
+//     for — and a zero-priced settle — a real settlement of record that
+//     moved nothing, whose tail is empty by the same rule that makes a
+//     positive amount carry legs (interpret.go:331) — both record no
+//     attribution, and both are absent from every account's report rather than
+//     counted in one of them.
+//
+//     The second case is the one worth being careful about, because the
+//     contract could have promised either answer. A zero-priced settle IS a
+//     settlement of record, so counting it is defensible; but attributing it
+//     would mean inventing an owner, and the only thing that could supply one
+//     is the API key — which this plane's fact contract does not carry and
+//     which would be a caller-supplied account, the one thing an attribution
+//     must never be. So the request is counted in a platform-wide view and
+//     in no account's, and the openapi says so in those words rather than
+//     promising a figure the tenancy rule cannot produce.
+func (applier *FactApplier) attribute(ctx context.Context, fact persistence.Fact, outcome ingestion.Outcome) error {
+	if len(outcome.Legs) == 0 {
+		return nil
+	}
+
+	// The tail's buckets, in the tail's order, so the attribution is
+	// deterministic on a page that is itself deterministic. The map is
+	// belt-and-braces: checkLegs already refuses a tail that names one bucket
+	// twice, so no fact reaching here can repeat a bucket. It stays because the
+	// cost is nil and the alternative is a duplicate row per duplicate bucket
+	// if a future contract ever permits one — a duplicate the applier would
+	// have written and the store's primary key would have refused, turning a
+	// report's accounting detail into a page-stopping error.
+	buckets := make([]string, 0, len(outcome.Legs))
+	seen := make(map[string]struct{}, len(outcome.Legs))
+	for _, leg := range outcome.Legs {
+		id := string(leg.Bucket)
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		buckets = append(buckets, id)
+	}
+
+	accounts, err := applier.dimensions.AccountsOf(ctx, buckets)
+	if err != nil {
+		return fmt.Errorf("application: resolve the accounts for fact %d request %s: %w",
+			fact.AppendSeq, outcome.RequestID, err)
+	}
+
+	// One row per account, under the same (request_id, kind_class) key the
+	// applied-facts ledger enforces, so a redelivery converges to a no-op
+	// exactly as it does there — the same replay reaching both.
+	for _, accountID := range accounts {
+		if err := applier.dimensions.Record(ctx, persistence.FactDimension{
+			RequestID: outcome.RequestID,
+			KindClass: outcome.Class,
+			AccountID: accountID,
+			AppendSeq: fact.AppendSeq,
+		}); err != nil {
+			return fmt.Errorf("application: attribute fact %d request %s to account %s: %w",
+				fact.AppendSeq, outcome.RequestID, accountID, err)
+		}
+	}
+	return nil
 }
 
 // applySettlement books a settled fact's derivation: the hold legs the tail

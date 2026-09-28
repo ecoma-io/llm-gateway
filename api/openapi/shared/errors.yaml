@@ -196,8 +196,11 @@ components:
             API today, as are the three projection codes
             (`unsupported_version`, `revision_gap`, `snapshot_required`);
             `service_unavailable` is produced by the Console API's readiness
-            probe. They are named here rather than in the document alone so a
-            caller of either surface has one vocabulary for both.
+            probe and by the usage report whose read outran its own per-request
+            deadline — two conditions that share the code because both are
+            retry-later answers, and each operation's own 503 description says
+            which one it is. They are named here rather than in the document
+            alone so a caller of either surface has one vocabulary for both.
         message:
           type: string
           description: >-

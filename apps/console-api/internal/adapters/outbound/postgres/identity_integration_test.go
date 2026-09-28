@@ -59,7 +59,7 @@ import (
 // derived from POSTGRES_TEST_ADMIN_DSN, database ensured and migration
 // history applied — or fails the test with the one-line recipe for getting
 // there.
-func integrationDB(t *testing.T) *sql.DB {
+func integrationDB(t testing.TB) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("pgx", planeDSN(t))
 	if err != nil {
@@ -79,7 +79,7 @@ func integrationDB(t *testing.T) *sql.DB {
 // file, so the suite applies exactly the files the repository ships — not a
 // copy, and not an embedded snapshot that could drift from
 // migrations/control/.
-func migrationsDir(t *testing.T) string {
+func migrationsDir(t testing.TB) string {
 	t.Helper()
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -102,7 +102,7 @@ func migrationsDir(t *testing.T) string {
 // ErrNoChange, and a database this suite prepared is one verify.sh can drive
 // on unchanged. The driver is deliberately never Close()d — closing it would
 // close the pool the tests still use; t.Cleanup owns that.
-func ensureIdentitySchema(t *testing.T, db *sql.DB) {
+func ensureIdentitySchema(t testing.TB, db *sql.DB) {
 	t.Helper()
 	driver, err := migratepgx.WithInstance(db, &migratepgx.Config{})
 	if err != nil {

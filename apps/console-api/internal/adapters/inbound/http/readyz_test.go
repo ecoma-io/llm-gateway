@@ -68,8 +68,7 @@ func TestReadyzGatesOnTheStoreAnswering(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := New(application.New("test"), &answeringPinger{pingErr: tt.pingErr}, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
-
+			handler := New(application.New("test"), &answeringPinger{pingErr: tt.pingErr}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), stubUsage())
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(stdhttp.MethodGet, "/readyz", nil)
 			req.Header.Set(RequestIDHeader, "readyz-request")
@@ -98,8 +97,7 @@ func TestReadyzGatesOnTheStoreAnswering(t *testing.T) {
 // means to finish, and a lost database turns into a 503 rather than a hang.
 func TestReadyzAsksTheQuestionUnderAShortDeadline(t *testing.T) {
 	pinger := &answeringPinger{}
-	handler := New(application.New("test"), pinger, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
-
+	handler := New(application.New("test"), pinger, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), stubUsage())
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(stdhttp.MethodGet, "/readyz", nil)
 	handler.ServeHTTP(rec, req)
@@ -139,8 +137,7 @@ func TestReadyzLogsTheDependencyAndNothingElse(t *testing.T) {
 		log.SetFlags(flags)
 	})
 
-	handler := New(application.New("test"), &answeringPinger{pingErr: errors.New("ping: " + secret)}, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
-
+	handler := New(application.New("test"), &answeringPinger{pingErr: errors.New("ping: " + secret)}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), stubUsage())
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(stdhttp.MethodGet, "/readyz", nil)
 	// Through New the middleware chooses the identifier; a valid header it
@@ -170,8 +167,7 @@ func TestReadyzLogsTheDependencyAndNothingElse(t *testing.T) {
 // outage it cannot fix, and the 503 that would have pulled it from traffic
 // would never be read.
 func TestHealthzStaysStaticWhileTheStoreIsDown(t *testing.T) {
-	handler := New(application.New("test"), &answeringPinger{pingErr: errors.New("connection refused")}, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
-
+	handler := New(application.New("test"), &answeringPinger{pingErr: errors.New("connection refused")}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), stubUsage())
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(stdhttp.MethodGet, "/healthz", nil)
 	handler.ServeHTTP(rec, req)
@@ -194,7 +190,7 @@ func TestNewRefusesAServerWithNothingToGateOn(t *testing.T) {
 			t.Error("New() built a handler with no readiness Pinger; /readyz would answer ready with nothing behind it")
 		}
 	}()
-	New(application.New("test"), nil, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
+	New(application.New("test"), nil, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), stubUsage())
 }
 
 // TestNewRefusesAServerWithNoSessionSurface is the same loud door for the
@@ -203,11 +199,34 @@ func TestNewRefusesAServerWithNothingToGateOn(t *testing.T) {
 // origin, content-type and double-submit guards all passing, that is exactly the
 // state a cross-site request is trying to reach. The only honest answer to one
 // is a construction failure.
+//
+// The OTHER four arguments are the real ones, and that is what makes this a
+// test of the session guard rather than a second copy of the readiness one
+// above it: New checks its dependencies in the order it states them, so a nil
+// readiness here would panic on the FIRST guard and this case would pass while
+// naming a guard it never reached. The nil is therefore in the third position
+// and nowhere else.
 func TestNewRefusesAServerWithNoSessionSurface(t *testing.T) {
 	defer func() {
 		if recover() == nil {
 			t.Error("New() built a handler with no session use cases; the session surface is the authentication boundary")
 		}
 	}()
-	New(application.New("test"), &answeringPinger{}, nil, newFakeConsoleReadUseCases())
+
+	New(application.New("test"), &answeringPinger{}, nil, newFakeConsoleReadUseCases(), stubUsage())
+}
+
+// TestNewRefusesAServerWithNoProductSurface is the same door on the other
+// dependency. A handler built without a read model would mount a product route
+// that panics on the first request it served, which is a crash inside a
+// request rather than a refusal at start — and a control plane that refuses to
+// start is an operator's five minutes, while a panic on the first console
+// load is a page five.
+func TestNewRefusesAServerWithNoProductSurface(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("New() built a handler with no usage read model; the product surface would panic on the first request it served")
+		}
+	}()
+	New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), nil)
 }

@@ -17,6 +17,14 @@ import (
 // is the arrival of the *surface*, not of one endpoint of it, and
 // `/v1/chat/completions/stream` is that defect while matching none of the
 // listed spellings.
+//
+// It is also the whole prefix rather than a list of the runtime's own paths
+// because the split is total in both directions: `/v1/*` is the runtime's
+// namespace and this plane serves nothing under it (docs/architecture/
+// planes.md, "Exposure"). The usage read model is the operation most likely to
+// be argued out of that — a report of the Control Plane's own books reads like
+// a console concern — and it is served at `/usage`, at the root, with the rest
+// of the console surface.
 const runtimeNamespace = "/v1/"
 
 // TestTheSurfaceIsTheDeclaredSet pins what this application serves. It fails
@@ -60,7 +68,13 @@ func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 		"GET /funding-buckets/{funding_bucket_id}/ledger",
 		"GET /reconciliation/findings",
 		"GET /reconciliation/runs",
+		// The usage read model, and the only row whose scope is a credential
+		// rather than a session. It is listed here for the same reason as the
+		// rest: a route that appears without a line in this list is a surface
+		// nobody reviewed.
+		"GET /usage",
 	}
+
 	sort.Strings(want)
 
 	if !slices.Equal(got, want) {

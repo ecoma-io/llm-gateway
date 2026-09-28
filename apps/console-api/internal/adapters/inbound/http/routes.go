@@ -48,7 +48,13 @@ type route struct {
 // the wire itself needs. The ten read use cases travel as their own seam beside
 // them rather than as members of the session one, because the two have
 // different consequences when they are absent — see ConsoleReadUseCases.
-func routes(app *application.App, readiness persistence.Pinger, sessions SessionUseCases, reads ConsoleReadUseCases) []route {
+//
+// usage is the fourth and the same shape as the two above: it is authenticated
+// by a CREDENTIAL rather than by a session cookie, so it does not go through
+// resolveSession and belongs to neither seam, and it is a seam of its own rather
+// than a member of either because it is wired from a different port — see
+// UsageUseCases.
+func routes(app *application.App, readiness persistence.Pinger, sessions SessionUseCases, reads ConsoleReadUseCases, usage UsageUseCases) []route {
 	product := []route{
 		// Sign-in: the only unauthenticated write, and the only way a session
 		// comes into existence. It carries the origin, content-type and
@@ -185,6 +191,22 @@ func routes(app *application.App, readiness persistence.Pinger, sessions Session
 			method:  stdhttp.MethodGet,
 			path:    "/reconciliation/runs",
 			handler: handleListReconciliationRuns(sessions, reads),
+		},
+		// The account's usage read model, and the only row on this surface
+		// authenticated by something other than a session cookie. It resolves
+		// a bearer credential to an account on the server, so the account this
+		// row answers about is never a value the caller sent. Every figure in
+		// its answer is derived from state this plane already holds, and none
+		// of them is an authority: the ledger remains the money record.
+		//
+		// It is a root path like every other product operation, and never
+		// `/v1/usage`: `/v1/*` is the Data Plane runtime's namespace, and a
+		// console read on it would be indistinguishable in a URL from a model
+		// call (ADR 0006 §5, `docs/architecture/planes.md`).
+		{
+			method:  stdhttp.MethodGet,
+			path:    "/usage",
+			handler: handleUsage(usage),
 		},
 	}
 	product = append(product, readsOnly...)

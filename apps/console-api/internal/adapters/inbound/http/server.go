@@ -64,23 +64,24 @@ const (
 // answered around, because a probe with no store behind it is exactly the
 // static /readyz this replaces.
 //
-// sessions is the four session operations and reads is the ten product reads,
-// behind the two narrow seams in wire.go and readwire_seam.go. Both are refused
-// for the same reason and with different reasoning behind it. A nil sessions
-// is a server that would answer every product operation as though every caller
-// were signed in — which, with the origin, content-type and double-submit
-// guards all passing, is exactly the state a CSRF attack is trying to produce.
-// A nil reads is a console whose ten screens render nothing, which is a
-// missing feature rather than a wrong answer. Neither is worth continuing past,
-// and neither is worth answering at request time either: a handler that reached
-// a nil seam would panic on the floor of a request goroutine, where the stack
-// names a request rather than the wiring that caused it. This is where the
-// stack would have said which screen is missing.
+// sessions is the four session operations, reads is the ten product reads and
+// usage is the credential-authenticated one, behind the three narrow seams in
+// wire.go, readwire_seam.go and usage.go. All three are refused for the same
+// reason and with different reasoning behind it. A nil sessions is a server
+// that would answer every product operation as though every caller were signed
+// in — which, with the origin, content-type and double-submit guards all
+// passing, is exactly the state a CSRF attack is trying to produce. A nil reads
+// is a console whose ten screens render nothing, which is a missing feature
+// rather than a wrong answer. A nil usage is one product screen missing, and it
+// is refused on the same terms: a missing feature answers 404 at worst, while a
+// nil seam panics on the floor of a request goroutine, where the stack names a
+// request rather than the wiring that caused it. This is where the stack would
+// have said which screen is missing.
 //
 // The surface itself is declared in routes.go and mounted here; this function
 // owns everything around it — the middleware, the two fallbacks below, and the
 // order they are composed in.
-func New(app *application.App, readiness persistence.Pinger, sessions SessionUseCases, reads ConsoleReadUseCases) stdhttp.Handler {
+func New(app *application.App, readiness persistence.Pinger, sessions SessionUseCases, reads ConsoleReadUseCases, usage UsageUseCases) stdhttp.Handler {
 	if readiness == nil {
 		panic("http: New requires a readiness Pinger; /readyz has nothing to gate on without one")
 	}
@@ -90,9 +91,12 @@ func New(app *application.App, readiness persistence.Pinger, sessions SessionUse
 	if reads == nil {
 		panic("http: New requires the console read use cases; ten product screens have nothing to render without them")
 	}
+	if usage == nil {
+		panic("http: New requires the usage use cases; the /usage surface has no use case to serve without one")
+	}
 	mux := stdhttp.NewServeMux()
 
-	table := routes(app, readiness, sessions, reads)
+	table := routes(app, readiness, sessions, reads, usage)
 	for _, rt := range table {
 		register(mux, rt)
 	}
@@ -274,6 +278,27 @@ func errorResponse(err error) (status int, code string, message string) {
 		// integer at all" is `400 invalid_request`. A generated client reads 500
 		// as retryable and a malformed page size is not retryable.
 		return stdhttp.StatusBadRequest, string(application.CodeInvalidRequest), applicationError.Message
+	case application.CodeUnauthenticated:
+		// 401 with a message that describes THIS credential and no other. The
+		// use case writes a fixed sentence on purpose, so every unresolved
+		// credential — absent, unknown, retired — is refused identically and
+		// the response is not an oracle over the credential space.
+		//
+		// There is deliberately no WWW-Authenticate challenge: this scheme is a
+		// deployment-supplied bearer token (console.yaml's securitySchemes), and
+		// naming a realm would tell a caller where to look for credentials
+		// without telling this surface anything it would act on.
+		//
+		// The session surface answers its own 401 through a transport error
+		// rather than through this branch (session.go's refusal and the sign-in
+		// failure), because a session's refusal has its own message and its own
+		// decision about the challenge. This branch is for an APPLICATION error
+		// — the usage read's unresolved credential — and its absence was a live
+		// defect once that read existed: a credential this surface could not
+		// resolve answered 500 `internal`, which a client reads as a server
+		// fault and retries, when the honest answer is that the caller must
+		// present a credential that resolves.
+		return stdhttp.StatusUnauthorized, string(application.CodeUnauthenticated), applicationError.Message
 	default:
 		return stdhttp.StatusInternalServerError, string(application.CodeInternal), internalErrorMessage
 	}
@@ -348,4 +373,31 @@ func (notReadyError) Error() string {
 
 func (notReadyError) response() (int, string, string) {
 	return stdhttp.StatusServiceUnavailable, "service_unavailable", notReadyMessage
+}
+
+// readTimeoutMessage is the public sentence for a read that outran its budget.
+// It is fixed and names no figure, no range and no account: a caller learns
+// that the answer was not computed and can retry the same request, and learns
+// nothing about what it would have said.
+const readTimeoutMessage = "the service could not complete this read within its time budget"
+
+// readTimeoutError is the transport fact that a read exceeded its deadline. It
+// is 503 rather than 500 for the reason notReadyError is: the condition is
+// expected to clear, so a caller retries later rather than differently, and the
+// contract promises exactly this for the analytics surface ("A caller that
+// exceeds it receives HTTP 503 with `service_unavailable`, which is a
+// retry-later answer rather than a differently-shaped one").
+//
+// It exists as a transport error rather than an application code because the
+// use case reports the overrun as an internal failure — it cannot know whether
+// the caller can retry — and the RETRY decision is this layer's, alongside
+// every other status it decides.
+type readTimeoutError struct{}
+
+func (readTimeoutError) Error() string {
+	return "read timed out"
+}
+
+func (readTimeoutError) response() (int, string, string) {
+	return stdhttp.StatusServiceUnavailable, "service_unavailable", readTimeoutMessage
 }

@@ -125,6 +125,52 @@ func (f *fakeQuarantine) Record(_ context.Context, quarantined persistence.Quara
 	return nil
 }
 
+// fakeFactDimensions is the analytics attribution (B16). It records what the
+// applier derived and resolves accounts for the buckets a tail names, standing
+// in for the store's join from a bucket to its owner.
+//
+// The owner map is a fixture rather than a derivation, because the rule it
+// stands for lives in SQL: a bucket names EITHER an account OR an entitlement,
+// and only the store can say which. A fake that derived the ownership itself
+// would be a second implementation of the one rule the read model's tenancy
+// depends on, and a test that agreed with it would prove nothing.
+type fakeFactDimensions struct {
+	rows    []persistence.FactDimension
+	owners  map[string]string // bucket id -> account id
+	failAll bool
+	failRec bool
+	asked   []string
+}
+
+func (f *fakeFactDimensions) Record(_ context.Context, dimension persistence.FactDimension) error {
+	if f.failRec {
+		return errors.New("attribution write failed")
+	}
+	f.rows = append(f.rows, dimension)
+	return nil
+}
+
+func (f *fakeFactDimensions) AccountsOf(_ context.Context, bucketIDs []string) ([]string, error) {
+	if f.failAll {
+		return nil, errors.New("account resolution failed")
+	}
+	f.asked = append(f.asked, bucketIDs...)
+	seen := make(map[string]struct{}, len(bucketIDs))
+	accounts := make([]string, 0, len(bucketIDs))
+	for _, id := range bucketIDs {
+		owner, known := f.owners[id]
+		if !known {
+			continue
+		}
+		if _, duplicate := seen[owner]; duplicate {
+			continue
+		}
+		seen[owner] = struct{}{}
+		accounts = append(accounts, owner)
+	}
+	return accounts, nil
+}
+
 // applierWorld is the fixture: the applier over fakes, with the settled
 // fact whose derivation the assertions below lean on — tail (450 on A,
 // 400 on B), settled amount 700, boundary partial on B.
@@ -133,6 +179,7 @@ type applierWorld struct {
 	settler    *fakeHoldSettler
 	ledger     *fakeAppliedLedger
 	quarantine *fakeQuarantine
+	dimensions *fakeFactDimensions
 	applier    *FactApplier
 }
 
@@ -143,8 +190,12 @@ func newApplierWorld(t *testing.T) *applierWorld {
 		settler:    &fakeHoldSettler{settlements: map[accounting.RequestID]accounting.Settlement{}},
 		ledger:     &fakeAppliedLedger{rows: map[factKey]*persistence.AppliedFact{}},
 		quarantine: &fakeQuarantine{},
+		// The two buckets the settled fact's tail names, both owned by one
+		// account by default. A test that needs a second account sets the map
+		// itself; a test that needs a bucket nobody owns leaves one out.
+		dimensions: &fakeFactDimensions{owners: map[string]string{}},
 	}
-	world.applier = NewFactApplier(world.settler, world.ledger, world.quarantine)
+	world.applier = NewFactApplier(world.settler, world.ledger, world.quarantine, world.dimensions)
 	return world
 }
 
@@ -543,10 +594,12 @@ func TestANewFactApplierRefusesNilPorts(t *testing.T) {
 		accounting  holdSettler
 		applied     persistence.AppliedFacts
 		quarantined persistence.QuarantinedFacts
+		dimensions  persistence.FactDimensions
 	}{
-		{"no accounting", nil, world.ledger, world.quarantine},
-		{"no ledger", world.settler, nil, world.quarantine},
-		{"no quarantine", world.settler, world.ledger, nil},
+		{"no accounting", nil, world.ledger, world.quarantine, world.dimensions},
+		{"no ledger", world.settler, nil, world.quarantine, world.dimensions},
+		{"no quarantine", world.settler, world.ledger, nil, world.dimensions},
+		{"no dimensions", world.settler, world.ledger, world.quarantine, nil},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
@@ -555,7 +608,175 @@ func TestANewFactApplierRefusesNilPorts(t *testing.T) {
 					t.Fatal("NewFactApplier accepted a missing port")
 				}
 			}()
-			NewFactApplier(tt.accounting, tt.applied, tt.quarantined)
+			NewFactApplier(tt.accounting, tt.applied, tt.quarantined, tt.dimensions)
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The analytics attribution (B16).
+//
+// The four properties below are the tenancy of the read model, and each one is
+// a way a number could have been quietly wrong. They are pinned here rather
+// than in the adapter's suite because the DECISION is the applier's: the
+// adapter is handed bucket ids and returns owners, and which of them the
+// applier asks about, and what it does when there are none, is made here.
+// ---------------------------------------------------------------------------
+
+func TestAnAppliedFactIsAttributedToTheAccountsItsTailDrawsOn(t *testing.T) {
+	world := newApplierWorld(t)
+	const accountA = "a1000000-0000-7000-8000-0000000000a1"
+	const accountB = "a1000000-0000-7000-8000-0000000000b1"
+	// The tail crosses two accounts: bucketA is the account's own PAYG
+	// balance, bucketB is funded by an entitlement on a subscription of a
+	// different account. A single-account tail would prove only the easy half.
+	world.dimensions.owners[bucketA] = accountA
+	world.dimensions.owners[bucketB] = accountB
+
+	if err := world.applier.Apply(context.Background(), settledFact(t)); err != nil {
+		t.Fatalf("Apply() error = %v, want nil", err)
+	}
+
+	// The account is DERIVED from the tail, so the applier asked about both
+	// buckets and about nothing else. A caller-supplied account would mean one
+	// argument here instead of the tail.
+	want := []string{bucketA, bucketB}
+	if len(world.dimensions.asked) != len(want) {
+		t.Fatalf("attribution asked about %v, want %v", world.dimensions.asked, want)
+	}
+	for i, bucket := range want {
+		if world.dimensions.asked[i] != bucket {
+			t.Errorf("asked[%d] = %s, want %s", i, world.dimensions.asked[i], bucket)
+		}
+	}
+
+	// BOTH accounts are recorded, each under the (request_id, kind class) key
+	// the applied-facts ledger enforces. Recording one would attribute the
+	// request to one of the accounts that paid for it and drop the other — a
+	// figure short by exactly the requests the dropped account funded.
+	wantRows := []persistence.FactDimension{
+		{RequestID: applierRequestID, KindClass: ingestion.ClassSettlement, AccountID: accountA, AppendSeq: 7},
+		{RequestID: applierRequestID, KindClass: ingestion.ClassSettlement, AccountID: accountB, AppendSeq: 7},
+	}
+	if len(world.dimensions.rows) != len(wantRows) {
+		t.Fatalf("attribution rows = %+v, want %d rows", world.dimensions.rows, len(wantRows))
+	}
+	for i, row := range wantRows {
+		got := world.dimensions.rows[i]
+		if got != row {
+			t.Errorf("rows[%d] = %+v, want %+v", i, got, row)
+		}
+	}
+}
+
+func TestAFactDrawingOnNoBucketOfAnAccountIsRecordedForNoAccount(t *testing.T) {
+	world := newApplierWorld(t)
+	// The owners map is empty: the store resolved no account for either
+	// bucket. This is the tenancy rule stated as a fact rather than a filter —
+	// a fact belonging to no account is not filtered into one.
+	if err := world.applier.Apply(context.Background(), settledFact(t)); err != nil {
+		t.Fatalf("Apply() error = %v, want nil", err)
+	}
+	if len(world.dimensions.rows) != 0 {
+		t.Fatalf("attribution rows = %+v, want none", world.dimensions.rows)
+	}
+	// The effect and the disposition still landed: attributing nothing is not
+	// the same as applying nothing, and a build that conflated them would drop
+	// the request from every report INCLUDING the platform's own.
+	if world.ledger.rows[factKey{applierRequestID, ingestion.ClassSettlement}] == nil {
+		t.Fatal("the applied row is missing: attribution failure must not become application failure")
+	}
+	if len(world.settler.moves) == 0 {
+		t.Fatal("the money did not move: attribution failure must not become application failure")
+	}
+}
+
+func TestAnOrphanIsAttributedToNoAccount(t *testing.T) {
+	world := newApplierWorld(t)
+	const accountA = "a1000000-0000-7000-8000-0000000000a1"
+	// The payload still names a bucket, so a fake that attributed from the
+	// PAYLOAD rather than from the applier's own derivation would attribute
+	// this. The orphan's Interpret returns no legs, and no legs means no
+	// buckets, and no buckets means no account.
+	world.dimensions.owners[bucketA] = accountA
+	capture := "gateway_observed"
+	attempt := "0c000000-0000-7000-8000-00000000000c"
+	inTokens := int64(1234)
+	fact := persistence.Fact{
+		AppendSeq:           9,
+		RequestID:           applierRequestID,
+		Kind:                ingestion.KindUnbillableOrphaned,
+		SchemaVersion:       ingestion.SchemaVersion,
+		Payload:             envelopeFor(t, legFor{FundingBucketID: bucketA, Amount: 40, Ordinal: 1}),
+		CaptureMethod:       &capture,
+		CommittedAttemptID:  &attempt,
+		ProviderInputTokens: &inTokens,
+	}
+	if err := world.applier.Apply(context.Background(), fact); err != nil {
+		t.Fatalf("Apply() error = %v, want nil", err)
+	}
+	if len(world.dimensions.asked) != 0 {
+		t.Errorf("an orphan asked about buckets %v, want none", world.dimensions.asked)
+	}
+	if len(world.dimensions.rows) != 0 {
+		t.Errorf("an orphan was attributed: %+v", world.dimensions.rows)
+	}
+}
+
+func TestAFactThatCannotBeAttributedStopsThePage(t *testing.T) {
+	world := newApplierWorld(t)
+	world.dimensions.failAll = true
+	// The money has already moved by this point, and the page still stops.
+	// The alternative — swallowing the failure and advancing the cursor — is
+	// how a request silently disappears from its customer's report with no
+	// error anywhere and no way to rebuild the row, because the cursor says
+	// the page is done.
+	err := world.applier.Apply(context.Background(), settledFact(t))
+	if err == nil {
+		t.Fatal("Apply() error = nil, want a stop")
+	}
+	if !strings.Contains(err.Error(), "accounts") {
+		t.Errorf("error = %q, want it to name the account resolution", err)
+	}
+	if world.ledger.rows[factKey{applierRequestID, ingestion.ClassSettlement}] != nil {
+		t.Error("the applied row was recorded beside a failed attribution: the page would advance past a fact with no owner")
+	}
+}
+
+func TestAFactWhoseAttributionCannotBeWrittenStopsThePage(t *testing.T) {
+	world := newApplierWorld(t)
+	const accountA = "a1000000-0000-7000-8000-0000000000a1"
+	world.dimensions.owners[bucketA] = accountA
+	world.dimensions.failRec = true
+	if err := world.applier.Apply(context.Background(), settledFact(t)); err == nil {
+		t.Fatal("Apply() error = nil, want a stop")
+	}
+	if world.ledger.rows[factKey{applierRequestID, ingestion.ClassSettlement}] != nil {
+		t.Error("the applied row was recorded beside a failed attribution write")
+	}
+}
+
+func TestARedeliveredFactIsNotAttributedTwice(t *testing.T) {
+	world := newApplierWorld(t)
+	const accountA = "a1000000-0000-7000-8000-0000000000a1"
+	world.dimensions.owners[bucketA] = accountA
+	world.dimensions.owners[bucketB] = accountA
+
+	fact := settledFact(t)
+	if err := world.applier.Apply(context.Background(), fact); err != nil {
+		t.Fatalf("first Apply() error = %v, want nil", err)
+	}
+	first := len(world.dimensions.rows)
+
+	// The same fact again, on a different append seq: a re-delivery rides a
+	// new position and the applier's read-before-write answers "already
+	// derived" from the (request_id, kind class) pair, so the attribution
+	// converges with it rather than doubling.
+	fact.AppendSeq = 8
+	if err := world.applier.Apply(context.Background(), fact); err != nil {
+		t.Fatalf("second Apply() error = %v, want nil", err)
+	}
+	if got := len(world.dimensions.rows); got != first {
+		t.Fatalf("attribution rows after a redelivery = %d, want %d", got, first)
 	}
 }

@@ -92,9 +92,19 @@ func invalidRequest(message string) *Error {
 }
 
 // Unauthenticated returns an error for a caller that did not identify itself
-// as a service this surface accepts.
+// as a service this surface accepts. The message is the caller's to write,
+// because a session's failure has a reason worth naming.
 func Unauthenticated(message string) *Error {
 	return &Error{Code: CodeUnauthenticated, Message: message}
+}
+
+// UnresolvedCredential is Unauthenticated for a credential whose failure must
+// not describe what it failed against. A session belongs to a browser that
+// can be told "no user is signed in"; a bearer credential belongs to a client
+// that would learn the account list by reading the refusals, so the message
+// here is fixed and says only that the credential did not resolve.
+func UnresolvedCredential() *Error {
+	return &Error{Code: CodeUnauthenticated, Message: "the credential presented does not resolve to an account"}
 }
 
 // Internal returns an error for an implementation failure. Its cause remains

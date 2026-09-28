@@ -13,6 +13,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -190,6 +191,47 @@ type Config struct {
 	// own tables — and the window's lookback is a decision about history
 	// rather than about a remote service.
 	Reconciliation Reconciliation
+
+	// Analytics is the usage read model's own resolution: which credentials
+	// speak for which accounts. It is a struct of its own rather than a field
+	// on Reconciliation because it is not a schedule and not a projection — it
+	// is the one setting in this package that decides WHO a report is about.
+	//
+	// It has no default, and that asymmetry is the whole of its design: every
+	// other group in this Config answers "how fast" or "where", and a default
+	// would be a survivable guess. This one answers "whose", and a default
+	// would be a report about somebody's spend served to anybody.
+	Analytics Analytics
+}
+
+// Analytics holds the credential-to-account resolution the usage read model
+// runs on.
+//
+// The account is derived from the credential and never named by a request, and
+// this type is where that derivation is configured. The secret's own half is
+// not in this plane's schema — control.api_keys holds the ownership record
+// (account, key state) and no digest, because the digest is the Data Plane's —
+// so a deployment supplies the mapping and the surface resolves against it.
+//
+// The tokens are secrets, and this group satisfies slog.LogValuer for exactly
+// the reason DataPlane does: the requirement that a credential never reach a
+// log line is enforced by the type rather than by every call site remembering
+// to. The COUNT of the table is visible, because an operator needs to know the
+// surface has scopes at all, and the content of each entry is not.
+type Analytics struct {
+	// Scope is the deployment's token-to-account table. It is required and it
+	// is never defaulted: a surface that cannot name a caller has no access
+	// control, and an access control that guesses an account is worse than none
+	// because the guess looks like an authorization.
+	Scope map[string]string
+}
+
+// LogValue renders the table's SIZE and nothing about its content. See the
+// type's comment for why a secret-bearing group has one.
+func (a Analytics) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.Int("scopes", len(a.Scope)),
+	)
 }
 
 // DataPlane holds the settings for the Control → Data projection's producer
@@ -397,10 +439,64 @@ func Load(lookup LookupEnv) (Config, error) {
 	}
 	cfg.Reconciliation = reconciliation
 
+	analytics, err := loadAnalytics(lookup)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Analytics = analytics
+
 	if err := validateAddr(cfg.Addr); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// loadAnalytics reads the credential-to-account resolution the usage read
+// model runs on.
+//
+// The variable is REQUIRED, and the failure it raises is the one error in this
+// package that is about access control rather than about an address or a
+// cadence. That is deliberate: the alternative — an empty table the surface
+// answers every credential against — is not a surface with no access control,
+// it is a surface that will happily start and then refuse every caller with an
+// error an operator has to read a log to understand, and a deployment that
+// "fixed" that by adding one scope would have one account's spend readable by
+// every holder of any other credential it ever issued.
+//
+// The JSON shape is `{"<token>": "<account-id>"}` rather than a list, because
+// a token is a MAP KEY and a map's keys are unique by construction: a list
+// would admit two entries for one token, and which of them resolved would be
+// the order of the file rather than a decision anybody made.
+func loadAnalytics(lookup LookupEnv) (Analytics, error) {
+	raw, ok := lookup("CONSOLE_API_ANALYTICS_SCOPE")
+	if !ok {
+		return Analytics{}, fmt.Errorf("CONSOLE_API_ANALYTICS_SCOPE must be set: the usage surface derives every account it answers about from this table, and a surface that cannot name a caller has no access control at all")
+	}
+	if strings.TrimSpace(raw) == "" {
+		return Analytics{}, fmt.Errorf("CONSOLE_API_ANALYTICS_SCOPE must not be empty: it is a JSON object of credential to account, and an empty one authorizes nobody")
+	}
+
+	var table map[string]string
+	if err := json.Unmarshal([]byte(raw), &table); err != nil {
+		// The value is never echoed. It is a table of secrets, and this error
+		// reaches the process log where a token would then sit forever.
+		return Analytics{}, fmt.Errorf("CONSOLE_API_ANALYTICS_SCOPE must be a JSON object of credential to account id")
+	}
+	if len(table) == 0 {
+		return Analytics{}, fmt.Errorf("CONSOLE_API_ANALYTICS_SCOPE must name at least one credential: an object with no entries authorizes nobody, which is a refusal expressed as a configuration that starts")
+	}
+	for token, accountID := range table {
+		switch {
+		case strings.TrimSpace(token) == "":
+			return Analytics{}, fmt.Errorf("CONSOLE_API_ANALYTICS_SCOPE carries an empty credential: an empty token must never resolve to an account")
+		case strings.TrimSpace(accountID) == "":
+			// The account identifier is named and not the token, because the
+			// account is the non-secret half: this message can say which of a
+			// deployment's scopes is malformed without exposing a credential.
+			return Analytics{}, fmt.Errorf("CONSOLE_API_ANALYTICS_SCOPE maps a credential to an empty account id")
+		}
+	}
+	return Analytics{Scope: table}, nil
 }
 
 // loadReconciliation reads the reconciliation pass's four dials.
