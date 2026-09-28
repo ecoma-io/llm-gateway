@@ -163,7 +163,7 @@ func routesWithPayments(app *application.App, readiness persistence.Pinger, sess
 		{
 			method:  stdhttp.MethodPost,
 			path:    "/payment-intents",
-			handler: handleBeginCheckout(sessions, surface.Payments),
+			handler: handleBeginTransfer(sessions, surface.Payments),
 		},
 	}
 
@@ -264,8 +264,9 @@ func routesWithPayments(app *application.App, readiness persistence.Pinger, sess
 		//
 		// Nothing on this row decides anything: a status was written by a signed
 		// delivery the provider sent to the endpoint below, and the console
-		// re-reads a payment after sending a customer to checkout instead of
-		// assuming an answer from the redirect.
+		// re-reads a payment rather than assuming anything from what the
+		// customer did on the page — the customer's own act is not evidence,
+		// and there is no redirect in this instrument to read an answer from.
 		{
 			method:  stdhttp.MethodGet,
 			path:    "/payment-intents",

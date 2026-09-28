@@ -151,10 +151,11 @@ const recordedDisposition = string(payments.DispositionRecorded)
 // nullText maps the domain's empty string onto SQL NULL and everything else
 // onto itself.
 //
-// The domain carries absence as the zero value — ProviderCheckoutRef,
-// ProviderPaymentRef, CheckoutURL, IntentID, kind and currency are all strings
-// that mean "not said" when empty — while the columns that hold them are
-// nullable, and the mapping has to be explicit for the reason accounting's
+// The domain carries absence as the zero value — ProviderTransferRef,
+// ProviderPaymentRef, ProviderQRURL, ProviderBankName, ProviderAccountHolder,
+// IntentID, kind and currency are all strings that mean "not said" when empty —
+// while the columns that hold them are nullable, and the mapping has to be
+// explicit for the reason accounting's
 // ledgerEntryArgs gives: an empty string is not NULL, and a column that
 // conflated them would make "this delivery reported no currency" and "this
 // delivery reported an empty currency" the same row.
@@ -241,7 +242,8 @@ type paymentIntentsRepo struct {
 // apart column by column.
 const paymentIntentColumns = `id, account_id, funding_bucket_id, amount_minor_units,
        currency, minor_unit_exponent, provider, idempotency_key, status,
-       provider_checkout_ref, provider_payment_ref, checkout_url,
+       provider_transfer_ref, provider_payment_ref, provider_qr_url,
+       provider_bank_name, provider_account_holder,
        refunded_minor_units, uncovered_refund_minor_units, state_version,
        expires_at, created_at, updated_at`
 
@@ -249,10 +251,11 @@ const insertPaymentIntent = `
 INSERT INTO control.payment_intents
     (id, account_id, funding_bucket_id, amount_minor_units,
      currency, minor_unit_exponent, provider, idempotency_key, status,
-     provider_checkout_ref, provider_payment_ref, checkout_url,
+     provider_transfer_ref, provider_payment_ref, provider_qr_url,
+     provider_bank_name, provider_account_holder,
      refunded_minor_units, uncovered_refund_minor_units, state_version,
      expires_at, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`
 
 const selectPaymentIntentByID = `
 SELECT ` + paymentIntentColumns + `
@@ -269,19 +272,20 @@ WHERE account_id = $1 AND idempotency_key = $2`
 // event names a provider reference, the reference resolves to a row this
 // platform wrote, and the row carries the account. A statement that also
 // filtered by an account named in the payload would be a statement trusting the
-// payload to say whose money moves — see the port's ByProviderCheckoutRef.
-const selectPaymentIntentByCheckoutRef = `
+// payload to say whose money moves — see the port's ByProviderTransferRef.
+const selectPaymentIntentByTransferRef = `
 SELECT ` + paymentIntentColumns + `
 FROM control.payment_intents
-WHERE provider = $1 AND provider_checkout_ref = $2`
+WHERE provider = $1 AND provider_transfer_ref = $2`
 
 // The payment-reference lookup, and the statement a refund resolves through.
 //
-// It has the checkout lookup's shape and its properties for the same reasons:
-// no account predicate, because a webhook has no session — the reference is
-// matched against a column THIS PLATFORM WROTE and the row carries the account —
-// and the provider predicate first, because a provider scopes its identifiers
-// to its own namespace and two providers can hand out the same string.
+// It has the transfer lookup's shape and its properties for the same reasons:
+// no account predicate, because a webhook arrives with no console session — the
+// reference is matched against a column THIS PLATFORM WROTE and the row carries
+// the account — and the provider predicate first, because a provider scopes its
+// identifiers to its own namespace and two providers can hand out the same
+// string.
 //
 // It seeks rather than scans: `payment_intents_provider_payment_ref_key` is a
 // partial unique index on exactly this pair, and the uniqueness is a guard as
@@ -372,7 +376,8 @@ func (r *paymentIntentsRepo) Create(ctx context.Context, intent payments.Intent)
 		string(intent.ID), intent.AccountID, intent.FundingBucketID, intent.AmountMinorUnits,
 		intent.Currency, int64(intent.MinorUnitExponent), intent.Provider, intent.IdempotencyKey,
 		string(intent.Status),
-		nullText(intent.ProviderCheckoutRef), nullText(intent.ProviderPaymentRef), nullText(intent.CheckoutURL),
+		nullText(intent.ProviderTransferRef), nullText(intent.ProviderPaymentRef), nullText(intent.ProviderQRURL),
+		nullText(intent.ProviderBankName), nullText(intent.ProviderAccountHolder),
 		intent.RefundedMinorUnits, intent.UncoveredRefundMinorUnits, intent.StateVersion,
 		intent.ExpiresAt, intent.CreatedAt, intent.UpdatedAt); err != nil {
 		if _, rollbackErr := q.ExecContext(ctx, `ROLLBACK TO SAVEPOINT payment_intent_create`); rollbackErr != nil {
@@ -406,11 +411,11 @@ func (r *paymentIntentsRepo) ByAccountAndIdempotencyKey(ctx context.Context, acc
 	return intent, nil
 }
 
-func (r *paymentIntentsRepo) ByProviderCheckoutRef(ctx context.Context, provider, ref string) (payments.Intent, error) {
-	intent, err := scanPaymentIntent(r.store.Querier(ctx).QueryRowContext(ctx, selectPaymentIntentByCheckoutRef,
+func (r *paymentIntentsRepo) ByProviderTransferRef(ctx context.Context, provider, ref string) (payments.Intent, error) {
+	intent, err := scanPaymentIntent(r.store.Querier(ctx).QueryRowContext(ctx, selectPaymentIntentByTransferRef,
 		provider, ref))
 	if err != nil {
-		return payments.Intent{}, wrapPaymentIntentRead(err, fmt.Sprintf("payment for provider %s checkout %s", provider, ref))
+		return payments.Intent{}, wrapPaymentIntentRead(err, fmt.Sprintf("payment for provider %s transfer %s", provider, ref))
 	}
 	return intent, nil
 }
@@ -440,43 +445,67 @@ func (r *paymentIntentsRepo) ByProviderPaymentRef(ctx context.Context, provider,
 // predicate, not the from-states, is what arbitrates a race between two refund
 // deliveries; RecordRefund below is where it is argued.
 
-// RecordCheckout writes the provider's checkout reference and URL and moves the
-// payment to checkout_open, in one statement.
+// RecordTransfer writes everything the provider answered with when it issued
+// this payment's destination — the virtual account the customer pays into, the
+// provider's own QR image of it, and the bank and holder names a customer checks
+// before sending — and moves the payment to awaiting_transfer, in one statement.
 //
 // The status predicate is the arbiter and the reference's write-once trigger is
-// the second refusal: a payment that already carries a checkout reference cannot
+// the second refusal: a payment that already carries a transfer reference cannot
 // reach this statement's `from` (`created`), because the only writer that sets
 // the reference sets the status in the same breath — so the two predicates agree
 // and the CAS never degrades into a re-point.
-const recordPaymentCheckout = `
+//
+// The status is CARRIED IN THE WHERE CLAUSE rather than compared in Go, and that
+// is what makes the move a compare-and-swap rather than an optimistic read. The
+// transition trigger fires on the ROW, so a statement the guard refuses affects
+// zero rows and fires nothing at all, while a caller that had read the status,
+// decided, and then written unconditionally would race its own second attempt.
+// What losing that costs is not a wrong status but the account one customer was
+// already told to pay into being replaced by another nobody holds: two attempts
+// both write a destination, the second overwrites the first's reference, and the
+// money the first customer sends arrives at an account this platform no longer
+// shows them.
+//
+// The three text columns take NULL for absence through nullText, and they are
+// not equally likely to be absent. The reference and the two names are non-empty
+// by the domain's own rule — a payment with no destination recorded, and a
+// destination with no bank or holder on it, are both states that look like a
+// working feature — while the QR URL may legitimately be empty, because a
+// destination a customer can type into a banking app is complete without an
+// image.
+const recordPaymentTransfer = `
 UPDATE control.payment_intents
-SET provider_checkout_ref = $2,
-    checkout_url = $3,
-    status = 'checkout_open',
+SET provider_transfer_ref = $2,
+    provider_qr_url = $3,
+    provider_bank_name = $4,
+    provider_account_holder = $5,
+    status = 'awaiting_transfer',
     state_version = state_version + 1,
-    updated_at = $4
+    updated_at = $6
 WHERE id = $1
-  AND status = ANY($5::text[])
-  AND provider_checkout_ref IS NULL`
+  AND status = ANY($7::text[])
+  AND provider_transfer_ref IS NULL`
 
-func (r *paymentIntentsRepo) RecordCheckout(ctx context.Context, id payments.IntentID, checkout payments.OpenedCheckout, from []payments.Status, now time.Time) (bool, error) {
-	if err := requirePaymentUnitOfWork(r.store, ctx, fmt.Sprintf("record checkout for payment %s", id)); err != nil {
+func (r *paymentIntentsRepo) RecordTransfer(ctx context.Context, id payments.IntentID, transfer payments.TransferInstructions, from []payments.Status, now time.Time) (bool, error) {
+	if err := requirePaymentUnitOfWork(r.store, ctx, fmt.Sprintf("record transfer for payment %s", id)); err != nil {
 		return false, err
 	}
-	res, err := r.store.Querier(ctx).ExecContext(ctx, recordPaymentCheckout,
-		string(id), checkout.ProviderRef, checkout.URL, now, statusStrings(from))
+	res, err := r.store.Querier(ctx).ExecContext(ctx, recordPaymentTransfer,
+		string(id), transfer.TransferCode, nullText(transfer.QRURL), nullText(transfer.BankName),
+		nullText(transfer.AccountHolder), now, statusStrings(from))
 	if err != nil {
-		return false, conflictOf(fmt.Errorf("postgres: record checkout for payment %s: %w", id, err))
+		return false, conflictOf(fmt.Errorf("postgres: record transfer for payment %s: %w", id, err))
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("postgres: record checkout for payment %s: read rows affected: %w", id, err)
+		return false, fmt.Errorf("postgres: record transfer for payment %s: read rows affected: %w", id, err)
 	}
 	// False means the world moved — another attempt wrote its own reference, or
 	// the payment is no longer in a state this move starts from. The caller
 	// re-reads and returns the winner's payment; it does not overwrite, because
-	// choosing between two live checkout sessions is not a decision this layer
-	// can make.
+	// choosing between two live destinations is not a decision this layer can
+	// make.
 	return n == 1, nil
 }
 
@@ -752,23 +781,28 @@ func statusStrings(statuses []payments.Status) []string {
 // three lookups, the list page, and the three compare-and-swaps' RETURNING — so
 // the projection cannot differ depending on which statement found the row.
 //
-// The three nullable text columns are scanned into their own locals and
-// assigned only when the database says so. NULL becomes the domain's empty
-// string, which is how this aggregate spells absence, and the direction matters
-// in both: a row with no checkout reference is a payment whose checkout has not
-// been opened — a "not yet", not an "unknown" — and the delivery resolution
-// reads exactly that distinction.
+// The nullable text columns are scanned into their own locals and assigned only
+// when the database says so. NULL becomes the domain's empty string, which is
+// how this aggregate spells absence, and the direction matters in both: a row
+// with no transfer reference is a payment whose destination has not been issued
+// yet — a "not yet", not an "unknown" — and the delivery resolution reads
+// exactly that distinction. The bank name, the account holder and the QR URL are
+// the same kind of absence for the same reason: they are the provider's answer,
+// they arrive with the reference or not at all, and a payment carrying none of
+// them is one whose customer has not been told where to send anything.
 func scanPaymentIntent(row rowScanner) (payments.Intent, error) {
 	var (
 		intent                                      payments.Intent
 		id, accountID, bucketID, currency, provider string
 		idempotencyKey, status                      string
 		exponent                                    int64
-		checkoutRef, paymentRef, checkoutURL        sql.NullString
+		transferRef, paymentRef                     sql.NullString
+		qrURL, bankName, accountHolder              sql.NullString
 	)
 	if err := row.Scan(&id, &accountID, &bucketID, &intent.AmountMinorUnits,
 		&currency, &exponent, &provider, &idempotencyKey, &status,
-		&checkoutRef, &paymentRef, &checkoutURL,
+		&transferRef, &paymentRef, &qrURL,
+		&bankName, &accountHolder,
 		&intent.RefundedMinorUnits, &intent.UncoveredRefundMinorUnits, &intent.StateVersion,
 		&intent.ExpiresAt, &intent.CreatedAt, &intent.UpdatedAt); err != nil {
 		return payments.Intent{}, err
@@ -781,9 +815,11 @@ func scanPaymentIntent(row rowScanner) (payments.Intent, error) {
 	intent.Provider = provider
 	intent.IdempotencyKey = idempotencyKey
 	intent.Status = payments.Status(status)
-	intent.ProviderCheckoutRef = checkoutRef.String
+	intent.ProviderTransferRef = transferRef.String
 	intent.ProviderPaymentRef = paymentRef.String
-	intent.CheckoutURL = checkoutURL.String
+	intent.ProviderQRURL = qrURL.String
+	intent.ProviderBankName = bankName.String
+	intent.ProviderAccountHolder = accountHolder.String
 	return intent, nil
 }
 

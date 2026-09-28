@@ -53,35 +53,57 @@ func seamSigningSecret() string { return "seam-" + strings.Repeat("s", 32) }
 // machine's scheduler.
 const seamTolerance = 5 * time.Minute
 
-// seamSignatureHeader is the provider's own header name, spelled here rather
-// than imported: the adapter keeps it unexported, and a fixture that signed with
-// whatever the implementation happened to call the header could not see the
-// header being renamed on the wire.
-const seamSignatureHeader = "Stripe-Signature"
+// The provider's two header names, spelled here rather than imported: the
+// adapter keeps them unexported, and a fixture that signed with whatever the
+// implementation happened to call a header could not see a header being renamed
+// on the wire.
+//
+// BOTH are pinned, and that is the point of naming them. This provider differs
+// from a card processor in exactly this: the signed instant is not an element of
+// the signature header but a second header of its own, and the two are one fact
+// — the signature is computed over this timestamp and these bytes. A fixture
+// that pinned only the signature would still pass on the day the timestamp
+// header was renamed or dropped, which is the day every real delivery stops
+// verifying and no test says why.
+const (
+	seamSignatureHeader = "X-SePay-Signature"
+	seamTimestampHeader = "X-SePay-Timestamp"
+)
 
 // signSeamDelivery computes the provider's signature the way the provider
 // documents it, as an INDEPENDENT construction: HMAC-SHA256 over
-// "{t}.{rawBody}", keyed with the signing secret's own bytes. A test that signed
-// through the implementation it verifies could not see a wrong separator or a
-// body re-encoded on its way into the MAC.
+// "{timestamp}.{rawBody}", keyed with the signing secret's own bytes, rendered
+// as the scheme-prefixed hexadecimal the signature header carries, beside the
+// timestamp in the seconds-resolution header the scheme pairs it with. A test
+// that signed through the implementation it verifies could not see a wrong
+// separator, a wrong spelling of the instant, or a body re-encoded on its way
+// into the MAC.
 func signSeamDelivery(signedAt time.Time, body []byte) map[string][]string {
 	stamp := strconv.FormatInt(signedAt.Unix(), 10)
 	mac := hmac.New(sha256.New, []byte(seamSigningSecret()))
 	mac.Write([]byte(stamp + "." + string(body)))
-	signed := "t=" + stamp + ",v1=" + hex.EncodeToString(mac.Sum(nil))
-	return map[string][]string{seamSignatureHeader: {signed}}
+	return map[string][]string{
+		seamSignatureHeader: {"sha256=" + hex.EncodeToString(mac.Sum(nil))},
+		seamTimestampHeader: {stamp},
+	}
 }
 
-// seamEventBody is a delivery the adapter can read: a completed, paid checkout
-// session naming both the checkout this platform opened and the payment it was
-// paid through. It carries insignificant whitespace and a key order no encoder
-// would choose, which is what makes the raw-bytes assertion below meaningful —
-// the same event in a canonical encoding is a DIFFERENT byte string, and the
-// signature covers the one that was sent.
-const seamEventBody = `{ "id" : "evt_seam_delivery" ,` +
-	`"type":"checkout.session.completed","created":1735689600,` +
-	`"data":{"object":{"id":"cs_seam_checkout","payment_intent":"pi_seam_payment",` +
-	`"amount_total":4200,"currency":"usd","payment_status":"paid"}}}`
+// seamEventBody is a delivery the adapter can read: money arriving at the
+// virtual account this platform asked the provider for. It carries insignificant
+// whitespace and a key order no encoder would choose, which is what makes the
+// raw-bytes assertion below meaningful — the same event in a canonical encoding
+// is a DIFFERENT byte string, and the signature covers the one that was sent.
+//
+// The three fields the adapter acts on are spelled as the provider spells them:
+// `id` is the transaction, `subAccount` is the destination the money arrived at,
+// and `transferType` of `in` is the one direction that funds anything. The rest
+// of the body is the provider's own presentation text, carried so that a
+// delivery which is more than this build reads is still a delivery it reads.
+const seamEventBody = `{ "id" : "92704" ,` +
+	`"gateway":"Vietcombank","transactionDate":"2026-09-28 12:00:00",` +
+	`"accountNumber":"0011002222333","subAccount":"va_seam_destination",` +
+	`"transferType":"in","transferAmount":4200,` +
+	`"content":"SEAM TOPUP","referenceCode":"FT2409SEAM"}`
 
 func seamVerifier() webhookVerifier {
 	return webhookVerifier{
@@ -219,88 +241,138 @@ func TestTheWebhookVerifierReadsTheRawBytesItWasHandedAndNothingElse(t *testing.
 	}
 	// The two references are the fields this seam grew, and they must arrive
 	// populated and in the right slots: the application resolves each against a
-	// different stored column, and a pair that crossed swapped would file every
-	// capture against a payment reference this plane never wrote.
-	if event.CheckoutRef != "cs_seam_checkout" {
-		t.Errorf("CheckoutRef = %q, want the session this platform opened", event.CheckoutRef)
+	// different stored column — the destination a capture resolves by, and the
+	// transaction the funding leg's command key is derived from — and a pair
+	// that crossed swapped would file every capture against a reference this
+	// plane never wrote.
+	if event.TransferRef != "va_seam_destination" {
+		t.Errorf("TransferRef = %q, want the destination the money arrived at", event.TransferRef)
 	}
-	if event.PaymentRef != "pi_seam_payment" {
-		t.Errorf("PaymentRef = %q, want the payment the session was paid through", event.PaymentRef)
+	if event.PaymentRef != "92704" {
+		t.Errorf("PaymentRef = %q, want the transaction's own id, which is the payment identifier under this provider", event.PaymentRef)
 	}
-	if event.EventID != "evt_seam_delivery" {
+	if event.EventID != "92704" {
 		t.Errorf("EventID = %q, want the delivery's own id", event.EventID)
 	}
 	if event.AmountMinorUnits == nil || *event.AmountMinorUnits != 4200 {
 		t.Errorf("AmountMinorUnits = %v, want 4200", event.AmountMinorUnits)
 	}
-	if event.Currency != "USD" {
-		t.Errorf("Currency = %q, want the uppercase ISO 4217 form the domain stores", event.Currency)
+	if event.Currency != "VND" {
+		t.Errorf("Currency = %q, want the currency this provider settles in: it names no currency on a delivery, and the empty string would quarantine every capture on the application's currency check", event.Currency)
 	}
 
 	t.Run("the same event in another encoding is a different delivery", func(t *testing.T) {
 		// The same facts, re-encoded. Nothing about the change is visible in
 		// the parsed event, so an implementation that hashed a re-encoding
 		// would accept this against the original's signature.
-		canonical := []byte(`{"id":"evt_seam_delivery","type":"checkout.session.completed","created":1735689600,` +
-			`"data":{"object":{"id":"cs_seam_checkout","payment_intent":"pi_seam_payment",` +
-			`"amount_total":4200,"currency":"usd","payment_status":"paid"}}}`)
+		canonical := []byte(`{"id":"92704","gateway":"Vietcombank","transactionDate":"2026-09-28 12:00:00",` +
+			`"accountNumber":"0011002222333","subAccount":"va_seam_destination",` +
+			`"transferType":"in","transferAmount":4200,"content":"SEAM TOPUP","referenceCode":"FT2409SEAM"}`)
 		if _, err := seamVerifier().Verify(signSeamDelivery(time.Now(), body), canonical); !errors.Is(err, payments.ErrBadSignature) {
 			t.Fatalf("Verify() error = %v, want %v: the signature covers the octets the provider sent, not this build's encoding of what they meant", err, payments.ErrBadSignature)
 		}
 	})
 }
 
-// TestTheWebhookVerifierTreatsAnExtraSignatureHeaderAsSmuggling is the header
-// half of the same authority, and it crosses the seam as the map it arrived as:
-// the handler hands the unparsed map over, and the implementation is what
-// refuses multiplicity. The composition root must not flatten the two into one
-// string on the way, which a wrapper that took the first value would do
-// silently.
-func TestTheWebhookVerifierTreatsAnExtraSignatureHeaderAsSmuggling(t *testing.T) {
+// TestTheWebhookVerifierTreatsAnExtraHeaderAsSmuggling is the header half of the
+// same authority, and it crosses the seam as the map it arrived as: the handler
+// hands the unparsed map over, and the implementation is what refuses
+// multiplicity. The composition root must not flatten anything into one string
+// on the way, which a wrapper that took the first value would do silently.
+//
+// BOTH headers are exercised, because with two of them the hazard is worse than
+// with one. A delivery carrying two signatures is refused rather than resolved
+// to whichever the implementation looked at first; a delivery carrying two
+// timestamps is the same request one step further in, because the timestamp is
+// half of what was signed — an implementation that picked one would verify a
+// signature against an instant that may not be the instant the delivery claims,
+// and which of the two a deployment accepted would depend on map iteration
+// order.
+func TestTheWebhookVerifierTreatsAnExtraHeaderAsSmuggling(t *testing.T) {
 	body := []byte(seamEventBody)
-	headers := signSeamDelivery(time.Now(), body)
-	// The same header spelled in another case, which is what a proxy shim or a
-	// hand-built map produces. Both values are individually valid, and that is
-	// the hazard: an implementation that picked one would accept a request
-	// carrying a signature this deployment does not honour.
-	lower := strings.ToLower(seamSignatureHeader)
-	headers[lower] = append(headers[lower], headers[seamSignatureHeader]...)
 
-	if _, err := seamVerifier().Verify(headers, body); !errors.Is(err, payments.ErrBadSignature) {
-		t.Fatalf("Verify() error = %v, want %v: a delivery that authenticates under more than one signature is smuggling", err, payments.ErrBadSignature)
-	}
+	t.Run("a second signature header", func(t *testing.T) {
+		headers := signSeamDelivery(time.Now(), body)
+		// The same header spelled in another case, which is what a proxy shim or a
+		// hand-built map produces. Both values are individually valid, and that is
+		// the hazard: an implementation that picked one would accept a request
+		// carrying a signature this deployment does not honour.
+		lower := strings.ToLower(seamSignatureHeader)
+		headers[lower] = append(headers[lower], headers[seamSignatureHeader]...)
+
+		if _, err := seamVerifier().Verify(headers, body); !errors.Is(err, payments.ErrBadSignature) {
+			t.Fatalf("Verify() error = %v, want %v: a delivery that authenticates under more than one signature is smuggling", err, payments.ErrBadSignature)
+		}
+	})
+
+	t.Run("a second timestamp header", func(t *testing.T) {
+		headers := signSeamDelivery(time.Now(), body)
+		lower := strings.ToLower(seamTimestampHeader)
+		headers[lower] = append(headers[lower], headers[seamTimestampHeader]...)
+
+		if _, err := seamVerifier().Verify(headers, body); !errors.Is(err, payments.ErrBadSignature) {
+			t.Fatalf("Verify() error = %v, want %v: the signed instant arrives in a header of its own, and a delivery carrying two of them has no single instant this deployment can say it authenticated", err, payments.ErrBadSignature)
+		}
+	})
 }
 
 // TestSeamPaymentIntentCopiesTheStoredPayment is the row-level crossing, and it
 // asserts the two things a derivation would get wrong.
 //
-// The checkout URL is copied EMPTY and not inferred from the status: the
-// contract types the field `[string, "null"]`, and a payment whose checkout does
-// not exist yet states that as an absence rather than as a status this layer
-// decided. The timestamps are copied from the instants the payment carries, not
-// computed from a configured window — the deadline is a stored fact, and a client
-// comparing this build's arithmetic against what the provider's page shows would
-// be comparing two different things.
+// The destination is copied — the four values the provider handed back and the
+// store recorded — and its absence is rendered as the nil the contract types
+// `[string, "null"]`, not inferred from the status: a payment whose destination
+// has not been recorded yet states that as an absence rather than as a status
+// this layer decided. The timestamps are copied from the instants the payment
+// carries, not computed from a configured window — the deadline is a stored
+// fact, and a client comparing this build's arithmetic against the deadline the
+// customer was given would be comparing two different things.
 func TestSeamPaymentIntentCopiesTheStoredPayment(t *testing.T) {
 	created := time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC)
 	expires := created.Add(30 * time.Minute)
 
 	record := seamPaymentIntent(seamStoredPayment(created, expires))
-	if record.ID != "pi_local_1" {
+	if record.ID != "pay_local_1" {
 		t.Errorf("ID = %q, want the platform's own payment id", record.ID)
 	}
-	if record.Status != "checkout_open" {
+	if record.Status != "awaiting_transfer" {
 		t.Errorf("Status = %q, want the status the delivery wrote", record.Status)
 	}
 	if record.AmountMinorUnits != 4200 || record.Currency != "USD" {
 		t.Errorf("amount = %d %s, want 4200 USD — the CANONICAL figure the ledger was told, not the provider's", record.AmountMinorUnits, record.Currency)
 	}
-	if record.CheckoutURL != "" {
-		t.Errorf("CheckoutURL = %q, want empty: an absence is not a value this layer invents", record.CheckoutURL)
+	if record.TransferInstructions != nil {
+		t.Errorf("TransferInstructions = %+v, want nil: a payment with no recorded destination states that as an absence, which the contract renders as null rather than as an object of empty strings", record.TransferInstructions)
 	}
 	if record.CreatedAt != "2026-09-28T12:00:00Z" || record.ExpiresAt != "2026-09-28T12:30:00Z" {
 		t.Errorf("timestamps = %s/%s, want the instants the payment carries rendered as RFC 3339 in UTC", record.CreatedAt, record.ExpiresAt)
 	}
+
+	// A recorded destination is an object, and it is what the customer reads
+	// before sending anything: a payment that kept reporting an absence while
+	// its destination sat in the store would be a top-up screen with no account
+	// to pay into.
+	t.Run("a recorded destination crosses as the four values the customer needs", func(t *testing.T) {
+		payment := seamStoredPayment(created, expires)
+		payment.ProviderTransferRef = "va_seam_destination"
+		payment.ProviderBankName = "Vietcombank"
+		payment.ProviderAccountHolder = "CONG TY TNHH VI DU"
+		payment.ProviderQRURL = "https://qr.sepay.vn/img?acc=0011002222333"
+
+		record := seamPaymentIntent(payment)
+		if record.TransferInstructions == nil {
+			t.Fatal("TransferInstructions is nil, want the destination the store recorded: a customer asked to transfer money with no account named has been told nothing")
+		}
+		if record.TransferInstructions.TransferCode != "va_seam_destination" {
+			t.Errorf("TransferCode = %q, want the provider's identifier for the destination", record.TransferInstructions.TransferCode)
+		}
+		if record.TransferInstructions.BankName != "Vietcombank" || record.TransferInstructions.AccountHolder != "CONG TY TNHH VI DU" {
+			t.Errorf("bank details = %q / %q, want the provider's own words for where the money goes", record.TransferInstructions.BankName, record.TransferInstructions.AccountHolder)
+		}
+		if record.TransferInstructions.QRURL != "https://qr.sepay.vn/img?acc=0011002222333" {
+			t.Errorf("QRURL = %q, want the provider's image verbatim: this layer does not parse, rewrite or fetch it", record.TransferInstructions.QRURL)
+		}
+	})
 }
 
 // TestThePaymentPageIsForwardedUnchanged pins the page's three figures, because
@@ -325,7 +397,7 @@ func TestThePaymentPageIsForwardedUnchanged(t *testing.T) {
 	if !forwarded.HasMore {
 		t.Error("HasMore = false, want the value the use case resolved: a client that stops here leaves rows it was told about unseen")
 	}
-	if len(forwarded.Items) != 1 || forwarded.Items[0].ID != "pi_local_1" {
+	if len(forwarded.Items) != 1 || forwarded.Items[0].ID != "pay_local_1" {
 		t.Errorf("Items = %+v, want the one row the page carried", forwarded.Items)
 	}
 
@@ -345,17 +417,17 @@ func TestThePaymentPageIsForwardedUnchanged(t *testing.T) {
 }
 
 // seamStoredPayment is the stored payment the row-level assertions are made
-// against: a payment whose checkout is open and whose checkout URL is NOT set,
+// against: a payment awaiting its transfer, with no destination recorded yet,
 // which is the state the contract renders as an explicit null and the state a
 // derivation would be most tempted to paper over.
 func seamStoredPayment(created, expires time.Time) paymentsdomain.Intent {
 	return paymentsdomain.Intent{
-		ID:               "pi_local_1",
-		AccountID:        "acct_1",
+		ID:               "pay_local_1",
+		AccountID:        "account_1",
 		FundingBucketID:  "bucket_1",
 		AmountMinorUnits: 4200,
 		Currency:         "USD",
-		Status:           "checkout_open",
+		Status:           "awaiting_transfer",
 		CreatedAt:        created,
 		ExpiresAt:        expires,
 	}

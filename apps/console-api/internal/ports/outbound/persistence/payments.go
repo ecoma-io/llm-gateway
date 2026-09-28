@@ -34,7 +34,7 @@ import (
 // PaymentIntents is the payment aggregate's durable surface.
 //
 // The two compare-and-swap members are the interesting ones. MoveStatus and
-// RecordCheckout both answer a bool, and the bool means "the row still showed
+// RecordTransfer both answer a bool, and the bool means "the row still showed
 // what you read, and it is now what you wrote" — never "nothing happened". A
 // caller that receives false re-reads and decides again; a caller that treated
 // false as an error would turn every lost race into a 5xx, and a lost race here
@@ -52,12 +52,13 @@ type PaymentIntents interface {
 
 	// ByAccountAndIdempotencyKey returns the payment a repeated request names,
 	// or ErrNotFound. It is the read behind convergence: a client that
-	// retried an open-checkout call gets the payment it already has rather
-	// than a second one.
+	// retried the call that opens a top-up gets the payment it already has
+	// rather than a second one.
 	ByAccountAndIdempotencyKey(ctx context.Context, accountID, key string) (payments.Intent, error)
 
-	// ByProviderCheckoutRef returns the payment a provider's CHECKOUT
-	// identifier names, or ErrNotFound.
+	// ByProviderTransferRef returns the payment a provider's TRANSFER
+	// identifier names — the destination it issued for one payment — or
+	// ErrNotFound.
 	//
 	// This is the lookup that keeps a third party's payload from choosing
 	// whose money moves. An event names a reference; the reference resolves to
@@ -66,22 +67,27 @@ type PaymentIntents interface {
 	// the provider said, because such a member would be a way to say "credit
 	// whatever the payload names" and a signature proves who sent a message,
 	// not what the message may do.
-	ByProviderCheckoutRef(ctx context.Context, provider, ref string) (payments.Intent, error)
+	//
+	// The reference is the destination and not a memo, and the difference is
+	// the whole reason this lookup is trustworthy: a destination is issued by
+	// the provider and is where the money can only have gone, while a memo is
+	// the customer's own free text that a bank may rewrite.
+	ByProviderTransferRef(ctx context.Context, provider, ref string) (payments.Intent, error)
 
 	// ByProviderPaymentRef returns the payment a provider's PAYMENT
-	// identifier names — the id of the money rather than of the checkout the
-	// money was taken through — or ErrNotFound.
+	// identifier names — the id of the money rather than of the destination it
+	// arrived at — or ErrNotFound.
 	//
 	// It exists because a refund delivery carries the second and not the
-	// first: a `charge.refunded` names a charge, whose payment intent is the
-	// value this column holds, and it never mentions the session the customer
-	// paid through. Before this member existed every refund this platform
-	// received resolved against a checkout-id column with a payment id and was
+	// first: a delivery reporting money going back names the payment, not the
+	// account it was paid into, so it never mentions the reference a capture
+	// was resolved by. Before this member existed every refund this platform
+	// received resolved against a transfer-id column with a payment id and was
 	// quarantined as a payment it could not find — the refund path was
 	// reachable in the domain and unreachable in production.
 	//
-	// It is a SECOND lookup and not a replacement: a capture's checkout
-	// reference is written before the customer is sent anywhere, so it is the
+	// It is a SECOND lookup and not a replacement: a capture's transfer
+	// reference is written before the customer is ever shown it, so it is the
 	// reference a capture resolves by; this one is the fallback and the
 	// refund's only route. The same rule governs both — the reference matches
 	// a column THIS PLATFORM wrote, and there is still no member that resolves
@@ -91,21 +97,22 @@ type PaymentIntents interface {
 	// so at most one row can answer.
 	ByProviderPaymentRef(ctx context.Context, provider, ref string) (payments.Intent, error)
 
-	// RecordCheckout writes the provider's checkout reference and URL, moving
-	// the payment to checkout_open, and reports whether the payment still
-	// showed the state the caller read.
+	// RecordTransfer writes the destination the provider issued — its
+	// reference, its image, the bank it sits at and the name it is held in —
+	// moving the payment to awaiting_transfer, and reports whether the payment
+	// still showed the state the caller read.
 	//
 	// It is a compare-and-swap on status and state version TOGETHER, and both
 	// predicates are load-bearing. The status predicate alone would let two
-	// concurrent attempts both write a checkout — the second overwriting the
-	// first's reference, and the customer's live session being replaced by one
-	// nobody holds. The version predicate alone would let a stale writer
-	// overwrite a payment that had since succeeded. The statement that
-	// implements this carries the status in its WHERE clause, because the
-	// transition trigger fires on the ROW and a guarded statement that matched
-	// zero rows fires nothing at all — which is what makes the CAS atomic
-	// rather than optimistic.
-	RecordCheckout(ctx context.Context, id payments.IntentID, checkout payments.OpenedCheckout, from []payments.Status, now time.Time) (bool, error)
+	// concurrent attempts both write a destination — the second overwriting
+	// the first's reference, and the account one customer was already told to
+	// pay into being replaced by another nobody holds. The version predicate
+	// alone would let a stale writer overwrite a payment that had since
+	// succeeded. The statement that implements this carries the status in its
+	// WHERE clause, because the transition trigger fires on the ROW and a
+	// guarded statement that matched zero rows fires nothing at all — which is
+	// what makes the CAS atomic rather than optimistic.
+	RecordTransfer(ctx context.Context, id payments.IntentID, transfer payments.TransferInstructions, from []payments.Status, now time.Time) (bool, error)
 
 	// MoveStatus applies a status transition with the same compare-and-swap
 	// discipline and the same both-predicates rule, and returns the payment as

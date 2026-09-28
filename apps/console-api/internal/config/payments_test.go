@@ -21,8 +21,8 @@ func samePayments(a, b Payments) bool {
 	return reflect.DeepEqual(a, b)
 }
 
-// paymentsTestSecretKey and paymentsTestSigningSecret are the two secrets the
-// fixtures below are configured with.
+// paymentsTestAPIToken and paymentsTestSigningSecret are the credential and the
+// signing secret the fixtures below are configured with.
 //
 // Both are ASSEMBLED from fragments rather than written as literals, and the
 // values are deliberately low-entropy repeats rather than anything shaped like
@@ -30,7 +30,7 @@ func samePayments(a, b Payments) bool {
 // GitHub's push protection, both of which refuse a secret-shaped string in a
 // fixture — and the scan is right to: a fixture only needs to be a string the
 // code treats as one, never a value that could be mistaken for a live key.
-func paymentsTestSecretKey() string {
+func paymentsTestAPIToken() string {
 	return "console-api-" + strings.Repeat("k", 32)
 }
 
@@ -38,16 +38,27 @@ func paymentsTestSigningSecret() string {
 	return "sig-" + strings.Repeat("w", 32)
 }
 
+// paymentsTestBankAccountXID and paymentsTestVAHolderName are the merchant's
+// order configuration: the bank account the provider issues destinations under,
+// and the name it stamps on them. Neither is a secret, and the holder name is
+// deliberately a name with spaces in it — it is prose that the provider carries
+// verbatim, not an identifier this build parses.
+func paymentsTestBankAccountXID() string { return "ba_1a2b3c4d" }
+
+const paymentsTestVAHolderName = "CONG TY TNHH VI DU"
+
 // validPaymentsEnv is the smallest environment that configures the group: the
-// six required values, the two bounds left to their defaults.
+// seven required values, the three optional order settings left unset and the
+// three defaults left to the loader.
 func validPaymentsEnv() map[string]string {
 	return map[string]string{
-		"CONSOLE_API_PAYMENTS_PROVIDER":               "stripe",
-		"CONSOLE_API_PAYMENTS_SECRET_KEY":             paymentsTestSecretKey(),
+		"CONSOLE_API_PAYMENTS_PROVIDER":               "sepay",
+		"CONSOLE_API_PAYMENTS_API_TOKEN":              paymentsTestAPIToken(),
 		"CONSOLE_API_PAYMENTS_WEBHOOK_SIGNING_SECRET": paymentsTestSigningSecret(),
 		"CONSOLE_API_PAYMENTS_PROVIDER_ACCOUNT_KEY":   "acct-console-api-merchant",
-		"CONSOLE_API_PAYMENTS_API_BASE_URL":           "https://api.stripe.com",
-		"CONSOLE_API_PAYMENTS_CHECKOUT_RETURN_URL":    "https://console.internal.example/billing/top-up",
+		"CONSOLE_API_PAYMENTS_API_BASE_URL":           "https://userapi-sandbox.sepay.vn/v2",
+		"CONSOLE_API_PAYMENTS_BANK_ACCOUNT_XID":       paymentsTestBankAccountXID(),
+		"CONSOLE_API_PAYMENTS_ORDER_VA_HOLDER_NAME":   paymentsTestVAHolderName,
 	}
 }
 
@@ -78,12 +89,14 @@ func TestLoadReadsThePaymentsGroup(t *testing.T) {
 			t.Fatalf("Load() error = %v", err)
 		}
 		want := Payments{
-			Provider:             "stripe",
-			SecretKey:            paymentsTestSecretKey(),
+			Provider:             "sepay",
+			APIToken:             paymentsTestAPIToken(),
 			WebhookSigningSecret: paymentsTestSigningSecret(),
 			ProviderAccountKey:   "acct-console-api-merchant",
-			APIBaseURL:           "https://api.stripe.com",
-			CheckoutReturnURL:    "https://console.internal.example/billing/top-up",
+			APIBaseURL:           "https://userapi-sandbox.sepay.vn/v2",
+			BankAccountXID:       paymentsTestBankAccountXID(),
+			VAHolderName:         paymentsTestVAHolderName,
+			QRCodeTemplate:       DefaultQRCodeTemplate,
 			WebhookTolerance:     DefaultWebhookTolerance,
 			RequestTimeout:       DefaultPaymentsRequestTimeout,
 		}
@@ -112,34 +125,49 @@ func TestLoadReadsThePaymentsGroup(t *testing.T) {
 	t.Run("refuses a group that sets only one of the required values", func(t *testing.T) {
 		// The all-or-nothing rule, and the case that makes it worth stating: a
 		// deployment that sets one payment variable has decided to run a
-		// payment surface, so the other five are missing rather than absent.
+		// payment surface, so the rest are missing rather than absent.
 		_, err := Load(lookup(paymentsEnv(map[string]string{
-			"CONSOLE_API_PAYMENTS_PROVIDER": "stripe",
+			"CONSOLE_API_PAYMENTS_PROVIDER": "sepay",
 		})))
 		if err == nil {
 			t.Fatal("Load() error = nil, want the group refused as half-configured")
 		}
-		if !strings.Contains(err.Error(), "CONSOLE_API_PAYMENTS_SECRET_KEY must be set") {
+		if !strings.Contains(err.Error(), "CONSOLE_API_PAYMENTS_API_TOKEN must be set") {
 			t.Errorf("Load() error = %q, want it to name the missing required variable", err)
 		}
 	})
 
-	t.Run("accepts a cleartext return URL where an https API base URL stands", func(t *testing.T) {
-		// The API base URL is https-only and the return URL is not, and the pair
-		// has to be asserted TOGETHER: run against two https URLs it would pass
-		// against a build that had dropped the restriction entirely, and run
-		// against a cleartext API URL it would fail against a build that applied
-		// one rule to both. The distinction is which URL carries a secret — the
-		// API one carries the deployment's bearer credential on every request,
-		// and the return one carries nothing but a browser to a console page.
-		cfg, err := Load(lookup(paymentsEnv(merge(validPaymentsEnv(), map[string]string{
-			"CONSOLE_API_PAYMENTS_CHECKOUT_RETURN_URL": "http://localhost:5173/billing/top-up",
-		}))))
+	t.Run("reads the optional order settings only when a deployment sets them", func(t *testing.T) {
+		// The three are OPTIONAL on purpose and the pair asserts both halves:
+		// absent, they cross as empty strings rather than as values this file
+		// invented, because which of them a provider needs depends on the bank
+		// and changes as the provider's own integration does. Present, they
+		// cross verbatim — this build does not translate a provider's template
+		// name into another.
+		cfg, err := Load(lookup(paymentsEnv(validPaymentsEnv())))
 		if err != nil {
-			t.Fatalf("Load() error = %v, want a local console over http accepted: a developer running this on a laptop is doing something reasonable, and nothing secret is sent there", err)
+			t.Fatalf("Load() error = %v", err)
 		}
-		if got := cfg.Payments.CheckoutReturnURL; got != "http://localhost:5173/billing/top-up" {
-			t.Errorf("return URL = %q, want the value as configured", got)
+		if cfg.Payments.TID != "" || cfg.Payments.VAPrefix != "" {
+			t.Errorf("unset order settings = (%q, %q), want both empty: an unset setting must not become a value the provider receives",
+				cfg.Payments.TID, cfg.Payments.VAPrefix)
+		}
+		if cfg.Payments.QRCodeTemplate != DefaultQRCodeTemplate {
+			t.Errorf("qrcode template = %q, want the shipped default %q", cfg.Payments.QRCodeTemplate, DefaultQRCodeTemplate)
+		}
+
+		set := merge(validPaymentsEnv(), map[string]string{
+			"CONSOLE_API_PAYMENTS_ORDER_TID":             "TERM-7",
+			"CONSOLE_API_PAYMENTS_ORDER_VA_PREFIX":       "CONSOLE",
+			"CONSOLE_API_PAYMENTS_ORDER_QRCODE_TEMPLATE": "full",
+		})
+		cfg, err = Load(lookup(paymentsEnv(set)))
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.Payments.TID != "TERM-7" || cfg.Payments.VAPrefix != "CONSOLE" || cfg.Payments.QRCodeTemplate != "full" {
+			t.Errorf("order settings = (%q, %q, %q), want the values as configured",
+				cfg.Payments.TID, cfg.Payments.VAPrefix, cfg.Payments.QRCodeTemplate)
 		}
 	})
 }
@@ -154,8 +182,8 @@ func TestLoadRefusesPaymentsSettingsThatCannotWork(t *testing.T) {
 			// Folding would accept this and produce a name the environment no
 			// longer shows, which is why the grammar refuses it instead.
 			name:    "rejects a provider name outside the folded alphabet",
-			env:     map[string]string{"CONSOLE_API_PAYMENTS_PROVIDER": "Stripe"},
-			wantErr: "CONSOLE_API_PAYMENTS_PROVIDER \"Stripe\" must be 1 to 64 characters",
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_PROVIDER": "SePay"},
+			wantErr: "CONSOLE_API_PAYMENTS_PROVIDER \"SePay\" must be 1 to 64 characters",
 		},
 		{
 			name:    "rejects an explicitly empty provider",
@@ -163,9 +191,9 @@ func TestLoadRefusesPaymentsSettingsThatCannotWork(t *testing.T) {
 			wantErr: "CONSOLE_API_PAYMENTS_PROVIDER must not be empty",
 		},
 		{
-			name:    "rejects an explicitly empty API secret",
-			env:     map[string]string{"CONSOLE_API_PAYMENTS_SECRET_KEY": ""},
-			wantErr: "CONSOLE_API_PAYMENTS_SECRET_KEY must not be empty",
+			name:    "rejects an explicitly empty API token",
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_API_TOKEN": ""},
+			wantErr: "CONSOLE_API_PAYMENTS_API_TOKEN must not be empty",
 		},
 		{
 			name:    "rejects an explicitly empty webhook signing secret",
@@ -195,39 +223,67 @@ func TestLoadRefusesPaymentsSettingsThatCannotWork(t *testing.T) {
 			// non-secret code paths log, which is the one thing a payment
 			// configuration must never produce.
 			name:    "rejects an API base URL carrying userinfo",
-			env:     map[string]string{"CONSOLE_API_PAYMENTS_API_BASE_URL": "https://user:" + paymentsTestSecretKey() + "@api.stripe.com"},
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_API_BASE_URL": "https://user:" + paymentsTestAPIToken() + "@userapi-sandbox.sepay.vn/v2"},
 			wantErr: "CONSOLE_API_PAYMENTS_API_BASE_URL must not carry userinfo",
 		},
 		{
-			name:    "rejects a return URL carrying userinfo",
-			env:     map[string]string{"CONSOLE_API_PAYMENTS_CHECKOUT_RETURN_URL": "https://user:" + paymentsTestSecretKey() + "@console.internal.example/billing"},
-			wantErr: "CONSOLE_API_PAYMENTS_CHECKOUT_RETURN_URL must not carry userinfo",
-		},
-		{
-			name:    "rejects a relative return URL",
-			env:     map[string]string{"CONSOLE_API_PAYMENTS_CHECKOUT_RETURN_URL": "/billing/top-up"},
-			wantErr: "CONSOLE_API_PAYMENTS_CHECKOUT_RETURN_URL must use the http or https scheme",
+			name:    "rejects a relative API base URL",
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_API_BASE_URL": "/v2"},
+			wantErr: "CONSOLE_API_PAYMENTS_API_BASE_URL must use the http or https scheme",
 		},
 		{
 			name:    "rejects an API base URL carrying a query",
-			env:     map[string]string{"CONSOLE_API_PAYMENTS_API_BASE_URL": "https://api.stripe.com?v=2024"},
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_API_BASE_URL": "https://userapi-sandbox.sepay.vn/v2?v=2024"},
 			wantErr: "CONSOLE_API_PAYMENTS_API_BASE_URL must carry no query or fragment",
 		},
 		{
-			// A cleartext API base URL would carry this deployment's payment API
-			// secret as a bearer credential in the clear, on every checkout. The
-			// case is loopback on purpose: nothing about 127.0.0.1 is unsafe, and
-			// the rule still applies because the URL is where the secret is SENT.
-			// An exemption for loopback would be one a deployment could be
-			// misconfigured past in staging and not in production.
+			// A cleartext API base URL would carry this deployment's API token —
+			// a credential with no permission scopes — as a bearer credential in
+			// the clear, on every call. The case is loopback on purpose: nothing
+			// about 127.0.0.1 is unsafe, and the rule still applies because the
+			// URL is where the token is SENT. An exemption for loopback would be
+			// one a deployment could be misconfigured past in staging and not in
+			// production.
 			name:    "rejects a cleartext API base URL",
-			env:     map[string]string{"CONSOLE_API_PAYMENTS_API_BASE_URL": "http://api.stripe.com"},
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_API_BASE_URL": "http://userapi-sandbox.sepay.vn/v2"},
 			wantErr: "CONSOLE_API_PAYMENTS_API_BASE_URL must use the https scheme",
 		},
 		{
-			name:    "rejects a return URL carrying a fragment",
-			env:     map[string]string{"CONSOLE_API_PAYMENTS_CHECKOUT_RETURN_URL": "https://console.internal.example/billing#done"},
-			wantErr: "CONSOLE_API_PAYMENTS_CHECKOUT_RETURN_URL must carry no query or fragment",
+			name:    "rejects an API base URL carrying a fragment",
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_API_BASE_URL": "https://userapi-sandbox.sepay.vn/v2#orders"},
+			wantErr: "CONSOLE_API_PAYMENTS_API_BASE_URL must carry no query or fragment",
+		},
+		{
+			// The bank account id goes into the request PATH, so a value that
+			// would need escaping addresses a resource the provider does not
+			// have. The case is a slash, which is the one that would silently
+			// become a second path segment rather than a 404.
+			name:    "rejects a bank account id that is not one path segment",
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_BANK_ACCOUNT_XID": "ba_1a2b/3c4d"},
+			wantErr: "CONSOLE_API_PAYMENTS_BANK_ACCOUNT_XID must be one URL-safe path segment",
+		},
+		{
+			name:    "rejects a bank account id with a space in it",
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_BANK_ACCOUNT_XID": "ba 1a2b3c4d"},
+			wantErr: "CONSOLE_API_PAYMENTS_BANK_ACCOUNT_XID must be one URL-safe path segment",
+		},
+		{
+			name:    "rejects an explicitly empty bank account id",
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_BANK_ACCOUNT_XID": ""},
+			wantErr: "CONSOLE_API_PAYMENTS_BANK_ACCOUNT_XID must be one URL-safe path segment",
+		},
+		{
+			name:    "rejects an empty virtual-account holder name",
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_ORDER_VA_HOLDER_NAME": ""},
+			wantErr: "CONSOLE_API_PAYMENTS_ORDER_VA_HOLDER_NAME must not be empty",
+		},
+		{
+			// The template has a default, so an empty one is a deployment that
+			// set the variable to nothing rather than one that left it alone —
+			// and an empty template name is not a choice of a template.
+			name:    "rejects an explicitly empty qrcode template",
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_ORDER_QRCODE_TEMPLATE": ""},
+			wantErr: "CONSOLE_API_PAYMENTS_ORDER_QRCODE_TEMPLATE must not be empty",
 		},
 		{
 			name:    "rejects a zero webhook tolerance",
@@ -240,9 +296,17 @@ func TestLoadRefusesPaymentsSettingsThatCannotWork(t *testing.T) {
 			wantErr: "CONSOLE_API_PAYMENTS_WEBHOOK_TOLERANCE must be greater than zero",
 		},
 		{
-			name:    "rejects a webhook tolerance past the ceiling",
-			env:     map[string]string{"CONSOLE_API_PAYMENTS_WEBHOOK_TOLERANCE": "1h"},
-			wantErr: "CONSOLE_API_PAYMENTS_WEBHOOK_TOLERANCE (1h0m0s) must be at most 15m0s",
+			// One minute past the provider's own window. The refusal has to say
+			// whose clock is authoritative, because "too big" alone reads as an
+			// arbitrary limit an operator would raise.
+			name:    "rejects a webhook tolerance past the provider's own window",
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_WEBHOOK_TOLERANCE": "6m"},
+			wantErr: "CONSOLE_API_PAYMENTS_WEBHOOK_TOLERANCE (6m0s) must be at most 5m0s",
+		},
+		{
+			name:    "rejects the tolerance the old deployment template carried",
+			env:     map[string]string{"CONSOLE_API_PAYMENTS_WEBHOOK_TOLERANCE": "15m"},
+			wantErr: "a delivery this process would honour and the provider would not is not a delivery",
 		},
 		{
 			name:    "rejects a malformed webhook tolerance",
@@ -268,7 +332,7 @@ func TestLoadRefusesPaymentsSettingsThatCannotWork(t *testing.T) {
 			// Both secrets are configured in every case above, and neither may
 			// reach a failure message: an operator reads these lines, and a
 			// startup line is the last place a credential should be.
-			for _, secret := range []string{paymentsTestSecretKey(), paymentsTestSigningSecret()} {
+			for _, secret := range []string{paymentsTestAPIToken(), paymentsTestSigningSecret()} {
 				if strings.Contains(err.Error(), secret) {
 					t.Errorf("Load() error = %q, must not carry a configured secret", err)
 				}
@@ -284,18 +348,20 @@ func TestPaymentsLogValueRedactsBothSecretsAndNamesEverySetting(t *testing.T) {
 	// available is an assertion on the rendered string, which is exactly what
 	// a call site would write.
 	payments := Payments{
-		Provider:             "stripe",
-		SecretKey:            paymentsTestSecretKey(),
+		Provider:             "sepay",
+		APIToken:             paymentsTestAPIToken(),
 		WebhookSigningSecret: paymentsTestSigningSecret(),
 		ProviderAccountKey:   "acct-console-api-merchant",
-		APIBaseURL:           "https://api.stripe.com",
-		CheckoutReturnURL:    "https://console.internal.example/billing/top-up",
+		APIBaseURL:           "https://userapi-sandbox.sepay.vn/v2",
+		BankAccountXID:       paymentsTestBankAccountXID(),
+		VAHolderName:         paymentsTestVAHolderName,
+		QRCodeTemplate:       DefaultQRCodeTemplate,
 		WebhookTolerance:     DefaultWebhookTolerance,
 		RequestTimeout:       DefaultPaymentsRequestTimeout,
 	}
 
 	value := payments.LogValue().String()
-	for _, secret := range []string{paymentsTestSecretKey(), paymentsTestSigningSecret()} {
+	for _, secret := range []string{paymentsTestAPIToken(), paymentsTestSigningSecret()} {
 		if strings.Contains(value, secret) {
 			t.Errorf("LogValue() = %q, must not carry a configured secret", value)
 		}
@@ -304,10 +370,12 @@ func TestPaymentsLogValueRedactsBothSecretsAndNamesEverySetting(t *testing.T) {
 		t.Errorf("LogValue() = %q, want both secrets redacted and nothing else", value)
 	}
 	for _, want := range []string{
-		"provider", "stripe",
+		"provider", "sepay",
 		"provider_account_key", "acct-console-api-merchant",
-		"api_base_url", "https://api.stripe.com",
-		"checkout_return_url", "https://console.internal.example/billing/top-up",
+		"api_base_url", "https://userapi-sandbox.sepay.vn/v2",
+		"bank_account_xid", paymentsTestBankAccountXID(),
+		"order_va_holder_name", paymentsTestVAHolderName,
+		"qrcode_template", DefaultQRCodeTemplate,
 		"webhook_tolerance", "request_timeout",
 	} {
 		if !strings.Contains(value, want) {
@@ -325,15 +393,17 @@ func TestTheFmtVerbsCannotPrintEitherSecret(t *testing.T) {
 	// rather than a convenience: it renders the group the way those call sites do
 	// and asserts the secrets are absent from the text.
 	payments := Payments{
-		Provider:             "stripe",
-		SecretKey:            paymentsTestSecretKey(),
+		Provider:             "sepay",
+		APIToken:             paymentsTestAPIToken(),
 		WebhookSigningSecret: paymentsTestSigningSecret(),
 		ProviderAccountKey:   "acct-console-api-merchant",
-		APIBaseURL:           "https://api.stripe.com",
-		CheckoutReturnURL:    "https://console.internal.example/billing/top-up",
+		APIBaseURL:           "https://userapi-sandbox.sepay.vn/v2",
+		BankAccountXID:       paymentsTestBankAccountXID(),
+		VAHolderName:         paymentsTestVAHolderName,
+		QRCodeTemplate:       DefaultQRCodeTemplate,
 		WebhookTolerance:     DefaultWebhookTolerance,
 		RequestTimeout:       DefaultPaymentsRequestTimeout,
-		TopUpOffers:          []TopUpOffer{{ID: "starter", AmountMinorUnits: 1000, Currency: "USD", MinorUnitExponent: 2, Label: "Starter"}},
+		TopUpOffers:          []TopUpOffer{{ID: "starter", AmountMinorUnits: 1000, Currency: "VND", MinorUnitExponent: 0, Label: "Starter"}},
 	}
 	// The nested wrapper is not decoration: it is the shape a real call site has,
 	// because nobody formats a configuration group on its own — they format the
@@ -355,7 +425,7 @@ func TestTheFmtVerbsCannotPrintEitherSecret(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rendered := tc.render()
-			for _, secret := range []string{paymentsTestSecretKey(), paymentsTestSigningSecret()} {
+			for _, secret := range []string{paymentsTestAPIToken(), paymentsTestSigningSecret()} {
 				if strings.Contains(rendered, secret) {
 					t.Fatalf("%s = %q, must not carry a configured secret", tc.name, rendered)
 				}
@@ -366,7 +436,7 @@ func TestTheFmtVerbsCannotPrintEitherSecret(t *testing.T) {
 			// Redacting by rendering nothing would pass the two assertions
 			// above while making the value useless in exactly the diagnostics it
 			// exists for, so the settings an operator needs are asserted present.
-			for _, want := range []string{"stripe", "acct-console-api-merchant", "starter"} {
+			for _, want := range []string{"sepay", "acct-console-api-merchant", "starter"} {
 				if !strings.Contains(rendered, want) {
 					t.Errorf("%s = %q, want it to name %s", tc.name, rendered, want)
 				}
@@ -499,9 +569,9 @@ func TestLoadReadsTheTopUpOffersADeploymentDeclares(t *testing.T) {
 	})
 
 	t.Run("carries a price in the ledger's own integer type", func(t *testing.T) {
-		// There is no ACCEPTED price that needs a 64-bit parse any more, and the
-		// arithmetic says so rather than this comment asserting it: the provider
-		// ceiling is 99,999,999, which is below 2^31-1, so every figure a
+		// There is no ACCEPTED price that needs a 64-bit parse, and the
+		// arithmetic says so rather than this comment asserting it: the policy
+		// ceiling is 1,000,000,000, which is below 2^31-1, so every figure a
 		// deployment can actually sell fits in a 32-bit integer. A case that
 		// loaded 2^52 and expected it accepted would be a test that cannot pass.
 		//
@@ -512,27 +582,27 @@ func TestLoadReadsTheTopUpOffersADeploymentDeclares(t *testing.T) {
 		// 64-bit parse for the same reason the ledger's money type is one — a
 		// price is the figure a customer is charged, and it is not carried in a
 		// type that depends on the build it was configured on.
-		if ProviderMaxUnitAmountMinorUnits >= int64(1)<<31-1 {
-			t.Fatalf("the provider ceiling is %d, which no longer sits below 2^31: the two ranges have met, and the accepted price a 32-bit parse could not read has to be tested again here",
-				ProviderMaxUnitAmountMinorUnits)
+		if MaxTopUpAmountMinorUnits >= int64(1)<<31-1 {
+			t.Fatalf("the policy ceiling is %d, which no longer sits below 2^31: the two ranges have met, and the accepted price a 32-bit parse could not read has to be tested again here",
+				MaxTopUpAmountMinorUnits)
 		}
 	})
 
-	t.Run("accepts a price this build can carry and the provider can charge", func(t *testing.T) {
-		// The ceiling that binds is the SMALLER of two — the provider's — and
-		// the case worth pinning is the boundary that actually applies. A test
-		// that only exercised the 2^53 one would pass against a build that had
-		// forgotten the provider entirely, which is the omission this pins.
+	t.Run("accepts a price at this deployment's own policy ceiling", func(t *testing.T) {
+		// The ceiling that binds is this deployment's policy one, and the case
+		// worth pinning is the boundary that actually applies. A test that only
+		// exercised the 2^53 one would pass against a build that had forgotten
+		// the policy entirely, which is the omission this pins.
 		declared := merge(
 			map[string]string{topUpOfferIDsVariable: "enterprise"},
-			offerEnvFor("enterprise", "99999999", "USD", "2", "Enterprise"),
+			offerEnvFor("enterprise", strconv.FormatInt(MaxTopUpAmountMinorUnits, 10), "VND", "0", "Enterprise"),
 		)
 		cfg, err := Load(lookup(offersEnv(declared)))
 		if err != nil {
 			t.Fatalf("Load() error = %v", err)
 		}
-		if got := cfg.Payments.TopUpOffers[0].AmountMinorUnits; got != ProviderMaxUnitAmountMinorUnits {
-			t.Errorf("amount = %d, want the %d provider ceiling itself accepted", got, ProviderMaxUnitAmountMinorUnits)
+		if got := cfg.Payments.TopUpOffers[0].AmountMinorUnits; got != MaxTopUpAmountMinorUnits {
+			t.Errorf("amount = %d, want the %d policy ceiling itself accepted", got, MaxTopUpAmountMinorUnits)
 		}
 	})
 
@@ -658,14 +728,14 @@ func TestLoadRefusesTopUpOffersThatCannotWork(t *testing.T) {
 		},
 		{
 			// One past the ceiling that actually binds. A figure inside the 2^53
-			// window and outside the provider's is the one that loads cleanly
-			// here and fails at the provider on every single checkout, so the
-			// refusal has to happen at boot with a message naming the provider —
-			// an operator who read only about the console would raise the wrong
-			// limit and change nothing.
-			name:     "rejects a price past what the payment provider's own API carries",
-			declared: merge(map[string]string{topUpOfferIDsVariable: "starter"}, offerEnvFor("starter", "100000000", "USD", "2", "Starter")),
-			wantErr:  `is priced at 100000000 minor units, over the 99999999 the payment provider's API can carry`,
+			// window and outside this deployment's policy is the one that would
+			// load cleanly here and then be sold, so the refusal has to happen at
+			// boot with a message naming the policy — an operator who read only
+			// about the console's parser would raise the wrong limit and change
+			// nothing.
+			name:     "rejects a price past this deployment's policy ceiling",
+			declared: merge(map[string]string{topUpOfferIDsVariable: "starter"}, offerEnvFor("starter", "1000000001", "USD", "2", "Starter")),
+			wantErr:  `is priced at 1000000001 minor units, over the 1000000000 this deployment will sell in one payment`,
 		},
 		{
 			name:     "rejects a lowercase currency",
@@ -774,7 +844,7 @@ func TestPaymentsLogValueNamesTheOffersItPublishes(t *testing.T) {
 	// reading it needs to know which offers this deployment is running, and the
 	// amounts and labels are readable from the configuration itself.
 	payments := Payments{
-		Provider:    "stripe",
+		Provider:    "sepay",
 		TopUpOffers: []TopUpOffer{{ID: "starter"}, {ID: "team-annual"}},
 	}
 	value := payments.LogValue().String()

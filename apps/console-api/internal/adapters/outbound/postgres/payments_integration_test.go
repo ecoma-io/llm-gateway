@@ -14,6 +14,7 @@ import (
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/accounting"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/payments"
+	paymentport "github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/payments"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
@@ -126,8 +127,8 @@ func payKey(t *testing.T, prefix string) string {
 	return prefix + "-" + strings.ReplaceAll(string(id), "-", "")
 }
 
-// payRef mints a provider's own reference — a checkout, a capture or a refund —
-// run-unique under the fixture's provider namespace.
+// payRef mints a provider's own reference — a transfer destination, a capture
+// or a refund — run-unique under the fixture's provider namespace.
 func payRef(t *testing.T, prefix string) string {
 	t.Helper()
 	id, err := payments.NewIntent(time.Now().UTC())
@@ -177,7 +178,7 @@ func (p *paymentRepos) openIntent(t *testing.T, f paymentFixture, key string, at
 		MinorUnitExponent: 2,
 		Provider:          f.provider,
 		IdempotencyKey:    key,
-		CheckoutTTL:       time.Hour,
+		TransferTTL:       time.Hour,
 		Now:               at,
 		MintedID:          id,
 		MintedAt:          at,
@@ -193,34 +194,53 @@ func (p *paymentRepos) openIntent(t *testing.T, f paymentFixture, key string, at
 	return intent
 }
 
-// openCaptureReady takes a payment as far as a capture can move it from: created
-// → checkout_open (through the port's own guarded move, so the fixture's state
-// is one the state machine admits) with a checkout reference a delivery could
-// resolve.
+// transferInstructions is a provider's answer as the port carries it: the
+// destination it issued for this payment, the bank that account sits at, the
+// name it is held in, and the provider's own image of the transfer.
+//
+// The strings are opaque to this plane — nothing here parses any of them, and
+// the bank name and the holder are matched against nothing — so the values
+// themselves are arbitrary: a test can assert only that they are all present,
+// and that each comes back out of the row unchanged.
+func transferInstructions(t *testing.T) payments.TransferInstructions {
+	t.Helper()
+	return payments.TransferInstructions{
+		TransferCode:  payRef(t, "va"),
+		BankName:      "Vietcombank",
+		AccountHolder: "LLM Gateway Test",
+		QRURL:         "https://qr.example.test/" + payRef(t, "qr"),
+	}
+}
+
+// openCaptureReady takes a payment as far as a capture can move it from: from
+// created to awaiting_transfer (through the port's own guarded move, so the
+// fixture's state is one the state machine admits) with a transfer reference a
+// delivery could resolve.
 func (p *paymentRepos) openCaptureReady(t *testing.T, intent payments.Intent) payments.Intent {
 	t.Helper()
-	checkout := payments.OpenedCheckout{URL: "https://checkout.example.test/" + payRef(t, "url"), ProviderRef: payRef(t, "cs")}
+	transfer := transferInstructions(t)
 	var applied bool
 	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
 		var err error
-		applied, err = p.intents.RecordCheckout(ctx, intent.ID, checkout,
+		applied, err = p.intents.RecordTransfer(ctx, intent.ID, transfer,
 			[]payments.Status{payments.StatusCreated}, micros(time.Now().UTC()))
 		return err
 	}); err != nil {
-		t.Fatalf("record checkout for payment %s: %v", intent.ID, err)
+		t.Fatalf("record transfer for payment %s: %v", intent.ID, err)
 	}
 	if !applied {
-		t.Fatalf("record checkout for payment %s did not apply", intent.ID)
+		t.Fatalf("record transfer for payment %s did not apply", intent.ID)
 	}
 	return p.mustByID(t, intent.ID)
 }
 
-// captured takes a payment through checkout and capture, leaving it succeeded
-// with the provider's payment reference set — the state a refund starts from.
+// captured takes a payment through a recorded destination and a capture, leaving
+// it succeeded with the provider's payment reference set — the state a refund
+// starts from.
 func (p *paymentRepos) captured(t *testing.T, f paymentFixture, key string) (payments.Intent, string) {
 	t.Helper()
 	intent := p.openCaptureReady(t, p.openIntent(t, f, key, time.Now().UTC()))
-	paymentRef := payRef(t, "pi")
+	paymentRef := payRef(t, "ref")
 	return p.recordCapture(t, intent, paymentRef), paymentRef
 }
 
@@ -233,7 +253,7 @@ func (p *paymentRepos) recordCapture(t *testing.T, intent payments.Intent, payme
 	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
 		var err error
 		captured, applied, err = p.intents.RecordCapture(ctx, intent.ID, paymentRef,
-			[]payments.Status{payments.StatusCheckoutOpen, payments.StatusRequiresAction,
+			[]payments.Status{payments.StatusAwaitingTransfer, payments.StatusRequiresAction,
 				payments.StatusExpired, payments.StatusCancelled}, micros(time.Now().UTC()))
 		return err
 	}); err != nil {
@@ -265,7 +285,7 @@ func (p *paymentRepos) event(t *testing.T, f paymentFixture, intent payments.Int
 		ProviderAccountKey: "acct-" + f.provider,
 		Provider:           f.provider,
 		IntentID:           intent.ID,
-		Kind:               "payment_intent.succeeded",
+		Kind:               paymentport.KindCaptured,
 		ProviderPaymentRef: paymentRef,
 		AmountMinorUnits:   int64Pointer(5000),
 		Currency:           "USD",
@@ -311,7 +331,7 @@ func sameIntent(got, want payments.Intent) bool {
 // of its keys.
 //
 // The whole row is compared, not a field of it, and the comparison is possible
-// because every column here is one this fixture chose: an absent checkout
+// because every column here is one this fixture chose: an absent transfer
 // reference and an absent capture reference are NULL in the schema and "" in the
 // domain, and a round trip that turned either into a zero or into the string
 // "null" would fail this test rather than pass it.
@@ -343,13 +363,13 @@ func TestIntegrationPaymentIntentRoundTripsThroughEveryLookup(t *testing.T) {
 	// transaction, and a read does not, because a read outside a unit of work
 	// sees a committed state, which is a correct answer to a correct question.
 	//
-	// A reference nothing opened is ErrNotFound and only that. The distinction
-	// is load-bearing on the webhook path: "this platform never opened that
-	// checkout" quarantines a delivery, while any other failure is
+	// A reference nothing issued is ErrNotFound and only that. The distinction
+	// is load-bearing on the webhook path: "this platform never issued that
+	// destination" quarantines a delivery, while any other failure is
 	// infrastructure and must stay distinguishable from it.
-	unknown := payRef(t, "cs-unknown")
-	if _, err := p.intents.ByProviderCheckoutRef(t.Context(), f.provider, unknown); !errors.Is(err, persistence.ErrNotFound) {
-		t.Errorf("ByProviderCheckoutRef(unknown) error = %v, want persistence.ErrNotFound", err)
+	unknown := payRef(t, "va-unknown")
+	if _, err := p.intents.ByProviderTransferRef(t.Context(), f.provider, unknown); !errors.Is(err, persistence.ErrNotFound) {
+		t.Errorf("ByProviderTransferRef(unknown) error = %v, want persistence.ErrNotFound", err)
 	}
 	unknownID, err := payments.NewIntent(time.Now().UTC())
 	if err != nil {
@@ -362,13 +382,17 @@ func TestIntegrationPaymentIntentRoundTripsThroughEveryLookup(t *testing.T) {
 		t.Errorf("ByAccountAndIdempotencyKey(unknown) error = %v, want persistence.ErrNotFound", err)
 	}
 
-	// The checkout reference lookup is the read the whole webhook resolution
-	// rests on, so it is exercised for real once the reference exists.
+	// The transfer reference lookup is the read the whole webhook resolution
+	// rests on, so it is exercised for real once the reference exists — and the
+	// row it returns is compared WHOLE for the same reason the reads above are:
+	// the provider's two names and its QR image are written by the destination
+	// statement and read back by this lookup, and a read path that dropped one
+	// of them would show a customer a destination they cannot check.
 	opened := p.openCaptureReady(t, want)
-	if got, err := p.intents.ByProviderCheckoutRef(t.Context(), f.provider, opened.ProviderCheckoutRef); err != nil {
-		t.Errorf("ByProviderCheckoutRef(opened) error = %v", err)
-	} else if got.ID != opened.ID {
-		t.Errorf("ByProviderCheckoutRef resolved %s, want %s", got.ID, opened.ID)
+	if got, err := p.intents.ByProviderTransferRef(t.Context(), f.provider, opened.ProviderTransferRef); err != nil {
+		t.Errorf("ByProviderTransferRef(opened) error = %v", err)
+	} else if !sameIntent(got, opened) {
+		t.Errorf("ByProviderTransferRef(opened):\n got  %+v\n want %+v", got, opened)
 	}
 }
 
@@ -395,7 +419,7 @@ func TestIntegrationPaymentIntentIdempotencyKeyIsOnePaymentPerAccount(t *testing
 	second, err := payments.New(payments.NewPayment{
 		AccountID: first.AccountID, FundingBucketID: first.FundingBucketID,
 		AmountMinorUnits: 5000, Currency: "USD", MinorUnitExponent: 2,
-		Provider: f.provider, IdempotencyKey: key, CheckoutTTL: time.Hour,
+		Provider: f.provider, IdempotencyKey: key, TransferTTL: time.Hour,
 		Now: at, MintedID: secondID, MintedAt: at,
 	})
 	if err != nil {
@@ -421,40 +445,52 @@ func TestIntegrationPaymentIntentIdempotencyKeyIsOnePaymentPerAccount(t *testing
 // what happened.
 // ---------------------------------------------------------------------------
 
-// TestIntegrationPaymentCheckoutIsRecordedOnceAndTheLoserIsToldSo is the
+// TestIntegrationPaymentTransferIsRecordedOnceAndTheLoserIsToldSo is the
 // compare-and-swap as the port describes it: the winner's write lands, and the
 // loser is answered with false and NO error — because a second attempt at the
-// same checkout is not a failure of this platform, it is the world having moved
-// while the caller was deciding.
+// same payment's destination is not a failure of this platform, it is the world
+// having moved while the caller was deciding.
 //
 // The loser's write is proved not to have landed by re-reading the row: a
 // verdict of false that had nevertheless written something would be worse than
-// an error, and only the row can tell the two apart.
-func TestIntegrationPaymentCheckoutIsRecordedOnceAndTheLoserIsToldSo(t *testing.T) {
+// an error, and only the row can tell the two apart. The losing writer carries a
+// destination of its own — its own reference, its own bank and holder, its own
+// image — so all four must be proved unchanged, and the failure they are proved
+// against is the one this statement's predicates exist to prevent: the account
+// one customer was already told to pay into being replaced by another nobody
+// holds.
+func TestIntegrationPaymentTransferIsRecordedOnceAndTheLoserIsToldSo(t *testing.T) {
 	p := integrationPayments(t)
-	f := p.newPaymentFixture(t, "payments-checkout")
-	intent := p.openIntent(t, f, payKey(t, "checkout"), time.Now().UTC())
+	f := p.newPaymentFixture(t, "payments-transfer")
+	intent := p.openIntent(t, f, payKey(t, "transfer"), time.Now().UTC())
 
-	first := payments.OpenedCheckout{URL: "https://checkout.example.test/first", ProviderRef: payRef(t, "cs-first")}
+	first := transferInstructions(t)
 	var applied bool
 	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
 		var err error
-		applied, err = p.intents.RecordCheckout(ctx, intent.ID, first,
+		applied, err = p.intents.RecordTransfer(ctx, intent.ID, first,
 			[]payments.Status{payments.StatusCreated}, micros(time.Now().UTC()))
 		return err
 	}); err != nil {
-		t.Fatalf("RecordCheckout: %v", err)
+		t.Fatalf("RecordTransfer: %v", err)
 	}
 	if !applied {
-		t.Fatal("RecordCheckout applied = false, want true for the payment's first checkout")
+		t.Fatal("RecordTransfer applied = false, want true for the payment's first destination")
 	}
 
 	won := p.mustByID(t, intent.ID)
-	if won.Status != payments.StatusCheckoutOpen {
-		t.Errorf("status = %q, want %q", won.Status, payments.StatusCheckoutOpen)
+	if won.Status != payments.StatusAwaitingTransfer {
+		t.Errorf("status = %q, want %q", won.Status, payments.StatusAwaitingTransfer)
 	}
-	if won.ProviderCheckoutRef != first.ProviderRef || won.CheckoutURL != first.URL {
-		t.Errorf("checkout = (%q, %q), want (%q, %q)", won.ProviderCheckoutRef, won.CheckoutURL, first.ProviderRef, first.URL)
+	// The whole destination is asserted, not just its reference: the two names
+	// and the image are what the customer checks before sending money, so a
+	// statement that wrote the reference and dropped them would leave the
+	// console rendering a destination nobody can check.
+	if won.ProviderTransferRef != first.TransferCode || won.ProviderQRURL != first.QRURL ||
+		won.ProviderBankName != first.BankName || won.ProviderAccountHolder != first.AccountHolder {
+		t.Errorf("destination = (%q, %q, %q, %q), want (%q, %q, %q, %q)",
+			won.ProviderTransferRef, won.ProviderQRURL, won.ProviderBankName, won.ProviderAccountHolder,
+			first.TransferCode, first.QRURL, first.BankName, first.AccountHolder)
 	}
 	// The version is bumped by the statement, not supplied by the caller: the
 	// caller has no expected version to pass and the column still moves.
@@ -464,21 +500,83 @@ func TestIntegrationPaymentCheckoutIsRecordedOnceAndTheLoserIsToldSo(t *testing.
 
 	// The loser: the row is no longer `created`, so the predicate the caller
 	// read no longer holds. False and nil, and the winner's values survive.
-	lost := payments.OpenedCheckout{URL: "https://checkout.example.test/second", ProviderRef: payRef(t, "cs-second")}
+	lost := transferInstructions(t)
 	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
 		var err error
-		applied, err = p.intents.RecordCheckout(ctx, intent.ID, lost,
+		applied, err = p.intents.RecordTransfer(ctx, intent.ID, lost,
 			[]payments.Status{payments.StatusCreated}, micros(time.Now().UTC()))
 		return err
 	}); err != nil {
-		t.Fatalf("the losing RecordCheckout returned an error: %v", err)
+		t.Fatalf("the losing RecordTransfer returned an error: %v", err)
 	}
 	if applied {
-		t.Error("the losing RecordCheckout applied = true, want false")
+		t.Error("the losing RecordTransfer applied = true, want false")
 	}
 	still := p.mustByID(t, intent.ID)
 	if !sameIntent(still, won) {
 		t.Errorf("the losing write changed the row:\n got  %+v\n want %+v", still, won)
+	}
+}
+
+// TestIntegrationPaymentTransferWithoutAQRImageReadsBackEmpty pins the one
+// member of the provider's answer that may legitimately be absent. The QR image
+// is an affordance and not the destination: a customer can type the account
+// number into their banking app, so a payment whose provider issued no image is
+// a payable payment, and the adapter must store its absence as NULL and read
+// that NULL back as the domain's empty string rather than as the string "null"
+// or as a scan error.
+//
+// It is asserted this way round because the absence is what is easy to get
+// wrong: the column is nullable, the domain spells absence as "", and a scan
+// that failed to tolerate a NULL here would turn a perfectly good destination
+// into a 500 on the read path.
+func TestIntegrationPaymentTransferWithoutAQRImageReadsBackEmpty(t *testing.T) {
+	p := integrationPayments(t)
+	f := p.newPaymentFixture(t, "payments-transfer-no-qr")
+	intent := p.openIntent(t, f, payKey(t, "transfer-no-qr"), time.Now().UTC())
+
+	typed := transferInstructions(t)
+	typed.QRURL = ""
+	var applied bool
+	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
+		var err error
+		applied, err = p.intents.RecordTransfer(ctx, intent.ID, typed,
+			[]payments.Status{payments.StatusCreated}, micros(time.Now().UTC()))
+		return err
+	}); err != nil {
+		t.Fatalf("RecordTransfer without a QR image: %v", err)
+	}
+	if !applied {
+		t.Fatal("RecordTransfer applied = false, want true for a destination the provider issued without an image")
+	}
+
+	// Read back through the resolution lookup rather than ByID, because both
+	// paths share the one scan and the lookup is the read the webhook drives.
+	got, err := p.intents.ByProviderTransferRef(t.Context(), f.provider, typed.TransferCode)
+	if err != nil {
+		t.Fatalf("ByProviderTransferRef: %v", err)
+	}
+	if got.ProviderQRURL != "" {
+		t.Errorf("qr url = %q, want the empty string: an absent image is NULL in the column and the domain's absence is empty", got.ProviderQRURL)
+	}
+	// The absence is the IMAGE's alone: the destination is complete without it.
+	if got.ProviderBankName != typed.BankName || got.ProviderAccountHolder != typed.AccountHolder {
+		t.Errorf("destination = (%q, %q), want (%q, %q) — a missing image must not take the names with it",
+			got.ProviderBankName, got.ProviderAccountHolder, typed.BankName, typed.AccountHolder)
+	}
+
+	// And the COLUMN is NULL rather than an empty string, which is the
+	// distinction the read path is written to tolerate: an empty string is not
+	// NULL, and a column that conflated them would make "the provider issued no
+	// image" and "the provider issued an empty image" the same row.
+	var nullQR int
+	if err := p.store.Querier(t.Context()).QueryRowContext(t.Context(),
+		`SELECT count(*) FROM control.payment_intents WHERE id = $1 AND provider_qr_url IS NULL`,
+		string(intent.ID)).Scan(&nullQR); err != nil {
+		t.Fatalf("count the payments recorded with no qr url: %v", err)
+	}
+	if nullQR != 1 {
+		t.Errorf("the destination recorded without an image has %d rows with a NULL provider_qr_url, want 1 — the absence was stored as a value", nullQR)
 	}
 }
 
@@ -497,7 +595,7 @@ func TestIntegrationPaymentMoveStatusCarriesItsStatusPredicate(t *testing.T) {
 	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
 		var err error
 		moved, applied, err = p.intents.MoveStatus(ctx, intent.ID,
-			[]payments.Status{payments.StatusCheckoutOpen}, payments.StatusRequiresAction, micros(time.Now().UTC()))
+			[]payments.Status{payments.StatusAwaitingTransfer}, payments.StatusRequiresAction, micros(time.Now().UTC()))
 		return err
 	}); err != nil {
 		t.Fatalf("MoveStatus: %v", err)
@@ -545,7 +643,7 @@ func TestIntegrationPaymentCaptureWritesTheReferenceAndTheStatusTogether(t *test
 	p := integrationPayments(t)
 	f := p.newPaymentFixture(t, "payments-capture")
 	intent := p.openCaptureReady(t, p.openIntent(t, f, payKey(t, "capture"), time.Now().UTC()))
-	paymentRef := payRef(t, "pi")
+	paymentRef := payRef(t, "ref")
 
 	var (
 		captured payments.Intent
@@ -554,7 +652,7 @@ func TestIntegrationPaymentCaptureWritesTheReferenceAndTheStatusTogether(t *test
 	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
 		var err error
 		captured, applied, err = p.intents.RecordCapture(ctx, intent.ID, paymentRef,
-			[]payments.Status{payments.StatusCheckoutOpen, payments.StatusRequiresAction,
+			[]payments.Status{payments.StatusAwaitingTransfer, payments.StatusRequiresAction,
 				payments.StatusExpired, payments.StatusCancelled}, micros(time.Now().UTC()))
 		return err
 	}); err != nil {
@@ -580,7 +678,7 @@ func TestIntegrationPaymentCaptureWritesTheReferenceAndTheStatusTogether(t *test
 	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
 		var err error
 		_, applied, err = p.intents.RecordCapture(ctx, intent.ID, payRef(t, "pi-second"),
-			[]payments.Status{payments.StatusCheckoutOpen}, micros(time.Now().UTC()))
+			[]payments.Status{payments.StatusAwaitingTransfer}, micros(time.Now().UTC()))
 		return err
 	}); err != nil {
 		t.Fatalf("the second RecordCapture returned an error: %v", err)
@@ -600,7 +698,7 @@ func TestIntegrationPaymentCaptureWritesTheReferenceAndTheStatusTogether(t *test
 	other := p.openCaptureReady(t, p.openIntent(t, f, payKey(t, "capture-other"), time.Now().UTC()))
 	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
 		_, _, err := p.intents.RecordCapture(ctx, other.ID, paymentRef,
-			[]payments.Status{payments.StatusCheckoutOpen}, micros(time.Now().UTC()))
+			[]payments.Status{payments.StatusAwaitingTransfer}, micros(time.Now().UTC()))
 		return err
 	}); err == nil {
 		t.Error("a second payment captured the same provider reference; want the unique index to refuse it")
@@ -622,9 +720,9 @@ func TestIntegrationPaymentCaptureWritesTheReferenceAndTheStatusTogether(t *test
 // collide.
 //
 // A self-update really does not collide, and that is exactly why the wrong
-// reading of this path is so expensive. `SET provider_payment_ref = 'cs_1'` on a
-// row that already holds 'cs_1' produces one entry in the index, and the index
-// is satisfied. Adding `succeeded` to the from-list would therefore NOT raise
+// reading of this path is so expensive. `SET provider_payment_ref = 'sepay-1'`
+// on a row that already holds 'sepay-1' produces one entry in the index, and the
+// index is satisfied. Adding `succeeded` to the from-list would therefore NOT raise
 // 23505 — it would succeed, and quietly rewrite the funding leg's command key
 // source to a second reference, which is the money bug the index was added to
 // stop. The guard is the from-list; the index is the second line of defence
@@ -644,7 +742,7 @@ func TestIntegrationPaymentCaptureRedeliveryIsSilent(t *testing.T) {
 	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
 		var err error
 		_, applied, err = p.intents.RecordCapture(ctx, before.ID, paymentRef,
-			[]payments.Status{payments.StatusCheckoutOpen, payments.StatusRequiresAction,
+			[]payments.Status{payments.StatusAwaitingTransfer, payments.StatusRequiresAction,
 				payments.StatusExpired, payments.StatusCancelled}, micros(time.Now().UTC()))
 		return err
 	}); err != nil {
@@ -663,10 +761,11 @@ func TestIntegrationPaymentCaptureRedeliveryIsSilent(t *testing.T) {
 // two refunds in sequence leave the second reported total on the row, and the
 // answer is read back from the row rather than from the arguments passed.
 //
-// The distinction this pins is between 800 and 1200. A `charge.refunded`
-// reports the charge's cumulative `amount_refunded`, so the second delivery of
-// a 400-then-800 refund pair says 800 — and a statement that ADDED its argument
-// to the row would store 400 + 800 = 1200 against a 5000 capture, pass every
+// The distinction this pins is between 800 and 1200. A delivery reporting a
+// refund reports the payment's CUMULATIVE refunded total rather than this
+// refund's own amount, so the second delivery of a 400-then-800 refund pair
+// says 800 — and a statement that ADDED its argument to the row would store
+// 400 + 800 = 1200 against a 5000 capture, pass every
 // CHECK, and be uncorrectable: every later report would be below what the row
 // holds. See the next test for what that costs under concurrency.
 func TestIntegrationPaymentRefundIsWrittenAbsolutely(t *testing.T) {
@@ -674,7 +773,7 @@ func TestIntegrationPaymentRefundIsWrittenAbsolutely(t *testing.T) {
 	f := p.newPaymentFixture(t, "payments-refund")
 	intent, _ := p.captured(t, f, payKey(t, "refund"))
 
-	partial := p.refund(t, intent, payRef(t, "re"), 2000, 0,
+	partial := p.refund(t, intent, payRef(t, "refund"), 2000, 0,
 		[]payments.Status{payments.StatusSucceeded}, payments.StatusPartiallyRefunded)
 	if partial.RefundedMinorUnits != 2000 || partial.UncoveredRefundMinorUnits != 0 {
 		t.Errorf("after the first refund, refunded = %d and uncovered = %d, want 2000 and 0",
@@ -692,7 +791,7 @@ func TestIntegrationPaymentRefundIsWrittenAbsolutely(t *testing.T) {
 	// stored it added to whatever the row already held, which is the drift this
 	// member's doc names — refunds of 40 then 30 out of a balance of 10 storing
 	// 50 where the payment's shortfall is 60.
-	second := p.refund(t, partial, payRef(t, "re"), 3500, 500,
+	second := p.refund(t, partial, payRef(t, "refund"), 3500, 500,
 		[]payments.Status{payments.StatusPartiallyRefunded}, payments.StatusPartiallyRefunded)
 	if second.RefundedMinorUnits != 3500 || second.UncoveredRefundMinorUnits != 500 {
 		t.Errorf("after the second refund, refunded = %d and uncovered = %d, want 3500 and 500 — the caller's cumulative total and the shortfall measured against it are both written whole",
@@ -702,7 +801,7 @@ func TestIntegrationPaymentRefundIsWrittenAbsolutely(t *testing.T) {
 	// The final report takes the payment to `refunded`, and the reference a
 	// refund leg would carry is not lost: it is on the delivery row that claims
 	// the refund, which is where the port's events repository records it.
-	final := p.refund(t, second, payRef(t, "re"), 5000, 0,
+	final := p.refund(t, second, payRef(t, "refund"), 5000, 0,
 		[]payments.Status{payments.StatusPartiallyRefunded}, payments.StatusRefunded)
 	if final.RefundedMinorUnits != 5000 || final.Status != payments.StatusRefunded {
 		t.Errorf("after the final refund, refunded = %d and status = %q, want 5000 and %q",
@@ -811,7 +910,7 @@ func TestIntegrationPaymentRefundGuardsAreVerdictsNotErrors(t *testing.T) {
 	f := p.newPaymentFixture(t, "payments-refund-ceiling")
 	intent, _ := p.captured(t, f, payKey(t, "refund-ceiling"))
 
-	allowed := p.refund(t, intent, payRef(t, "re"), 4000, 0,
+	allowed := p.refund(t, intent, payRef(t, "refund"), 4000, 0,
 		[]payments.Status{payments.StatusSucceeded}, payments.StatusPartiallyRefunded)
 
 	for _, refusal := range []struct {
@@ -833,7 +932,7 @@ func TestIntegrationPaymentRefundGuardsAreVerdictsNotErrors(t *testing.T) {
 			)
 			if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
 				var err error
-				refused, applied, err = p.intents.RecordRefund(ctx, allowed.ID, payRef(t, "re"), refusal.reported, refusal.uncovered,
+				refused, applied, err = p.intents.RecordRefund(ctx, allowed.ID, payRef(t, "refund"), refusal.reported, refusal.uncovered,
 					[]payments.Status{payments.StatusSucceeded, payments.StatusPartiallyRefunded},
 					refusal.to, micros(time.Now().UTC()))
 				return err
@@ -858,7 +957,7 @@ func TestIntegrationPaymentRefundGuardsAreVerdictsNotErrors(t *testing.T) {
 //
 // Both of this plane's convergence routes are built on catching a unique
 // violation and then doing more work in the same unit of work: a repeated
-// open-checkout request re-reads the payment it already has, and a redelivered
+// open-transfer request re-reads the payment it already has, and a redelivered
 // provider event is answered 200 with nothing written. In PostgreSQL a failed
 // statement ABORTS the transaction it fired in — every statement after it
 // answers SQLSTATE 25P02, and the commit at the end fails outright, so a scope
@@ -875,7 +974,7 @@ func TestIntegrationPaymentConvergencePathsSurviveTheirOwnTransaction(t *testing
 	p := integrationPayments(t)
 	f := p.newPaymentFixture(t, "payments-convergence")
 	intent := p.openIntent(t, f, payKey(t, "convergence"), time.Now().UTC())
-	event := p.event(t, f, intent, payRef(t, "evt"), payRef(t, "pi"))
+	event := p.event(t, f, intent, payRef(t, "delivery"), payRef(t, "ref"))
 
 	// The retry carries a FRESH id, which is what makes this test about the
 	// idempotency key at all. A second Create of the same intent STRUCT would
@@ -899,7 +998,7 @@ func TestIntegrationPaymentConvergencePathsSurviveTheirOwnTransaction(t *testing
 		MinorUnitExponent: intent.MinorUnitExponent,
 		Provider:          f.provider,
 		IdempotencyKey:    intent.IdempotencyKey,
-		CheckoutTTL:       time.Hour,
+		TransferTTL:       time.Hour,
 		Now:               retryAt,
 		MintedID:          retryID,
 		MintedAt:          retryAt,
@@ -1006,7 +1105,7 @@ func TestIntegrationPaymentEventDeliveryKeyIsOneDeliveryPerProviderAccount(t *te
 	p := integrationPayments(t)
 	f := p.newPaymentFixture(t, "payments-events")
 	intent := p.openIntent(t, f, payKey(t, "events"), time.Now().UTC())
-	event := p.event(t, f, intent, payRef(t, "evt"), payRef(t, "pi"))
+	event := p.event(t, f, intent, payRef(t, "delivery"), payRef(t, "ref"))
 
 	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
 		return p.events.Record(ctx, event)
@@ -1106,7 +1205,7 @@ func TestIntegrationPaymentEventIsRecordedProvisionalAndSettlesOnce(t *testing.T
 	p := integrationPayments(t)
 	f := p.newPaymentFixture(t, "payments-events-settle")
 	intent := p.openIntent(t, f, payKey(t, "events-settle"), time.Now().UTC())
-	event := p.event(t, f, intent, payRef(t, "evt-settle"), payRef(t, "pi"))
+	event := p.event(t, f, intent, payRef(t, "evt-settle"), payRef(t, "ref"))
 	if event.Disposition != payments.DispositionApplied {
 		t.Fatalf("the fixture asked for %q, and this test is about the adapter refusing to write it", event.Disposition)
 	}
@@ -1170,7 +1269,7 @@ func TestIntegrationPaymentEventAmountsRoundTripAbsence(t *testing.T) {
 	f := p.newPaymentFixture(t, "payments-events-amount")
 	intent := p.openIntent(t, f, payKey(t, "events-amount"), time.Now().UTC())
 
-	silent := p.event(t, f, intent, payRef(t, "evt-silent"), payRef(t, "pi"))
+	silent := p.event(t, f, intent, payRef(t, "evt-silent"), payRef(t, "ref"))
 	silent.AmountMinorUnits = nil
 	silent.Currency = ""
 	// The third absence on the same row, and the one a NOT NULL column would
@@ -1179,7 +1278,7 @@ func TestIntegrationPaymentEventAmountsRoundTripAbsence(t *testing.T) {
 	// adapter records that as the domain's zero instant rather than inventing
 	// one.
 	silent.OccurredAt = time.Time{}
-	zero := p.event(t, f, intent, payRef(t, "evt-zero"), payRef(t, "pi"))
+	zero := p.event(t, f, intent, payRef(t, "evt-zero"), payRef(t, "ref"))
 	zero.AmountMinorUnits = int64Pointer(0)
 
 	if err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
@@ -1272,12 +1371,12 @@ func TestIntegrationPaymentQuarantineKeepsTheClaimAndTheBytes(t *testing.T) {
 	mismatch := payments.QuarantineRecord{
 		Provider:           f.provider,
 		ProviderAccountKey: "acct-" + f.provider,
-		EventID:            payRef(t, "evt"),
+		EventID:            payRef(t, "delivery"),
 		IntentID:           intent.ID,
-		Kind:               "payment_intent.amount_mismatch",
+		Kind:               paymentport.KindCaptured,
 		// The claim this delivery made, kept as claimed and never acted on: an
 		// amount of zero is a claim, and the pointer is what says so.
-		ProviderPaymentRef: payRef(t, "pi"),
+		ProviderPaymentRef: payRef(t, "ref"),
 		AmountMinorUnits:   int64Pointer(0),
 		Currency:           "USD",
 		Reason:             payments.ReasonAmountMismatch,
@@ -1530,7 +1629,7 @@ func TestIntegrationPaymentWritesRefuseOutsideAUnitOfWork(t *testing.T) {
 		AccountID: f.account, FundingBucketID: string(f.bucket.ID),
 		AmountMinorUnits: 5000, Currency: "USD", MinorUnitExponent: 2,
 		Provider: f.provider, IdempotencyKey: payKey(t, "refusal-unwritten"),
-		CheckoutTTL: time.Hour, Now: now, MintedID: unwrittenID, MintedAt: now,
+		TransferTTL: time.Hour, Now: now, MintedID: unwrittenID, MintedAt: now,
 	})
 	if err != nil {
 		t.Fatalf("New payment: %v", err)
@@ -1545,34 +1644,33 @@ func TestIntegrationPaymentWritesRefuseOutsideAUnitOfWork(t *testing.T) {
 			err := p.intents.Create(ctx, unwritten)
 			return err == nil, err
 		},
-		"PaymentIntents.RecordCheckout": func() (bool, error) {
-			applied, err := p.intents.RecordCheckout(ctx, opened.ID,
-				payments.OpenedCheckout{URL: "https://checkout.example.test/refused", ProviderRef: payRef(t, "cs")},
-				[]payments.Status{payments.StatusCreated}, now)
+		"PaymentIntents.RecordTransfer": func() (bool, error) {
+			applied, err := p.intents.RecordTransfer(ctx, opened.ID,
+				transferInstructions(t), []payments.Status{payments.StatusCreated}, now)
 			return applied, err
 		},
 		"PaymentIntents.MoveStatus": func() (bool, error) {
 			_, applied, err := p.intents.MoveStatus(ctx, opened.ID,
-				[]payments.Status{payments.StatusCheckoutOpen}, payments.StatusRequiresAction, now)
+				[]payments.Status{payments.StatusAwaitingTransfer}, payments.StatusRequiresAction, now)
 			return applied, err
 		},
 		"PaymentIntents.RecordCapture": func() (bool, error) {
-			_, applied, err := p.intents.RecordCapture(ctx, opened.ID, payRef(t, "pi"),
-				[]payments.Status{payments.StatusCheckoutOpen}, now)
+			_, applied, err := p.intents.RecordCapture(ctx, opened.ID, payRef(t, "ref"),
+				[]payments.Status{payments.StatusAwaitingTransfer}, now)
 			return applied, err
 		},
 		"PaymentIntents.RecordRefund": func() (bool, error) {
-			_, applied, err := p.intents.RecordRefund(ctx, opened.ID, payRef(t, "re"), 100, 0,
+			_, applied, err := p.intents.RecordRefund(ctx, opened.ID, payRef(t, "refund"), 100, 0,
 				[]payments.Status{payments.StatusSucceeded}, payments.StatusPartiallyRefunded, now)
 			return applied, err
 		},
 		"PaymentEvents.Record": func() (bool, error) {
-			err := p.events.Record(ctx, p.event(t, f, intent, payRef(t, "evt"), payRef(t, "pi")))
+			err := p.events.Record(ctx, p.event(t, f, intent, payRef(t, "delivery"), payRef(t, "ref")))
 			return err == nil, err
 		},
 		"PaymentEvents.Settle": func() (bool, error) {
 			err := p.events.Settle(ctx, payments.DeliveryKey{
-				Provider: f.provider, ProviderAccountKey: "acct-" + f.provider, EventID: payRef(t, "evt"),
+				Provider: f.provider, ProviderAccountKey: "acct-" + f.provider, EventID: payRef(t, "delivery"),
 			}, payments.DispositionQuarantined)
 			return err == nil, err
 		},

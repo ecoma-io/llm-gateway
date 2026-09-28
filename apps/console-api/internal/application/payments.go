@@ -16,9 +16,9 @@ import (
 
 // The payment integration's use cases (B15).
 //
-// This file is where the two halves of a payment meet: a browser-facing
-// checkout that starts a payment, and a provider-facing webhook that finishes
-// one. The rule that shapes every line of it is stated once, in
+// This file is where the two halves of a payment meet: a customer-facing top-up
+// that opens a payment, and a provider-facing webhook that finishes one. The
+// rule that shapes every line of it is stated once, in
 // ports/outbound/payments, and repeated here because it is the whole design:
 //
 //	A verified event is a CLAIM about a payment, not a payment.
@@ -83,13 +83,13 @@ type bucketReader interface {
 }
 
 // PaymentsSettings is the deployment's own identity in the payment conversation:
-// which provider this plane talks to, which merchant account at that provider
-// is ours, and where a customer is sent after checkout.
+// which provider this plane talks to and which merchant account at that
+// provider is ours.
 //
-// It is a struct rather than three more constructor parameters because the
-// three travel together and a caller that supplied two of them and forgot the
-// third would get a provider name of "" — which is not a provider, and would
-// silently make every stored payment unresolvable.
+// It is a struct rather than two more constructor parameters because the two
+// travel together and a caller that supplied one and forgot the other would get
+// a provider name of "" — which is not a provider, and would silently make
+// every stored payment unresolvable.
 type PaymentsSettings struct {
 	// Provider names which provider adapter this deployment uses. It is the
 	// value stored on every payment row and the value every delivery is
@@ -104,12 +104,6 @@ type PaymentsSettings struct {
 	// the merchant would absorb the second customer's delivery and leave them
 	// unfunded with no error anywhere.
 	ProviderAccountKey string
-	// CheckoutReturnURL is where the provider sends a customer who finishes.
-	// It is built from configuration and NEVER from a request parameter: a
-	// checkout API that accepted an absolute redirect URL from its caller
-	// would be an open redirect on a payment page, and the URL is not merely
-	// cosmetic — it is where a customer lands holding a session.
-	CheckoutReturnURL string
 }
 
 // Payments is the payment integration's use cases.
@@ -123,7 +117,7 @@ type Payments struct {
 	buckets    bucketReader
 	funding    accountFunding
 	ledger     topUpWriter
-	provider   paymentprovider.Checkout
+	provider   paymentprovider.Transfers
 	offers     TopUpCatalogue
 	settings   PaymentsSettings
 }
@@ -134,9 +128,6 @@ func (p *Payments) providerName() string { return p.settings.Provider }
 
 // providerAccountKey is this deployment's merchant identifier at the provider.
 func (p *Payments) providerAccountKey() string { return p.settings.ProviderAccountKey }
-
-// checkoutReturnURL is where a customer is sent after a checkout.
-func (p *Payments) checkoutReturnURL() string { return p.settings.CheckoutReturnURL }
 
 // NewPayments builds the payment use cases around the ports they need. It
 // panics on a nil port for the reason every constructor in this package does: a
@@ -153,7 +144,7 @@ func NewPayments(
 	buckets bucketReader,
 	funding accountFunding,
 	ledger topUpWriter,
-	provider paymentprovider.Checkout,
+	provider paymentprovider.Transfers,
 	offers TopUpCatalogue,
 	settings PaymentsSettings,
 ) *Payments {
@@ -187,15 +178,13 @@ func NewPayments(
 	// payments exist; what it must not have is a working top-up button. Every
 	// path that could open a payment already refuses correctly against an empty
 	// catalogue, because an offer id that is not in the map is not an offer:
-	// BeginCheckout answers InvalidRequest with the same sentence an unknown id
+	// BeginTransfer answers InvalidRequest with the same sentence an unknown id
 	// gets, and the offers read answers an empty list rather than an error. A
 	// panic here would turn "this deployment does not sell top-ups" into a
 	// process that will not start, which is a worse answer to a legitimate
 	// configuration than a screen with the button absent.
 	case settings.Provider == "":
 		panic("application: NewPayments requires the provider this deployment talks to")
-	case settings.CheckoutReturnURL == "":
-		panic("application: NewPayments requires the checkout return URL")
 	}
 	return &Payments{
 		store:      store,
@@ -281,7 +270,7 @@ type TopUpCatalogue struct {
 //
 // It panics on a duplicate id, for the reason every constructor in this package
 // panics: a catalogue that cannot say which of two prices is the real one is a
-// wiring defect, and the middle of a checkout is a strictly worse place to
+// wiring defect, and the middle of a top-up is a strictly worse place to
 // discover it.
 func NewTopUpCatalogue(offers []TopUpOffer) TopUpCatalogue {
 	byID := make(map[string]TopUpOffer, len(offers))
@@ -317,13 +306,14 @@ func (c TopUpCatalogue) List() []TopUpOffer {
 	return out
 }
 
-// BeginCheckoutRequest is one attempt to start funding an account.
+// BeginTransferRequest is one attempt to start funding an account.
 //
-// The account comes from the session and is never a request parameter: an
-// account id in a body would be a way to fund somebody else, and the console
-// has no legitimate use for such a field.
-type BeginCheckoutRequest struct {
-	// AccountID is the session's account, resolved by the transport.
+// The account comes from the authenticated session and is never a request
+// parameter: an account id in a body would be a way to fund somebody else, and
+// the console has no legitimate use for such a field.
+type BeginTransferRequest struct {
+	// AccountID is the authenticated session's account, resolved by the
+	// transport.
 	AccountID string
 	// OfferID names an offer in this deployment's catalogue.
 	OfferID string
@@ -336,9 +326,9 @@ type BeginCheckoutRequest struct {
 	IdempotencyKey string
 }
 
-// BeginCheckoutResult is what the caller gets: the payment, and whether this
+// BeginTransferResult is what the caller gets: the payment, and whether this
 // call created it.
-type BeginCheckoutResult struct {
+type BeginTransferResult struct {
 	// Intent is the payment as it now stands. On a converged call it is the
 	// payment the key already named, which may be in any later state — a
 	// retry after a customer already paid returns a succeeded payment, and
@@ -351,8 +341,8 @@ type BeginCheckoutResult struct {
 	Converged bool
 }
 
-// BeginCheckout opens a funding top-up and sends the customer to a hosted
-// checkout.
+// BeginTransfer opens a funding top-up and obtains, from the provider, the
+// destination the customer is to pay into.
 //
 // The order of the four steps is the design, and each step's position closes a
 // specific failure:
@@ -361,33 +351,42 @@ type BeginCheckoutResult struct {
 //     idempotency key is derived from the payment's own identifier, and a key
 //     derived from something that does not exist until the provider answers
 //     cannot make a retry the same request — so a lost response would mean a
-//     second call with a new key and a customer charged twice. Durability
-//     first is what turns "retry" into "the same request".
+//     second call with a new key and a customer handed a second destination
+//     for one payment. Durability first is what turns "retry" into "the same
+//     request".
 //
 //  2. The provider call happens OUTSIDE any transaction. No external call
 //     belongs inside a database transaction: the provider is an HTTP service
 //     with its own latency and its own outages, and a transaction held open
 //     across it pins a connection and a row lock for as long as a third party
-//     takes to answer. The port says the same thing from the other side (a
-//     checkout cannot move money), and the two rules meet here.
+//     takes to answer. The port says the same thing from the other side
+//     (opening a transfer cannot move money), and the two rules meet here.
 //
-//  3. The checkout is recorded in a SECOND transaction, guarded by a
+//  3. The destination is recorded in a SECOND transaction, guarded by a
 //     compare-and-swap. Two concurrent calls can both reach the provider —
 //     that is what the idempotency key is for — but only one of them may
-//     write the reference the customer's live session depends on.
+//     write the account the customer will be told to pay into.
 //
 //  4. Everything that reads the account's state happens before any of it,
 //     because a closed account's payment is a payment this platform should
 //     not be opening in the first place.
 //
-// A provider failure between steps 1 and 3 leaves the payment in `created`. It
+// The destination is recorded BEFORE the customer is ever shown it, and that is
+// the property the whole path rests on: the value a later delivery will be
+// resolved through is one this plane wrote down first, so a delivery naming it
+// can only be a delivery about a destination this platform asked the provider
+// for.
+//
+// A provider OUTAGE between steps 1 and 3 leaves the payment in `created`. It
 // is not an orphan: the next call with the same idempotency key converges on
 // it and retries the provider with the SAME idempotency key, which is exactly
-// the retry the provider's own key semantics are designed to absorb.
-func (p *Payments) BeginCheckout(ctx context.Context, in BeginCheckoutRequest) (BeginCheckoutResult, error) {
+// the retry the provider's own key semantics are designed to absorb. The one
+// refusal that is not an outage leaves nothing to retry, and the arm below that
+// answers it abandons the payment instead.
+func (p *Payments) BeginTransfer(ctx context.Context, in BeginTransferRequest) (BeginTransferResult, error) {
 	offer, ok := p.offers.Offer(in.OfferID)
 	if !ok {
-		return BeginCheckoutResult{}, InvalidRequest("that top-up offer is not one this deployment sells")
+		return BeginTransferResult{}, InvalidRequest("that top-up offer is not one this deployment sells")
 	}
 	// The key is checked HERE, against the domain's own rule, and not left to
 	// payments.New below to refuse. It is the only field of the request that
@@ -402,18 +401,18 @@ func (p *Payments) BeginCheckout(ctx context.Context, in BeginCheckoutRequest) (
 	// The message is the domain's, produced by the domain's check, so the rule
 	// and its wording have exactly one home on both sides of the boundary.
 	if err := payments.CheckIdempotencyKey(in.IdempotencyKey); err != nil {
-		return BeginCheckoutResult{}, InvalidRequest(err.Error())
+		return BeginTransferResult{}, InvalidRequest(err.Error())
 	}
 	if in.AccountID == "" {
-		return BeginCheckoutResult{}, Unauthenticated("a top-up requires an account")
+		return BeginTransferResult{}, Unauthenticated("a top-up requires an account")
 	}
 
 	account, err := p.accounts.ByID(ctx, identity.AccountID(in.AccountID))
 	if err != nil {
 		if errors.Is(err, persistence.ErrNotFound) {
-			return BeginCheckoutResult{}, Unauthenticated("that account does not exist")
+			return BeginTransferResult{}, Unauthenticated("that account does not exist")
 		}
-		return BeginCheckoutResult{}, fmt.Errorf("application: begin checkout: read account: %w", err)
+		return BeginTransferResult{}, fmt.Errorf("application: begin top-up: read account: %w", err)
 	}
 	if account.State != identity.AccountActive {
 		// Suspended and closed alike. A suspended account is one whose
@@ -422,34 +421,89 @@ func (p *Payments) BeginCheckout(ctx context.Context, in BeginCheckoutRequest) (
 		// spend it. The refusal is a conflict rather than a validation error:
 		// the request is well-formed and the server's state is what refuses
 		// it.
-		return BeginCheckoutResult{}, Conflict("that account may not fund itself while it is not active")
+		return BeginTransferResult{}, Conflict("that account may not fund itself while it is not active")
 	}
 
 	intent, converged, err := p.openIntent(ctx, in, offer)
 	if err != nil {
-		return BeginCheckoutResult{}, err
+		return BeginTransferResult{}, err
 	}
-	if converged && intent.ProviderCheckoutRef != "" {
-		// The payment already has a checkout. Returning it is the whole point
-		// of the key: the customer's second click gets the session their first
-		// click opened, rather than a second one they would have to choose
-		// between.
-		return BeginCheckoutResult{Intent: intent, Converged: true}, nil
+	if converged && intent.ProviderTransferRef != "" {
+		// The payment already has a destination. Returning it is the whole
+		// point of the key: the customer's second click gets the account their
+		// first click was given, rather than a second one they would have to
+		// choose between.
+		return BeginTransferResult{Intent: intent, Converged: true}, nil
 	}
 
 	// OUTSIDE any unit of work. See the header.
-	session, err := p.provider.OpenCheckout(ctx, paymentprovider.CheckoutRequest{
-		IdempotencyKey:   checkoutIdempotencyKey(intent.ID),
+	destination, err := p.provider.OpenTransfer(ctx, paymentprovider.TransferRequest{
+		IdempotencyKey:   transferIdempotencyKey(intent.ID),
 		AmountMinorUnits: intent.AmountMinorUnits,
 		Currency:         intent.Currency,
-		Reference:        string(intent.ID),
-		ReturnURL:        p.checkoutReturnURL(),
+		ExpiresIn:        transferTTL,
 	})
 	if err != nil {
-		// The payment stands in `created`, and the next attempt with this key
-		// converges on it. No error state is written: an intent that recorded
-		// "the provider was down" would be an intent that remembered a fact
-		// about a third party rather than about itself.
+		// ORDER IDENTITY THE PROVIDER WILL NOT ISSUE TWICE is checked first,
+		// and it is the one failure here whose answer is not a retry.
+		//
+		// The provider already holds a destination under this payment's own
+		// identity, it did not return it to this process, and it documents no
+		// way to read one back. What that leaves is a destination that exists
+		// and that no customer was ever shown: nobody holds the account, so
+		// nobody can pay into it, and the money it might receive is money
+		// nobody is waiting for. The payment must not stay in `created` either,
+		// because `created` is the state a retry converges on and a retry is
+		// precisely what cannot work — the provider refuses this identity
+		// identically and forever, so the row would go on implying that one
+		// more attempt is all it needs.
+		//
+		// The attempt is therefore abandoned locally, BEFORE the caller is told
+		// anything: the payment moves from `created` to `cancelled`, which is a
+		// legal edge of the state machine and the honest one. The customer
+		// cancelled nothing — this platform gave up on the attempt — but the
+		// vocabulary has no better word for a payment that can never be paid,
+		// and the console must not offer to resume it. The next attempt a
+		// client makes is then a NEW payment under a NEW idempotency key, which
+		// derives a new order identity at the provider; the key itself is not
+		// touched, so a client that repeats the SAME call converges on this
+		// cancelled payment and is told, truthfully, that this attempt is over.
+		//
+		// The write is a compare-and-swap out of `created` and a lost race is
+		// IGNORED rather than reported. A concurrent attempt may have moved the
+		// row already — to `cancelled` for this same reason, or onward to a
+		// state this call knows nothing about — and losing the swap means the
+		// row is not this caller's to decide any more. Treating that as a
+		// failure would turn the ordinary outcome of two concurrent retries
+		// into a 5xx, which is the mistake the persistence port's own comment
+		// on its compare-and-swap members warns about.
+		//
+		// WHAT THIS WRITE IS NOT, because the sentence above is easy to
+		// overstate: it is a decision about a row in this platform's own table
+		// and nothing else. It does not cancel anything at the provider, does
+		// not claim the destination there was released, and does not claim the
+		// account is gone. Nothing in this process could reach the provider to
+		// do any of that — the port has no member for it.
+		if errors.Is(err, paymentprovider.ErrOrderCodeTaken) {
+			abandonErr := p.store.WithinTx(ctx, func(txCtx context.Context) error {
+				now, err := dbNow(txCtx, p.clock, "abandon payment")
+				if err != nil {
+					return err
+				}
+				_, _, err = p.intents.MoveStatus(txCtx, intent.ID,
+					[]payments.Status{payments.StatusCreated}, payments.StatusCancelled, now)
+				return err
+			})
+			if abandonErr != nil {
+				return BeginTransferResult{}, fmt.Errorf("application: abandon payment %s after the provider refused its transfer identity: %w", intent.ID, abandonErr)
+			}
+			return BeginTransferResult{}, Conflict("this top-up's destination is already held by the provider and cannot be shown; start a new top-up to be given another")
+		}
+
+		// Every other failure leaves the payment in `created`, and the next
+		// attempt with this key converges on it. No error state is written: an
+		// intent that recorded "the provider was down" would be an intent that
+		// remembered a fact about a third party rather than about itself.
 		//
 		// The two CLASSES are separated here and nowhere else, because this is
 		// the only layer that can tell them apart: the port says whether the
@@ -461,46 +515,54 @@ func (p *Payments) BeginCheckout(ctx context.Context, in BeginCheckoutRequest) (
 		// the other and stays an internal error. Answering both the same way
 		// would either invite a retry storm against a permanent refusal or
 		// report a passing outage as a fault of this platform.
-		cause := fmt.Errorf("application: begin checkout for payment %s: %w", intent.ID, err)
+		cause := fmt.Errorf("application: begin transfer for payment %s: %w", intent.ID, err)
 		if errors.Is(err, paymentprovider.ErrProviderUnavailable) {
-			return BeginCheckoutResult{}, UpstreamUnavailable(cause)
+			return BeginTransferResult{}, UpstreamUnavailable(cause)
 		}
-		return BeginCheckoutResult{}, cause
+		return BeginTransferResult{}, cause
 	}
 
 	var recorded payments.Intent
 	err = p.store.WithinTx(ctx, func(txCtx context.Context) error {
-		now, err := dbNow(txCtx, p.clock, "record checkout")
+		now, err := dbNow(txCtx, p.clock, "record transfer")
 		if err != nil {
 			return err
 		}
-		applied, err := p.intents.RecordCheckout(txCtx, intent.ID,
-			payments.OpenedCheckout{URL: session.URL, ProviderRef: session.ProviderRef},
+		applied, err := p.intents.RecordTransfer(txCtx, intent.ID,
+			payments.TransferInstructions{
+				TransferCode:  destination.TransferCode,
+				BankName:      destination.BankName,
+				AccountHolder: destination.AccountHolder,
+				QRURL:         destination.QRURL,
+			},
 			[]payments.Status{payments.StatusCreated}, now)
 		if err != nil {
-			return fmt.Errorf("record checkout: %w", err)
+			return fmt.Errorf("record transfer: %w", err)
 		}
 		after, err := p.intents.ByID(txCtx, intent.ID)
 		if err != nil {
-			return fmt.Errorf("re-read payment after recording its checkout: %w", err)
+			return fmt.Errorf("re-read payment after recording its destination: %w", err)
 		}
 		recorded = after
 		if !applied {
-			// Another attempt won the swap and wrote its own reference. The
-			// loser does NOT overwrite it: whichever checkout the customer's
-			// browser was last sent to is the one whose reference must stand,
-			// and choosing between two live sessions is not a decision this
-			// layer can make. The converged read above returns the winner's
-			// payment, and the provider's idempotency key means the two calls
-			// were the same request at the provider anyway.
+			// Another attempt won the swap and wrote its own destination. The
+			// loser does NOT overwrite it: whichever account the customer was
+			// last handed is the one that must stand, and choosing between two
+			// accounts the provider issued for this payment is not a decision
+			// this layer can make — money sent to either would be money for
+			// this payment, and a customer shown two different account numbers
+			// for one payment has no way to know which to pay. The converged
+			// read above returns the winner's payment, and the provider's
+			// idempotency key means the two calls were the same request at the
+			// provider anyway.
 			return nil
 		}
 		return nil
 	})
 	if err != nil {
-		return BeginCheckoutResult{}, fmt.Errorf("application: record checkout for payment %s: %w", intent.ID, err)
+		return BeginTransferResult{}, fmt.Errorf("application: record transfer for payment %s: %w", intent.ID, err)
 	}
-	return BeginCheckoutResult{Intent: recorded, Converged: converged}, nil
+	return BeginTransferResult{Intent: recorded, Converged: converged}, nil
 }
 
 // openIntent creates the payment, or converges on the one the key already
@@ -517,7 +579,7 @@ func (p *Payments) BeginCheckout(ctx context.Context, in BeginCheckoutRequest) (
 // payment it already has — which is the entire purpose of the key, and turning
 // it into an error would make the retry the key exists to make safe into the
 // one thing it is not.
-func (p *Payments) openIntent(ctx context.Context, in BeginCheckoutRequest, offer TopUpOffer) (payments.Intent, bool, error) {
+func (p *Payments) openIntent(ctx context.Context, in BeginTransferRequest, offer TopUpOffer) (payments.Intent, bool, error) {
 	var intent payments.Intent
 	var converged bool
 	err := p.store.WithinTx(ctx, func(txCtx context.Context) error {
@@ -549,7 +611,7 @@ func (p *Payments) openIntent(ctx context.Context, in BeginCheckoutRequest, offe
 			MinorUnitExponent: offer.MinorUnitExponent,
 			Provider:          p.providerName(),
 			IdempotencyKey:    in.IdempotencyKey,
-			CheckoutTTL:       checkoutTTL,
+			TransferTTL:       transferTTL,
 			Now:               now,
 			MintedID:          id,
 			MintedAt:          now,
@@ -576,32 +638,45 @@ func (p *Payments) openIntent(ctx context.Context, in BeginCheckoutRequest, offe
 		return nil
 	})
 	if err != nil {
-		return payments.Intent{}, false, fmt.Errorf("application: begin checkout for account %s: %w", in.AccountID, err)
+		return payments.Intent{}, false, fmt.Errorf("application: begin top-up for account %s: %w", in.AccountID, err)
 	}
 	return intent, converged, nil
 }
 
-// checkoutTTL is how long this platform waits for a customer to finish a
-// checkout before giving up on it locally.
+// transferTTL is how long this platform waits for a customer to make a bank
+// transfer before giving up on the payment locally.
 //
 // It is a product decision rather than a technical bound, and it is short on
-// purpose: a stale checkout in a customer's list is a thing they may try to
-// pay twice. Note what it is NOT — it is not a deadline on the money. A payment
-// that succeeds after this expires is still honoured, because expiry is this
+// purpose: a stale destination in a customer's list is a thing they may try to
+// pay twice.
+//
+// It is handed to the provider as the lifetime of the account it issues, and
+// that is the whole reason it travels rather than living in the adapter's
+// configuration: the deadline the console prints for a customer and the window
+// the account stays payable are ONE fact, and two authorities for one fact
+// drift. A console that told a customer thirty minutes while the account
+// remained payable for a day would send them hurrying for nothing, and the
+// reverse would refuse money at a moment nobody had mentioned.
+//
+// Note what it is NOT — it is not a deadline on the money. A payment that
+// succeeds after this expires is still honoured, because expiry is this
 // platform's patience and the provider is the only party that states whether a
 // customer paid.
-const checkoutTTL = 30 * time.Minute
+const transferTTL = 30 * time.Minute
 
-// checkoutIdempotencyKey derives the provider's idempotency key for a
-// checkout from the payment's identity.
+// transferIdempotencyKey derives the provider's idempotency key for a transfer
+// from the payment's identity.
 //
 // Derived and not minted, because the whole value of the key is that the SAME
-// value appears on every attempt at the same logical checkout. A key minted per
+// value appears on every attempt at the same logical transfer. A key minted per
 // call would be a key that makes every retry a NEW request at the provider,
-// which is a customer charged once per retry — and the failure is silent,
-// because the provider would be behaving exactly as documented.
-func checkoutIdempotencyKey(id payments.IntentID) string {
-	return "checkout:" + string(id)
+// which is a customer handed a second destination for one payment — and the
+// failure is silent, because the provider would be behaving exactly as
+// documented. It is also the identity the provider derives its own order code
+// from, which is what makes a second attempt under this key a collision the
+// provider refuses rather than a second destination it issues.
+func transferIdempotencyKey(id payments.IntentID) string {
+	return "transfer:" + string(id)
 }
 
 // EventOutcome is what became of one verified delivery.
@@ -676,7 +751,7 @@ type ProviderDelivery struct {
 //     deliberately claims no key at all (see step 2).
 //
 //  2. The payment is resolved from the STORED reference. Not found is an
-//     ordinary answer, not a fault: a delivery can arrive for a checkout
+//     ordinary answer, not a fault: a delivery can arrive for a payment
 //     another deployment opened, or for one this platform created outside this
 //     surface. It is quarantined — and NOT recorded as an event, so that the
 //     redelivery every provider will send stays applicable. The branch's own
@@ -748,9 +823,9 @@ func (p *Payments) ApplyProviderEvent(ctx context.Context, delivery ProviderDeli
 			// here would permanently absorb every future delivery of this
 			// event id. There is a real, if narrow, window in which a delivery
 			// arrives for a payment this plane HAS opened but has not yet
-			// written the provider's checkout reference for — BeginCheckout
+			// written the provider's transfer reference for — BeginTransfer
 			// records the intent before it calls the provider and writes the
-			// reference in a second transaction after the provider answers —
+			// destination in a second transaction after the provider answers —
 			// and a delivery that landed in that gap would be refused as
 			// unknown, burn the key, and leave the customer's real money
 			// unapplied forever, with the provider's own retries arriving as
@@ -831,24 +906,30 @@ func (p *Payments) ApplyProviderEvent(ctx context.Context, delivery ProviderDeli
 // resolveDelivery finds the payment a delivery names, or refuses in domain
 // words.
 //
-// THE CHECKOUT REFERENCE IS TRIED FIRST, and the order is a decision rather
+// THE TRANSFER REFERENCE IS TRIED FIRST, and the order is a decision rather
 // than an accident of which field is written first. A capture delivery carries
-// both references, and the checkout is the one this plane WROTE — it was
-// recorded before the customer was sent anywhere, it is the value the provider
-// was handed, and resolving through it means a capture lands on the payment the
-// console opened rather than on whatever row happens to hold that payment id.
-// The payment reference is the fallback, and it is the ONLY route a refund has:
-// a refund delivery names the money and never the session it was taken through.
+// both references, and the transfer is the one this plane WROTE: the provider
+// issued that destination for this one payment, and this platform recorded it
+// before the customer was ever shown it. Resolving through it means a capture
+// lands on the payment the console opened rather than on whatever row happens
+// to hold that payment id — and it does so on the strength of a value that is
+// evidence about where money went rather than a claim about what somebody
+// meant: an account the provider issued can only receive money this platform
+// asked for, while a transfer's free-text memo is the customer's own words,
+// which a bank may rewrite, truncate or uppercase and which a customer may
+// simply not type. The payment reference is the fallback, and it is the ONLY
+// route a refund has: a refund delivery names the money and never the
+// destination it arrived at.
 //
 // There is still deliberately no fallback to anything inside the payload. Both
 // references are matched against columns this platform wrote; a delivery that
 // names neither is a delivery about a payment this platform did not open, and
 // the answer is to record it rather than to look harder for somebody to credit.
 func (p *Payments) resolveDelivery(ctx context.Context, event paymentprovider.ProviderEvent) (payments.Intent, error) {
-	if payments.ValidProviderReference(event.CheckoutRef) {
-		return p.resolveBy(ctx, "checkout", event.CheckoutRef,
+	if payments.ValidProviderReference(event.TransferRef) {
+		return p.resolveBy(ctx, "transfer", event.TransferRef,
 			func(ctx context.Context, ref string) (payments.Intent, error) {
-				return p.intents.ByProviderCheckoutRef(ctx, p.providerName(), ref)
+				return p.intents.ByProviderTransferRef(ctx, p.providerName(), ref)
 			})
 	}
 	if payments.ValidProviderReference(event.PaymentRef) {
@@ -857,7 +938,7 @@ func (p *Payments) resolveDelivery(ctx context.Context, event paymentprovider.Pr
 				return p.intents.ByProviderPaymentRef(ctx, p.providerName(), ref)
 			})
 	}
-	return payments.Intent{}, fmt.Errorf("%w: a delivery that names neither a checkout this platform opened nor a payment it recorded", payments.ErrUnknownPayment)
+	return payments.Intent{}, fmt.Errorf("%w: a delivery that names neither a destination this platform was issued nor a payment it recorded", payments.ErrUnknownPayment)
 }
 
 // resolveBy runs one of the two lookups and translates its miss into the
@@ -865,7 +946,7 @@ func (p *Payments) resolveDelivery(ctx context.Context, event paymentprovider.Pr
 //
 // The two arms differ only in which column they match, and folding them
 // together is what keeps the miss identical between them: a provider reference
-// nothing stored resolves to is one answer whether it arrived in the checkout
+// nothing stored resolves to is one answer whether it arrived in the transfer
 // field or the payment field, and two hand-written copies of that translation
 // would be two chances to report one of them as a fault instead.
 func (p *Payments) resolveBy(ctx context.Context, what, ref string, lookup func(context.Context, string) (payments.Intent, error)) (payments.Intent, error) {
@@ -880,8 +961,8 @@ func (p *Payments) resolveBy(ctx context.Context, what, ref string, lookup func(
 }
 
 // claimedPaymentRef is the payment reference a delivery is taken to name: the
-// provider's payment id when the delivery states one, and the checkout id when
-// it does not.
+// provider's payment id when the delivery states one, and the transfer's own
+// identifier when it does not.
 //
 // The fallback is a real decision rather than a convenience, and it is
 // documented here because it is the one place this feature accepts a weaker
@@ -889,14 +970,15 @@ func (p *Payments) resolveBy(ctx context.Context, what, ref string, lookup func(
 // event row's claimed reference, the payment's stored reference — which the
 // schema refuses to let a `succeeded` row hold as NULL — and the funding leg's
 // command key, which must be derived from something unique per paid payment and
-// a checkout id is that. A provider that completes a session without naming the
-// payment intent it created has still taken the customer's money, and refusing
-// the capture over the absent name would strand a real payment for an operator
-// to fund by hand — a worse outcome than recording the economic event under the
+// a transfer's identifier is that, because the provider issued it for this one
+// payment and nobody else holds it. A provider that takes the customer's money
+// without naming the payment it created has still taken it, and refusing the
+// capture over the absent name would strand a real payment for an operator to
+// fund by hand — a worse outcome than recording the economic event under the
 // identifier the delivery did carry.
 //
 // What the fallback COSTS is stated rather than hidden: a refund naming the
-// payment intent will not resolve against a row whose reference is a checkout
+// payment intent will not resolve against a row whose reference is a transfer
 // id, and that delivery quarantines as an unknown payment — with the provider's
 // own reference on the quarantine row, which is the case that column exists
 // for.
@@ -904,7 +986,7 @@ func claimedPaymentRef(event paymentprovider.ProviderEvent) string {
 	if event.PaymentRef != "" {
 		return event.PaymentRef
 	}
-	return event.CheckoutRef
+	return event.TransferRef
 }
 
 // applyClaim checks one delivery against the payment and, when it is a capture
@@ -945,7 +1027,7 @@ func (p *Payments) applyClaim(txCtx context.Context, intent payments.Intent, eve
 		// credit. Losing it means another delivery of this same capture is
 		// already doing the work.
 		_, moved, err := p.intents.RecordCapture(txCtx, intent.ID, claimedPaymentRef(event),
-			[]payments.Status{payments.StatusCheckoutOpen, payments.StatusRequiresAction,
+			[]payments.Status{payments.StatusAwaitingTransfer, payments.StatusRequiresAction,
 				payments.StatusExpired, payments.StatusCancelled}, now)
 		if err != nil {
 			return false, "", fmt.Errorf("record capture for payment %s: %w", intent.ID, err)
@@ -1007,7 +1089,7 @@ func (p *Payments) applyClaim(txCtx context.Context, intent payments.Intent, eve
 // compare-and-swap, which is why a payment in that situation is left where it
 // was rather than moved to succeeded. A capture for a closed BUCKET is refused
 // after the swap, by the ledger, and the payment stays `succeeded`: the money
-// is real, the customer's card was charged, and a payment that says it happened
+// is real, the customer has already sent it, and a payment that says it happened
 // with a quarantine naming why it could not land is the state an operator can
 // act on. The refusal table asserts exactly that, under "a capture for a bucket
 // that has been closed".
@@ -1365,7 +1447,7 @@ func (p *Payments) recordQuarantine(ctx context.Context, now time.Time, event pa
 // over-long currency is the empty string — the same sentinel it uses for a
 // field it could not read — so a guard would route exactly the deliveries that
 // are MOST about the currency to the reason for a different fault. A paid
-// checkout whose `currency` is `null` arrives with an amount that matches to the
+// transfer whose `currency` is `null` arrives with an amount that matches to the
 // unit and is filed as `amount_mismatch`, beside a quarantine row whose own
 // currency column is NULL: the operator is told the sum disagrees when the sum
 // is not what is wrong. Every payment this plane opens has a non-empty
@@ -1452,27 +1534,41 @@ func (p *Payments) ListPayments(ctx context.Context, accountID, cursor string, l
 	return PaymentPage{Items: items, HasMore: hasMore, NextCursor: next}, nil
 }
 
-// CheckoutURLFor returns the hosted checkout a payment's customer should be
-// sent back to, if the payment has one.
+// TransferInstructionsFor returns the destination a payment's customer was
+// given, if the payment has one.
 //
-// It exists so the transport never builds a redirect from anything but a stored
-// row. The URL is returned VERBATIM and is never parsed, never checked against
-// a host, and never assembled from a request parameter: it is a promise the
-// provider made and this platform is keeping on the provider's behalf.
-func (p *Payments) CheckoutURLFor(ctx context.Context, accountID string, id payments.IntentID) (string, error) {
+// It exists so the transport never tells a customer where to send money from
+// anything but a stored row. The four values are returned VERBATIM: they are the
+// provider's own account, its own name for the bank, its own name for the
+// holder and its own image, all of them a promise the provider made and this
+// platform is keeping on the provider's behalf — none is parsed, host-checked
+// or composed here, and none is assembled from a request parameter.
+//
+// A payment in `created` has no destination, and the zero value is the true
+// answer for it rather than an error: the console renders no instructions,
+// which is exactly what there are. The reason is worth stating, because it is
+// the reason the destination is written down at all: the customer must be shown
+// the account the provider issued for this one payment, and a payment that has
+// not reached the provider yet has none to show.
+func (p *Payments) TransferInstructionsFor(ctx context.Context, accountID string, id payments.IntentID) (payments.TransferInstructions, error) {
 	intent, err := p.intents.ByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, persistence.ErrNotFound) {
-			return "", NotFound("that payment does not exist")
+			return payments.TransferInstructions{}, NotFound("that payment does not exist")
 		}
-		return "", fmt.Errorf("application: read payment %s: %w", id, err)
+		return payments.TransferInstructions{}, fmt.Errorf("application: read payment %s: %w", id, err)
 	}
 	if intent.AccountID != accountID {
 		// The caller asked about a payment that is not its own. Answered as a
 		// miss rather than as a refusal, for the reason the console's reads
 		// carry no forbidden sentinel: a distinct answer for "not yours"
 		// turns the difference into a confirmation oracle.
-		return "", NotFound("that payment does not exist")
+		return payments.TransferInstructions{}, NotFound("that payment does not exist")
 	}
-	return intent.CheckoutURL, nil
+	return payments.TransferInstructions{
+		TransferCode:  intent.ProviderTransferRef,
+		BankName:      intent.ProviderBankName,
+		AccountHolder: intent.ProviderAccountHolder,
+		QRURL:         intent.ProviderQRURL,
+	}, nil
 }

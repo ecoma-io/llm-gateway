@@ -48,7 +48,7 @@ import (
 // boolean, or a handler that has to know which of the two it was given.
 //
 // The verifier is composed HERE rather than inside buildPaymentsSurface, and
-// the split follows the two secrets: that function is handed the API secret,
+// the split follows the two credentials: that function is handed the API token,
 // because calling the provider needs it, and this one is handed the signing
 // secret, because authenticating a delivery needs that. Neither function ever
 // holds both, and neither logs either — config.Payments' own doc comment says
@@ -81,8 +81,8 @@ type paymentUseCases struct {
 	payments *application.Payments
 }
 
-func (u paymentUseCases) BeginCheckout(ctx context.Context, accountID, offerID, idempotencyKey string) (http.PaymentIntentResult, error) {
-	result, err := u.payments.BeginCheckout(ctx, application.BeginCheckoutRequest{
+func (u paymentUseCases) BeginTransfer(ctx context.Context, accountID, offerID, idempotencyKey string) (http.PaymentIntentResult, error) {
+	result, err := u.payments.BeginTransfer(ctx, application.BeginTransferRequest{
 		AccountID:      accountID,
 		OfferID:        offerID,
 		IdempotencyKey: idempotencyKey,
@@ -197,30 +197,50 @@ func (u paymentUseCases) ListTopUpOffers(ctx context.Context) (http.TopUpOfferLi
 // declares.
 //
 // Every field is a COPY and none is derived, and the two that could tempt a
-// derivation are the two that matter. CheckoutURL is copied, empty included,
-// rather than being inferred from the status: the contract types it
-// `[string, "null"]`, the seam renders the empty string as null, and a payment
-// whose checkout does not exist yet is one fact rather than two. And ExpiresAt
+// derivation are the two that matter. The destination is copied from the four
+// values the store recorded, and the wire renders their absence as null rather
+// than inventing an empty object: the contract types `transfer_instructions` as
+// an object or null, null is the state of a payment whose destination has not
+// been recorded yet, and that state is one fact rather than two. And ExpiresAt
 // is copied from the intent's own deadline rather than computed from CreatedAt
 // and a configured window — the deadline is a stored fact, and a client
-// comparing a computed one against what the provider's checkout page shows
-// would be comparing this build's arithmetic against the provider's.
+// comparing a computed one against the deadline the customer was given would be
+// comparing this build's arithmetic against the provider's.
+//
+// The nil-versus-object choice rests on the destination reference alone, and it
+// is a translation rather than a derivation: the provider hands back all four
+// values in one answer, so the store either holds all four or none, and the
+// reference is the member that is the payment's lookup key — the one a delivery
+// names and the one the domain refuses to leave blank on a recorded
+// destination. The four values cross by CONVERSION between the domain's own
+// struct and the seam's, so a field either grows is a compile error here rather
+// than a value silently dropped on its way out to a customer who would then
+// send money to an incomplete set of instructions.
 //
 // The timestamps go through wireTimestamp, which renders the zero instant as
 // the empty string. That is the same rendering every other record on this
 // surface uses, and the contract makes both fields required strings, so an
 // absent instant is the empty string rather than an omitted key.
 func seamPaymentIntent(intent payments.Intent) http.PaymentIntentRecord {
-	return http.PaymentIntentRecord{
+	record := http.PaymentIntentRecord{
 		ID:                string(intent.ID),
 		Status:            string(intent.Status),
 		AmountMinorUnits:  intent.AmountMinorUnits,
 		Currency:          intent.Currency,
 		MinorUnitExponent: intent.MinorUnitExponent,
-		CheckoutURL:       intent.CheckoutURL,
 		CreatedAt:         wireTimestamp(intent.CreatedAt),
 		ExpiresAt:         wireTimestamp(intent.ExpiresAt),
 	}
+	if intent.ProviderTransferRef != "" {
+		destination := http.PaymentTransferInstructions(payments.TransferInstructions{
+			TransferCode:  intent.ProviderTransferRef,
+			BankName:      intent.ProviderBankName,
+			AccountHolder: intent.ProviderAccountHolder,
+			QRURL:         intent.ProviderQRURL,
+		})
+		record.TransferInstructions = &destination
+	}
+	return record
 }
 
 // webhookVerifier adapts the provider adapter's verifier to the http package's

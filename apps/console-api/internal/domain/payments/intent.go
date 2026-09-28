@@ -48,20 +48,23 @@ type Status string
 
 const (
 	// StatusCreated is a payment this platform opened and for which no
-	// checkout has been begun. It exists so the intent is durable BEFORE the
+	// destination has been recorded. It exists so the intent is durable BEFORE the
 	// provider is called: the provider's idempotency key is derived from the
 	// intent's identity, and a key derived from something that does not exist
 	// until after the call is a key that cannot make a retry the same request.
 	StatusCreated Status = "created"
 
-	// StatusCheckoutOpen is a payment with a hosted checkout the customer has
-	// been sent to and has not yet finished. It is the state a top-up spends
-	// most of its life in.
-	StatusCheckoutOpen Status = "checkout_open"
+	// StatusAwaitingTransfer is a payment whose customer has been given the
+	// instructions that will settle it and has not yet sent the money. It is
+	// the state a top-up spends most of its life in, and the name says what is
+	// actually true: this platform is waiting on a bank transfer to arrive at
+	// a destination it asked the provider for, and nothing the customer does in
+	// a browser changes that.
+	StatusAwaitingTransfer Status = "awaiting_transfer"
 
 	// StatusRequiresAction is a payment the provider says needs something from
 	// the customer before it can settle — a challenge, an authentication step.
-	// It is a separate status rather than a flag on checkout_open because the
+	// It is a separate status rather than a flag on awaiting_transfer because the
 	// customer's next action is different and a console that rendered the two
 	// identically would be telling a customer to do something that is not what
 	// the provider asked for.
@@ -83,7 +86,7 @@ const (
 	// to read, and the difference is the customer's own doing.
 	StatusCancelled Status = "cancelled"
 
-	// StatusExpired is a payment whose checkout was not completed in time.
+	// StatusExpired is a payment whose customer did not transfer in time.
 	// It is NOT terminal in the way failed is, and the difference is the whole
 	// reason this status exists: a provider-authoritative event may arrive
 	// after this platform has given up waiting, and a customer who paid must
@@ -143,10 +146,10 @@ var ErrDuplicateEvent = fmt.Errorf("payments: that provider event is already rec
 // platform never opened, or one that is not the payment it was matched to.
 //
 // It is the answer a provider must be able to get for a real payment: a
-// webhook can arrive for a checkout whose intent write this platform has not
-// seen — a delivery racing the checkout response, a replay of a payment from a
-// previous deployment, a provider that emits an event for a checkout this
-// account created outside this surface. Refusing is correct in every one of
+// webhook can arrive for a payment whose intent write this platform has not
+// seen — a delivery racing the response that recorded its destination, a replay
+// of a payment from a previous deployment, a provider that emits an event for a
+// destination this account was issued outside this surface. Refusing is correct in every one of
 // those cases, because accepting an event for an unknown payment is exactly the
 // shape of "credit whatever the payload says", and a signature proves who sent
 // a message, not what the message is allowed to do.
@@ -156,8 +159,8 @@ var ErrUnknownPayment = fmt.Errorf("payments: that delivery names no payment thi
 // (account, idempotency key) pair.
 //
 // It is NOT an error to answer as one. The key exists so that a client which
-// retried an open-checkout call — after a dropped response, a refreshed tab,
-// an impatient double click — gets the payment it already has instead of a
+// retried the call that opens a top-up — after a dropped response, a refreshed
+// tab, an impatient double click — gets the payment it already has instead of a
 // second one, and the caller's correct response is to converge: re-read the
 // payment the key names and return it. A caller that surfaced this as a
 // failure would make the retry that the key was invented to make safe into an

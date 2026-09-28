@@ -95,7 +95,7 @@ type IntentContext = interface {
 // the message concerns. An implementation that resolved an account from a
 // provider payload has given the payload the authority to say who gets money,
 // and the failure is not a bug that shows up in testing — it is a forged
-// metadata field on a real, validly-signed, real provider checkout, which is
+// metadata field on a real, validly-signed, real provider transaction, which is
 // something any customer can set through the provider's own dashboard.
 //
 // So the lookup direction is fixed. An event names a PROVIDER REFERENCE. The
@@ -155,11 +155,22 @@ type Intent struct {
 	// change with its own CHECK revision rather than as a silent insert.
 	Provider string
 
-	// ProviderCheckoutRef is the provider's identifier for the checkout, set
-	// when the hosted checkout is opened. It is the reference a later event
+	// ProviderTransferRef is the provider's own identifier for the DESTINATION
+	// the customer was told to send money to — the account the provider issued
+	// for this payment alone. It is set when the destination is recorded,
+	// before the customer is ever shown it. It is the reference a later event
 	// names, which is why it is the intent's lookup key and why an event
 	// arriving before it is set is a "not yet" rather than an "unknown".
-	ProviderCheckoutRef string
+	//
+	// The value is the provider's, not this platform's, and that is the whole
+	// reason it can be the lookup key. A reference this platform minted and
+	// asked the customer to type into a transfer memo would be free text: a
+	// bank may uppercase it, strip it, or truncate it, and the customer may
+	// simply not type it. A destination the provider issued cannot be edited by
+	// anyone — the money can only arrive at it — so a delivery naming it is
+	// evidence about where the money went rather than a claim about what
+	// somebody meant.
+	ProviderTransferRef string
 
 	// ProviderPaymentRef is the provider's identifier for the PAYMENT — the
 	// economic event, as distinct from the delivery that reported it. It is
@@ -170,9 +181,9 @@ type Intent struct {
 	// input for that derivation.
 	ProviderPaymentRef string
 
-	// IdempotencyKey is the caller's key for opening the checkout, unique per
+	// IdempotencyKey is the caller's key for opening the payment, unique per
 	// account. Two clicks of a "Top up" button produce one payment, not two
-	// open checkouts, and a client that retries after a dropped response
+	// destinations, and a client that retries after a dropped response
 	// gets the payment it already has rather than a second one.
 	IdempotencyKey string
 
@@ -214,17 +225,35 @@ type Intent struct {
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
-	// ExpiresAt is when an un-completed checkout stops being waitable. It is
+	// ExpiresAt is when an un-settled payment stops being waitable. It is
 	// a local deadline and NOT a terminal fact about the money: an event
 	// arriving after it is still honoured, because the provider is the only
 	// party that gets to say whether the customer paid.
 	ExpiresAt time.Time
 
-	// CheckoutURL is the provider's hosted-checkout URL, returned verbatim
-	// and never parsed. It is held on the intent so a returning customer can
-	// be sent back to a checkout they started, which is why it is stored
-	// rather than only returned.
-	CheckoutURL string
+	// ProviderQRURL is the provider's own image of the transfer to make,
+	// returned verbatim and never parsed. It is held on the intent so a
+	// returning customer can be shown the same instructions they were given,
+	// which is why it is stored rather than only returned.
+	//
+	// It is NULLABLE, and the nullability is a fact about the provider rather
+	// than about this build: an answer that carries no image is an answer whose
+	// customer types the destination by hand, and a payment in that state is
+	// perfectly payable. A column that demanded an image would refuse a real
+	// destination for lacking a decoration.
+	ProviderQRURL string
+
+	// ProviderBankName and ProviderAccountHolder are the provider's own words
+	// for where the money goes, stored so the console can render a destination
+	// a customer can check before sending anything.
+	//
+	// They are EVIDENCE FOR THE CUSTOMER and are never compared against
+	// anything. Nothing in this package reads them to decide whether a payment
+	// was made, and that is deliberate: they are the provider's presentation
+	// text, and a platform that matched a payment on a bank's display name
+	// would be authenticating money with a string a human chose.
+	ProviderBankName      string
+	ProviderAccountHolder string
 }
 
 // IntentID is this platform's identifier for a payment: a minted version-7
@@ -383,7 +412,7 @@ type ProviderEventRecord struct {
 	// IntentID is the payment this delivery resolved to, or empty for a
 	// delivery that named none. It is empty precisely when the delivery is
 	// quarantined as an unknown payment, which is the disposition an event
-	// for a checkout this platform has no record of gets.
+	// for a destination this platform has no record of gets.
 	IntentID IntentID
 
 	// Kind is the provider's own vocabulary for the delivery, carried

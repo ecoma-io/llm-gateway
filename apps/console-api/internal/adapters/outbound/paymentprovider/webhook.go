@@ -17,22 +17,36 @@ import (
 
 // The provider's webhook signing scheme, as its documentation states it.
 //
-// Stripe sends one header, named below, whose value is a comma-separated list
-// of key=value elements: `t` is the Unix timestamp in seconds at which the
-// delivery was signed, `v1` is the HMAC-SHA256 of the string formed by
-// concatenating that timestamp's decimal spelling, a ".", and the request body
-// — `"{t}.{rawBody}"` — keyed with the endpoint's signing secret (the value
-// the provider's dashboard calls its webhook secret, used as its own bytes).
-// The `v0` scheme and any further element the provider adds are not part of
-// this build's vocabulary and are ignored; a `v1` is required.
+// SePay sends TWO headers where a card processor sends one, and both are
+// required: the timestamp is not an element inside the signature header but a
+// header of its own, and a verifier that read only the signature would have no
+// idea which instant was signed. The scheme is
+//
+//	X-SePay-Signature: sha256={lowercase hexadecimal HMAC-SHA256}
+//	X-SePay-Timestamp: {Unix time in SECONDS}
+//
+// where the signed message is `"{timestamp}.{rawBody}"` — the timestamp's
+// decimal spelling, a ".", and the request body's exact bytes — keyed with the
+// webhook's signing secret. The signature value carries a scheme prefix, so the
+// hexadecimal digest is parsed out of the header rather than taken whole.
+//
+// THE PROVIDER'S OWN WINDOW IS 300 SECONDS. It states that a signature is valid
+// for five minutes either side of the timestamp it carries, which is why the
+// deployment's configured tolerance is refused above that figure at load: a
+// tolerance this process would honour that the provider would not is a number
+// that reads like a defence and is not one.
 const (
 	// signatureHeader is the header the delivery's signature arrives in.
-	signatureHeader = "Stripe-Signature"
+	signatureHeader = "X-SePay-Signature"
 
-	// timestampElement and signatureElement are the two elements this build
-	// reads out of that header, spelled as the provider spells them.
-	timestampElement = "t"
-	signatureElement = "v1"
+	// timestampHeader is the header the signed instant arrives in.
+	timestampHeader = "X-SePay-Timestamp"
+
+	// signatureScheme is the prefix the signature's value carries. It is
+	// required rather than stripped-if-present: the scheme is what says which
+	// MAC the digest is, and a value that does not name one is a value this
+	// build has not been told how to check.
+	signatureScheme = "sha256"
 )
 
 // ErrStaleDelivery reports that a delivery authenticated but its signed
@@ -55,8 +69,8 @@ var ErrStaleDelivery = errors.New("paymentprovider: the delivery's signed timest
 // Verifier verifies the provider's webhook deliveries and reports what they
 // claim.
 type Verifier struct {
-	// signingSecret is the endpoint's signing secret, held only to be used as
-	// an HMAC key. It never reaches a log line or an error.
+	// signingSecret is the webhook's signing secret, held only to be used as an
+	// HMAC key. It never reaches a log line or an error.
 	signingSecret string
 
 	// tolerance is how far the delivery's signed timestamp may sit from now,
@@ -70,11 +84,18 @@ type Verifier struct {
 	now func() time.Time
 }
 
-// NewVerifier returns the verifier described by an endpoint's signing secret
-// and the staleness bound. It panics on an empty secret or a non-positive
-// tolerance for the reason New panics on an empty API secret: both are wiring
-// defects, and a verifier with either is a verifier that answers yes to every
-// delivery or refuses every delivery.
+// NewVerifier returns the verifier described by a webhook's signing secret and
+// the staleness bound. It panics on an empty secret or a non-positive tolerance
+// for the reason New panics on an empty API token: both are wiring defects, and
+// a verifier with either is a verifier that answers yes to every delivery or
+// refuses every delivery.
+//
+// A tolerance above the provider's own 300-second window is refused for the
+// same reason, and it is the one bound here that is the PROVIDER's rather than
+// this process's: honouring a delivery the provider would consider expired is a
+// decision this platform has no standing to make, and an operator who widened
+// the window to paper over a clock fault would be widening the replay window
+// for anybody who captured a delivery. Skew is fixed by fixing the clock.
 func NewVerifier(signingSecret string, tolerance time.Duration) *Verifier {
 	if signingSecret == "" {
 		panic("paymentprovider: NewVerifier requires a webhook signing secret")
@@ -82,8 +103,15 @@ func NewVerifier(signingSecret string, tolerance time.Duration) *Verifier {
 	if tolerance <= 0 {
 		panic("paymentprovider: NewVerifier requires a positive webhook tolerance")
 	}
+	if tolerance > maxProviderTolerance {
+		panic("paymentprovider: the webhook tolerance must not exceed the provider's own 300-second window: a delivery this process would accept and the provider would not is not a delivery")
+	}
 	return &Verifier{signingSecret: signingSecret, tolerance: tolerance, now: time.Now}
 }
+
+// maxProviderTolerance is the window the provider's own documentation states as
+// the validity of one of its signatures.
+const maxProviderTolerance = 300 * time.Second
 
 // Compile-time proof that the verifier satisfies the port's verification half.
 var _ payments.WebhookVerifier = (*Verifier)(nil)
@@ -103,21 +131,40 @@ var _ payments.WebhookVerifier = (*Verifier)(nil)
 // that promise by never constructing a second representation of the body
 // before the HMAC is compared.
 //
-// The refusal order is deliberate: the header, then the signature, then the
-// freshness, then the content. An unauthenticated caller therefore learns
-// nothing about this deployment's clock or its event vocabulary, and a delivery
-// that fails freshness but not authentication is reported as stale rather than
-// as unauthentic.
+// The refusal order is deliberate: both headers, then the timestamp's spelling,
+// then the signature's spelling, then the authenticity, then the freshness,
+// then the content. An unauthenticated caller therefore learns nothing about
+// this deployment's clock or its event vocabulary, and a delivery that fails
+// freshness but not authentication is reported as stale rather than as
+// unauthentic. The provider's window is symmetric, so a clock that runs fast is
+// as acceptable as one that runs slow — see withinTolerance.
 func (v *Verifier) Verify(headers map[string][]string, rawBody []byte) (payments.ProviderEvent, error) {
-	header, err := singleHeader(headers, signatureHeader)
+	signature, err := singleHeader(headers, signatureHeader)
 	if err != nil {
 		return payments.ProviderEvent{}, err
 	}
-	timestamp, signature, err := parseSignatureHeader(header)
+	timestamp, err := singleHeader(headers, timestampHeader)
 	if err != nil {
 		return payments.ProviderEvent{}, err
 	}
-	provided, err := hex.DecodeString(signature)
+
+	// The timestamp is parsed BEFORE the MAC is computed, and the order is
+	// harmless because the string that is signed is the one that arrived: a
+	// caller that spelled the instant as something other than a whole number of
+	// Unix seconds has sent a header this build cannot compare against a clock,
+	// and computing a MAC over it first would only be a slower way to refuse it.
+	// The RAW spelling is what goes into the MAC — see sign — so a leading zero
+	// does not become a different string between verification and comparison.
+	seconds, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil {
+		return payments.ProviderEvent{}, fmt.Errorf("%w: the %s header is not a Unix time in seconds", payments.ErrBadSignature, timestampHeader)
+	}
+
+	digest, err := parseSignature(signature)
+	if err != nil {
+		return payments.ProviderEvent{}, err
+	}
+	provided, err := hex.DecodeString(digest)
 	if err != nil {
 		return payments.ProviderEvent{}, fmt.Errorf("%w: the signature is not a hexadecimal digest", payments.ErrBadSignature)
 	}
@@ -131,14 +178,6 @@ func (v *Verifier) Verify(headers map[string][]string, rawBody []byte) (payments
 		return payments.ProviderEvent{}, fmt.Errorf("%w: the signature does not match these bytes", payments.ErrBadSignature)
 	}
 
-	seconds, err := strconv.ParseInt(timestamp, 10, 64)
-	if err != nil {
-		// Unreachable through parseSignatureHeader, which parses the element
-		// before returning it; kept because a signed timestamp this build
-		// cannot read is not a timestamp to compare against, and the branch
-		// that cannot happen is cheaper than the assumption that it cannot.
-		return payments.ProviderEvent{}, fmt.Errorf("%w: the signed timestamp is not a Unix time in seconds", payments.ErrBadSignature)
-	}
 	if !withinTolerance(time.Unix(seconds, 0).UTC(), v.now(), v.tolerance) {
 		return payments.ProviderEvent{}, fmt.Errorf("%w: the delivery was signed %s ago and the tolerance is %s", ErrStaleDelivery, v.now().Sub(time.Unix(seconds, 0).UTC()), v.tolerance)
 	}
@@ -159,6 +198,11 @@ func (v *Verifier) Verify(headers map[string][]string, rawBody []byte) (payments
 // header smuggling, and the port's own comment names this as the thing the
 // multiplicity is preserved to prevent. The inbound requestid middleware
 // refuses a repeated request id on exactly this reasoning.
+//
+// With TWO required headers the hazard is the same and the stakes are higher
+// than with one: a delivery carrying two timestamps and one signature could be
+// verified against whichever timestamp the implementation happened to pick, so
+// the pair a deployment accepted would depend on map iteration order.
 func singleHeader(headers map[string][]string, name string) (string, error) {
 	values := []string{}
 	for key, many := range headers {
@@ -176,71 +220,37 @@ func singleHeader(headers map[string][]string, name string) (string, error) {
 	}
 }
 
-// parseSignatureHeader reads the `t` and `v1` elements out of the signature
-// header and refuses every way it can fail to state exactly one of each.
+// parseSignature takes the hexadecimal digest out of the signature header's
+// value, requiring the scheme prefix that names which digest it is.
 //
-// The timestamp is returned as the STRING the header carried, not as a number,
-// because the string is what the provider signed: `"{t}.{rawBody}"`. Parsing it
-// into an integer and formatting it back would be a normalisation of the signed
-// material, and a header spelling the timestamp with a leading zero would then
-// be signed under one string and verified under another. The decimal value is
-// parsed separately, and only to compare against the clock.
-//
-// A repeated `v1` is refused rather than matched against any of them. The
-// provider documents that two signatures appear during a secret rotation, and
-// that is exactly the shape that makes accepting any of several unsafe: this
-// deployment has ONE configured secret, so a delivery carrying two v1 values
-// carries one it expects this endpoint to ignore, and a verifier that ignores
-// it cannot say which secret authenticated the delivery. The cost is that a
-// rotation must be done in a step, which is a deployment decision an operator
-// makes deliberately; the alternative is a permanent open door.
-func parseSignatureHeader(header string) (timestamp, signature string, err error) {
-	var (
-		haveTimestamp, haveSignature bool
-	)
-	for _, element := range strings.Split(header, ",") {
-		key, value, ok := strings.Cut(strings.TrimSpace(element), "=")
-		if !ok {
-			return "", "", fmt.Errorf("%w: the signature header carries an element that is not a key=value pair", payments.ErrBadSignature)
-		}
-		switch key = strings.TrimSpace(key); key {
-		case timestampElement:
-			if haveTimestamp {
-				return "", "", fmt.Errorf("%w: the signature header carries the timestamp more than once", payments.ErrBadSignature)
-			}
-			haveTimestamp = true
-			timestamp = strings.TrimSpace(value)
-		case signatureElement:
-			if haveSignature {
-				return "", "", fmt.Errorf("%w: the signature header carries more than one %s signature", payments.ErrBadSignature, signatureElement)
-			}
-			haveSignature = true
-			signature = strings.TrimSpace(value)
-		default:
-			// Unknown elements — the provider's `v0` scheme, and whatever it
-			// adds later — are ignored rather than refused: they are not part
-			// of this build's verification, and a scheme the provider stops
-			// sending must not be what stops this endpoint accepting its
-			// deliveries.
-		}
+// The prefix is compared case-insensitively and the digest is not: a scheme
+// spelled `SHA256=` is the same scheme and refusing it would be a refusal of a
+// provider's typography rather than of its message, while the digest's case is
+// the decoder's business — hex.DecodeString reads both — and folding it here
+// would be this function inventing a normalisation of signed material. Only the
+// digest is signed, so only the digest is compared, byte for byte, after
+// decoding.
+func parseSignature(header string) (string, error) {
+	scheme, digest, ok := strings.Cut(header, "=")
+	if !ok {
+		return "", fmt.Errorf("%w: the signature header does not name a scheme, so this build has not been told which digest it carries", payments.ErrBadSignature)
 	}
-	if !haveTimestamp {
-		return "", "", fmt.Errorf("%w: the signature header carries no %s timestamp", payments.ErrBadSignature, timestampElement)
+	if !strings.EqualFold(strings.TrimSpace(scheme), signatureScheme) {
+		// The scheme is named rather than echoed. An unknown scheme is a
+		// provider that has moved to something this build does not implement,
+		// and echoing its spelling into an error line would be this package
+		// repeating attacker-chosen text back into a log.
+		return "", fmt.Errorf("%w: the signature header names a scheme this build does not verify", payments.ErrBadSignature)
 	}
-	if !haveSignature {
-		return "", "", fmt.Errorf("%w: the signature header carries no %s signature", payments.ErrBadSignature, signatureElement)
+	digest = strings.TrimSpace(digest)
+	if digest == "" {
+		return "", fmt.Errorf("%w: the signature header carries an empty digest", payments.ErrBadSignature)
 	}
-	if timestamp == "" || signature == "" {
-		return "", "", fmt.Errorf("%w: the signature header carries an empty %s or %s value", payments.ErrBadSignature, timestampElement, signatureElement)
-	}
-	if _, err := strconv.ParseInt(timestamp, 10, 64); err != nil {
-		return "", "", fmt.Errorf("%w: the signed timestamp is not a Unix time in seconds", payments.ErrBadSignature)
-	}
-	return timestamp, signature, nil
+	return digest, nil
 }
 
 // sign computes the provider's signature over the timestamp's own spelling and
-// the raw body: HMAC-SHA256(key = signing secret, message = "{t}.{rawBody}").
+// the raw body: HMAC-SHA256(key = signing secret, message = "{timestamp}.{rawBody}").
 //
 // The concatenation is written out as three writes rather than by building the
 // signed string, so the body is never copied and never re-encoded on its way
@@ -259,114 +269,127 @@ func sign(signingSecret, timestamp string, rawBody []byte) []byte {
 // The comparison is symmetric and the sign of the test matters: a provider's
 // clock running slightly ahead of this platform's is common and benign, and a
 // one-sided tolerance would refuse real deliveries from a provider whose clock
-// is fast. The domain carries the same function — occurredWithinTolerance in
-// the payments domain — for the same reason, and the two are stated the same
-// way round so a reader who has seen one recognises the other.
+// is fast. The provider's own window is symmetric too, so this matches the rule
+// the signature is issued under rather than a stricter one of this build's
+// invention.
 func withinTolerance(signed, now time.Time, tolerance time.Duration) bool {
 	skew := now.Sub(signed)
 	return skew <= tolerance && skew >= -tolerance
 }
 
-// The event kinds this adapter reads, spelled exactly as the provider spells
-// them.
+// The provider's field values this adapter reads, spelled exactly as the
+// provider spells them.
 //
-// The provider emits hundreds of these and this build reads five. That small
-// number is the design rather than an early stage of it: what follows is not a
-// list of everything that can arrive, it is the list of everything whose
-// meaning this platform has decided IN ADVANCE. Everything else is passed
-// through to the application under the provider's own name — see portKind —
-// and quarantined there with a reason an operator can act on.
+// There is ONE value here that changes what the platform does, and its smallness
+// is the design rather than an early stage of it: this is not a list of
+// everything the provider can send, it is the list of everything whose meaning
+// this platform has decided IN ADVANCE. Every other value — including every
+// value of transferType this build has not been told the meaning of — crosses
+// to the application under the provider's own spelling and is quarantined there
+// with a reason an operator can act on.
 const (
-	// kindCheckoutCompleted is the primary delivery: the customer finished the
-	// checkout. With a card it arrives paid; with a delayed-notification method
-	// it may arrive UNPAID, which is why payment_status is read below.
-	kindCheckoutCompleted = "checkout.session.completed"
-	// kindCheckoutAsyncPaymentSucceeded is the delayed notification that the
-	// money arrived, and it follows an unpaid completion.
-	kindCheckoutAsyncPaymentSucceeded = "checkout.session.async_payment_succeeded"
-	// kindCheckoutAsyncPaymentFailed is the delayed notification that the money
-	// did not arrive.
-	kindCheckoutAsyncPaymentFailed = "checkout.session.async_payment_failed"
-	// kindCheckoutExpired is the session this platform's own TTL outlived,
-	// announced.
-	kindCheckoutExpired = "checkout.session.expired"
-	// kindChargeRefunded is the provider reporting that money went BACK to the
-	// customer. It is a CHARGE event rather than a session event, and the
-	// difference is load-bearing: the object it carries is a Charge, and a
-	// Charge's identifiers are not the checkout reference this platform stored.
-	// See the reference discussion in normalise.
-	kindChargeRefunded = "charge.refunded"
+	// transferTypeIn is the provider's word for money ARRIVING. It is the only
+	// value that funds anything.
+	transferTypeIn = "in"
+
+	// transferTypeOut is the provider's word for money LEAVING the account.
+	//
+	// It is named here so that the one thing this build must never do with it
+	// can be said in one place: it is NOT a refund. Reading it as one would be
+	// the single most expensive mistake available in this file. The platform
+	// recognises refunds so that a customer's money going back is recorded
+	// rather than quarantined as noise, and it recognises them on a delivery
+	// that says a PAYMENT was refunded. An outgoing transfer says only that
+	// money left the merchant's account — it may be a payout to the operator's
+	// own bank, a fee, a settlement sweep, or a transfer an operator made by
+	// hand — and booking any of those against a customer's payment would attach
+	// a real debit to whichever payment happened to match, moving a status and
+	// writing a refund projection for money that was never returned. It
+	// therefore crosses to the application under the provider's own name and is
+	// recorded as a kind this build does not act on, which is what it is.
+	transferTypeOut = "out"
 )
 
-// eventEnvelope is the wire shape of a provider event, as much of it as this
-// build reads: the delivery's identity, its kind, when the provider observed
-// it, and the object it is about.
+// settlementCurrency is the currency this provider settles in, and therefore
+// the currency its deliveries' amounts are stated in.
+//
+// The provider's webhook names no currency, and this constant is the answer to
+// that rather than a default chosen here. SePay moves domestic Vietnamese bank
+// transfers: there is exactly one currency an amount from it can be in, and a
+// platform that accepted its deliveries has configured its offers in that
+// currency or has configured a top-up nobody can pay. Reporting the empty
+// string instead — the port's spelling of "the provider stated none" — would
+// quarantine every delivery this integration will ever receive on the
+// application's currency check, which is a working integration reported as a
+// mismatch.
+//
+// It is a fact about the PROVIDER and it lives in the adapter for that reason.
+// It is also not a rubber stamp: the application still compares it against the
+// currency the payment was denominated in, so a deployment that priced an offer
+// in anything else is refused at the delivery rather than credited as though
+// the figures agreed — which is where a currency mistake belongs, one layer
+// before money moves.
+const settlementCurrency = "VND"
+
+// eventEnvelope is the wire shape of a provider delivery, as much of it as this
+// build reads: the transaction's identity, the destination the money arrived
+// at, which way it moved, and for how much.
 //
 // Every field is a RAW JSON TOKEN rather than a typed value, and that is the
 // one decision this file's tolerance rests on. With typed fields, a single
 // unreadable field fails the decode of the WHOLE envelope: a body whose
-// `amount_total` is spelled `12.5`, or quoted as a string, or turned into an
+// `transferAmount` is spelled `"5000000"`, or as a decimal, or turned into an
 // object by a schema change, would take the event id down with it — and the
 // event id is the one thing the caller needs to record the delivery at all.
 // Reading each field as its own token means a field this build cannot read
 // costs exactly that field: the port reports it as an ABSENT value and the
 // APPLICATION quarantines the delivery with a reason a human resolves
-// (amount_mismatch, unknown_kind, unknown_payment). The port's
+// (amount_mismatch, unknown_payment, currency_mismatch). The port's
 // ErrMalformedEvent comment carries the argument in full — "we could not read
 // your message" and "we read it and could not use it" are different things to
 // tell a provider, and only the first of them is this function's refusal.
 //
-// api_version is deliberately NOT read. The provider versions its API and this
-// build does not gate on the version string, because the version is not what
-// gives a field its meaning — the field does. A release that renamed
-// amount_total would produce a delivery with no readable amount, which is a
-// quarantine the application records with evidence; gating on the version
-// instead would refuse every delivery on the day the provider shipped an
-// unrelated field, and the refusal would be permanent.
+// The provider's own `transactionDate` and `accountNumber` are deliberately NOT
+// read. The first carries no timezone and would have to be given one to become
+// an instant, which is this adapter inventing a fact; the second is the payer's
+// or the merchant's account depending on a reading this build has not verified,
+// and it is evidence rather than a key — nothing here would compare it against
+// anything. The port's OccurredAt is therefore the zero time on every delivery
+// this provider sends, which is the port's own spelling of "the provider stated
+// none this build can place".
+//
+// Neither field is a LOSS, and it is worth being exact about where they end up,
+// because "we do not read it" and "we keep it anyway" are different claims. What
+// this build keeps is the authenticated BODY, and the port keeps that only on a
+// delivery it could not apply: an applied delivery needs no evidence, because
+// the ledger leg and the payment's own state are the evidence, while a
+// quarantined one is the case where an operator has to answer "what did the
+// provider actually send". So an operator reading a quarantine sees these two
+// fields inside the raw bytes, unparsed and compared against nothing; an applied
+// delivery's bytes are not stored at all, and the fields in them were never read
+// on the way past.
 type eventEnvelope struct {
-	ID      json.RawMessage `json:"id"`
-	Type    json.RawMessage `json:"type"`
-	Created json.RawMessage `json:"created"`
-	Data    *eventData      `json:"data"`
-}
-
-// eventData is the envelope's data member, read only far enough to reach the
-// object inside it.
-type eventData struct {
-	Object json.RawMessage `json:"object"`
-}
-
-// eventObject is the wire shape of the object a delivery is about, across BOTH
-// shapes this adapter reads: a Checkout Session (the session events) and a
-// Charge (the refund event). The field names do not collide between the two, so
-// one struct reads both, and each kind below reads only the members that belong
-// to its own shape.
-type eventObject struct {
-	// ID is the object's own identifier: the Checkout Session's id on a session
-	// event — which is exactly the reference this platform stored when it
-	// opened the checkout — and the Charge's id on a charge event.
+	// ID is the transaction's identity, and the provider repeats it on every
+	// redelivery of this transaction — which is what makes it the dedup key.
+	// The provider spells it as an integer, so the reader below accepts the
+	// number's own decimal spelling as well as a string.
 	ID json.RawMessage `json:"id"`
 
-	// AmountTotal is the session's total, in the currency's smallest unit: the
-	// same unit the port's minor units are.
-	AmountTotal json.RawMessage `json:"amount_total"`
+	// SubAccount is the virtual account the money arrived at: the destination
+	// this platform asked the provider for, echoed back. It is the reference a
+	// capture resolves by, and it is an account the provider issued for one
+	// payment rather than a memo a customer typed, which is the whole reason
+	// this integration is built on it.
+	SubAccount json.RawMessage `json:"subAccount"`
 
-	// AmountRefunded is how much of a charge the provider has refunded. It is
-	// the charge's RUNNING total, not one refund's increment.
-	AmountRefunded json.RawMessage `json:"amount_refunded"`
+	// TransferType says which way the money moved: arriving, or leaving.
+	TransferType json.RawMessage `json:"transferType"`
 
-	// PaymentIntent is the payment intent a charge belongs to, which is the
-	// provider's identifier for the PAYMENT rather than for the checkout. It is
-	// null on charges old enough to predate payment intents, which is why the
-	// reader below falls back to the charge's own id.
-	PaymentIntent json.RawMessage `json:"payment_intent"`
-
-	// Currency is the provider's lowercase ISO 4217 code.
-	Currency json.RawMessage `json:"currency"`
-
-	// PaymentStatus distinguishes a completed session whose money has arrived
-	// ("paid") from one whose money has not ("unpaid").
-	PaymentStatus json.RawMessage `json:"payment_status"`
+	// TransferAmount is the transaction's amount, in the settlement currency's
+	// smallest unit — which for a currency with no minor unit is the amount
+	// itself. It is read as an exact integer or reported as absent, never
+	// rounded.
+	TransferAmount json.RawMessage `json:"transferAmount"`
 }
 
 // maxProviderEventIDLength is how long an event id this build can RECORD is.
@@ -395,14 +418,14 @@ const maxProviderEventIDLength = 255
 // this one. The port's ErrMalformedEvent comment states the whole argument.
 //
 // Everything else is read into the event and left to the application, including
-// everything this build does not understand. An unfamiliar kind crosses under
-// the provider's own name; an amount whose spelling cannot be converted exactly
-// is reported as an ABSENT amount rather than a rounded one, which is the one
-// way an amount can go quietly wrong; a delivery naming no object at all is
-// reported with no reference. Each of those becomes a quarantine the
-// application writes with an operator-actionable reason, and each is a better
-// outcome than a 2xx that recorded nothing while the provider's real delivery
-// went unseen.
+// everything this build does not understand. A transfer moving in a direction
+// this build has no rule for crosses under the provider's own name; an amount
+// whose spelling cannot be converted exactly is reported as an ABSENT amount
+// rather than a rounded one, which is the one way an amount can go quietly
+// wrong; a delivery naming no destination is reported with no reference. Each of
+// those becomes a quarantine the application writes with an operator-actionable
+// reason, and each is a better outcome than a 2xx that recorded nothing while
+// the provider's real delivery went unseen.
 //
 // The body has already been authenticated when this runs. That is what makes a
 // named-but-unreadable delivery the application's problem rather than an
@@ -416,14 +439,14 @@ func normalise(rawBody []byte) (payments.ProviderEvent, error) {
 		return payments.ProviderEvent{}, fmt.Errorf("%w: the body would not decode as a provider event: %w", payments.ErrMalformedEvent, err)
 	}
 
-	eventID, ok := rawString(envelope.ID)
+	eventID, ok := rawIdentifier(envelope.ID)
 	if !ok || eventID == "" {
 		// The delivery's own identity, and the idempotency key for THIS
-		// delivery. Absent, empty, or spelled as something other than a string
-		// are one answer: this body cannot be named, so the caller writes
+		// delivery. Absent, empty, or spelled as something this build cannot
+		// read are one answer: this body cannot be named, so the caller writes
 		// nothing and answers 2xx rather than keying a row on an identity it
 		// made up.
-		return payments.ProviderEvent{}, fmt.Errorf("%w: the body carries no event id, so the caller has no key to record it under", payments.ErrMalformedEvent)
+		return payments.ProviderEvent{}, fmt.Errorf("%w: the body carries no delivery id, so the caller has no key to record it under", payments.ErrMalformedEvent)
 	}
 	if len(eventID) > maxProviderEventIDLength {
 		// The same answer as an absent id, for the same reason and by the same
@@ -437,161 +460,91 @@ func normalise(rawBody []byte) (payments.ProviderEvent, error) {
 		// bytes can never be stored. A 200 tells the provider to stop and puts
 		// the reason in this plane's log, which is the one place an operator
 		// can act on it.
-		return payments.ProviderEvent{}, fmt.Errorf("%w: the body's event id is %d characters and this build records at most %d, so the caller has no key to record it under",
+		return payments.ProviderEvent{}, fmt.Errorf("%w: the body's delivery id is %d characters and this build records at most %d, so the caller has no key to record it under",
 			payments.ErrMalformedEvent, len(eventID), maxProviderEventIDLength)
 	}
 
-	object := decodeObject(envelope.Data)
-	providerKind, _ := rawString(envelope.Type)
-
-	// What the delivery names, and for how much. The provider's two shapes
-	// state the same facts under different names, so the branch is by kind and
-	// never by guess: reading `amount_total` off a charge would be reading a
-	// field that is not there and calling its absence "no amount".
-	//
-	// TWO REFERENCES COME OUT OF THIS BRANCH and they are not interchangeable.
-	// A Checkout Session's own id is the reference this platform wrote when it
-	// opened the checkout, and the session's `payment_intent` is the provider's
-	// id for the money. A capture delivery carries BOTH — the session is the
-	// object and the payment intent is a field on it. A refund delivery carries
-	// only the second: a `charge.refunded` names a charge, whose `payment_intent`
-	// is the payment, and it never mentions the session the customer paid
-	// through. Each is read into the field that names what it is, and the
-	// application resolves each against the column that holds it.
-	var (
-		checkoutRef string
-		paymentRef  string
-		amount      *int64
-		currency    string
-	)
-	if providerKind == kindChargeRefunded {
-		// The payment this charge belongs to, with the charge's own id as the
-		// fallback for a charge that predates payment intents. There is no
-		// checkout reference to read: the delivery does not carry one, and
-		// inventing the session id here — even by looking it up — would be
-		// putting a value into the message that the provider never signed.
-		paymentRef, _ = rawString(object.PaymentIntent)
-		if paymentRef == "" {
-			paymentRef, _ = rawString(object.ID)
-		}
-		paymentRef = storableProviderText(paymentRef, maxStorableReferenceLength)
-		amount = readableAmount(object.AmountRefunded)
-	} else {
-		// Every other delivery this build reads is about a Checkout Session.
-		// The session's id is the reference this platform stored; its payment
-		// intent is the money's own id, and it is what a later refund will
-		// name — so it is read here, at the one moment the provider states
-		// both, and stored by the application as the payment's economic
-		// identity. It is absent only from a session that carries no payment
-		// at all, which is a session this build never captures anyway.
-		checkoutRef, _ = rawString(object.ID)
-		checkoutRef = storableProviderText(checkoutRef, maxStorableReferenceLength)
-		paymentRef, _ = rawString(object.PaymentIntent)
-		paymentRef = storableProviderText(paymentRef, maxStorableReferenceLength)
-		amount = readableAmount(object.AmountTotal)
-	}
-	if code, ok := rawString(object.Currency); ok {
-		currency = storableCurrency(code)
-	}
+	// TWO REFERENCES COME OUT OF THIS BODY and only one of them is a destination.
+	// The virtual account is what the money arrived at and is what a capture
+	// resolves by; the transaction's own id is the economic event, and it is
+	// what the funding leg's command key is derived from — two deliveries of one
+	// transaction therefore derive one key, and a second transaction into the
+	// same account derives another, which is exactly the distinction the ledger
+	// needs. They are separate fields for the reason the port states: the
+	// application resolves them against different stored columns, and a refund,
+	// were this provider to report one, would name the second and never the
+	// first.
+	transferRef, _ := rawString(envelope.SubAccount)
+	transferRef = storableProviderText(transferRef, maxStorableReferenceLength)
 
 	return payments.ProviderEvent{
 		// The port's vocabulary where this build has one, and the provider's own
-		// string everywhere else — empty only if the provider left the type out
-		// entirely, which the application treats as a kind it does not know.
+		// value everywhere else — empty only if the provider left the direction
+		// out entirely, which the application treats as a kind it does not know.
 		//
 		// Bounded to what the ledger's column carries, and reduced to nothing
-		// when the provider's name is longer: see storableProviderText. An
+		// when the provider's value is longer: see storableProviderText. An
 		// unrecordable kind must not become the storage layer's 5xx.
-		Kind: storableProviderText(portKind(providerKind, object), maxStorableKindLength),
-		// The delivery, not the payment. A provider emits several distinct
-		// events for one payment, and keying a credit on this would fund that
-		// payment once per event.
+		Kind: storableProviderText(portKind(rawStringOrEmpty(envelope.TransferType)), maxStorableKindLength),
+		// The delivery, not the payment. The provider repeats it on a
+		// redelivery, and keying the dedup record on it is what makes the second
+		// delivery a duplicate rather than a second credit.
 		EventID: eventID,
-		// The checkout this platform opened, when the delivery names one.
-		CheckoutRef: checkoutRef,
-		// The payment the money moved for, when the delivery names one.
-		PaymentRef: paymentRef,
+		// The destination the provider issued for this platform's payment, when
+		// the delivery names one.
+		TransferRef: transferRef,
+		// The transaction's own id — the economic event — carried under the
+		// identifier the port reserves for it.
+		PaymentRef: storableProviderText(eventID, maxStorableReferenceLength),
 		// The provider's amount in the unit the port's minor units are, or nil
 		// when this build could not read one exactly. A nil is a refusal the
 		// application makes, not a zero it might credit.
-		AmountMinorUnits: amount,
-		Currency:         currency,
-		// The provider's own `created`, or the zero time when it stated none.
-		OccurredAt: readableInstant(envelope.Created),
+		AmountMinorUnits: readableAmount(envelope.TransferAmount),
+		// The provider names no currency on a delivery, and this provider
+		// settles in exactly one. See settlementCurrency.
+		Currency: settlementCurrency,
+		// The provider states no instant this build can place. See eventEnvelope.
+		OccurredAt: time.Time{},
 	}, nil
 }
 
-// portKind maps the provider's own kind onto the port's vocabulary, and passes
-// every kind this build has not decided the meaning of through under the
-// provider's own name.
+// portKind maps the provider's own direction onto the port's vocabulary, and
+// passes every value this build has not decided the meaning of through under
+// the provider's own spelling.
 //
-// The two mapped kinds are the only events that can change what a customer is
-// owed, and the mapping is what keeps the provider's spellings out of the
-// application: the application switches on `captured` and `refunded` and
-// quarantines everything else as an unknown kind — which is exactly the right
-// treatment for a kind this build has not interpreted, an event that is known
-// to be unusable rather than one that failed to arrive.
+// ONE mapping is made here and the reason it is the only one is the reason this
+// function is worth reading. Money arriving is the capture — that is what the
+// port's KindCaptured means, and it is the only kind that funds anything. Money
+// leaving is NOT the port's KindRefunded, however much it looks like one from a
+// distance: see transferTypeOut for what reading it that way would cost. Every
+// other value, including the empty one, crosses unchanged and is quarantined by
+// the application as a kind this build does not act on, which is exactly the
+// right treatment for an event that is known to be unusable rather than one that
+// failed to arrive.
 //
 // The pass-through is the port's own contract ("Kind is the provider's own
 // vocabulary, as a plain string") and it is NOT the same as ignoring the event:
 // an unfamiliar kind still reaches the application with its id, its reference
 // and whatever amount could be read.
-func portKind(providerKind string, object eventObject) string {
-	switch providerKind {
-	case kindCheckoutCompleted:
-		// The completed session is the one shape whose kind does NOT by itself
-		// mean the money arrived. The provider emits it for
-		// delayed-notification methods with payment_status "unpaid", and the
-		// money follows — or does not — as an async payment event. Funding the
-		// unpaid form would credit a customer whose transfer may still fail, so
-		// only the paid form is this platform's capture; the unpaid form
-		// crosses under the provider's own name and is recorded as a kind this
-		// build does not act on, which is what it is.
-		if status, ok := rawString(object.PaymentStatus); ok && status == "paid" {
-			return payments.KindCaptured
-		}
-		return providerKind
-	case kindCheckoutAsyncPaymentSucceeded:
-		// The delayed notification that the money did arrive: the same economic
-		// event as a paid completion, in a second spelling. It is mapped to the
-		// same kind, and the pair cannot fund the payment twice — the
-		// application resolves both to one payment, and the payment's own state
-		// machine refuses the second delivery's effect (the status CAS runs
-		// before the credit), recording it as a state conflict instead.
+func portKind(transferType string) string {
+	switch transferType {
+	case transferTypeIn:
 		return payments.KindCaptured
-	case kindChargeRefunded:
-		// Money went back to the customer. The port has a kind for it, so it is
-		// recognised rather than passed through as noise: "we understood your
-		// message" and "we could not read your message" are different things to
-		// tell a provider.
-		return payments.KindRefunded
-	case kindCheckoutAsyncPaymentFailed, kindCheckoutExpired:
-		// Recognised, and deliberately NOT mapped to either kind: a delayed
-		// payment that failed and a session that expired both report that no
-		// money is coming, this platform has made no claim about either, and
-		// neither of the port's two kinds is true of them. They cross as the
-		// provider's own events, recorded and left alone.
-		return providerKind
 	default:
-		return providerKind
+		return transferType
 	}
 }
 
-// decodeObject reads the delivery's object, and reports an object this build
-// cannot read as an empty one.
+// rawStringOrEmpty reads a raw token as a string, reporting the empty string
+// for a member that states something this build cannot read.
 //
-// The failure is swallowed deliberately: an unreadable object is a delivery
-// with no reference, no amount and no currency, which the application
-// quarantines as an unknown payment — and it is NOT a reason to discard the
-// event id that has already been read, because that id is what lets the
-// delivery be recorded at all.
-func decodeObject(data *eventData) eventObject {
-	var object eventObject
-	if data == nil || len(data.Object) == 0 {
-		return object
-	}
-	_ = json.Unmarshal(data.Object, &object)
-	return object
+// It exists for the ONE call site where the empty spelling is the honest
+// answer rather than a value to refuse: an unreadable transferType is a
+// direction this build has no rule for, which is the same answer the absent
+// member gets and is reported to the application as an unknown kind.
+func rawStringOrEmpty(raw json.RawMessage) string {
+	value, _ := rawString(raw)
+	return value
 }
 
 // nullToken is the JSON null as its own bytes, so that a member the provider
@@ -616,6 +569,49 @@ func rawString(raw json.RawMessage) (string, bool) {
 		return "", false
 	}
 	return value, true
+}
+
+// rawIdentifier reads a raw JSON token that NAMES something — a delivery id, a
+// transaction id — as the text this build will record it under, and reports
+// whether it could read one.
+//
+// It accepts the two spellings a provider actually uses for an identifier: a
+// JSON string, and a JSON number. The number case is not a coercion, and the
+// distinction is worth being exact about, because the same file refuses to
+// coerce values elsewhere. Coercing a value would be inventing a spelling the
+// provider did not send — reading `12.5` as a string, or a boolean as anything
+// at all. An integer's decimal spelling is what the provider's bytes SAY: the
+// token `92704` states the text "92704" exactly, and returning it is reading
+// the body rather than interpreting it. Everything else — a decimal, an
+// exponent, a boolean, an object, an array — is refused, because none of them
+// names a thing this build can key a record on.
+//
+// Whether a string and a number spelling of the same identifier are the SAME
+// delivery is a question this function deliberately does not answer: they are
+// two byte strings, and a provider that changed its spelling mid-flight would
+// record two deliveries under two ids — which the payment's own state machine
+// refuses to turn into two credits, exactly as it refuses any second delivery
+// of one transaction. Fabricating sameness here, by parsing the number and
+// re-rendering it, would be this adapter deciding that two different tokens are
+// one identity, which is a claim about the provider's behaviour rather than a
+// reading of its bytes.
+func rawIdentifier(raw json.RawMessage) (string, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, nullToken) {
+		return "", false
+	}
+	if trimmed[0] == '"' {
+		return rawString(trimmed)
+	}
+	for i, b := range trimmed {
+		if i == 0 && b == '-' {
+			continue
+		}
+		if b < '0' || b > '9' {
+			return "", false
+		}
+	}
+	return string(trimmed), true
 }
 
 // maxStorableReferenceLength and maxStorableKindLength are how much of the
@@ -656,39 +652,23 @@ const (
 // unrecoverable.
 //
 // What an unreadable value means depends on which one it is, and every meaning
-// is a refusal rather than a default: a payment reference this build cannot
-// record is one it cannot resolve, so the delivery resolves to no payment and
-// is quarantined as unknown; a kind it cannot record is one it has no rule for,
-// so the delivery is quarantined as an unknown kind. Neither credits anything.
+// is a refusal rather than a default: a destination this build cannot record is
+// one it cannot resolve, so the delivery resolves to no payment and is
+// quarantined as unknown; a kind it cannot record is one it has no rule for, so
+// the delivery is quarantined as an unknown kind. Neither credits anything.
+//
+// The bound is in BYTES where the columns it mirrors are bounded in CHARACTERS,
+// and the strictness is deliberate: a byte count is never smaller than a rune
+// count, so this can only ever refuse a value the column would have held — and
+// refusing is a failure an operator reads, while the alternative, measuring in
+// runes and being wrong about the encoding, is the truncation this function
+// exists to prevent. The values it is applied to are account and transaction
+// identifiers, which are ASCII in every documented case.
 func storableProviderText(value string, max int) string {
 	if len(value) > max {
 		return ""
 	}
 	return value
-}
-
-// storableCurrency folds the provider's lowercase code to the uppercase ISO
-// 4217 form the domain stores and compares, and reports the empty string when
-// the result is not the three letters that form can hold.
-//
-// Folding a spelling is not the same act as converting an amount, which is why
-// the case is repaired here; the shape is not, which is why it is refused. A
-// code that is not three letters cannot be compared against a payment's
-// currency in any way that means anything — and reporting it as unstated is
-// what makes the application REFUSE the delivery (its currency comparison is
-// against a payment whose currency is always three letters) rather than the
-// storage layer answering the provider with a 5xx it will retry forever.
-func storableCurrency(code string) string {
-	folded := strings.ToUpper(code)
-	if len(folded) != 3 {
-		return ""
-	}
-	for _, r := range folded {
-		if r < 'A' || r > 'Z' {
-			return ""
-		}
-	}
-	return folded
 }
 
 // readableAmount reads an amount exactly as the provider's integer encoding
@@ -699,50 +679,28 @@ func storableCurrency(code string) string {
 // EXACTLY. The refusal is the point rather than a limitation: the port's
 // AmountMinorUnits is nil on one, and a nil amount is what makes the
 // application quarantine the delivery instead of crediting a figure this build
-// guessed at. An amount of `12.5` truncated to `12` is a charge nobody agreed
+// guessed at. An amount of `12.5` truncated to `12` is a payment nobody agreed
 // to, and it would be invisible in every log line that reported it.
+//
+// A QUOTED integer is refused too, and it is the refusal most likely to be
+// argued with, because `"5000000"` plainly means five million. It is refused
+// because the port's amount is a number and a provider that quotes one has
+// changed the type of a money field — and the day a quoted amount arrives it
+// may arrive with a separator, a currency word, or a decimal, and the reading
+// that accepts the quotes today is the reading that has to decide what to do
+// with those tomorrow. Refusing costs a quarantine an operator resolves; the
+// tolerant reading costs a guess about money.
 func readableAmount(raw json.RawMessage) *int64 {
-	amount, err := strconv.ParseInt(string(bytes.TrimSpace(raw)), 10, 64)
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, nullToken) {
+		return nil
+	}
+	if trimmed[0] == '"' {
+		return nil
+	}
+	amount, err := strconv.ParseInt(string(trimmed), 10, 64)
 	if err != nil {
 		return nil
 	}
 	return &amount
 }
-
-// readableInstant reads the provider's `created` member as the instant it
-// states, and reports the zero time when it states none this build can read.
-//
-// A zero OccurredAt is a real answer and not an oversight. `created` is the
-// provider's own claim about when it observed the outcome; a body that omits it
-// makes no claim, and substituting the signature header's timestamp (when the
-// delivery was SENT, a different fact) or this process's clock (which says
-// nothing about the provider at all) would be this adapter composing a fact
-// nobody stated.
-//
-// The RANGE is checked before time.Unix, and the check is not about
-// readability. time.Unix accepts any int64, and a seconds figure past the year
-// 9999 builds an instant whose microsecond count overflows when the driver
-// encodes it, so the database raises a datetime field overflow (SQLSTATE 22008)
-// — which nothing translates, so the whole delivery rolls back and the provider
-// retries the same bytes forever. The number is well inside int64, which is
-// exactly why the parse above would not catch it. A `created` this build cannot
-// place on a calendar is a claim this build cannot record, and the zero time is
-// the same "the provider stated none this build can read" answer the omitted
-// member gets.
-func readableInstant(raw json.RawMessage) time.Time {
-	seconds, err := strconv.ParseInt(string(bytes.TrimSpace(raw)), 10, 64)
-	if err != nil || seconds < minProviderInstantUnix || seconds > maxProviderInstantUnix {
-		return time.Time{}
-	}
-	return time.Unix(seconds, 0).UTC()
-}
-
-// The calendar this build can keep. The bounds are 0001-01-01T00:00:00Z and
-// 9999-12-31T23:59:59Z in Unix seconds — the range PostgreSQL's `timestamptz`
-// holds — and they are constants of the storage, not a policy about the
-// provider: a provider that reported a year outside them would be reporting
-// something the row cannot say.
-const (
-	minProviderInstantUnix int64 = -62135596800
-	maxProviderInstantUnix int64 = 253402300799
-)

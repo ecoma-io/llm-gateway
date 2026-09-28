@@ -103,8 +103,8 @@ const (
 // request to an unwired payment operation is a logged 500 rather than a panic.
 //
 // A caller that supplies a surface must supply BOTH halves: a process that can
-// open payments but cannot verify a delivery would create checkouts it can never
-// settle, and that is refused here rather than discovered by a customer. More
+// open payments but cannot verify a delivery would open payments whose destinations
+// it can never be told about, and that is refused here rather than discovered by a customer. More
 // than one surface is a wiring mistake with no meaning, so it is refused too.
 //
 // The surface is the one argument that is not a required positional parameter,
@@ -132,7 +132,7 @@ func New(app *application.App, readiness persistence.Pinger, sessions SessionUse
 	payments := unwiredPaymentSurface()
 	if len(surface) == 1 {
 		if surface[0].Payments == nil || surface[0].Verifier == nil {
-			panic("http: New requires both halves of the payment surface; a server that can open payments but not verify a delivery would open checkouts it can never settle")
+			panic("http: New requires both halves of the payment surface; a server that can open payments but not verify a delivery would hand out destinations it could never be told were paid")
 		}
 		if surface[0].Provider == "" {
 			// An empty name is not a missing feature like the two nil halves

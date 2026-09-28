@@ -20,7 +20,7 @@ func TestTheStatusSpellingsAreTheContracts(t *testing.T) {
 		want   string
 	}{
 		{StatusCreated, "created"},
-		{StatusCheckoutOpen, "checkout_open"},
+		{StatusAwaitingTransfer, "awaiting_transfer"},
 		{StatusRequiresAction, "requires_action"},
 		{StatusSucceeded, "succeeded"},
 		{StatusFailed, "failed"},

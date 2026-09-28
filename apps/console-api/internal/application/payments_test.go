@@ -12,8 +12,8 @@ import (
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
-// The payment use cases (B15): the browser-facing checkout that starts a
-// payment, and the provider-facing webhook that finishes one.
+// The payment use cases (B15): the customer-facing top-up that opens a payment,
+// and the provider-facing webhook that finishes one.
 //
 // Three properties are what this file is for, and everything else is a refusal
 // or a boundary check around them.
@@ -59,7 +59,7 @@ type paymentsPorts struct {
 	buckets    bucketReader
 	funding    accountFunding
 	ledger     topUpWriter
-	provider   paymentprovider.Checkout
+	provider   paymentprovider.Transfers
 	offers     TopUpCatalogue
 	settings   PaymentsSettings
 }
@@ -81,7 +81,7 @@ func newPaymentsPorts(w *paymentsWorld) paymentsPorts {
 		buckets:    fakeBucketReader{world: w},
 		funding:    fakeAccountFunding{world: w},
 		ledger:     fakeTopUpWriter{world: w},
-		provider:   fakeCheckoutProvider{world: w},
+		provider:   fakeTransferProvider{world: w},
 		offers:     NewTopUpCatalogue(w.offers),
 		settings:   w.settings,
 	}
@@ -108,7 +108,6 @@ func TestNewPaymentsRefusesAnyMissingPort(t *testing.T) {
 		{"the accounting top-up primitive", func(p *paymentsPorts) { p.ledger = nil }, "the accounting top-up primitive"},
 		{"the payment provider", func(p *paymentsPorts) { p.provider = nil }, "the payment provider"},
 		{"the configured provider", func(p *paymentsPorts) { p.settings.Provider = "" }, "the provider this deployment talks to"},
-		{"the configured return URL", func(p *paymentsPorts) { p.settings.CheckoutReturnURL = "" }, "the checkout return URL"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -150,7 +149,7 @@ func TestAnEmptyCatalogueIsADeploymentRatherThanAWiringDefect(t *testing.T) {
 		t.Fatalf("Offers() = %v, want nothing", offers)
 	}
 
-	_, err := p.BeginCheckout(t.Context(), BeginCheckoutRequest{
+	_, err := p.BeginTransfer(t.Context(), BeginTransferRequest{
 		AccountID:      paymentsAccountID,
 		OfferID:        "starter",
 		IdempotencyKey: "key-1",
@@ -159,31 +158,31 @@ func TestAnEmptyCatalogueIsADeploymentRatherThanAWiringDefect(t *testing.T) {
 		t.Errorf("an empty catalogue answered %q, want %q", code, CodeInvalidRequest)
 	}
 	if len(w.intents) != 0 || len(w.providerCalls) != 0 {
-		t.Errorf("a refused checkout wrote something: %d payments, %d provider calls", len(w.intents), len(w.providerCalls))
+		t.Errorf("a refused top-up wrote something: %d payments, %d provider calls", len(w.intents), len(w.providerCalls))
 	}
 }
 
-// TestBeginCheckoutRefusesBeforeItWritesAnything covers the four gates that run
+// TestBeginTransferRefusesBeforeItWritesAnything covers the four gates that run
 // ahead of any write. Each refusal is a different category because each calls
 // for different client behaviour: an offer this deployment does not sell is the
 // client's mistake and the client's to fix, an account that may not fund itself
 // is a server state the client cannot see and cannot repair by editing its
 // request.
-func TestBeginCheckoutRefusesBeforeItWritesAnything(t *testing.T) {
+func TestBeginTransferRefusesBeforeItWritesAnything(t *testing.T) {
 	cases := []struct {
 		name  string
 		setup func(*paymentsWorld)
-		in    BeginCheckoutRequest
+		in    BeginTransferRequest
 		want  Code
 	}{
 		{
 			name: "an offer this deployment does not sell",
-			in:   BeginCheckoutRequest{AccountID: paymentsAccountID, OfferID: "platinum", IdempotencyKey: "key-1"},
+			in:   BeginTransferRequest{AccountID: paymentsAccountID, OfferID: "platinum", IdempotencyKey: "key-1"},
 			want: CodeInvalidRequest,
 		},
 		{
 			name: "no idempotency key",
-			in:   BeginCheckoutRequest{AccountID: paymentsAccountID, OfferID: "starter"},
+			in:   BeginTransferRequest{AccountID: paymentsAccountID, OfferID: "starter"},
 			want: CodeInvalidRequest,
 		},
 		{
@@ -194,29 +193,29 @@ func TestBeginCheckoutRefusesBeforeItWritesAnything(t *testing.T) {
 			// error types. A customer holding a key one character too long is a
 			// 400 with a sentence about the key, not a page for an operator.
 			name: "an idempotency key past what the schema carries",
-			in:   BeginCheckoutRequest{AccountID: paymentsAccountID, OfferID: "starter", IdempotencyKey: strings.Repeat("k", 129)},
+			in:   BeginTransferRequest{AccountID: paymentsAccountID, OfferID: "starter", IdempotencyKey: strings.Repeat("k", 129)},
 			want: CodeInvalidRequest,
 		},
 		{
 			name: "no account at all",
-			in:   BeginCheckoutRequest{OfferID: "starter", IdempotencyKey: "key-1"},
+			in:   BeginTransferRequest{OfferID: "starter", IdempotencyKey: "key-1"},
 			want: CodeUnauthenticated,
 		},
 		{
 			name: "an account this platform does not have",
-			in:   BeginCheckoutRequest{AccountID: "99999999-9999-4999-8999-999999999999", OfferID: "starter", IdempotencyKey: "key-1"},
+			in:   BeginTransferRequest{AccountID: "99999999-9999-4999-8999-999999999999", OfferID: "starter", IdempotencyKey: "key-1"},
 			want: CodeUnauthenticated,
 		},
 		{
 			name:  "a suspended account",
 			setup: func(w *paymentsWorld) { w.seedAccount(paymentsAccountID, identity.AccountSuspended) },
-			in:    BeginCheckoutRequest{AccountID: paymentsAccountID, OfferID: "starter", IdempotencyKey: "key-1"},
+			in:    BeginTransferRequest{AccountID: paymentsAccountID, OfferID: "starter", IdempotencyKey: "key-1"},
 			want:  CodeConflict,
 		},
 		{
 			name:  "a closed account",
 			setup: func(w *paymentsWorld) { w.seedAccount(paymentsAccountID, identity.AccountClosed) },
-			in:    BeginCheckoutRequest{AccountID: paymentsAccountID, OfferID: "starter", IdempotencyKey: "key-1"},
+			in:    BeginTransferRequest{AccountID: paymentsAccountID, OfferID: "starter", IdempotencyKey: "key-1"},
 			want:  CodeConflict,
 		},
 	}
@@ -228,40 +227,40 @@ func TestBeginCheckoutRefusesBeforeItWritesAnything(t *testing.T) {
 			}
 			p := newPayments(w)
 
-			_, err := p.BeginCheckout(t.Context(), tc.in)
+			_, err := p.BeginTransfer(t.Context(), tc.in)
 			if code := applicationCodeOf(t, err); code != tc.want {
-				t.Errorf("BeginCheckout(%s) answered %q, want %q", tc.name, code, tc.want)
+				t.Errorf("BeginTransfer(%s) answered %q, want %q", tc.name, code, tc.want)
 			}
 			if len(w.intents) != 0 {
-				t.Errorf("a refused checkout opened %d payments", len(w.intents))
+				t.Errorf("a refused top-up opened %d payments", len(w.intents))
 			}
 			if len(w.providerCalls) != 0 {
-				t.Errorf("a refused checkout reached the provider %d times", len(w.providerCalls))
+				t.Errorf("a refused top-up reached the provider %d times", len(w.providerCalls))
 			}
 		})
 	}
 }
 
-// TestABeginCheckoutAtTheKeyBoundIsCarriedNotRefused is the other side of the
+// TestABeginTransferAtTheKeyBoundIsCarriedNotRefused is the other side of the
 // gate above, and it is a test of the BOUND rather than of the gate: a check
 // written by hand at the call site is a second statement of a number the domain
 // already holds, and the failure mode of getting it wrong is a customer whose
 // perfectly legal 128-character key is refused by an application that is
 // stricter than the schema it is writing to. The application asks the domain's
 // own function, so this test would fail if the two ever disagreed.
-func TestABeginCheckoutAtTheKeyBoundIsCarriedNotRefused(t *testing.T) {
+func TestABeginTransferAtTheKeyBoundIsCarriedNotRefused(t *testing.T) {
 	w := newPaymentsWorld(t)
 	p := newPayments(w)
 
-	if _, err := p.BeginCheckout(t.Context(), BeginCheckoutRequest{
+	if _, err := p.BeginTransfer(t.Context(), BeginTransferRequest{
 		AccountID:      paymentsAccountID,
 		OfferID:        "starter",
 		IdempotencyKey: strings.Repeat("k", 128),
 	}); err != nil {
-		t.Fatalf("BeginCheckout() with a key at the schema's own width answered %v, want it carried", err)
+		t.Fatalf("BeginTransfer() with a key at the schema's own width answered %v, want it carried", err)
 	}
 	if len(w.intents) != 1 {
-		t.Fatalf("the checkout opened %d payments, want one", len(w.intents))
+		t.Fatalf("the top-up opened %d payments, want one", len(w.intents))
 	}
 	for _, stored := range w.intents {
 		if got := len(stored.IdempotencyKey); got != 128 {
@@ -270,23 +269,24 @@ func TestABeginCheckoutAtTheKeyBoundIsCarriedNotRefused(t *testing.T) {
 	}
 }
 
-// TestBeginCheckoutRecordsThePaymentBeforeItCallsTheProvider pins the ordering
+// TestBeginTransferRecordsThePaymentBeforeItCallsTheProvider pins the ordering
 // the provider's idempotency key depends on. The key is derived from the
 // payment's own identifier, and a key derived from something that does not
 // exist until the provider answers cannot make a retry the same request — a
-// lost response would mean a second call under a new key and a customer charged
-// twice. The intent is therefore durable, and committed, before the call.
-func TestBeginCheckoutRecordsThePaymentBeforeItCallsTheProvider(t *testing.T) {
+// lost response would mean a second call under a new key and a customer handed
+// a second destination for one payment. The intent is therefore durable, and
+// committed, before the call.
+func TestBeginTransferRecordsThePaymentBeforeItCallsTheProvider(t *testing.T) {
 	w := newPaymentsWorld(t)
 	p := newPayments(w)
 
-	result, err := p.BeginCheckout(t.Context(), BeginCheckoutRequest{
+	result, err := p.BeginTransfer(t.Context(), BeginTransferRequest{
 		AccountID:      paymentsAccountID,
 		OfferID:        "starter",
 		IdempotencyKey: "key-1",
 	})
 	if err != nil {
-		t.Fatalf("BeginCheckout: %v", err)
+		t.Fatalf("BeginTransfer: %v", err)
 	}
 
 	order := strings.Join(w.order, " ")
@@ -303,51 +303,57 @@ func TestBeginCheckoutRecordsThePaymentBeforeItCallsTheProvider(t *testing.T) {
 	}
 
 	// The provider was handed the payment's own identity and the offer's own
-	// price: nothing a browser sent reaches the provider as a figure.
+	// price: nothing a browser sent reaches the provider as a figure. The key is
+	// the one derived from the payment, and the lifetime is this platform's own
+	// window — the same one the console prints for the customer.
 	if len(w.providerCalls) != 1 {
 		t.Fatalf("the provider was called %d times, want once", len(w.providerCalls))
 	}
 	call := w.providerCalls[0]
-	if call.Reference != string(result.Intent.ID) {
-		t.Errorf("the provider was told the payment is %q, want %q", call.Reference, result.Intent.ID)
+	if want := "transfer:" + string(result.Intent.ID); call.IdempotencyKey != want {
+		t.Errorf("the provider was told the transfer is %q, want %q", call.IdempotencyKey, want)
 	}
 	if call.AmountMinorUnits != 1000 || call.Currency != "USD" {
 		t.Errorf("the provider was asked for %d %s, want the offer's 1000 USD", call.AmountMinorUnits, call.Currency)
 	}
-	if call.ReturnURL != paymentsReturnURL {
-		t.Errorf("the provider was told to return the customer to %q, want the configured %q", call.ReturnURL, paymentsReturnURL)
+	if call.ExpiresIn != transferTTL {
+		t.Errorf("the provider was told the destination lives %s, want this platform's own %s", call.ExpiresIn, transferTTL)
 	}
 
-	// And the answer is durable: the checkout reference and URL the customer's
-	// browser depends on are on the row, not just in the response.
+	// And the answer is durable: the destination a returning customer must be
+	// shown again is on the row, not just in the response.
 	stored := w.storedIntent(t, result.Intent.ID)
-	if stored.ProviderCheckoutRef != w.providerSession.ProviderRef {
-		t.Errorf("the stored payment names checkout %q, want %q", stored.ProviderCheckoutRef, w.providerSession.ProviderRef)
+	if stored.ProviderTransferRef != w.providerInstructions.TransferCode {
+		t.Errorf("the stored payment names destination %q, want %q", stored.ProviderTransferRef, w.providerInstructions.TransferCode)
 	}
-	if stored.CheckoutURL != w.providerSession.URL {
-		t.Errorf("the stored payment carries URL %q, want %q", stored.CheckoutURL, w.providerSession.URL)
+	if stored.ProviderQRURL != w.providerInstructions.QRURL {
+		t.Errorf("the stored payment carries image %q, want %q", stored.ProviderQRURL, w.providerInstructions.QRURL)
 	}
-	if stored.Status != payments.StatusCheckoutOpen {
-		t.Errorf("the stored payment is %q, want %q", stored.Status, payments.StatusCheckoutOpen)
+	if stored.ProviderBankName != w.providerInstructions.BankName || stored.ProviderAccountHolder != w.providerInstructions.AccountHolder {
+		t.Errorf("the stored payment holds the destination at %q for %q, want %q and %q",
+			stored.ProviderBankName, stored.ProviderAccountHolder, w.providerInstructions.BankName, w.providerInstructions.AccountHolder)
+	}
+	if stored.Status != payments.StatusAwaitingTransfer {
+		t.Errorf("the stored payment is %q, want %q", stored.Status, payments.StatusAwaitingTransfer)
 	}
 }
 
-// TestBeginCheckoutCallsTheProviderOutsideAnyUnitOfWork is the whole reason the
-// checkout is written in two transactions rather than one. A transaction held
+// TestBeginTransferCallsTheProviderOutsideAnyUnitOfWork is the whole reason the
+// top-up is written in two transactions rather than one. A transaction held
 // open across the provider's call pins a connection and a row lock for as long
 // as a third party takes to answer, and the port says the same thing from the
-// other side: a checkout cannot move money, so it has no business inside the
-// unit of work that does.
-func TestBeginCheckoutCallsTheProviderOutsideAnyUnitOfWork(t *testing.T) {
+// other side: opening a transfer cannot move money, so it has no business
+// inside the unit of work that does.
+func TestBeginTransferCallsTheProviderOutsideAnyUnitOfWork(t *testing.T) {
 	w := newPaymentsWorld(t)
 	p := newPayments(w)
 
-	if _, err := p.BeginCheckout(t.Context(), BeginCheckoutRequest{
+	if _, err := p.BeginTransfer(t.Context(), BeginTransferRequest{
 		AccountID:      paymentsAccountID,
 		OfferID:        "starter",
 		IdempotencyKey: "key-1",
 	}); err != nil {
-		t.Fatalf("BeginCheckout: %v", err)
+		t.Fatalf("BeginTransfer: %v", err)
 	}
 
 	if len(w.providerDepth) != 1 {
@@ -362,31 +368,31 @@ func TestBeginCheckoutCallsTheProviderOutsideAnyUnitOfWork(t *testing.T) {
 	// The two writes around it are inside units of work, so the depth of 0
 	// above is the call being outside them rather than the store not existing.
 	if w.beginUnits != 2 {
-		t.Errorf("the checkout took %d units of work, want two: the payment, then its checkout reference", w.beginUnits)
+		t.Errorf("the top-up took %d units of work, want two: the payment, then its destination", w.beginUnits)
 	}
 }
 
-// TestBeginCheckoutConvergesOnTheKey checks the retry the key exists for. A
+// TestBeginTransferConvergesOnTheKey checks the retry the key exists for. A
 // customer who clicks twice, or whose first response was lost, gets the ONE
 // payment they meant rather than a second one they would have to choose
-// between — and the provider is not asked for a second session, because a
-// second session is a second way to charge them.
-func TestBeginCheckoutConvergesOnTheKey(t *testing.T) {
+// between — and the provider is not asked for a second destination, because a
+// customer shown two accounts for one payment has no way to know which to pay.
+func TestBeginTransferConvergesOnTheKey(t *testing.T) {
 	w := newPaymentsWorld(t)
 	p := newPayments(w)
-	request := BeginCheckoutRequest{AccountID: paymentsAccountID, OfferID: "starter", IdempotencyKey: "key-1"}
+	request := BeginTransferRequest{AccountID: paymentsAccountID, OfferID: "starter", IdempotencyKey: "key-1"}
 
-	first, err := p.BeginCheckout(t.Context(), request)
+	first, err := p.BeginTransfer(t.Context(), request)
 	if err != nil {
-		t.Fatalf("the first checkout: %v", err)
+		t.Fatalf("the first top-up: %v", err)
 	}
 	if first.Converged {
 		t.Errorf("the first call reports itself converged")
 	}
 
-	second, err := p.BeginCheckout(t.Context(), request)
+	second, err := p.BeginTransfer(t.Context(), request)
 	if err != nil {
-		t.Fatalf("the second checkout: %v", err)
+		t.Fatalf("the second top-up: %v", err)
 	}
 	if !second.Converged {
 		t.Errorf("the second call does not report convergence, so a client cannot know its retry was harmless")
@@ -394,33 +400,33 @@ func TestBeginCheckoutConvergesOnTheKey(t *testing.T) {
 	if second.Intent.ID != first.Intent.ID {
 		t.Errorf("the second call produced payment %s, want the first one, %s", second.Intent.ID, first.Intent.ID)
 	}
-	if second.Intent.ProviderCheckoutRef != first.Intent.ProviderCheckoutRef {
-		t.Errorf("the second call returned checkout %q, want the one the customer was already sent to, %q",
-			second.Intent.ProviderCheckoutRef, first.Intent.ProviderCheckoutRef)
+	if second.Intent.ProviderTransferRef != first.Intent.ProviderTransferRef {
+		t.Errorf("the second call returned destination %q, want the one the customer was already given, %q",
+			second.Intent.ProviderTransferRef, first.Intent.ProviderTransferRef)
 	}
 	if len(w.intents) != 1 {
 		t.Errorf("two calls under one key produced %d payments, want one", len(w.intents))
 	}
 	if len(w.providerCalls) != 1 {
-		t.Errorf("the provider was asked for %d sessions, want one", len(w.providerCalls))
+		t.Errorf("the provider was asked for %d destinations, want one", len(w.providerCalls))
 	}
 }
 
-// TestBeginCheckoutRetriesUnderTheSameProviderIdempotencyKey covers the window
-// the whole design is shaped around: the payment is durable, the provider call
-// fails, and the payment stands in `created` with no checkout reference. The
-// next call with the same key converges on that payment and calls the provider
-// again — under the SAME key, which is what makes the provider collapse the two
-// attempts into one charge instead of taking the customer's money twice.
-func TestBeginCheckoutRetriesUnderTheSameProviderIdempotencyKey(t *testing.T) {
+// TestBeginTransferRetriesUnderTheSameProviderIdempotencyKey covers the window
+// the whole design is shaped around: the payment is durable, the provider does
+// not answer, and the payment stands in `created` with no destination. The next
+// call with the same key converges on that payment and asks the provider again
+// — under the SAME key, which is what makes the provider treat the two attempts
+// as one request rather than issuing a second destination for one payment.
+func TestBeginTransferRetriesUnderTheSameProviderIdempotencyKey(t *testing.T) {
 	w := newPaymentsWorld(t)
 	w.providerErr = errPaymentsProviderDown
 	p := newPayments(w)
-	request := BeginCheckoutRequest{AccountID: paymentsAccountID, OfferID: "starter", IdempotencyKey: "key-1"}
+	request := BeginTransferRequest{AccountID: paymentsAccountID, OfferID: "starter", IdempotencyKey: "key-1"}
 
-	_, err := p.BeginCheckout(t.Context(), request)
+	_, err := p.BeginTransfer(t.Context(), request)
 	if err == nil {
-		t.Fatalf("a provider outage was reported as a successful checkout")
+		t.Fatalf("a provider outage was reported as a successful top-up")
 	}
 
 	// Nothing was written as a failure state: the payment stands in its birth
@@ -436,13 +442,13 @@ func TestBeginCheckoutRetriesUnderTheSameProviderIdempotencyKey(t *testing.T) {
 	if intents[0].Status != payments.StatusCreated {
 		t.Errorf("the payment left behind by a provider outage is %q, want %q", intents[0].Status, payments.StatusCreated)
 	}
-	if intents[0].ProviderCheckoutRef != "" {
-		t.Errorf("a payment whose provider call failed carries checkout reference %q", intents[0].ProviderCheckoutRef)
+	if intents[0].ProviderTransferRef != "" {
+		t.Errorf("a payment whose provider call failed carries destination %q", intents[0].ProviderTransferRef)
 	}
 
 	// The retry: a healthy provider, the same key, the same payment.
 	w.providerErr = nil
-	result, err := p.BeginCheckout(t.Context(), request)
+	result, err := p.BeginTransfer(t.Context(), request)
 	if err != nil {
 		t.Fatalf("the retry: %v", err)
 	}
@@ -460,79 +466,81 @@ func TestBeginCheckoutRetriesUnderTheSameProviderIdempotencyKey(t *testing.T) {
 	if firstKey != secondKey {
 		t.Errorf("the retry used key %q, want the first attempt's %q: a new key is a second charge", secondKey, firstKey)
 	}
-	if want := "checkout:" + string(result.Intent.ID); firstKey != want {
+	if want := "transfer:" + string(result.Intent.ID); firstKey != want {
 		t.Errorf("the provider's idempotency key is %q, want %q — derived from the payment, not minted per call", firstKey, want)
 	}
 	if len(w.intents) != 1 {
 		t.Errorf("the retry left %d payments, want one", len(w.intents))
 	}
-	if result.Intent.Status != payments.StatusCheckoutOpen {
-		t.Errorf("the retry left the payment %q, want %q", result.Intent.Status, payments.StatusCheckoutOpen)
+	if result.Intent.Status != payments.StatusAwaitingTransfer {
+		t.Errorf("the retry left the payment %q, want %q", result.Intent.Status, payments.StatusAwaitingTransfer)
 	}
 }
 
-// TestBeginCheckoutKeepsTheWinnersCheckoutReferenceWhenTheSwapLoses covers the
-// race the second transaction exists for. Two attempts can both reach the
-// provider — that is what the idempotency key is for — but only one of them may
-// write the reference the customer's live session depends on. Choosing between
-// two live sessions is not a decision this layer can make, so the loser writes
-// nothing and returns the winner's row.
-func TestBeginCheckoutKeepsTheWinnersCheckoutReferenceWhenTheSwapLoses(t *testing.T) {
+// TestBeginTransferKeepsTheWinnersDestinationWhenTheSwapLoses covers the race
+// the second transaction exists for. Two attempts can both reach the provider —
+// that is what the idempotency key is for — but only one of them may write the
+// account the customer will be told to pay into. Choosing between two accounts
+// the provider issued for one payment is not a decision this layer can make, so
+// the loser writes nothing and returns the winner's row.
+func TestBeginTransferKeepsTheWinnersDestinationWhenTheSwapLoses(t *testing.T) {
 	w := newPaymentsWorld(t)
 	var losing payments.IntentID
 	w.onProviderCall = func(int) {
-		// Another attempt with the same key commits its own checkout while this
-		// call is inside the provider's latency — the window between the
-		// provider's answer and the reference being recorded.
+		// Another attempt with the same key commits its own destination while
+		// this call is inside the provider's latency — the window between the
+		// provider's answer and the destination being recorded.
 		id := w.intentByKey[paymentsKey(paymentsAccountID, "key-1")]
 		winner := w.storedIntent(t, id)
-		winner.ProviderCheckoutRef = "cs_winner"
-		winner.CheckoutURL = "https://pay.example/checkout/winner"
-		winner.Status = payments.StatusCheckoutOpen
+		winner.ProviderTransferRef = "dest_winner"
+		winner.ProviderBankName = "Techcombank"
+		winner.ProviderAccountHolder = "WINNER CO"
+		winner.ProviderQRURL = "https://qr.example/winner"
+		winner.Status = payments.StatusAwaitingTransfer
 		winner.StateVersion++
 		w.put(winner)
 		losing = id
 	}
 	p := newPayments(w)
 
-	result, err := p.BeginCheckout(t.Context(), BeginCheckoutRequest{
+	result, err := p.BeginTransfer(t.Context(), BeginTransferRequest{
 		AccountID:      paymentsAccountID,
 		OfferID:        "starter",
 		IdempotencyKey: "key-1",
 	})
 	if err != nil {
-		t.Fatalf("BeginCheckout: %v", err)
+		t.Fatalf("BeginTransfer: %v", err)
 	}
 
 	stored := w.storedIntent(t, losing)
-	if stored.ProviderCheckoutRef != "cs_winner" {
-		t.Errorf("the payment now names checkout %q, want the winner's %q: the loser overwrote a live session",
-			stored.ProviderCheckoutRef, "cs_winner")
+	if stored.ProviderTransferRef != "dest_winner" {
+		t.Errorf("the payment now names destination %q, want the winner's %q: the loser overwrote an account the customer may already have been given",
+			stored.ProviderTransferRef, "dest_winner")
 	}
-	if stored.CheckoutURL != "https://pay.example/checkout/winner" {
-		t.Errorf("the payment now carries URL %q, want the winner's", stored.CheckoutURL)
+	if stored.ProviderBankName != "Techcombank" || stored.ProviderAccountHolder != "WINNER CO" {
+		t.Errorf("the payment now holds the destination at %q for %q, want the winner's", stored.ProviderBankName, stored.ProviderAccountHolder)
 	}
-	if result.Intent.ProviderCheckoutRef != "cs_winner" {
-		t.Errorf("the caller was returned checkout %q rather than the winner's: it would send the customer to a session nobody holds",
-			result.Intent.ProviderCheckoutRef)
+	if result.Intent.ProviderTransferRef != "dest_winner" {
+		t.Errorf("the caller was returned destination %q rather than the winner's: a customer shown two accounts for one payment cannot know which to pay",
+			result.Intent.ProviderTransferRef)
 	}
 }
 
-// TestBeginCheckoutSeparatesAProviderOutageFromARefusal pins the one place the
+// TestBeginTransferSeparatesAProviderOutageFromARefusal pins the one place the
 // two failure classes are told apart. The port says whether the provider failed
 // to answer, and the difference is what a client does next: an outage is a 503
 // whose correct answer is to retry later, while a provider that refused the
 // request is a defect on one side or the other and must not invite a retry
 // storm against a condition no retry can change.
-func TestBeginCheckoutSeparatesAProviderOutageFromARefusal(t *testing.T) {
-	request := BeginCheckoutRequest{AccountID: paymentsAccountID, OfferID: "starter", IdempotencyKey: "key-1"}
+func TestBeginTransferSeparatesAProviderOutageFromARefusal(t *testing.T) {
+	request := BeginTransferRequest{AccountID: paymentsAccountID, OfferID: "starter", IdempotencyKey: "key-1"}
 
 	t.Run("an unreachable provider is the retryable class", func(t *testing.T) {
 		w := newPaymentsWorld(t)
 		w.providerErr = paymentprovider.ErrProviderUnavailable
 		p := newPayments(w)
 
-		_, err := p.BeginCheckout(t.Context(), request)
+		_, err := p.BeginTransfer(t.Context(), request)
 		if code := applicationCodeOf(t, err); code != CodeUpstreamUnavailable {
 			t.Errorf("an unreachable provider answered %q, want %q", code, CodeUpstreamUnavailable)
 		}
@@ -546,9 +554,9 @@ func TestBeginCheckoutSeparatesAProviderOutageFromARefusal(t *testing.T) {
 		w.providerErr = errPaymentsProviderRefused
 		p := newPayments(w)
 
-		_, err := p.BeginCheckout(t.Context(), request)
+		_, err := p.BeginTransfer(t.Context(), request)
 		if err == nil {
-			t.Fatalf("a refused checkout was reported as a success")
+			t.Fatalf("a refused transfer was reported as a success")
 		}
 		if applicationError, ok := As(err); ok && applicationError.Code == CodeUpstreamUnavailable {
 			t.Errorf("a refusal was reported as an outage, which asks the client to retry a condition that will not clear")
@@ -559,13 +567,79 @@ func TestBeginCheckoutSeparatesAProviderOutageFromARefusal(t *testing.T) {
 	})
 }
 
+// TestBeginTransferAbandonsThePaymentTheProviderWillNotReissue covers the one
+// refusal that is neither an outage nor retryable. The provider already holds a
+// destination under this payment's order identity, it did not return the
+// destination to this process, and it documents no way to read one back — so
+// there is an account somewhere that no customer was ever shown, and no retry
+// will produce a second one.
+//
+// What the test pins is the LOCAL consequence: the payment must not stay in
+// `created`. That is the state a retry converges on, and leaving the row there
+// would go on implying that one more attempt is all this payment needs, when the
+// provider refuses the identity identically and forever. The abandonment is a
+// decision about a row in this platform's own table, made before the caller is
+// told anything.
+func TestBeginTransferAbandonsThePaymentTheProviderWillNotReissue(t *testing.T) {
+	w := newPaymentsWorld(t)
+	w.providerErr = paymentprovider.ErrOrderCodeTaken
+	p := newPayments(w)
+	request := BeginTransferRequest{AccountID: paymentsAccountID, OfferID: "starter", IdempotencyKey: "key-1"}
+
+	_, err := p.BeginTransfer(t.Context(), request)
+	if code := applicationCodeOf(t, err); code != CodeConflict {
+		t.Fatalf("a transfer identity the provider would not reissue answered %q, want %q", code, CodeConflict)
+	}
+	// It is a conflict and not an outage. An outage invites the client to retry
+	// later, and this condition is the one thing a retry cannot clear, so the
+	// two must not be answered alike.
+	if errors.Is(err, paymentprovider.ErrProviderUnavailable) {
+		t.Errorf("the refusal was reported as the retryable class")
+	}
+
+	intents := make([]payments.Intent, 0, len(w.intents))
+	for _, intent := range w.intents {
+		intents = append(intents, intent)
+	}
+	if len(intents) != 1 {
+		t.Fatalf("the refused attempt left %d payments, want the one it recorded before calling", len(intents))
+	}
+	abandoned := intents[0]
+	if abandoned.Status != payments.StatusCancelled {
+		t.Errorf("the payment is %q after the refusal, want %q: `created` is what a retry converges on, and this attempt can never be paid", abandoned.Status, payments.StatusCancelled)
+	}
+	if abandoned.ProviderTransferRef != "" {
+		t.Errorf("the abandoned payment carries destination %q, though no customer was ever shown one", abandoned.ProviderTransferRef)
+	}
+
+	// The repeat: the SAME key, so it converges on the cancelled payment rather
+	// than opening a second one, reaches the provider again under the same order
+	// identity, is refused again, and must leave the number of payments where it
+	// was. Minting a second payment under this key would derive a second order
+	// identity at the provider, which is the one thing the key exists to prevent.
+	_, err = p.BeginTransfer(t.Context(), request)
+	if code := applicationCodeOf(t, err); code != CodeConflict {
+		t.Fatalf("the repeat answered %q, want %q", code, CodeConflict)
+	}
+	if len(w.intents) != 1 {
+		t.Errorf("the repeat left %d payments, want the one it converged on", len(w.intents))
+	}
+	if len(w.providerCalls) != 2 {
+		t.Fatalf("the provider was called %d times, want the first attempt and its repeat", len(w.providerCalls))
+	}
+	if w.providerCalls[0].IdempotencyKey != w.providerCalls[1].IdempotencyKey {
+		t.Errorf("the repeat used key %q, want the first attempt's %q: a second identity is a second order at the provider",
+			w.providerCalls[1].IdempotencyKey, w.providerCalls[0].IdempotencyKey)
+	}
+}
+
 // captureFixture is the world one capture test runs against: a payment whose
-// checkout is open, an active account, an active bucket, and the delivery that
-// funds it.
+// customer has been handed a destination, an active account, an active bucket,
+// and the delivery that funds it.
 func captureFixture(t *testing.T, w *paymentsWorld) (payments.Intent, ProviderDelivery) {
 	t.Helper()
 	intent := w.seedIntent(t, nil)
-	return intent, w.delivery("evt_1", paymentprovider.KindCaptured, intent.ProviderCheckoutRef, "pi_1", 1000, "USD")
+	return intent, w.delivery("delivery_1", paymentprovider.KindCaptured, intent.ProviderTransferRef, "ref_1", 1000, "USD")
 }
 
 // TestApplyProviderEventAppliesACaptureAsOneUnitOfWork is the webhook's centre
@@ -643,7 +717,7 @@ func TestApplyProviderEventAppliesACaptureAsOneUnitOfWork(t *testing.T) {
 
 	// The money landed, keyed on the payment rather than on the delivery, so a
 	// re-notification of the same capture converges on the leg already on file.
-	wantKey, err := payments.TopUpCommandKey(paymentsProviderName, "pi_1")
+	wantKey, err := payments.TopUpCommandKey(paymentsProviderName, "ref_1")
 	if err != nil {
 		t.Fatalf("deriving the payment's command key: %v", err)
 	}
@@ -672,17 +746,17 @@ func TestApplyProviderEventAppliesACaptureAsOneUnitOfWork(t *testing.T) {
 	if after.Status != payments.StatusSucceeded {
 		t.Errorf("the payment is %q, want %q", after.Status, payments.StatusSucceeded)
 	}
-	if after.ProviderPaymentRef != "pi_1" {
-		t.Errorf("the payment carries provider payment reference %q, want %q", after.ProviderPaymentRef, "pi_1")
+	if after.ProviderPaymentRef != "ref_1" {
+		t.Errorf("the payment carries provider payment reference %q, want %q", after.ProviderPaymentRef, "ref_1")
 	}
 
 	// The delivery is on file with what it claimed and what was done with it.
-	record, ok := w.eventRecord("evt_1")
+	record, ok := w.eventRecord("delivery_1")
 	if !ok {
 		t.Fatalf("the delivery was not recorded")
 	}
-	if record.IntentID != intent.ID || record.ProviderPaymentRef != "pi_1" {
-		t.Errorf("the recorded delivery names %s / %q, want %s / %q", record.IntentID, record.ProviderPaymentRef, intent.ID, "pi_1")
+	if record.IntentID != intent.ID || record.ProviderPaymentRef != "ref_1" {
+		t.Errorf("the recorded delivery names %s / %q, want %s / %q", record.IntentID, record.ProviderPaymentRef, intent.ID, "ref_1")
 	}
 	if record.Disposition != payments.DispositionApplied {
 		t.Errorf("the recorded delivery says %q, want %q", record.Disposition, payments.DispositionApplied)
@@ -728,7 +802,7 @@ func TestApplyProviderEventAnswersARedeliveryAsADuplicate(t *testing.T) {
 //
 // The obvious move — insert the event row anyway so a redelivery is a duplicate
 // rather than a second quarantine — is wrong, because the dedup key is a CLAIM.
-// A delivery that lands in the window between BeginCheckout's two transactions
+// A delivery that lands in the window between BeginTransfer's two transactions
 // resolves to no payment, and claiming its key would permanently absorb every
 // future delivery of that event id, leaving a real customer's real money
 // unapplied forever while the provider's own retries arrived as duplicates of a
@@ -738,7 +812,7 @@ func TestApplyProviderEventQuarantinesAnUnknownPaymentWithoutClaimingItsKey(t *t
 	w.seedIntent(t, nil)
 	p := newPayments(w)
 
-	delivery := w.delivery("evt_unknown", paymentprovider.KindCaptured, "cs_not_ours", "pi_not_ours", 1000, "USD")
+	delivery := w.delivery("delivery_unknown", paymentprovider.KindCaptured, "cs_not_ours", "ref_not_ours", 1000, "USD")
 	outcome, err := p.ApplyProviderEvent(t.Context(), delivery)
 	if err != nil {
 		t.Fatalf("ApplyProviderEvent: %v", err)
@@ -766,8 +840,8 @@ func TestApplyProviderEventQuarantinesAnUnknownPaymentWithoutClaimingItsKey(t *t
 	// and the bytes the signature covered are what an operator resolves the row
 	// with, and a quarantine that discarded them would be a mystery rather than
 	// a question.
-	if record.ProviderPaymentRef != "pi_not_ours" {
-		t.Errorf("the quarantine row carries reference %q, want the provider's own %q", record.ProviderPaymentRef, "pi_not_ours")
+	if record.ProviderPaymentRef != "ref_not_ours" {
+		t.Errorf("the quarantine row carries reference %q, want the provider's own %q", record.ProviderPaymentRef, "ref_not_ours")
 	}
 	if string(record.Payload) != string(delivery.RawBody) {
 		t.Errorf("the quarantine row kept %q, want the verified bytes %q", record.Payload, delivery.RawBody)
@@ -792,10 +866,10 @@ func TestApplyProviderEventQuarantinesAnUnknownPaymentWithoutClaimingItsKey(t *t
 
 // TestApplyProviderEventQuarantinesAReferenceOnlyDeliveryItCannotFind is the
 // payment-reference half of the same property, and it is the case that makes a
-// refund survivable. A refund delivery names the payment and never the session
-// it was taken through, so resolution has no checkout reference to try; when
-// the payment reference matches nothing, the delivery is quarantined as an
-// unknown payment — and the quarantine row still carries the reference, which
+// refund survivable. A refund delivery names the payment and never the
+// destination the money arrived at, so resolution has no transfer reference to
+// try; when the payment reference matches nothing, the delivery is quarantined
+// as an unknown payment — and the quarantine row still carries the reference, which
 // is what lets an operator answer "which payment did the provider mean" without
 // the payload.
 func TestApplyProviderEventQuarantinesAReferenceOnlyDeliveryItCannotFind(t *testing.T) {
@@ -803,7 +877,7 @@ func TestApplyProviderEventQuarantinesAReferenceOnlyDeliveryItCannotFind(t *test
 	w.seedIntent(t, nil)
 	p := newPayments(w)
 
-	delivery := w.delivery("evt_refund_orphan", paymentprovider.KindRefunded, "", "pi_nowhere", 400, "USD")
+	delivery := w.delivery("delivery_refund_orphan", paymentprovider.KindRefunded, "", "ref_nowhere", 400, "USD")
 	outcome, err := p.ApplyProviderEvent(t.Context(), delivery)
 	if err != nil {
 		t.Fatalf("ApplyProviderEvent: %v", err)
@@ -815,8 +889,8 @@ func TestApplyProviderEventQuarantinesAReferenceOnlyDeliveryItCannotFind(t *test
 	if len(w.quarantines) != 1 {
 		t.Fatalf("the delivery left %d quarantine rows, want one", len(w.quarantines))
 	}
-	if got := w.quarantines[0].ProviderPaymentRef; got != "pi_nowhere" {
-		t.Errorf("the quarantine row carries reference %q, want %q", got, "pi_nowhere")
+	if got := w.quarantines[0].ProviderPaymentRef; got != "ref_nowhere" {
+		t.Errorf("the quarantine row carries reference %q, want %q", got, "ref_nowhere")
 	}
 	if len(w.events) != 0 {
 		t.Errorf("the delivery claimed its dedup key: %d event rows, want none", len(w.events))
@@ -832,11 +906,11 @@ func TestApplyProviderEventQuarantinesAReferenceOnlyDeliveryItCannotFind(t *test
 func TestApplyProviderEventQuarantinesEveryRefusalWithItsOwnReason(t *testing.T) {
 	succeeded := func(intent *payments.Intent) {
 		intent.Status = payments.StatusSucceeded
-		intent.ProviderPaymentRef = "pi_1"
+		intent.ProviderPaymentRef = "ref_1"
 	}
 	refunded := func(intent *payments.Intent) {
 		intent.Status = payments.StatusRefunded
-		intent.ProviderPaymentRef = "pi_1"
+		intent.ProviderPaymentRef = "ref_1"
 		intent.RefundedMinorUnits = 1000
 	}
 	cases := []struct {
@@ -853,7 +927,10 @@ func TestApplyProviderEventQuarantinesEveryRefusalWithItsOwnReason(t *testing.T)
 		{
 			name: "a kind this build does not act on",
 			delivery: func(w *paymentsWorld, i payments.Intent) ProviderDelivery {
-				return w.delivery("evt_1", "checkout.expired", i.ProviderCheckoutRef, "", 1000, "USD")
+				// A kind the adapter would report verbatim for an event this
+				// build has no rule for: not one of the port's two, and not a
+				// name this plane pretends to know.
+				return w.delivery("delivery_1", "an_unrecognised_kind", i.ProviderTransferRef, "", 1000, "USD")
 			},
 			want:      payments.ReasonUnknownKind,
 			claimsKey: true,
@@ -861,7 +938,7 @@ func TestApplyProviderEventQuarantinesEveryRefusalWithItsOwnReason(t *testing.T)
 		{
 			name: "an amount that is not the one this payment was opened for",
 			delivery: func(w *paymentsWorld, i payments.Intent) ProviderDelivery {
-				return w.delivery("evt_1", paymentprovider.KindCaptured, i.ProviderCheckoutRef, "pi_1", 999, "USD")
+				return w.delivery("delivery_1", paymentprovider.KindCaptured, i.ProviderTransferRef, "ref_1", 999, "USD")
 			},
 			want:      payments.ReasonAmountMismatch,
 			claimsKey: true,
@@ -869,7 +946,7 @@ func TestApplyProviderEventQuarantinesEveryRefusalWithItsOwnReason(t *testing.T)
 		{
 			name: "an amount the delivery does not state at all",
 			delivery: func(w *paymentsWorld, i payments.Intent) ProviderDelivery {
-				return w.noAmountDelivery("evt_1", paymentprovider.KindCaptured, i.ProviderCheckoutRef, "pi_1", "USD")
+				return w.noAmountDelivery("delivery_1", paymentprovider.KindCaptured, i.ProviderTransferRef, "ref_1", "USD")
 			},
 			want:      payments.ReasonAmountMismatch,
 			claimsKey: true,
@@ -877,7 +954,7 @@ func TestApplyProviderEventQuarantinesEveryRefusalWithItsOwnReason(t *testing.T)
 		{
 			name: "a currency that is not the one this payment is denominated in",
 			delivery: func(w *paymentsWorld, i payments.Intent) ProviderDelivery {
-				return w.delivery("evt_1", paymentprovider.KindCaptured, i.ProviderCheckoutRef, "pi_1", 1000, "EUR")
+				return w.delivery("delivery_1", paymentprovider.KindCaptured, i.ProviderTransferRef, "ref_1", 1000, "EUR")
 			},
 			want:      payments.ReasonCurrencyMismatch,
 			claimsKey: true,
@@ -886,7 +963,7 @@ func TestApplyProviderEventQuarantinesEveryRefusalWithItsOwnReason(t *testing.T)
 			name: "a payment that already has the final word on the money",
 			seed: succeeded,
 			delivery: func(w *paymentsWorld, i payments.Intent) ProviderDelivery {
-				return w.delivery("evt_1", paymentprovider.KindCaptured, i.ProviderCheckoutRef, "pi_1", 1000, "USD")
+				return w.delivery("delivery_1", paymentprovider.KindCaptured, i.ProviderTransferRef, "ref_1", 1000, "USD")
 			},
 			want:      payments.ReasonStateConflict,
 			claimsKey: true,
@@ -895,7 +972,7 @@ func TestApplyProviderEventQuarantinesEveryRefusalWithItsOwnReason(t *testing.T)
 			name:  "a capture for an account that is no longer active",
 			setup: func(_ *testing.T, w *paymentsWorld) { w.seedAccount(paymentsAccountID, identity.AccountSuspended) },
 			delivery: func(w *paymentsWorld, i payments.Intent) ProviderDelivery {
-				return w.delivery("evt_1", paymentprovider.KindCaptured, i.ProviderCheckoutRef, "pi_1", 1000, "USD")
+				return w.delivery("delivery_1", paymentprovider.KindCaptured, i.ProviderTransferRef, "ref_1", 1000, "USD")
 			},
 			want:      payments.ReasonAccountClosed,
 			claimsKey: true,
@@ -906,7 +983,7 @@ func TestApplyProviderEventQuarantinesEveryRefusalWithItsOwnReason(t *testing.T)
 				delete(w.accounts, identity.AccountID(paymentsAccountID))
 			},
 			delivery: func(w *paymentsWorld, i payments.Intent) ProviderDelivery {
-				return w.delivery("evt_1", paymentprovider.KindCaptured, i.ProviderCheckoutRef, "pi_1", 1000, "USD")
+				return w.delivery("delivery_1", paymentprovider.KindCaptured, i.ProviderTransferRef, "ref_1", 1000, "USD")
 			},
 			want:      payments.ReasonAccountClosed,
 			claimsKey: true,
@@ -917,7 +994,7 @@ func TestApplyProviderEventQuarantinesEveryRefusalWithItsOwnReason(t *testing.T)
 				w.setBucketStatus(accounting.FundingBucketID("bucket-"+paymentsAccountID), accounting.BucketClosed)
 			},
 			delivery: func(w *paymentsWorld, i payments.Intent) ProviderDelivery {
-				return w.delivery("evt_1", paymentprovider.KindCaptured, i.ProviderCheckoutRef, "pi_1", 1000, "USD")
+				return w.delivery("delivery_1", paymentprovider.KindCaptured, i.ProviderTransferRef, "ref_1", 1000, "USD")
 			},
 			want:      payments.ReasonBucketClosed,
 			claimsKey: true,
@@ -935,7 +1012,7 @@ func TestApplyProviderEventQuarantinesEveryRefusalWithItsOwnReason(t *testing.T)
 		{
 			name: "a refund ahead of the capture it refunds",
 			delivery: func(w *paymentsWorld, i payments.Intent) ProviderDelivery {
-				return w.delivery("evt_1", paymentprovider.KindRefunded, i.ProviderCheckoutRef, "pi_1", 400, "USD")
+				return w.delivery("delivery_1", paymentprovider.KindRefunded, i.ProviderTransferRef, "ref_1", 400, "USD")
 			},
 			want:      payments.ReasonRefundAheadOfCapture,
 			claimsKey: true,
@@ -944,7 +1021,7 @@ func TestApplyProviderEventQuarantinesEveryRefusalWithItsOwnReason(t *testing.T)
 			name: "a refund that states no amount at all",
 			seed: succeeded,
 			delivery: func(w *paymentsWorld, i payments.Intent) ProviderDelivery {
-				return w.noAmountDelivery("evt_1", paymentprovider.KindRefunded, "", "pi_1", "USD")
+				return w.noAmountDelivery("delivery_1", paymentprovider.KindRefunded, "", "ref_1", "USD")
 			},
 			// A refund with no figure is not a refund of zero and it is not a
 			// ceiling: this platform cannot tell how much went back, and the
@@ -959,7 +1036,7 @@ func TestApplyProviderEventQuarantinesEveryRefusalWithItsOwnReason(t *testing.T)
 			name: "a refund above what the capture took",
 			seed: succeeded,
 			delivery: func(w *paymentsWorld, i payments.Intent) ProviderDelivery {
-				return w.delivery("evt_1", paymentprovider.KindRefunded, "", "pi_1", 1001, "USD")
+				return w.delivery("delivery_1", paymentprovider.KindRefunded, "", "ref_1", 1001, "USD")
 			},
 			want:      payments.ReasonRefundCeiling,
 			claimsKey: true,
@@ -973,7 +1050,7 @@ func TestApplyProviderEventQuarantinesEveryRefusalWithItsOwnReason(t *testing.T)
 			name: "a refund against a payment that is already fully refunded",
 			seed: refunded,
 			delivery: func(w *paymentsWorld, i payments.Intent) ProviderDelivery {
-				return w.delivery("evt_1", paymentprovider.KindRefunded, "", "pi_1", 1200, "USD")
+				return w.delivery("delivery_1", paymentprovider.KindRefunded, "", "ref_1", 1200, "USD")
 			},
 			want:      payments.ReasonStateConflict,
 			claimsKey: true,
@@ -981,7 +1058,7 @@ func TestApplyProviderEventQuarantinesEveryRefusalWithItsOwnReason(t *testing.T)
 		{
 			name: "a delivery naming a payment this platform never opened",
 			delivery: func(w *paymentsWorld, i payments.Intent) ProviderDelivery {
-				return w.delivery("evt_1", paymentprovider.KindCaptured, "cs_not_ours", "pi_not_ours", 1000, "USD")
+				return w.delivery("delivery_1", paymentprovider.KindCaptured, "cs_not_ours", "ref_not_ours", 1000, "USD")
 			},
 			want:      payments.ReasonUnknownPayment,
 			claimsKey: false,
@@ -1054,13 +1131,13 @@ func TestARefusedDeliveryIsLabelledQuarantinedInTheEventLedger(t *testing.T) {
 	w := newPaymentsWorld(t)
 	intent := w.seedIntent(t, func(intent *payments.Intent) {
 		intent.Status = payments.StatusSucceeded
-		intent.ProviderPaymentRef = "pi_1"
+		intent.ProviderPaymentRef = "ref_1"
 	})
 	p := newPayments(w)
 
 	// A capture for a payment that already has the final word: recorded, and
 	// refused as a state conflict.
-	delivery := w.delivery("evt_conflict", paymentprovider.KindCaptured, intent.ProviderCheckoutRef, "pi_1", 1000, "USD")
+	delivery := w.delivery("delivery_conflict", paymentprovider.KindCaptured, intent.ProviderTransferRef, "ref_1", 1000, "USD")
 	outcome, err := p.ApplyProviderEvent(t.Context(), delivery)
 	if err != nil {
 		t.Fatalf("ApplyProviderEvent: %v", err)
@@ -1070,7 +1147,7 @@ func TestARefusedDeliveryIsLabelledQuarantinedInTheEventLedger(t *testing.T) {
 			outcome.Disposition, outcome.Reason, payments.ReasonStateConflict)
 	}
 
-	record, ok := w.eventRecord("evt_conflict")
+	record, ok := w.eventRecord("delivery_conflict")
 	if !ok {
 		t.Fatalf("the delivery was not recorded at all, so its retry would be a second quarantine row rather than a duplicate")
 	}
@@ -1103,12 +1180,12 @@ func TestARefusedDeliveryIsLabelledQuarantinedInTheEventLedger(t *testing.T) {
 func TestADeliveryThatCarriedItsClaimOutIsLabelledApplied(t *testing.T) {
 	w := newPaymentsWorld(t)
 	intent := w.seedIntent(t, func(intent *payments.Intent) {
-		intent.Status = payments.StatusCheckoutOpen
+		intent.Status = payments.StatusAwaitingTransfer
 	})
 	p := newPayments(w)
 
 	outcome, err := p.ApplyProviderEvent(t.Context(),
-		w.delivery("evt_capture", paymentprovider.KindCaptured, intent.ProviderCheckoutRef, "pi_1", 1000, "USD"))
+		w.delivery("delivery_capture", paymentprovider.KindCaptured, intent.ProviderTransferRef, "ref_1", 1000, "USD"))
 	if err != nil {
 		t.Fatalf("ApplyProviderEvent: %v", err)
 	}
@@ -1116,7 +1193,7 @@ func TestADeliveryThatCarriedItsClaimOutIsLabelledApplied(t *testing.T) {
 		t.Fatalf("the capture was answered %q/%q, want it applied", outcome.Disposition, outcome.Reason)
 	}
 
-	record, ok := w.eventRecord("evt_capture")
+	record, ok := w.eventRecord("delivery_capture")
 	if !ok {
 		t.Fatalf("the applied delivery was not recorded")
 	}
@@ -1161,8 +1238,8 @@ func TestApplyProviderEventRollsTheDeliveryAndTheCreditBackTogether(t *testing.T
 		if len(w.legs) != 0 {
 			t.Errorf("a failed delivery credited %d ledger legs", len(w.legs))
 		}
-		if got := w.storedIntent(t, intent.ID).Status; got != payments.StatusCheckoutOpen {
-			t.Errorf("the payment is %q after a rollback, want %q", got, payments.StatusCheckoutOpen)
+		if got := w.storedIntent(t, intent.ID).Status; got != payments.StatusAwaitingTransfer {
+			t.Errorf("the payment is %q after a rollback, want %q", got, payments.StatusAwaitingTransfer)
 		}
 	})
 
@@ -1188,12 +1265,13 @@ func TestApplyProviderEventRollsTheDeliveryAndTheCreditBackTogether(t *testing.T
 	})
 }
 
-// TestACaptureResolvesByItsCheckoutReferenceBeforeItsPaymentReference pins the
-// order of the two lookups. A capture carries both references, and the checkout
-// is the one this plane WROTE: it was recorded before the customer was sent
-// anywhere, so resolving through it lands the capture on the payment the
-// console opened rather than on whatever row happens to hold that payment id.
-func TestACaptureResolvesByItsCheckoutReferenceBeforeItsPaymentReference(t *testing.T) {
+// TestACaptureResolvesByItsTransferReferenceBeforeItsPaymentReference pins the
+// order of the two lookups. A capture carries both references, and the transfer
+// is the one this plane WROTE: the provider issued that destination for this one
+// payment and it was recorded before the customer was shown it, so resolving
+// through it lands the capture on the payment the console opened rather than on
+// whatever row happens to hold that payment id.
+func TestACaptureResolvesByItsTransferReferenceBeforeItsPaymentReference(t *testing.T) {
 	w := newPaymentsWorld(t)
 	intent, delivery := captureFixture(t, w)
 	p := newPayments(w)
@@ -1204,27 +1282,27 @@ func TestACaptureResolvesByItsCheckoutReferenceBeforeItsPaymentReference(t *test
 	if len(w.resolveLookups) == 0 {
 		t.Fatalf("the delivery resolved through no lookup at all")
 	}
-	if want := "checkout:" + intent.ProviderCheckoutRef; w.resolveLookups[0] != want {
+	if want := "transfer:" + intent.ProviderTransferRef; w.resolveLookups[0] != want {
 		t.Errorf("resolution tried %q first, want %q", w.resolveLookups[0], want)
 	}
 }
 
 // TestARefundResolvesByThePaymentReferenceItNames covers the reference a refund
 // delivery can carry and the reason the port has two fields rather than one. A
-// refund names the payment and never the session it was taken through, so a
-// lookup that only knew checkout references would leave every refund this
-// platform received recorded as a payment it could not find.
+// refund names the payment and never the destination it arrived at, so a lookup
+// that only knew transfer references would leave every refund this platform
+// received recorded as a payment it could not find.
 func TestARefundResolvesByThePaymentReferenceItNames(t *testing.T) {
 	w := newPaymentsWorld(t)
 	intent := w.seedIntent(t, func(intent *payments.Intent) {
 		intent.Status = payments.StatusSucceeded
-		intent.ProviderPaymentRef = "pi_1"
+		intent.ProviderPaymentRef = "ref_1"
 	})
 	p := newPayments(w)
 
-	// No checkout reference at all: the only route to this payment is the
+	// No transfer reference at all: the only route to this payment is the
 	// provider's payment id.
-	outcome, err := p.ApplyProviderEvent(t.Context(), w.delivery("evt_refund", paymentprovider.KindRefunded, "", "pi_1", 400, "USD"))
+	outcome, err := p.ApplyProviderEvent(t.Context(), w.delivery("delivery_refund", paymentprovider.KindRefunded, "", "ref_1", 400, "USD"))
 	if err != nil {
 		t.Fatalf("ApplyProviderEvent: %v", err)
 	}
@@ -1234,7 +1312,7 @@ func TestARefundResolvesByThePaymentReferenceItNames(t *testing.T) {
 	if outcome.IntentID != intent.ID {
 		t.Errorf("the refund resolved to %s, want %s", outcome.IntentID, intent.ID)
 	}
-	if want := "payment:pi_1"; !slicesContains(w.resolveLookups, want) {
+	if want := "payment:ref_1"; !slicesContains(w.resolveLookups, want) {
 		t.Errorf("resolution never tried %q; it tried %v", want, w.resolveLookups)
 	}
 	after := w.storedIntent(t, intent.ID)
@@ -1276,7 +1354,7 @@ func TestTwoPartialRefundsOfOnePaymentARecordedAsTwoCorrections(t *testing.T) {
 	w := newPaymentsWorld(t)
 	intent := w.seedIntent(t, func(intent *payments.Intent) {
 		intent.Status = payments.StatusSucceeded
-		intent.ProviderPaymentRef = "pi_1"
+		intent.ProviderPaymentRef = "ref_1"
 	})
 	p := newPayments(w)
 
@@ -1285,10 +1363,10 @@ func TestTwoPartialRefundsOfOnePaymentARecordedAsTwoCorrections(t *testing.T) {
 		reported int64
 		want     payments.Status
 	}{
-		{eventID: "evt_refund_a", reported: 400, want: payments.StatusPartiallyRefunded},
-		{eventID: "evt_refund_b", reported: 800, want: payments.StatusPartiallyRefunded},
+		{eventID: "delivery_refund_a", reported: 400, want: payments.StatusPartiallyRefunded},
+		{eventID: "delivery_refund_b", reported: 800, want: payments.StatusPartiallyRefunded},
 	} {
-		outcome, err := p.ApplyProviderEvent(t.Context(), w.delivery(refund.eventID, paymentprovider.KindRefunded, "", "pi_1", refund.reported, "USD"))
+		outcome, err := p.ApplyProviderEvent(t.Context(), w.delivery(refund.eventID, paymentprovider.KindRefunded, "", "ref_1", refund.reported, "USD"))
 		if err != nil {
 			t.Fatalf("refund %s: %v", refund.eventID, err)
 		}
@@ -1322,7 +1400,7 @@ func TestTwoPartialRefundsOfOnePaymentARecordedAsTwoCorrections(t *testing.T) {
 	if w.refundAmounts[0] != 400 || w.refundAmounts[1] != 800 {
 		t.Errorf("the refunds were recorded as %v, want [400 800]: each delivery hands the repository the provider's own cumulative figure", w.refundAmounts)
 	}
-	if w.refundRefs[0] != "pi_1" || w.refundRefs[1] != "pi_1" {
+	if w.refundRefs[0] != "ref_1" || w.refundRefs[1] != "ref_1" {
 		t.Errorf("the refunds were recorded under %v, want the payment reference both times: a charge-level refund names no individual refund", w.refundRefs)
 	}
 
@@ -1367,7 +1445,7 @@ func TestTheUncoveredRefundIsMeasuredAgainstThePaymentNotTheDelivery(t *testing.
 	bucketID := accounting.FundingBucketID("bucket-" + paymentsAccountID)
 	intent := w.seedIntent(t, func(intent *payments.Intent) {
 		intent.Status = payments.StatusSucceeded
-		intent.ProviderPaymentRef = "pi_1"
+		intent.ProviderPaymentRef = "ref_1"
 	})
 	// 10 units of the 1000-unit capture are still in the bucket; the rest has
 	// been spent, which is what makes a refund leave a shortfall at all.
@@ -1379,10 +1457,10 @@ func TestTheUncoveredRefundIsMeasuredAgainstThePaymentNotTheDelivery(t *testing.
 		reported int64
 		short    int64
 	}{
-		{eventID: "evt_refund_a", reported: 40, short: 30},
-		{eventID: "evt_refund_b", reported: 70, short: 60},
+		{eventID: "delivery_refund_a", reported: 40, short: 30},
+		{eventID: "delivery_refund_b", reported: 70, short: 60},
 	} {
-		outcome, err := p.ApplyProviderEvent(t.Context(), w.delivery(refund.eventID, paymentprovider.KindRefunded, "", "pi_1", refund.reported, "USD"))
+		outcome, err := p.ApplyProviderEvent(t.Context(), w.delivery(refund.eventID, paymentprovider.KindRefunded, "", "ref_1", refund.reported, "USD"))
 		if err != nil {
 			t.Fatalf("refund %s: %v", refund.eventID, err)
 		}
@@ -1422,11 +1500,11 @@ func TestARedeliveredRefundConvergesInsteadOfQuarantining(t *testing.T) {
 	w := newPaymentsWorld(t)
 	intent := w.seedIntent(t, func(intent *payments.Intent) {
 		intent.Status = payments.StatusSucceeded
-		intent.ProviderPaymentRef = "pi_1"
+		intent.ProviderPaymentRef = "ref_1"
 	})
 	p := newPayments(w)
 
-	first, err := p.ApplyProviderEvent(t.Context(), w.delivery("evt_refund_a", paymentprovider.KindRefunded, "", "pi_1", 400, "USD"))
+	first, err := p.ApplyProviderEvent(t.Context(), w.delivery("delivery_refund_a", paymentprovider.KindRefunded, "", "ref_1", 400, "USD"))
 	if err != nil {
 		t.Fatalf("the first refund: %v", err)
 	}
@@ -1435,7 +1513,7 @@ func TestARedeliveredRefundConvergesInsteadOfQuarantining(t *testing.T) {
 	}
 
 	// The same refunded state, a different delivery id.
-	again, err := p.ApplyProviderEvent(t.Context(), w.delivery("evt_refund_b", paymentprovider.KindRefunded, "", "pi_1", 400, "USD"))
+	again, err := p.ApplyProviderEvent(t.Context(), w.delivery("delivery_refund_b", paymentprovider.KindRefunded, "", "ref_1", 400, "USD"))
 	if err != nil {
 		t.Fatalf("the re-notified refund: %v", err)
 	}
@@ -1486,11 +1564,11 @@ func TestARedeliveredRefundInAFoldedCurrencyStillConverges(t *testing.T) {
 	w := newPaymentsWorld(t)
 	w.seedIntent(t, func(intent *payments.Intent) {
 		intent.Status = payments.StatusSucceeded
-		intent.ProviderPaymentRef = "pi_1"
+		intent.ProviderPaymentRef = "ref_1"
 	})
 	p := newPayments(w)
 
-	first, err := p.ApplyProviderEvent(t.Context(), w.delivery("evt_refund_a", paymentprovider.KindRefunded, "", "pi_1", 400, "USD"))
+	first, err := p.ApplyProviderEvent(t.Context(), w.delivery("delivery_refund_a", paymentprovider.KindRefunded, "", "ref_1", 400, "USD"))
 	if err != nil {
 		t.Fatalf("the first refund: %v", err)
 	}
@@ -1498,7 +1576,7 @@ func TestARedeliveredRefundInAFoldedCurrencyStillConverges(t *testing.T) {
 		t.Fatalf("the first refund was answered %q/%q, want it applied", first.Disposition, first.Reason)
 	}
 
-	folded, err := p.ApplyProviderEvent(t.Context(), w.delivery("evt_refund_b", paymentprovider.KindRefunded, "", "pi_1", 400, "usd"))
+	folded, err := p.ApplyProviderEvent(t.Context(), w.delivery("delivery_refund_b", paymentprovider.KindRefunded, "", "ref_1", 400, "usd"))
 	if err != nil {
 		t.Fatalf("the refund whose currency is folded: %v", err)
 	}
@@ -1532,7 +1610,7 @@ func TestARefundInAnotherCurrencyIsNotACeiling(t *testing.T) {
 	w := newPaymentsWorld(t)
 	intent := w.seedIntent(t, func(intent *payments.Intent) {
 		intent.Status = payments.StatusSucceeded
-		intent.ProviderPaymentRef = "pi_1"
+		intent.ProviderPaymentRef = "ref_1"
 		intent.RefundedMinorUnits = 1000
 	})
 	p := newPayments(w)
@@ -1540,7 +1618,7 @@ func TestARefundInAnotherCurrencyIsNotACeiling(t *testing.T) {
 	// 25000 is far above the 1000 already recognised, so this is NOT the
 	// convergence branch doing its job: the currency is what refuses it, and a
 	// check placed below the branch would have reached the ceiling instead.
-	outcome, err := p.ApplyProviderEvent(t.Context(), w.delivery("evt_refund_eur", paymentprovider.KindRefunded, "", "pi_1", 25000, "EUR"))
+	outcome, err := p.ApplyProviderEvent(t.Context(), w.delivery("delivery_refund_eur", paymentprovider.KindRefunded, "", "ref_1", 25000, "EUR"))
 	if err != nil {
 		t.Fatalf("the foreign-currency refund: %v", err)
 	}
@@ -1581,12 +1659,12 @@ func TestAnOlderRefundReportConvergesInsteadOfQuarantining(t *testing.T) {
 	w := newPaymentsWorld(t)
 	intent := w.seedIntent(t, func(intent *payments.Intent) {
 		intent.Status = payments.StatusPartiallyRefunded
-		intent.ProviderPaymentRef = "pi_1"
+		intent.ProviderPaymentRef = "ref_1"
 		intent.RefundedMinorUnits = 800
 	})
 	p := newPayments(w)
 
-	outcome, err := p.ApplyProviderEvent(t.Context(), w.delivery("evt_refund_older", paymentprovider.KindRefunded, "", "pi_1", 400, "USD"))
+	outcome, err := p.ApplyProviderEvent(t.Context(), w.delivery("delivery_refund_older", paymentprovider.KindRefunded, "", "ref_1", 400, "USD"))
 	if err != nil {
 		t.Fatalf("ApplyProviderEvent: %v", err)
 	}
@@ -1609,7 +1687,7 @@ func TestAnOlderRefundReportConvergesInsteadOfQuarantining(t *testing.T) {
 	if len(w.events) != 1 {
 		t.Fatalf("the ledger holds %d deliveries, want the one that arrived", len(w.events))
 	}
-	record, ok := w.eventRecord("evt_refund_older")
+	record, ok := w.eventRecord("delivery_refund_older")
 	if !ok {
 		t.Fatalf("the delivery was not recorded at all")
 	}
@@ -1774,49 +1852,54 @@ func TestListPaymentsRefusesWhatTheSurfaceRefuses(t *testing.T) {
 	}
 }
 
-// TestCheckoutURLForAnswersAnotherAccountsPaymentAsAMiss pins the shape of the
-// ownership refusal. The caller asked about a payment that is not its own, and
-// the answer is the one a genuinely absent row gets, because a distinct answer
-// for "not yours" turns the difference into a confirmation oracle.
-func TestCheckoutURLForAnswersAnotherAccountsPaymentAsAMiss(t *testing.T) {
+// TestTransferInstructionsForAnswersAnotherAccountsPaymentAsAMiss pins the
+// shape of the ownership refusal. The caller asked about a payment that is not
+// its own, and the answer is the one a genuinely absent row gets, because a
+// distinct answer for "not yours" turns the difference into a confirmation
+// oracle.
+func TestTransferInstructionsForAnswersAnotherAccountsPaymentAsAMiss(t *testing.T) {
 	w := newPaymentsWorld(t)
 	w.seedAccount(paymentsAccount2ID, identity.AccountActive)
-	intent := w.seedIntent(t, func(intent *payments.Intent) {
-		intent.CheckoutURL = "https://pay.example/checkout/mine"
-	})
+	intent := w.seedIntent(t, nil)
 	p := newPayments(w)
 
-	url, err := p.CheckoutURLFor(t.Context(), paymentsAccountID, intent.ID)
+	instructions, err := p.TransferInstructionsFor(t.Context(), paymentsAccountID, intent.ID)
 	if err != nil {
-		t.Fatalf("CheckoutURLFor: %v", err)
+		t.Fatalf("TransferInstructionsFor: %v", err)
 	}
-	// Verbatim, and never parsed: it is a promise the provider made and this
+	// Verbatim, and never parsed: they are a promise the provider made and this
 	// platform is keeping on the provider's behalf.
-	if url != "https://pay.example/checkout/mine" {
-		t.Errorf("CheckoutURLFor = %q, want the stored URL unchanged", url)
+	if instructions.TransferCode != w.providerInstructions.TransferCode ||
+		instructions.BankName != w.providerInstructions.BankName ||
+		instructions.AccountHolder != w.providerInstructions.AccountHolder ||
+		instructions.QRURL != w.providerInstructions.QRURL {
+		t.Errorf("TransferInstructionsFor = %+v, want the stored destination %+v unchanged", instructions, w.providerInstructions)
 	}
 
-	if _, err := p.CheckoutURLFor(t.Context(), paymentsAccount2ID, intent.ID); applicationCodeOf(t, err) != CodeNotFound {
+	if _, err := p.TransferInstructionsFor(t.Context(), paymentsAccount2ID, intent.ID); applicationCodeOf(t, err) != CodeNotFound {
 		t.Errorf("another account's payment was not answered as a miss")
 	}
 	missing := payments.IntentID("44444444-4444-4444-8444-444444444444")
-	if _, err := p.CheckoutURLFor(t.Context(), paymentsAccountID, missing); applicationCodeOf(t, err) != CodeNotFound {
+	if _, err := p.TransferInstructionsFor(t.Context(), paymentsAccountID, missing); applicationCodeOf(t, err) != CodeNotFound {
 		t.Errorf("a payment that does not exist was not answered as a miss")
 	}
 
-	// A payment whose checkout was never recorded answers an empty string
-	// rather than an error: the console renders no button, which is the truth.
+	// A payment that has not reached the provider has no destination, and the
+	// answer for it is the zero value rather than an error: the console renders
+	// no instructions, which is exactly what there are.
 	unopened := w.seedIntent(t, func(intent *payments.Intent) {
 		intent.Status = payments.StatusCreated
-		intent.ProviderCheckoutRef = ""
-		intent.CheckoutURL = ""
+		intent.ProviderTransferRef = ""
+		intent.ProviderBankName = ""
+		intent.ProviderAccountHolder = ""
+		intent.ProviderQRURL = ""
 	})
-	url, err = p.CheckoutURLFor(t.Context(), paymentsAccountID, unopened.ID)
+	instructions, err = p.TransferInstructionsFor(t.Context(), paymentsAccountID, unopened.ID)
 	if err != nil {
-		t.Fatalf("a payment with no checkout was refused: %v", err)
+		t.Fatalf("a payment with no destination was refused: %v", err)
 	}
-	if url != "" {
-		t.Errorf("a payment with no checkout answered URL %q, want empty", url)
+	if (instructions != payments.TransferInstructions{}) {
+		t.Errorf("a payment with no destination answered %+v, want nothing", instructions)
 	}
 }
 
@@ -1875,7 +1958,7 @@ func TestOffersPublishesTheDeclarationOrderAsACopy(t *testing.T) {
 // refusal. Which price a customer is charged may not depend on ordering, so a
 // catalogue that declares one offer id twice is a wiring defect rather than a
 // later-entry-wins, and the place to learn about it is construction rather than
-// the middle of a checkout.
+// the middle of a top-up.
 func TestNewTopUpCatalogueRefusesADuplicateIdentifier(t *testing.T) {
 	defer func() {
 		if recovered := recover(); recovered == nil {
