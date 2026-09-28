@@ -38,11 +38,20 @@ import (
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/adapters/inbound/http"
 	dataplaneadapter "github.com/ecoma-io/llm-gateway/apps/console-api/internal/adapters/outbound/dataplane"
+	// The payment provider adapter is aliased for the reason dataplaneadapter
+	// is, and here it is not only a convention: `paymentprovider` is also the
+	// alias internal/application gives the PORT this adapter implements, and
+	// the port package itself is named `payments` — the same name the DOMAIN
+	// package carries. A file that imported the port and the domain unaliased
+	// would have two different `payments.X` in it, so the adapter is named for
+	// what it is and this file names neither of the other two.
+	paymentprovideradapter "github.com/ecoma-io/llm-gateway/apps/console-api/internal/adapters/outbound/paymentprovider"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/adapters/outbound/postgres"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/application"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/config"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/accounting"
 	dataplaneport "github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/dataplane"
+	paymentsport "github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/payments"
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/ports/outbound/persistence"
 )
 
@@ -253,6 +262,26 @@ func main() {
 		postgres.NewClock(store),
 	)
 
+	// The payment integration's use cases (B15), or nothing at all when this
+	// deployment serves no payment surface. It is built HERE, beside the
+	// accounting primitives it funds through and before any listener opens, so
+	// that a payment configuration which cannot work is a startup line rather
+	// than a customer's failed checkout. The HTTP surface that serves it is
+	// composed BESIDE it and not inside it: paymentSurfaces below is what
+	// crosses the use cases into the transport's own vocabulary, and the two
+	// functions are separate so that neither holds both of this integration's
+	// secrets — that one is handed the API secret, because calling the provider
+	// needs it, and this one is handed the signing secret, because verifying a
+	// delivery needs that.
+	paymentsSurface, err := buildPaymentsSurface(store, accounting, cfg.Payments)
+	if err != nil {
+		log.Printf("console-api payments: %v", err)
+		os.Exit(1)
+	}
+	if paymentsSurface != nil {
+		log.Printf("console-api payments ready for provider %q", cfg.Payments.Provider)
+	}
+
 	// The Data Plane half of both loops: an HTTP client whose behaviour is
 	// deliberately the library default (the per-cycle deadlines below are what
 	// bound every call), and the adapter that speaks the management façade's
@@ -351,7 +380,7 @@ func main() {
 	defer stop()
 
 	server := &stdhttp.Server{
-		Handler: newHandler(version, store, sessions, reads, postgres.NewAnalytics(store), cfg.Analytics.Scope),
+		Handler: newHandler(version, store, sessions, reads, postgres.NewAnalytics(store), cfg.Analytics.Scope, paymentSurfaces(paymentsSurface, cfg.Payments)...),
 		// ReadHeaderTimeout guards against a peer that connects and says
 		// nothing — a slowloris costs a goroutine forever without it. The
 		// read/write body and idle timeouts wait until there is real traffic
@@ -717,6 +746,19 @@ const (
 // the navigation works, and only the data is missing. So the process refuses
 // to start rather than serve a surface it knows it cannot fill, and the error
 // names the constructor that refused so the line in the log is actionable.
+// The payment surface is OPTIONAL and arrives as a variadic for the reason the
+// constructor it forwards to takes one: a deployment that configures no
+// provider serves no payment surface, and the four payment rows then answer
+// fail-closed rather than being absent from the route table — they are part of
+// the declared contract, and a table with a hole in it is a contract a test
+// cannot read. See unwiredPaymentSurface for what those handlers answer and why
+// a 500 is the correct answer for a process that has recorded exactly nothing.
+//
+// It is a variadic rather than a fifth parameter every caller must fill: the
+// three callers in this package's own test pass no surface at all, and a test
+// that had to spell out a nil would be a test asserting the absence of a
+// feature it is not about. http.New refuses anything that is not exactly one
+// complete pair, so "optional" does not become "sometimes half-wired".
 func newHandler(
 	version string,
 	readiness persistence.Pinger,
@@ -724,6 +766,7 @@ func newHandler(
 	reads http.ConsoleReadUseCases,
 	analytics persistence.Analytics,
 	scopes map[string]string,
+	surface ...http.PaymentSurface,
 ) stdhttp.Handler {
 	// The scope table is the wiring of the usage surface and nothing else's.
 	// The table came out of config.Load, which has already refused an empty
@@ -745,7 +788,7 @@ func newHandler(
 		log.Printf("console-api analytics: the usage surface cannot be mounted: %v", err)
 		os.Exit(1)
 	}
-	return http.New(application.New(version), readiness, sessions, reads, usage)
+	return http.New(application.New(version), readiness, sessions, reads, usage, surface...)
 }
 
 // buildConsoleSurface is the wiring newHandler refuses to do for itself: it
@@ -801,6 +844,111 @@ func buildConsoleSurface(store persistence.Store, projectionLog persistence.Proj
 		return nil, nil, err
 	}
 	return sessions, reads, nil
+}
+
+// buildPaymentsSurface constructs the payment integration's use cases over the
+// ports they need, and returns nil when this deployment serves no payment
+// surface at all.
+//
+// The nil is a STATE rather than a failure, and there is exactly one way to be
+// in it: the payments group is off unless a deployment names it, and
+// config.Payments says so at length. A group that IS configured with an empty
+// offer list is emphatically not this state — it is a deployment that publishes
+// no top-up surface while still having payment history to list, and both
+// config.Payments and application.NewPayments document that as coherent. The
+// catalogue is therefore built from whatever the deployment declared, empty
+// included, and application.NewPayments is asked for the whole surface: a
+// console whose offers read answers an empty list is the correct answer to "I
+// sell nothing yet", and dropping the surface here would also drop the payments
+// an account already has.
+//
+// The three repositories arrive with their first caller. This function is that
+// caller, and the caller of THIS function is main, which builds it before the
+// listener opens so a provider that cannot be reached with the configuration it
+// was given is a startup refusal and not a 500 on a customer's first top-up.
+// Every failure it can report is a configuration one — the provider adapter and
+// the constructor both panic on a mistake rather than returning it, and each
+// panic is unreachable from a validated config.Payments.
+func buildPaymentsSurface(store persistence.Store, accountingUseCases *application.Accounting, cfg config.Payments) (*application.Payments, error) {
+	if cfg.Provider == "" {
+		return nil, nil
+	}
+
+	// The provider a deployment NAMES has to be a provider this build
+	// IMPLEMENTS, and the check is here rather than in config because the
+	// answer is a property of the code, not of the configuration's shape.
+	//
+	// The failure it prevents has no symptom. The only adapter this build
+	// carries speaks one provider's API and verifies one provider's signature
+	// scheme, so a deployment naming another would get them anyway: the
+	// process starts, logs that it is ready for the provider it named, and
+	// answers 400 "did not authenticate" to every genuine delivery from a
+	// provider it was never going to understand. The operator's next move is to
+	// suspect the endpoint secret, which is the one value that is certainly
+	// right — while the payments themselves are filed under a namespace no
+	// delivery can ever reach.
+	adapterName, known := paymentsport.ProviderName(cfg.Provider)
+	if !known {
+		return nil, fmt.Errorf(
+			"CONSOLE_API_PAYMENTS_PROVIDER %q names a provider this build has no adapter for; %q is the one it implements, and a webhook signed with another provider's scheme would be refused as unauthenticated for every delivery",
+			cfg.Provider, adapterName)
+	}
+
+	// The catalogue is built in DECLARATION ORDER, carrying the label, because
+	// both are things a chooser renders and the application's own catalogue
+	// keeps them for exactly that. It is a translation and not a price list:
+	// every figure below was validated by config.Payments, and this function
+	// chooses no price, no name and no order of its own.
+	//
+	// A duplicate id is refused by application.NewTopUpCatalogue with a panic,
+	// and config refuses the same thing at load time. The second refusal is not
+	// redundant belt-and-braces: it is the one that holds for a caller that
+	// never went through config, and which of two prices a customer is charged
+	// is not a question that may be settled by ordering.
+	offers := make([]application.TopUpOffer, 0, len(cfg.TopUpOffers))
+	for _, offer := range cfg.TopUpOffers {
+		offers = append(offers, application.TopUpOffer{
+			ID:                offer.ID,
+			AmountMinorUnits:  offer.AmountMinorUnits,
+			Currency:          offer.Currency,
+			MinorUnitExponent: offer.MinorUnitExponent,
+			Label:             offer.Label,
+		})
+	}
+	catalogue := application.NewTopUpCatalogue(offers)
+
+	// One accounting use case satisfies the three narrow interfaces the payment
+	// use case declares for itself, and the wideness is deliberate on the other
+	// side: the refund path holds a bucket READER, the delivery path holds the
+	// account-funding opener, and the credit holds TopUp — one method, because
+	// the correction primitive is the one a third party's message must never
+	// reach. Handing the use case itself is what the interface is for: the port
+	// did not have to be smeared across three adapters to stay narrow.
+	//
+	// The provider adapter holds the API secret and the verifier holds the
+	// signing secret, which is why the constructor below is handed the first and
+	// not the second — the webhook path's verifier is composed by the seam that
+	// serves it.
+	provider := paymentprovideradapter.New(cfg.APIBaseURL, cfg.SecretKey, cfg.RequestTimeout)
+
+	return application.NewPayments(
+		store,
+		postgres.NewPaymentIntents(store),
+		postgres.NewPaymentEvents(store),
+		postgres.NewPaymentQuarantine(store),
+		postgres.NewClock(store),
+		postgres.NewAccounts(store),
+		accountingUseCases,
+		accountingUseCases,
+		accountingUseCases,
+		provider,
+		catalogue,
+		application.PaymentsSettings{
+			Provider:           cfg.Provider,
+			ProviderAccountKey: cfg.ProviderAccountKey,
+			CheckoutReturnURL:  cfg.CheckoutReturnURL,
+		},
+	), nil
 }
 
 // run serves until the process is asked to stop, then drains.

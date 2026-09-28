@@ -202,6 +202,16 @@ type Config struct {
 	// would be a survivable guess. This one answers "whose", and a default
 	// would be a report about somebody's spend served to anybody.
 	Analytics Analytics
+
+	// Payments is how this process reaches the external payment provider:
+	// where it is, what this process presents to it, where the customer is
+	// sent back to, and the two bounds that govern one call and one delivery.
+	// It is a group of its own rather than fields on DataPlane because the
+	// peer is a third party holding money rather than the other plane holding
+	// state, and it is the one group here that may be absent: a deployment
+	// that says nothing about payments runs no payment surface, while a
+	// deployment that says something about them must say all of it.
+	Payments Payments
 }
 
 // Analytics holds the credential-to-account resolution the usage read model
@@ -444,6 +454,11 @@ func Load(lookup LookupEnv) (Config, error) {
 		return Config{}, err
 	}
 	cfg.Analytics = analytics
+	payments, err := loadPayments(lookup)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Payments = payments
 
 	if err := validateAddr(cfg.Addr); err != nil {
 		return Config{}, err

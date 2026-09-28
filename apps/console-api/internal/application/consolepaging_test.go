@@ -264,7 +264,7 @@ func TestEveryPageCarriesACursorAndHasMoreIsTheOnlyEndOfCollection(t *testing.T)
 	ident := func(s string) string { return s }
 
 	t.Run("a full page with no probe row is the end", func(t *testing.T) {
-		items, hasMore, next := PageOf([]string{"a", "b", "c"}, 3, ident, list, filters)
+		items, hasMore, next := PageOf([]string{"a", "b", "c"}, 3, ident, list, filters, "")
 		if hasMore {
 			t.Error("has_more = true for a page the probe row did not extend; a full page is the end of the collection")
 		}
@@ -282,7 +282,7 @@ func TestEveryPageCarriesACursorAndHasMoreIsTheOnlyEndOfCollection(t *testing.T)
 		// exhausted. The reverse of this is the bug — treating a short page as
 		// "there may be more" forever leaves a console paging until it stops
 		// getting rows for a reason that has nothing to do with the data.
-		items, hasMore, next := PageOf([]string{"a", "b"}, 3, ident, list, filters)
+		items, hasMore, next := PageOf([]string{"a", "b"}, 3, ident, list, filters, "")
 		if hasMore {
 			t.Error("has_more = true with no probe row; a short page is the end when the probe did not extend it")
 		}
@@ -299,7 +299,7 @@ func TestEveryPageCarriesACursorAndHasMoreIsTheOnlyEndOfCollection(t *testing.T)
 		// The probe is asked for and then discarded: items holds AT MOST the
 		// limit the caller asked for. Handing the extra row back would let a
 		// caller render limit+1 rows while believing it asked for limit.
-		items, hasMore, next := PageOf([]string{"a", "b", "c"}, 2, ident, list, filters)
+		items, hasMore, next := PageOf([]string{"a", "b", "c"}, 2, ident, list, filters, "")
 		if !hasMore {
 			t.Error("has_more = false with a probe row present; continuing is worth it")
 		}
@@ -354,7 +354,7 @@ func TestEveryPageCarriesACursorAndHasMoreIsTheOnlyEndOfCollection(t *testing.T)
 		seen := map[string]int{}
 		after := ""
 		for pageNumber := 0; pageNumber < 10; pageNumber++ {
-			items, _, next := PageOf(fetch(after), 2, ident, list, filters)
+			items, _, next := PageOf(fetch(after), 2, ident, list, filters, after)
 			for _, row := range items {
 				seen[row]++
 			}
@@ -366,8 +366,9 @@ func TestEveryPageCarriesACursorAndHasMoreIsTheOnlyEndOfCollection(t *testing.T)
 				t.Fatal("the walk did not terminate within ten pages of a seven-row collection")
 			}
 		}
-		if after != "" {
-			t.Errorf("the walk ended at %q, want the empty position of a walk with nothing left to read", after)
+		if after != "k7" {
+			t.Errorf("the walk ended at %q, want %q: the final empty page repeats the position the walk asked for, rather than naming a start-of-collection position that was never a row",
+				after, "k7")
 		}
 		for row, count := range seen {
 			if count != 1 {
@@ -386,7 +387,7 @@ func TestEveryPageCarriesACursorAndHasMoreIsTheOnlyEndOfCollection(t *testing.T)
 		// the one that must not happen: the empty position is the one before the
 		// first row, so a client that stored it would re-read the whole
 		// collection on every request and never advance.
-		items, hasMore, next := PageOf[string](nil, 2, ident, list, filters)
+		items, hasMore, next := PageOf[string](nil, 2, ident, list, filters, "")
 		if items == nil {
 			t.Error("items = nil; the contract's `items` is an array, and null is not one")
 		}
@@ -399,12 +400,32 @@ func TestEveryPageCarriesACursorAndHasMoreIsTheOnlyEndOfCollection(t *testing.T)
 		}
 	})
 
+	t.Run("an empty page reached PAST a row repeats the position it was asked from", func(t *testing.T) {
+		// The case F4 of the review pass describes: page 1 returned rows and a
+		// cursor naming one of them, and by the time page 2 is asked for the
+		// collection is empty. The old behaviour minted a cursor naming the
+		// empty string — which is the START of the collection, not the end, and
+		// a client holding it re-reads page 1 forever. The position this page
+		// was asked FROM is the truth about where the walk stands, and the
+		// cursor is re-encoded from it: resuming on it asks for the rows after
+		// k2, which is where the walk was, rather than restarting from the
+		// beginning.
+		items, hasMore, next := PageOf[string](nil, 2, ident, list, filters, "k2")
+		if items == nil || len(items) != 0 || hasMore {
+			t.Fatalf("items = %v has_more = %v, want an empty page and no continuation", items, hasMore)
+		}
+		assertAPlaceableCursor(t, list, filters, next)
+		if after := cursorAfter(t, next, list, filters); after != "k2" {
+			t.Errorf("the cursor names position %q, want the %q this page was asked from: an empty page must not be told it is at the start of the collection", after, "k2")
+		}
+	})
+
 	t.Run("a cursor only means something in its own collection and filters", func(t *testing.T) {
 		// PageOf mints the cursor and ResolvePage checks it, and the check is
 		// the only thing standing between a caller and a page from another walk.
 		// Asserting it here rather than trusting it is what makes the two
 		// functions one contract.
-		_, _, next := PageOf([]string{"a", "b", "c"}, 2, ident, list, filters)
+		_, _, next := PageOf([]string{"a", "b", "c"}, 2, ident, list, filters, "")
 		if _, _, err := ResolvePage(list, next, 2, filters); err != nil {
 			t.Errorf("the cursor PageOf minted was refused by ResolvePage for the same list and filters: %v", err)
 		}

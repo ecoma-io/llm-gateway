@@ -16,9 +16,7 @@
 # The gateway's product domains (accounts, keys, subscriptions, usage) are
 # not designed yet. When one arrives, its contract changes here first and the
 # implementation follows it, never the reverse — see AGENTS.md, "The API
-# contract is the OpenAPI document". The usage read model's own fragment is
-# `./shared/analytics.yaml`: it answers from the Control Plane's own derived
-# state, and the fragment is where what it is allowed to say is declared.
+# contract is the OpenAPI document".
 openapi: 3.1.0
 info:
   title: Ecoma LLM Gateway — Console API
@@ -32,19 +30,32 @@ info:
     Plane's own dependencies are not answering returns HTTP 503 and the
     `service_unavailable` code.
 
-    The surface has two halves that meet at the credential on the request. The
+    The surface has two halves that meet at the session cookie. The
     **session surface** — sign-in, the current principal, sign-out — is the
     only part reachable without one, and the only part that writes nothing but
     the session itself. The **product surface** is everything else, and every
-    operation on it authorizes against the account the request's credential
-    names. That credential is the session cookie for all of them but one: the
-    usage operation accepts `consoleCredential` instead, a bearer credential for
-    the caller that has no browser at all — a script, a scheduled report, an
-    operator's tooling — because a session is a thing a browser holds and this
-    surface is not only read by browsers.
+    operation on it requires a session and authorizes against the account that
+    session names.
+
+    The session credential is declared as `sessionCookie` in
+    `components.securitySchemes` and named by every operation that requires
+    one; the operations that require none say so with an empty `security`
+    list rather than leaving it to a reader to infer, exactly as the Data
+    Plane's management contract does.
+
+    Exactly one operation in this document is on neither half, and the reason
+    it is here at all is that its route is this application's:
+    `POST /payment-webhooks/{provider}` is called by the payment provider's
+    servers and never by a browser, and it is authenticated by a cryptographic
+    signature over the raw request body rather than by a session cookie. It
+    declares no security requirement — `security: []`, which is a statement
+    that no cookie and no token is asked for on this row — sends no CORS
+    header, and has no client-side use — a console page's only correct number
+    of calls to it is zero — and a client generated from this document must
+    not publish it as a callable function.
 
     The account is never a path segment and never a query parameter the
-    caller sets. It comes from the credential, always; a resource the caller's
+    caller sets. It comes from the session, always; a resource the session's
     account does not own is a 404 the query did not return, not a 403 a filter
     turned into one. Unsafe methods additionally require a same-origin
     `Origin` and a JSON content type, which no cross-site HTML form can
@@ -55,11 +66,6 @@ info:
     `./shared/console.yaml`, alongside the session types — one fragment rather
     than a second document, because the repository holds exactly three OpenAPI
     documents, one per application (AGENTS.md rule 2).
-
-    Usage is on it. Its scope is derived from the credential on the request
-    and never named by the caller, so the rule above about the account never
-    being a parameter is a property of the statement rather than a convention
-    this surface asks its handlers to remember.
 servers:
   - url: /
 tags:
@@ -74,9 +80,7 @@ tags:
       The session surface. Sign-in, the current principal and sign-out — the
       three operations reachable without a session, and the only three that
       do. Sign-in is the sole unauthenticated write on this surface: it
-      creates the session cookie every other BROWSER operation requires — the
-      usage operation is the one that takes a bearer credential instead
-      (`consoleCredential`), for the caller that holds no cookie at all.
+      creates the session cookie every other operation requires.
   - name: account
     description: >-
       The session's own account: its dashboard, its plan catalogue, and the
@@ -105,6 +109,25 @@ tags:
       Read-only: acknowledging a finding records an operator's decision, and
       that write is a separate change with its own contract. A finding is
       evidence, not a repair path, and nothing on this surface refunds anyone.
+  - name: payments
+    description: >-
+      Funding the account: the payments a customer opened, and the top-up
+      offers they open them against. The offers are published here read-only,
+      because a chooser cannot be rendered from a price the client does not
+      know, and reading a price is not setting one: a payment is opened by
+      naming a server-owned OFFER and never by sending an amount — the server
+      prices the offer, and a client that could set a price could charge itself
+      whatever it liked. Its outcome is equally not a client's to decide: a
+      payment moves only when the provider's servers say so, so every status
+      here is something a page READS after the fact and can never make true.
+  - name: webhooks
+    description: >-
+      The payment provider's delivery endpoint, and the only tag in this
+      document with no console operation under it. It is authenticated by a
+      signature over the raw body rather than by a session, it is never called
+      by a browser, and it is declared here because the route belongs to this
+      application — not because a console may reach it. A client generated
+      from this document must not publish it.
   - name: usage
     description: >-
       The account's usage read model — derived figures over a bounded range, at
@@ -126,7 +149,6 @@ tags:
       invisible in the output, an integer being an integer regardless of what
       the field is called (docs/architecture/analytics.md §10.2). A figure this
       surface cannot source honestly is one it does not serve.
-
 paths:
   /healthz:
     get:
@@ -137,6 +159,12 @@ paths:
       description: >-
         Returns 200 while the process is able to serve. Anything more than
         "is the process alive" belongs to /readyz, not here.
+
+        It declares no security requirement: a probe is called by an
+        orchestrator that holds no session and could not present one, and a
+        liveness check that demanded a credential would fail for a reason that
+        has nothing to do with whether the process is alive.
+      security: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
       responses:
@@ -167,6 +195,12 @@ paths:
         and only its database. The Data Plane is never among them: this
         service is ready when it can serve the console, whether or not the
         runtime is reachable.
+
+        It declares no security requirement, exactly as /healthz does: a probe
+        that needed a session would report this deployment unready whenever the
+        orchestrator had none, which is a lie about this process's
+        dependencies.
+      security: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
       responses:
@@ -198,6 +232,12 @@ paths:
         Returns the version stamped into the console-api binary at build time.
         It is the repository release version when the release lane supplies
         one, and "dev" for an unstamped local build.
+
+        It declares no security requirement for the same reason the two probes
+        above do, and it is grouped with them deliberately: the three were
+        exempted from the `no-store` rule together, and they are exempted from
+        the session together.
+      security: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
       responses:
@@ -260,6 +300,14 @@ paths:
         sign-in that failed still costs the credential comparison, and the
         comparison is constant-time, so the wall time of a rejection does not
         answer whether the account exists.
+
+        It declares no security requirement, and it could not declare one: it
+        is the operation that CREATES the session every other operation
+        presents, so a requirement here would be a credential that cannot
+        exist yet. The 401 below is not that requirement failing — it is the
+        credential in the body not matching, which is why it shares one
+        answer with a removed user and an invited row.
+      security: []
       requestBody:
         required: true
         content:
@@ -367,6 +415,13 @@ paths:
         and the client treats it as one: the browser is not a security
         boundary, and every product operation re-checks the session
         server-side regardless of what this said.
+
+        It requires the session cookie, declared here rather than left to the
+        prose above: without that cookie the answer is the 401 below, so a
+        caller generated from this document can be told the credential is a
+        precondition instead of discovering it from a status.
+      security:
+        - sessionCookie: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
       responses:
@@ -402,6 +457,19 @@ paths:
         of, so the second call answers 204 whether or not there was anything
         to end — and a caller who cares can read the cookie's absence as the
         answer.
+
+        It declares NO security requirement, and the absence is the design
+        rather than an omission. Every other product operation fails closed on
+        a missing cookie; this one must not, because the caller that has just
+        lost its session is exactly the caller that needs a sign-out to
+        finish — a requirement here would refuse the one call whose whole
+        purpose is to make the absence durable, and a client generated from
+        this document would be told it may not call sign-out until it can
+        prove what it no longer has. The credential it does accept when
+        present is the same `sessionCookie` scheme the rest of the surface
+        names; the row simply treats its absence as "there is nothing to
+        revoke" rather than as a refusal.
+      security: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
       responses:
@@ -449,6 +517,8 @@ paths:
         The composition is a use case in `internal/application`, not a new
         layer, and the operation is declared here so the contract and the
         implementation are the same review.
+      security:
+        - sessionCookie: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
       responses:
@@ -494,6 +564,8 @@ paths:
         account comes from the session, and the query carries the predicate
         with it — not as a filter applied afterwards, but as a `WHERE` clause,
         so another account's row is a row the query never returned.
+      security:
+        - sessionCookie: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
         - name: state
@@ -557,6 +629,8 @@ paths:
         was minted with is not in this table, was never stored in it, and is
         not recoverable from it — the one time it exists is the mint's
         response.
+      security:
+        - sessionCookie: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
         - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
@@ -621,6 +695,8 @@ paths:
         the query's account predicate is what stops a key landing under an
         account the caller did not name — because there is no account to
         name.
+      security:
+        - sessionCookie: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
       requestBody:
@@ -689,6 +765,8 @@ paths:
         Read-only. Publishing, retiring and adding a grant definition are
         commercial acts with their own review, and a console that could
         publish a plan would be a second place a price becomes real.
+      security:
+        - sessionCookie: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
         - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
@@ -739,6 +817,8 @@ paths:
         a row carrying a future `cancel_at` would be describing a decision
         that has not taken effect yet, and one that renders the two
         separately is telling the operator the truth about both.
+      security:
+        - sessionCookie: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
         - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
@@ -789,6 +869,8 @@ paths:
         would be showing nothing — there is no such column, deliberately,
         because a third copy of the same number with no rebuild story is how
         two consoles start disagreeing about what a customer bought.
+      security:
+        - sessionCookie: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
         - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
@@ -850,6 +932,8 @@ paths:
         closes when the cycle ends, while an account bucket is the PAYG
         balance and does not roll. A list that merged them would render two
         sets of figures with incompatible meanings side by side.
+      security:
+        - sessionCookie: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
         - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
@@ -908,6 +992,8 @@ paths:
         twice. The `direction` filter exists because operators read a ledger
         for two different questions — what came in, and what went out — and
         the two are not the same read.
+      security:
+        - sessionCookie: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
         - name: funding_bucket_id
@@ -971,6 +1057,334 @@ paths:
           $ref: "./shared/errors.yaml#/components/responses/InternalError"
 
   # ---------------------------------------------------------------------------
+  # Payments: funding the account.
+  #
+  # The other half of the accounting section above — a `topup` leg is written
+  # because one of these completed, and never because a client said so. The
+  # three operations here are what a customer can choose, the money coming in,
+  # and neither of them moves money with a card: the payment is a hosted
+  # checkout the customer completes on the provider's own page, and this
+  # process never sees a card number, a CVV or a cardholder field. There is no
+  # type here for one to arrive in.
+  # ---------------------------------------------------------------------------
+
+  /top-up-offers:
+    get:
+      operationId: listTopUpOffers
+      tags:
+        - payments
+      summary: The top-up offers this deployment sells
+      description: >-
+        What a customer may choose to top up with: each offer's identifier, the
+        amount it charges, the currency that amount is in, and a label to
+        render. It is the price list, and a console that rendered a top-up
+        chooser without it would be asking a customer to name an offer they
+        could not see — a blind POST, which is not a screen.
+
+        This is the ONLY operation on this surface that publishes a price, and
+        publishing it read-only is what keeps the design whole rather than
+        breaking it. The request side still names an OFFER and never an amount:
+        `CreatePaymentIntentRequest` carries no `amount_minor_units` and no
+        `currency`, and nothing here changes that. Showing a price and being
+        able to set one are different powers, and they are held by different
+        operations — a client that reads these figures is reading what the
+        server charges, not choosing it.
+
+        The offers are this DEPLOYMENT's own configuration rather than
+        anybody's rows: a price this plane decides, not a fact about an
+        account. That is why the operation is not account-scoped, carries no
+        account parameter, and returns the same list to every session that may
+        fund itself.
+
+        The response is deliberately not a `PageEnvelope`, and the reason is
+        the one this repository already gives for rejecting page numbers: a
+        cursor names a POSITION, and a fixed price list has no position to
+        name. There is no `total` either — a count maintained for a list that
+        arrives whole would be a number that goes stale for nobody's benefit.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The offers this deployment publishes.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/TopUpOfferList"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+
+  /payment-intents:
+    get:
+      operationId: listPaymentIntents
+      tags:
+        - payments
+      summary: The account's payments, newest first
+      description: >-
+        The account's payments, keyset-paged, newest first. The cursor is a
+        payment's own id and it is unique, so a page can neither skip a
+        payment nor read one twice, and the id is minted in time order, so a
+        page is very nearly a slice of the account's payment history in the
+        order it happened.
+
+        The list is the account's payments and **only** the account's. The
+        account comes from the session, and the query carries the predicate
+        with it — as a `WHERE` clause and not as a filter applied to rows
+        already fetched — so another account's payment is a row the query
+        never returned.
+
+        Nothing on this read decides anything about a payment: an intent's
+        status was written by a signed delivery from the provider's servers,
+        and a page that rendered a payment as settled is rendering the
+        provider's word as this plane recorded it. That is why the console
+        reloads a payment after sending a customer to checkout instead of
+        assuming the answer from the redirect.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+        - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
+        - $ref: "./shared/console.yaml#/components/parameters/PageLimit"
+      responses:
+        "200":
+          description: One page of the account's payments, newest first.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/PaymentIntentPage"
+        "400":
+          description: A pagination parameter does not satisfy the contract.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+    post:
+      operationId: createPaymentIntent
+      tags:
+        - payments
+      summary: Open a payment against a top-up offer
+      description: >-
+        Opens a payment for the top-up the customer chose, and answers with it.
+        The request names an OFFER and the server prices it: `amount_minor_units`
+        and `currency` are not fields of the request and cannot be, because a
+        client-supplied amount is not a smaller version of a policy, it is the
+        absence of one. A price is a decision this platform makes about what a
+        top-up costs, in the currency it settles in; a client that could send
+        one could charge itself one minor unit or a billion, and the server
+        would have no rule to refuse either. The offer resolves, here and
+        server-side, into an amount the request never carried.
+
+        The response is the payment, and it is durable **before** the provider
+        is called: the intent is written first because the provider's own
+        idempotency key is derived from the payment's identity, and a key
+        derived from something that does not exist until after the call is a
+        key that cannot make a retry the same request. That ordering is also
+        what makes the 503 below safe to retry.
+
+        A retried request carrying the same `idempotency_key` converges: it is
+        answered with the payment the account already has, the same `id` and
+        the same checkout, rather than opening a second one. The 201 is the
+        answer on both the first call and the converged repeat, because the
+        client asked for a payment and now holds it; which of the two happened
+        is not a difference a page may act on, so the contract does not make
+        one available.
+
+        Nothing here decides that a payment succeeded. The provider does, from
+        its own servers, at an endpoint no browser can call — see
+        `POST /payment-webhooks/{provider}` — and a console learns the outcome
+        by re-reading the payment.
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "./shared/console.yaml#/components/schemas/CreatePaymentIntentRequest"
+      responses:
+        "201":
+          description: >-
+            The payment, priced and durable. It is the account's own payment,
+            created under the session's account and never under one the
+            request could name, and a repeat under the same idempotency key
+            answers with this same payment rather than a second one. The same
+            201 answers both the first call and the converged repeat, and the
+            converged answer may carry a payment in a LATER state than the one
+            this call's request would have opened — including a payment that
+            has already succeeded. Which of the two happened is not a
+            difference a page may act on, so the contract does not make one
+            available: a client renders the payment it was handed, and a
+            retry after a customer already paid does not send them to a
+            checkout again.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/PaymentIntent"
+        "400":
+          description: >-
+            The body does not satisfy the contract, and exactly four things
+            earn it — a list stated in full because each member is a refusal a
+            client can act on, and because a cause this operation cannot
+            produce would be a promise the next reader would build against.
+
+            A body that is not one JSON object: bytes that do not decode, an
+            empty body, a stream carrying more than one JSON value, or a body
+            larger than this surface reads. The refusal is the same for all
+            four because the answer is the same — there is no request here to
+            price.
+
+            An offer this deployment does not publish. An offer named blank,
+            and a request that leaves the member out entirely, are the same
+            answer and not a separate cause: neither is a name the catalogue
+            holds, and a price this surface invented for one would be a charge
+            nobody configured. `GET /top-up-offers` is where the offers that
+            would not be refused are published.
+
+            A missing or blank idempotency key, because a top-up without one
+            is a top-up the server cannot tell from a second deliberate
+            top-up: the key is the caller's own statement that two requests
+            are one act, and the server will not guess it on their behalf.
+
+            An idempotency key longer than the `maxLength` this schema
+            states. The bound is enforced rather than merely declared, and
+            the enforcement sits in the application — where the key's meaning
+            lives — rather than in this operation's body decoder, so a
+            refusal from there reaches a client as this status and is listed
+            here for that reason. A client that sent a longer key has a
+            bounded key available to it and cannot use this one; the refusal
+            is the honest answer rather than a truncation this surface
+            performed on the caller's identity for the top-up.
+
+            One thing is deliberately NOT on that list, and it is said out
+            loud because a reader could otherwise take it from the schema. An
+            unknown member is not refused: the body decoder this operation
+            uses is the surface's one decoder and it accepts a member it does
+            not know rather than rejecting the request over it, so this
+            response is not where an unknown field is answered. A request in
+            a representation this operation does not parse is refused `415`,
+            declared below and not here — a malformed JSON body and a media
+            type this surface will not read are two different refusals with
+            two different recoveries.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
+        "403":
+          $ref: "./shared/console.yaml#/components/responses/CrossOriginRequest"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "409":
+          description: >-
+            The request is well-formed and this server's own state refuses it,
+            and the code is `conflict`. It is not a 400 and the difference is
+            the client's next move: there is nothing wrong with the request to
+            correct, and no edit to it would help — asking again in the same
+            way fails the same way until something else changes, and the
+            client cannot see what that something is.
+
+            One state produces it today: an account whose own state does not
+            permit a new payment. It is refused here rather than at a later
+            screen, because the money would land somewhere this account cannot
+            currently use — a suspended or closed account may not fund itself
+            — and the code is `conflict` rather than `invalid_request` for the
+            reason above: the body is well-formed, no edit to it would help,
+            and the account's state is the fact that has to change.
+
+            The idempotency key is deliberately NOT a second cause. A repeated
+            key is the caller saying two requests are ONE act, and the answer
+            to that is the payment the key already names — a 201, whether the
+            repeat arrives a second later or after the customer has paid.
+            Turning a repeat into a refusal would break the very protection
+            the key exists to provide, and it would say "you asked twice" where
+            the caller's actual situation is "you asked once and did not hear
+            the answer".
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "415":
+          $ref: "./shared/console.yaml#/components/responses/NonJSONRequest"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+        "503":
+          description: >-
+            The payment provider that would open the checkout did not answer,
+            so there is no checkout to send the customer to. The code is
+            `upstream_unavailable`: the condition is the provider's and is
+            expected to clear, so the caller retries later rather than
+            differently.
+
+            The payment itself is durable and is NOT lost — it exists in
+            `created` with a null `checkout_url`, written before the provider
+            was called precisely so that this case has something to retry
+            against. A retry under the same idempotency key converges on that
+            same payment and opens the checkout this attempt could not, which
+            is the retry the provider's own key semantics are built to absorb.
+            The key is required of every attempt for exactly this reason: an
+            attempt without one could not be retried as the same request at
+            all.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+
+  # ---------------------------------------------------------------------------
   # Reconciliation: what the worker found.
   # ---------------------------------------------------------------------------
 
@@ -994,6 +1408,8 @@ paths:
         anybody, and a correction to an append-only ledger is a **new
         adjustment leg** naming the entry it corrects — an operator's act with
         an `operator_id` on it, never a button on a findings table.
+      security:
+        - sessionCookie: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
         - name: status
@@ -1064,6 +1480,8 @@ paths:
         indistinguishable. The half-open window is returned as its two halves
         because a window rendered as an inclusive pair is one an operator
         cannot tell from one that overlapped the last.
+      security:
+        - sessionCookie: []
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
         - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
@@ -1099,6 +1517,333 @@ paths:
           $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
         "500":
           $ref: "./shared/errors.yaml#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # The payment provider's delivery endpoint.
+  #
+  # The one operation in this document that is not a console operation, and the
+  # only reason it is declared here at all is that its route belongs to this
+  # application. It is called by the provider's servers; it is authenticated by
+  # a signature over the raw request body; it carries no session, no security
+  # scheme and no CORS. The browser guards every other unsafe method on this
+  # surface carries — the same-origin `Origin`, the JSON content type, the
+  # double-submit token — must NOT be attached to it: a provider has no origin,
+  # no cookie and no session, and an operation that demanded one would be an
+  # operation the provider could never call.
+  #
+  # A client generated from this document must not publish a function for it.
+  # The correct number of times for a console page to make this request is
+  # zero, which is also the whole of what a page must know about it.
+  # ---------------------------------------------------------------------------
+
+  /payment-webhooks/{provider}:
+    post:
+      operationId: receiveProviderWebhook
+      tags:
+        - webhooks
+      summary: One delivery from the payment provider — never a console call
+      description: >-
+        This operation is called by the payment provider's servers. It is not
+        called by the console, it is not called by any browser, and it must
+        never be invoked from browser code: it is authenticated by a
+        cryptographic signature computed over the exact bytes of the request
+        body with a signing secret only the provider and this deployment hold,
+        and NOT by a session cookie. The request carries no session, no origin
+        and no double-submit token. A client generated from this document must
+        not expose it as a callable function, and a console page's only correct
+        response to this operation existing is to never call it.
+
+        The signature covers the RAW BYTES, and the raw bytes are what are
+        verified. The body is never parsed and re-serialised before
+        verification, because a decoded object has lost its whitespace, its
+        key order, its duplicate keys and its number spellings, and a
+        signature computed over that authenticates something the provider
+        never sent. The header below carries the signature; the path segment
+        is an ADDRESS, not a request parameter, and this process answers for
+        exactly one of them — see the parameter and the 404 below.
+
+        The statuses are a deliberate and unusual shape, and the rule that
+        produces them is one sentence: **2xx means "this event needs no
+        further delivery from you"**. Applied, already recorded as a duplicate,
+        and quarantined are all 2xx with one identical body, because the only
+        decision the provider makes from this response is whether to send the
+        event again. A quarantined delivery is one this build authenticated
+        and cannot interpret — an event kind it has no rule for, a schema
+        version ahead of it — and it is recorded, where it can be, as an
+        operator's work item; refusing it would put a permanent refusal into
+        the provider's retry budget, and a retry storm is what comes out of
+        that.
+
+        400 has exactly one meaning, and the sentence above is what keeps it
+        narrow: this delivery may not be acted on, and never will be. Five
+        things earn it, and every one of them is a fact about the DELIVERY
+        rather than a verdict on its contents — which is the property that
+        makes the status safe to hand a provider, because a 4xx says "do not
+        send this again" and the provider's next attempt carries these same
+        bytes. In the order the branches run: the body declared a
+        Content-Encoding this endpoint will not decode, because a compressed
+        body is not the body that was signed; it declared a Content-Type that
+        cannot carry the JSON this endpoint verifies; it is larger than the
+        read bound, and the bound is what an operator is told rather than the
+        size that arrived, because producing that figure would mean reading a
+        body precisely because it is too large to read; the delivery did not
+        authenticate — the signature header absent, appearing more than once,
+        or unequal to what this deployment computes over these exact bytes;
+        or it authenticated and is STALE, arriving outside the freshness
+        tolerance this deployment allows between the moment the provider signed
+        it and the moment it was received, which is a replay rather than a
+        delivery, and this plane refuses it for the same reason it refuses a
+        forged one — a signature proves who sent a message, and the tolerance
+        is what makes it proof about a MOMENT. A redelivery of a stale event
+        carries the same signed timestamp, so a retry could only repeat the
+        refusal, which is why none of the five belongs in the provider's retry
+        budget. Each has its own log line, so an operator can tell a malformed
+        delivery from a forged one from a replayed one.
+
+        It is NOT the answer to a delivery this build authenticated and cannot
+        read — that is a 200, and the two must not share a status. A refusal
+        for authenticity and a refusal for readability are opposite events, an
+        attack or a misconfiguration against a provider bug, and a status that
+        meant both would be a status an operator cannot monitor: the responses
+        they call for have nothing in common, and a 400 cannot say which one
+        happened. Keeping them apart is also what keeps the rule above total
+        rather than "2xx means we used it, except sometimes", and a retry
+        would buy nothing anyway — the provider's next attempt carries the
+        SAME bytes, so a tenth reading could not find what the first did not.
+
+        5xx is declared for exactly one situation — nothing was durably
+        recorded — because that is the only case in which a redelivery can
+        change the outcome.
+
+        Nothing here names an account and nothing here is authorized against
+        one. A delivery names a reference; the reference resolves to a payment
+        THIS PLANE CREATED, and that payment carries the account and the
+        funding bucket fixed when it was opened. The account is a consequence
+        of a stored row rather than of anything the payload said, because a
+        signature proves who sent a message and not what the message may do.
+
+        A 404 here is about the ADDRESS rather than the message, and it is
+        reached before the signature is: this deployment serves one provider,
+        the path segment must name it, and a delivery addressed to any other
+        is refused without a header being read or a byte of the body being
+        taken. That is the whole of why it exists — the alternative is what
+        this row would do without it: verify every delivery to every path
+        against the one configured secret, so that a mistyped endpoint URL
+        answers the provider "did not authenticate" for a URL that was never
+        served, and an operator hunts a signing-secret problem that is not
+        there.
+      security: []
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+        - name: provider
+          in: path
+          required: true
+          description: >-
+            The provider this delivery is addressed to, and the value this
+            deployment answers for is the provider name it was configured
+            with — the same name that selects the adapter, the signing secret
+            and the event vocabulary. It is not a selector a caller sets: a
+            delivery addressed to any other value is refused `404` before a
+            header is read or a byte of the body is taken, and the refusal is
+            about the ADDRESS rather than the message — the path is declared
+            and the segment is simply not served, so no signature is ever
+            computed over a body sent here. One provider exists today, and a
+            second arrives as a code change with its own contract change, not
+            as a string a caller picks.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+        - name: Stripe-Signature
+          in: header
+          required: true
+          description: >-
+            The signature header this deployment's provider signs its
+            deliveries with, spelled exactly as that provider spells it — the
+            adapter reads this one name and no other. It is a fixed name of
+            this contract and not a slot a caller fills in: the deployment
+            speaks exactly one provider, that provider's signature scheme
+            fixes the header, and a second provider arrives as a code change
+            with its own contract change rather than as a string a caller
+            picks. A delivery whose signature arrives only under some other
+            header name is one this deployment cannot verify, and it is
+            refused 400 — the same answer as a delivery carrying no signature
+            at all, because it is the same fact seen twice: this is the name
+            the check reads, and nothing else on the request is read as a
+            signature.
+
+            The value is the provider's signature over the exact bytes of the
+            request body, together with the timestamp the provider signed it
+            at, in the provider's own element syntax. It must be present, and
+            it must appear at most once — a request carrying two is refused
+            rather than resolved to either, because accepting "the first of
+            several" is how a smuggled value wins — and it is compared against
+            the signature this deployment computes in constant time. Absent,
+            repeated, or unequal is a 400: the delivery did not authenticate,
+            and a wrong signature will be wrong again. So is a signature that
+            is correct over a MOMENT this deployment no longer accepts: the
+            provider's signature covers a timestamp as well as the body, this
+            deployment bounds how old a signed delivery may be, and a delivery
+            outside that bound is refused as a replay. No request carries that
+            bound — it is configuration — and the two refusals share one
+            status because they share one property: neither becomes usable on
+            a second attempt.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 1024
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              description: >-
+                The provider's own event, exactly as it sent it. Its members
+                are the provider's vocabulary, and this contract deliberately
+                fixes none of them: the bytes are what the signature covers
+                and what an adapter interprets, and a schema here would be this
+                repository's opinion about somebody else's payload. The one
+                thing this document asserts about the body is that it is JSON,
+                which is what makes a signature over the raw bytes the right
+                check at all.
+      responses:
+        "200":
+          description: >-
+            The delivery needs no further delivery. ONE response, with one
+            identical body, for every outcome an authenticated delivery can
+            have — applied, an already-recorded duplicate, a quarantine, and a
+            delivery whose event cannot be read at all — and that is the design
+            rather than a simplification, because this is the rule with no
+            exceptions rather than a rule with some. Applied and duplicate
+            answer the same way because the event's effect, if it had one, is
+            already durable. A quarantine answers the same way because the
+            alternative is a permanent refusal retried forever. An unreadable
+            delivery answers the same way because a retry could only resend
+            these very bytes. Applied, duplicate and quarantined deliveries are
+            recorded where they can be, and the body names no disposition, so a
+            provider's implementation cannot branch on one, which is a decision
+            it has no business making.
+
+            A delivery that authenticated but carries no readable event id is
+            LOGGED rather than stored, and the distinction is the reason this
+            response is a 200 instead of a 4xx. The record of a delivery is
+            keyed by the event id it reports, and an id that is absent is not a
+            key anything can be deduplicated on: a row written under it would
+            swallow the NEXT unreadable delivery as a duplicate, and reporting
+            a real event as already seen is worse than reporting nothing at
+            all. The operator reads the log line; the provider is told to stop
+            sending this one either way.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/WebhookAcknowledgement"
+        "400":
+          description: >-
+            This delivery may not be acted on, and never will be. The code is
+            `invalid_request`, and there are exactly five ways to earn it. In
+            the order the branches run: the body declared a Content-Encoding
+            this endpoint will not decode — a compressed body is not the body
+            that was signed; it declared a Content-Type that cannot carry the
+            JSON this endpoint verifies; it is larger than the read bound; the
+            delivery did not authenticate — the signature header is absent,
+            appears more than once, or does not equal what this deployment
+            computes over these exact bytes; or it authenticated but is STALE,
+            arriving outside the freshness tolerance this deployment allows
+            between the moment the provider signed it and the moment it was
+            received, which is a replay rather than a delivery. None becomes
+            usable on a second attempt: a malformed body carries its own
+            defect, a wrong signature will be wrong again, and a redelivery
+            re-sends the same signed timestamp.
+
+            The one thing this response deliberately does NOT cover is a body
+            this build cannot read. An authenticated delivery whose event is
+            unreadable is answered 200, because a status that meant both would
+            be a status an operator could not monitor, and a signature failure
+            and a provider bug are not one event. The refusal is a 4xx rather
+            than a 5xx on purpose: a 400 keeps a permanently unusable delivery
+            out of the provider's retry budget, which is the one thing a
+            provider's retry could not fix.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "404":
+          description: >-
+            The delivery is addressed to a provider this deployment does not
+            serve. This is not the shared `NotFound` the rest of the document
+            answers an unmatched path with, and the difference is the whole
+            point of the status: the path IS declared — this operation is
+            right here — and it is the path SEGMENT that is not served, so a
+            caller that read "no operation is declared at the requested path"
+            would go looking for a typo in the operation name instead of at
+            the provider name in the URL.
+
+            The refusal is about the ADDRESS and not about the message, and it
+            is reached first: the configured provider name is compared with
+            the segment before the signature header is read and before a byte
+            of the body is taken, so this response says nothing about whether
+            the delivery would have authenticated. An operator reads it as a
+            URL mistake — the endpoint name in the provider's dashboard does
+            not match the provider this deployment was configured with — which
+            is why it is a 404 rather than a 400 that would send them hunting
+            a signing-secret problem that does not exist. A 4xx keeps the
+            delivery out of the provider's retry budget either way, and a
+            redelivery to the same wrong address is refused identically:
+            nothing was read, and nothing was recorded.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          description: >-
+            Nothing was durably recorded, and the code is `internal`. This is
+            the ONE case in which a redelivery can change the outcome, and it
+            is the only 5xx here for that reason: the delivery is not on file,
+            no state moved, and the provider's next attempt is the correct
+            next step rather than a repetition of a decision already made.
+            Internal causes are logged against the request identifier and
+            never serialized.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+
+  # ---------------------------------------------------------------------------
+  # The one security scheme this document declares, named by every operation
+  # that requires a session and by no operation that does not. It sits here
+  # rather than in a fragment for the reason the fragments exist in the first
+  # place: `shared/` holds shapes more than one document reaches for, and this
+  # scheme is this document's alone — the Data Plane's façade declares a service
+  # identity of its own, and the two must not be able to be mistaken for one
+  # another. The prose is the contract (AGENTS.md, "The API contract is the
+  # OpenAPI document"): the machine-readable half below is what a client
+  # generator reads, and the sentences are what tell a human why the shape is
+  # what it is.
+  # ---------------------------------------------------------------------------
 
   /usage:
     get:
@@ -1315,8 +2060,49 @@ paths:
             application/json:
               schema:
                 $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+
 components:
   securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-console_session
+      description: >-
+        The console's session, presented by the browser that holds it: the
+        only credential this surface accepts, and a cookie rather than a
+        bearer token because the caller population is browsers. The browser
+        attaches it to every same-origin request by itself, no page script
+        ever reads its value — it is `HttpOnly` — and a credential that cannot
+        be read is a credential that cannot be pasted into a request built
+        somewhere else. Its value is an opaque 256-bit identifier, the session
+        row it names stores only the SHA-256 digest of it, and the `Secure`,
+        `SameSite=Strict` and `Path=/` attributes are part of the credential
+        rather than conveniences around it; the `SessionCookie` header states
+        the same value from the response's side.
+
+        An operation that requires this credential names it in its own
+        `security`, and an operation that requires none says `security: []`.
+        The empty list is not a gap left for a reader to fill in: it is the
+        statement that no cookie is asked for on that row, and the difference
+        matters in both directions. Declared the other way round, this scheme
+        would tell a generated client that sign-in needs a session — the one
+        operation that creates one — that sign-out needs a session a caller
+        has just lost, and that a probe needs a session an orchestrator has
+        never had.
+
+        It is not the only guard on a write, and it is the only SCHEME here.
+        Every unsafe operation additionally clears a same-origin `Origin`, a
+        JSON content type and a double-submit header, and none of those is a
+        second security scheme because none of them is a credential: each is
+        a check that a browser made this request rather than a script on
+        another site, they are enforced together and cannot be satisfied
+        separately, and a client that could choose among them would be a
+        client choosing which half of its own CSRF protection to perform. The
+        webhook at `POST /payment-webhooks/{provider}` declares `security: []`
+        as well, for the one reason a row on this surface can: it is
+        authenticated by a signature over the request body that only the
+        provider's servers and this deployment can compute, so no cookie is
+        asked for and none would help.
     consoleCredential:
       type: http
       scheme: bearer

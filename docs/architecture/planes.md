@@ -69,6 +69,7 @@ applied.
 | `plans`, `subscriptions`, `entitlements`                                                  | Control Plane | Decided here: what an account is allowed and expected to consume. The runtime sees only the capacity this produces, as a grant.                                                                                                                                                                                                                                    |
 | `funding_buckets`                                                                         | Control Plane | The ledger's bucket: maintained in the same transaction as its legs and rebuildable from them. It is the source of truth for money, which is the one thing the runtime must not hold (ADR 0004).                                                                                                                                                                   |
 | `settlements`, `ledger_entries`                                                           | Control Plane | Money. Written from the usage facts the runtime observed, idempotently by `request_id`.                                                                                                                                                                                                                                                                            |
+| `payment_intents`, `payment_events`, `payment_quarantine`                                 | Control Plane | Money, and the one door a customer drives. What this platform asked an external provider to charge, the deliveries whose signature it verified, and the ones it could not apply. The provider owns no row here and the browser redirect is not an authority, so a payment's status moves only on a verified server-to-server event (ADR 0013).                     |
 | `request_intake`                                                                          | Data Plane    | Observed here: idempotent replay must be decidable inside the admission transaction from relational state alone, and admission is the runtime's (ADR 0004).                                                                                                                                                                                                        |
 | `reservations` (+ allocation legs)                                                        | Data Plane    | Observed here: the runtime creates the hold and closes it, and the hot path must be able to draw down and release with the Control Plane down.                                                                                                                                                                                                                     |
 | Quota projection                                                                          | Data Plane    | Projected here: the lockable capacity row admission guards on, seeded from Control-Plane grants and written only by the runtime. Not a balance — an enforcement ceiling that converges to the ledger (ADR 0004).                                                                                                                                                   |
@@ -166,6 +167,17 @@ surface, and provider credentials and API-key hashes never appear in a console
 response. The exact network exposure is a deployment decision; the
 architectural contract is that the management surface is internal (ADR 0006,
 section 11).
+
+B15 adds the one public route whose caller is not a browser holding a session:
+the payment provider's own servers post to `POST /payment-webhooks/{provider}`
+on `console-api`. It sits outside the `/api` prefix precisely because it is not
+the console's API — it is authenticated by a signature over the exact request
+bytes rather than by a credential this platform issued, and it is the only
+public route on either plane that can move money
+(ADR [0013](../adr/0013-payment-integration.md)). Everything a payment does on
+the console's own surface is a read of what such a delivery already wrote; the
+browser that returns from a hosted checkout refreshes a status and cannot set
+one.
 
 ## What this page does not decide
 

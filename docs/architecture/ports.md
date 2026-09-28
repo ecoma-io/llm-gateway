@@ -134,3 +134,95 @@ Control Plane's call asks the Data Plane to change something the Data Plane
 owns, so it is a command the Data Plane can refuse rather than a read it
 answers from what it already recorded ([cross-plane
 protocols](cross-plane-protocols.md)).
+
+## The payment chain, end to end
+
+The payment integration (ADR [0013](../adr/0013-payment-integration.md)) is the
+second flow that crosses every layer on this page, and it is worth reading
+downward for a different reason than the fact feed: the fact feed shows how a
+plane boundary is kept, and this shows how a layer boundary is kept when the
+other end of the wire is a third party that does not share this repository's
+vocabulary, its database, or its trust.
+
+It has two directions, and which one carries financial authority is the whole
+design.
+
+**Outbound — a customer decides to fund their account.**
+
+```text
+console (browser)                          POST /payment-intents with an OFFER;
+   │                                       never an amount — the server prices it
+   ▼
+console-api adapters/inbound/http          the handler — the account comes from the
+   │                                       SESSION, never from the body or the path
+   ▼
+console-api application                    Payments.BeginCheckout — writes the intent
+   │                                       FIRST, then calls the provider OUTSIDE the
+   │                                       transaction, then records the checkout
+   ▼
+console-api ports/outbound/payments        Checkout.OpenCheckout — the interface the
+   │                                       use case is written against
+   ▼
+console-api adapters/outbound/paymentprovider   the provider's endpoint shape, its
+                                           headers, its idempotency key, its amount
+                                           encoding — all facts about THEM, none of
+                                           which appears above this line
+```
+
+**Inbound — the provider says what happened. This direction, and only this
+direction, may credit an account.**
+
+```text
+payment provider's servers                POST /payment-webhooks/{provider}
+   │
+   ▼
+console-api adapters/inbound/http          the handler: reads the body as BYTES, never
+   │                                       parses it, and verifies the signature over
+   │                                       those exact bytes. A bad signature is a
+   │                                       400 and nothing is written anywhere
+   ▼
+console-api ports/outbound/payments        WebhookVerifier — Verify(headers, rawBody).
+   │                                       This package does not import net/http, so no
+   │                                       implementation can be handed a parsed body
+   ▼
+console-api adapters/outbound/paymentprovider   the provider's header name, its HMAC
+   │                                       scheme and its event vocabulary live here
+   │                                       and are normalized into the port's two kinds
+   ▼
+console-api application                    Payments.ApplyProviderEvent — ONE unit of work:
+   │                                       record the delivery, resolve the payment from
+   │                                       the STORED reference, check the claim against
+   │                                       the domain, CAS the status, credit last
+   ▼
+console-api ports/outbound/persistence     PaymentEvents / PaymentIntents / PaymentQuarantine
+   │                                       — every write refuses to run outside a unit
+   │                                       of work
+   ▼
+console-api adapters/outbound/postgres     the three tables in `control`, and the unique
+                                           key that makes a redelivery a duplicate
+                                           rather than a second credit
+```
+
+Four things this chain demonstrates, and each is why a layer is shaped the way
+it is:
+
+- **The provider is local infrastructure, not a second seam.**
+  `ports/outbound/payments` is reached over the public internet, and its peer
+  owns no row of ours — which is exactly what distinguishes it from `dataplane`
+  and is asserted in `internal/arch/packages_test.go` rather than argued. The
+  first direction may fail for a week without the inference path noticing.
+- **A verification is not a decision.** The adapter answers one question — "is
+  this ours, and what does it claim?" — and knows nothing about intents,
+  accounts or buckets. If the adapter could resolve an event to an account, it
+  would be an adapter with the authority to move a customer's money. The
+  resolution is the application's, against a row this plane wrote.
+- **The bytes that are verified are the bytes that are interpreted.** This is a
+  property of the port's signature rather than a rule in a comment: `Verify`
+  takes `[]byte`, and `net/http` is not imported here at all. A decoded body has
+  lost its whitespace, key order and number spellings, and an HMAC over a
+  re-serialisation authenticates a message that was never sent.
+- **The two directions are joined by a row, not by a return value.** The
+  customer's browser returning from the hosted checkout reaches the first
+  direction's list and re-reads a status. It cannot set one. The only writer of
+  a status from `checkout_open` to `succeeded` is the second direction, which is
+  the whole of why a redirect is not financial authority.

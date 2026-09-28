@@ -41,6 +41,39 @@ const (
 	// refusal itself is the session surface's to make.
 	CodeUnauthenticated Code = "unauthenticated"
 
+	// CodeConflict says the request is well-formed and the server's own state
+	// refuses it — the caller asked for something that is not available from
+	// here, and asking again in the same way will fail the same way until
+	// something else changes.
+	//
+	// It is separated from CodeInvalidRequest because the two call for
+	// different client behaviour, and conflating them makes one of those
+	// behaviours wrong. An invalid request is the client's mistake and its
+	// correct response is to change the request; a conflict is not the
+	// client's mistake, and a client that "fixed" it by mutating its payload
+	// would be guessing at server state it cannot see. A payment top-up asked
+	// for on a suspended account is the case this exists for: there is
+	// nothing wrong with the request, and there is no edit to it that would
+	// help.
+	CodeConflict Code = "conflict"
+
+	// CodeUpstreamUnavailable says a dependency this plane does not control —
+	// the payment provider — did not answer, or answered that it is unwell.
+	//
+	// It is separated from CodeInternal because the two call for opposite
+	// client behaviour, and this is the only code in the vocabulary whose
+	// correct answer is RETRY. The condition is the provider's, it is expected
+	// to clear, and the request was never faulted: a client that retried an
+	// internal error would be reporting a bug, and a client that did not retry
+	// this one would be abandoning a top-up that is about to become possible.
+	// The contract names both directions — "the caller retries later rather
+	// than differently" — and the durable payment it leaves behind is what
+	// makes that retry converge on the payment it already has.
+	//
+	// It is NOT a 5xx for the payment: nothing about the payment is unwell, and
+	// the payment exists in `created` either way.
+	CodeUpstreamUnavailable Code = "upstream_unavailable"
+
 	// CodeInternal says the application cannot complete a request safely.
 	// Its public representation is deliberately generic at the transport edge.
 	CodeInternal Code = "internal"
@@ -85,6 +118,13 @@ func InvalidRequest(message string) *Error {
 	return &Error{Code: CodeInvalidRequest, Message: message}
 }
 
+// Conflict returns an error for a request the server's own state refuses. The
+// message says what is not available from here and never what would make it
+// available, because that is a decision an operator makes rather than a client.
+func Conflict(message string) *Error {
+	return &Error{Code: CodeConflict, Message: message}
+}
+
 // invalidRequest is InvalidRequest for this package's own refusals, where the
 // message is written at the point that knows what was wrong with the input.
 func invalidRequest(message string) *Error {
@@ -112,6 +152,15 @@ func UnresolvedCredential() *Error {
 // fixed public message "internal error".
 func Internal(cause error) *Error {
 	return &Error{Code: CodeInternal, cause: cause}
+}
+
+// UpstreamUnavailable returns an error for a dependency that did not answer.
+// The cause is kept for the server and never serialized, for the same reason
+// Internal's is: a provider's own prose is written for an operator holding a
+// credential, and the status, the code and the request identifier are what a
+// caller acts on.
+func UpstreamUnavailable(cause error) *Error {
+	return &Error{Code: CodeUpstreamUnavailable, cause: cause}
 }
 
 // App holds the use-cases this process currently exposes. It is concrete on

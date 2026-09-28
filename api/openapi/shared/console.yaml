@@ -46,6 +46,13 @@ components:
         served against the new filter, because a page reached through a
         mismatched cursor is a page whose rows belong to a question the caller
         is no longer asking.
+
+        An empty page's `next_cursor` names the position the page was REQUESTED
+        FROM, so paging past the end holds the walk where it is rather than
+        restarting it: a client that pages once more gets the same empty page
+        and `has_more: false`, and an empty position — the one before the first
+        row — is only ever named by the FIRST page of a walk that is empty from
+        the start.
       schema:
         $ref: "#/components/schemas/Cursor"
     PageLimit:
@@ -104,7 +111,26 @@ components:
         The probes are exempt because they carry no account data and caching
         them is harmless, which is also why they are exempt by enumeration
         rather than by a rule: a reader sees three exempt paths rather than
-        having to evaluate a policy.
+        having to evaluate a policy. They are also the ONLY exempt responses,
+        and the payment provider's webhook is the case worth naming because a
+        reader would expect to find it on that list: no browser calls that
+        operation, no browser reads its answer, and the answer carries neither
+        a secret nor any account's data, so an argument for exempting it can
+        be made. The argument loses to a mechanical fact about where the
+        answer is written. Every response this surface produces goes through
+        one of the same two writers — the JSON writer and the error writer —
+        and both set `Cache-Control: no-store` unconditionally, before any
+        handler has an opinion about it. That includes the webhook's: the 200
+        for a delivery that was recorded or already known, the 400 for one
+        that did not authenticate, and the 404 for a provider this deployment
+        does not serve. An exemption would therefore be an edit to a writer
+        rather than a sentence in a contract, and it would put a per-path hole
+        in a rule that is otherwise total — the exempt list is exactly three
+        paths long, which is what makes it checkable, and a fourth entry
+        invented in prose would be indistinguishable from the exemption
+        somebody forgot to remove. The webhook's response blocks declare this
+        header for that reason, and not because the provider's servers keep a
+        cache.
       schema:
         type: string
         example: no-store
@@ -723,6 +749,413 @@ components:
           format: date-time
       additionalProperties: false
 
+    # -------------------------------------------------------------------------
+    # Payments.
+    #
+    # Money coming IN, and the two shapes a screen renders of it: the request
+    # that names an offer, and the payment that results. The amount is never
+    # the client's to name — `CreatePaymentIntentRequest` states why at length
+    # — and a payment's state is never the browser's to decide: every move
+    # `PaymentIntentState` describes is made from a signed delivery the
+    # provider's servers sent to `POST /payment-webhooks/{provider}`, so the
+    # only way a client ever learns that a payment succeeded is by reading one
+    # of these after the fact.
+    # -------------------------------------------------------------------------
+
+    CurrencyCode:
+      type: string
+      minLength: 3
+      maxLength: 3
+      pattern: "^[A-Z]{3}$"
+      description: >-
+        An ISO 4217 currency code: exactly three letters, uppercase. It is a
+        named schema because two shapes carry one — the price an offer
+        publishes and the payment that price becomes — and the two must not be
+        able to drift, because an offer's currency IS the currency of the
+        payment it opens. The server normalises to this form before storing or
+        returning a code, so the pattern describes everything that reaches a
+        client rather than imposing an obligation on one: a client may rely on
+        what it is handed, and need not repair it.
+
+    PaymentIntentState:
+      type: string
+      enum:
+        - created
+        - checkout_open
+        - requires_action
+        - succeeded
+        - failed
+        - cancelled
+        - expired
+        - partially_refunded
+        - refunded
+        - quarantined
+      description: >-
+        Where a payment stands. It is the provider's account of the money and
+        never the client's: a payment moves because a signed delivery said so,
+        and no operation on this surface can set this field.
+
+        `created` is a payment this platform opened **before** it called the
+        provider, and it is a durable state rather than a moment: the
+        provider's own idempotency key is derived from the payment's identity,
+        so the payment has to exist before the call that can fail.
+        `checkout_open` is a customer at the provider's hosted page who has
+        not finished, and `requires_action` is the provider asking them for
+        one more step — a separate state rather than a flag, because the
+        customer's next act is different and a console that rendered the two
+        alike would be telling them to do something the provider did not ask
+        for. `succeeded` is the one irreversible move: it is the only state
+        from which a funding leg is written, and every balance on a bucket
+        follows from it. `expired` and `cancelled` are LOCAL decisions — this
+        platform stopped waiting, or the customer walked away — and neither is
+        a fact about the money, which is why a delivery arriving later still
+        funds the customer: the provider is the only party that gets to say
+        whether they paid. `partially_refunded` and `refunded` describe money
+        the provider gave back, which changes what the customer keeps and not
+        what was funded. `quarantined` is the one member a payment never moves
+        into: it is what a delivery that authenticated and could not be
+        interpreted is recorded as, so an operator reads one state vocabulary
+        rather than two, and the payment's own status stays whatever the money
+        says it is.
+
+    PaymentIntent:
+      type: object
+      description: >-
+        One payment: what this platform asked the provider to charge, and what
+        became of it. The amount was priced **here**, from the offer the
+        customer named, and it is the figure the ledger is credited with when
+        a signed delivery reports the capture — the two are compared, and a
+        delivery that disagrees funds nothing.
+
+        `checkout_url` is the provider's own page, returned verbatim and never
+        parsed: it is a promise the provider makes and this plane keeps on the
+        provider's behalf. The status is the provider's word and cannot be set
+        by a client — a browser that decided a payment had succeeded would be
+        deciding the instant a customer's balance moved.
+      required:
+        - id
+        - status
+        - amount_minor_units
+        - currency
+        - minor_unit_exponent
+        - checkout_url
+        - created_at
+        - expires_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: >-
+            This platform's identifier for the payment, minted here. It is
+            what the provider is handed as the payment's reference, so a
+            delivery names a payment this plane created rather than one the
+            payload asked for.
+        status:
+          $ref: "#/components/schemas/PaymentIntentState"
+        amount_minor_units:
+          type: integer
+          format: int64
+          maximum: 9007199254740991
+          description: >-
+            What the customer is charged, in integer minor units of
+            `currency`, and the figure the ledger is credited with. It is
+            bounded by `Number.MAX_SAFE_INTEGER` — 2^53 − 1 — and the bound is
+            a fact about the CLIENT rather than about the ledger: the console
+            is JavaScript, where an integer above that value has no exact
+            representation, so an amount this surface returned above it would
+            be a figure the console could not compare, add or send back
+            without silently rounding it. The ledger holds 64-bit money; the
+            ceiling is stated here because this surface's only reader cannot
+            read past it.
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+          description: >-
+            The currency the amount is denominated in. It is on a payment
+            although it is deliberately absent from `Money`, because a payment
+            is denominated in whatever the customer was charged in — a fact
+            about a transaction with a third party — rather than in this
+            platform's own settlement unit. A delivery reporting another
+            currency is refused rather than converted: this plane has no rate
+            and no authority to pick one.
+        minor_unit_exponent:
+          type: integer
+          minimum: 0
+          maximum: 4
+          description: >-
+            How many decimal places `currency` is written to, on the same
+            terms `TopUpOffer` states: 0 for a currency with no minor unit, up
+            to 4 for the few the standard writes further. It travels with the
+            payment and not only with the offer, because a payment is read
+            long after the offer that priced it may have been withdrawn — the
+            exponent is a property of the currency the customer was charged
+            in, and a client that had to look it up in the live price list
+            would render a historical payment as a different amount the day
+            that offer was removed. The amount is integer minor units and
+            nothing here places the decimal point for the client; this is the
+            figure it needs to place it itself.
+        checkout_url:
+          type: [string, "null"]
+          description: >-
+            The provider's hosted checkout, where the customer completes the
+            payment. Returned verbatim and never parsed, rewritten or
+            re-derived by anything on this side — the URL is the provider's to
+            shape, and a client that read a session id out of it would break
+            the day that shape changed. Null exactly while the payment is
+            `created`: a payment exists before its checkout does, deliberately,
+            so that the provider's idempotency key can be derived from a
+            durable identity. A customer returning to a payment they started
+            is sent back to this same URL.
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: >-
+            When an uncompleted checkout stops being waited on. It is a
+            deadline on this platform's PATIENCE and not a fact about the
+            money: a delivery arriving after it is still honoured, because the
+            provider alone gets to say whether the customer paid.
+      additionalProperties: false
+
+    CreatePaymentIntentRequest:
+      type: object
+      description: >-
+        A customer funding their account, expressed as a request for an OFFER
+        rather than as an amount. That is the whole of the design and not a
+        simplification: a client-supplied amount is not a smaller version of a
+        policy, it is the absence of one. The server prices the offer, and a
+        client that could set a price could charge itself one minor unit or a
+        billion, with no rule here to refuse either — so `amount_minor_units`
+        and `currency` are not fields of this schema, and their absence is the
+        requirement rather than an omission. The offer resolves, server-side,
+        into an amount and a currency the request never carries. The offers it
+        may name are published by `GET /top-up-offers`, which is where a client
+        reads a price — and reading one there does not make it settable here.
+
+        `idempotency_key` is required, and the reason is the opposite of the
+        reason minting an API key has no key at all: a repeated mint should
+        produce a second credential, because the caller meant "give me
+        another one", while a repeated TOP-UP must produce one payment,
+        because the caller meant "fund me once" and a network retry does not
+        change what they meant. A request without a key is therefore refused
+        rather than served as a new payment: the server cannot tell a
+        double-clicked button from two deliberate top-ups, and a missing key
+        makes it guess.
+      required:
+        - offer
+        - idempotency_key
+      properties:
+        offer:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[a-z0-9_-]+$"
+          description: >-
+            The top-up offer's identifier, as this deployment publishes it in
+            `GET /top-up-offers`. Opaque to the client: it is one of the ids
+            that operation returned, it is not an amount, and nothing on this
+            side parses it. An offer this deployment does not publish is
+            refused rather than guessed at — a request naming one is asking
+            for a price that does not exist, and inventing it is the one thing
+            this schema exists to prevent.
+
+            The bound and the alphabet are `TopUpOffer.id`'s own, restated
+            here rather than left to that schema: an offer this deployment
+            could not declare is an offer it cannot publish, so a name outside
+            that shape is refused by the lookup and never by a shape check —
+            the refusal is the same 400 an unknown name gets, and a caller
+            that reads this line only needs to know which strings could ever
+            name something.
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: >-
+            The caller's identity for this top-up, bounded at 128 characters.
+            Every attempt at the same logical top-up carries the same value —
+            the first try, the retry after a dropped response, and the retry
+            after a provider outage — and a request repeating a key is
+            answered with the payment that key already names rather than with
+            a second one. That payment may be in any state by then, including
+            one that has already succeeded, and the honest thing for a client
+            to do with a converged answer is render what it was told: a retry
+            after a customer paid must not send them to a checkout again.
+      additionalProperties: false
+
+    TopUpOffer:
+      type: object
+      description: >-
+        One price this deployment publishes: what a customer is charged if they
+        choose it, expressed here and nowhere else. It is a row of a price list
+        rather than a fact about an account, which is why it carries no account
+        and why reading it is not a read of anybody's data.
+
+        The label is the only member a chooser renders and the only one that is
+        not authority: it is presentation, the amount and the currency are the
+        price, and a client that preferred the label's number to
+        `amount_minor_units` would be pricing a top-up itself — which is the
+        one thing `CreatePaymentIntentRequest` exists to make impossible.
+      required:
+        - id
+        - amount_minor_units
+        - currency
+        - minor_unit_exponent
+        - label
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[a-z0-9_-]+$"
+          description: >-
+            The offer's identifier, and the exact value
+            `CreatePaymentIntentRequest.offer` carries. Same bound, same
+            opacity: it is a name, not an amount, and it is the only thing a
+            request says about what to charge.
+
+            The shape is the deployment's rather than a convention a client
+            invented, and it is stated because it is checkable rather than
+            because it is a rule this operation enforces: an offer is declared
+            by an operator, that offer's own settings are spelled from its id,
+            and an id outside this alphabet or over this length could not be
+            declared at all — so no name of any other shape can be an offer
+            this surface publishes. A request carrying one is refused exactly
+            as an unknown name is refused, by the lookup and not by a shape
+            check: the answer is the 400 that says this deployment does not
+            publish that offer, which is the same answer for both.
+        amount_minor_units:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 9007199254740991
+          description: >-
+            What choosing this offer charges, in integer minor units of
+            `currency`. Strictly positive, because a free offer is not a
+            top-up and a zero here would be a payment that funds nothing while
+            still occupying the customer's checkout. Bounded by
+            `Number.MAX_SAFE_INTEGER` — 2^53 − 1 — for the same reason
+            `PaymentIntent.amount_minor_units` is: the console is JavaScript,
+            where an integer above it has no exact representation, so a price
+            this surface published above it would be a number the console
+            could not compare or render without silently rounding it.
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+          description: >-
+            The currency of this price, and therefore the currency of the
+            payment it opens: an offer's currency IS the payment's currency,
+            because nothing on this surface converts. This plane refuses a
+            provider delivery reporting any other currency rather than
+            converting it, so an offer whose currency disagreed with the
+            deployment's settlement currency (issue #63's singleton) is a
+            deployment misconfiguration for an operator to fix, not a client's
+            problem to work around.
+        minor_unit_exponent:
+          type: integer
+          minimum: 0
+          maximum: 4
+          description: >-
+            How many decimal places `currency` is written to — 0 for a
+            currency with no minor unit, up to 4 for the few the standard
+            writes further. It is the exponent the server uses to place a
+            decimal point when a human-facing amount is rendered, and it
+            travels so a client can do the same without carrying its own
+            currency table: the range is bounded and enforced here rather than
+            the client holding a list of codes that would be stale the day a
+            currency was added.
+        label:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: >-
+            A human-readable name for the offer — the string a chooser shows.
+            Presentation and not authority: it is not priced, not parsed, and
+            not a stable identifier.
+
+            It is REQUIRED, and the requirement is the deployment's own rather
+            than a preference of this schema: every offer an operator declares
+            carries a label, a missing one is refused where the offer is
+            declared, and a label that is only whitespace is refused exactly
+            as a missing one is, because whitespace is not a name. The refusal
+            happens when the deployment starts rather than when a chooser is
+            rendered, and that is the point of it — an offer with no name is a
+            price a screen would have to show without a word for it, and a
+            price list that cannot be rendered is a configuration error an
+            operator has to see, not a blank row a customer discovers.
+
+            Bounded at 120 characters, which is a bound on SIZE rather than on
+            shape: a label is prose and is shown to a customer as it was
+            configured, and what this stops is a configuration value that is
+            really a document arriving in a list that arrives whole.
+      additionalProperties: false
+
+    TopUpOfferList:
+      type: object
+      description: >-
+        The offers this deployment publishes, in the order an operator declared
+        them. That order is a presentation decision rather than a promise about
+        data, and it is what a chooser renders.
+
+        Deliberately NOT a `PageEnvelope`: every other list on this surface
+        pages, and this one cannot honestly do so. A cursor names a POSITION in
+        a history, and a price list has no position to name — the offers are
+        the deployment's configuration, fixed until somebody edits it, so the
+        set cannot shift under a reader the way a table of rows does, and a
+        cursor into it would be a claim about an ordering that only exists
+        because a person wrote it down. There is no `total` either, for the
+        reason this file states at the top: a count this plane would have to
+        maintain is a count that goes stale, and nothing here needs one.
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/TopUpOffer"
+          description: >-
+            The published offers. A deployment publishes a handful, and the
+            list does not grow with request volume, which is the other half of
+            why it arrives whole.
+      additionalProperties: false
+
+    # The one schema in this file that is not a console fragment. It belongs to
+    # `POST /payment-webhooks/{provider}`, which is the payment provider's own
+    # endpoint — declared in `console.yaml` because the operation is this
+    # application's, and reachable by no browser. It lives here because this
+    # document holds no inline schemas at all: every shape a client reads is in
+    # this fragment, and the provider's acknowledgement is a shape a reader of
+    # this contract meets.
+    WebhookAcknowledgement:
+      type: object
+      description: >-
+        The one body a webhook 2xx carries, and it is deliberately the same
+        body for EVERY outcome an authenticated delivery can have: applied,
+        already recorded, quarantined, and a delivery whose event is not
+        readable at all. The rule it encodes is that **2xx means "this event
+        needs no further delivery from you"** and nothing more. A quarantined
+        delivery is one this build authenticated and could not interpret — an
+        event kind it has no rule for, a schema ahead of it — and it is
+        recorded where it can be, as an operator's work item; refusing it would
+        put a permanent refusal into the provider's retry budget, and a retry
+        storm is what comes out of that. A delivery with no readable event id
+        is acknowledged the same way and recorded nowhere but the log, because
+        the record of a delivery is keyed by the event id it reports and an
+        absent id would swallow the next unreadable delivery as a duplicate.
+        Naming the disposition here would invite a provider's implementation to
+        branch on it, which is a decision the provider has no business making
+        and one this plane could not make true.
+      required:
+        - received
+      properties:
+        received:
+          type: boolean
+          description: >-
+            Always true. It acknowledges the delivery and says nothing about
+            it — not the disposition, not the payment, not the amount. A
+            provider that read more into an acknowledgement than "stop sending
+            this one" would be reading a claim this body does not make.
+      additionalProperties: false
+
     PriceSnapshot:
       type: object
       required:
@@ -1183,6 +1616,13 @@ components:
     # retained history on every page, re-reading the same rows forever behind
     # a position that never moves. The last page's cursor resumes the walk and
     # returns an empty page, which is the honest answer.
+    #
+    # An EMPTY page's `next_cursor` is the one cursor in this surface not
+    # derived from a row: it names the position the page was REQUESTED FROM
+    # (the beginning for a first page). That is the truth about where the walk
+    # stands, and it is what prevents an empty page from being told it is at
+    # the start of the collection — naming the start would be a different
+    # position, and a console that stored it would re-read page one forever.
     # -------------------------------------------------------------------------
 
     PageEnvelope:
@@ -1299,6 +1739,19 @@ components:
               type: array
               items:
                 $ref: "#/components/schemas/LedgerEntry"
+      unevaluatedProperties: false
+
+    PaymentIntentPage:
+      allOf:
+        - $ref: "#/components/schemas/PageEnvelope"
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: "#/components/schemas/PaymentIntent"
       unevaluatedProperties: false
 
     FindingPage:

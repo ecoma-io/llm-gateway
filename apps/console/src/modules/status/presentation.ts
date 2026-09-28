@@ -36,6 +36,7 @@ import type {
   Finding,
   FundingBucket,
   LedgerEntry,
+  PaymentIntentState,
   ReconciliationRun,
   Subscription,
   User,
@@ -201,6 +202,101 @@ export const LEDGER_KIND_PRESENTATION = {
  * nothing else. The sign is read, never computed — a leg's `settled_delta` is
  * the value the ledger stored.
  */
+/**
+ * Where one payment stands, as a customer reads it.
+ *
+ * Keyed exhaustively over the generated `PaymentIntentState` union, and the
+ * union is the contract's own ten members rather than a summary of them: a
+ * state added to `console.yaml` lands here as a compile error until somebody
+ * labels it, which is the property the file header states and the one this map
+ * has to satisfy like every other.
+ *
+ * The labels are sentences about the MONEY, and two of them are load-bearing in
+ * a way the others are not:
+ *
+ *   - `expired` does NOT say the payment will never be funded, because the
+ *     contract's own state machine allows `expired → succeeded`. Expiry is a
+ *     LOCAL decision — this platform stopped waiting — and a delivery arriving
+ *     after it is still honoured, because the provider alone gets to say
+ *     whether the customer paid. A label reading "Not funded" would be the
+ *     console promising a customer something the provider can still contradict.
+ *   - `quarantined` is not a failure of the payment. It is what a delivery that
+ *     authenticated and could not be interpreted is recorded as, so the label
+ *     says what actually happened to the delivery and leaves the money's own
+ *     status alone.
+ */
+export const PAYMENT_STATE_PRESENTATION = {
+  created: { label: "Checkout not open yet", icon: Clock, tone: "info" },
+  checkout_open: { label: "Waiting at your provider", icon: CircleDashed, tone: "info" },
+  requires_action: {
+    label: "Your provider needs another step",
+    icon: TriangleAlert,
+    tone: "warning",
+  },
+  // NOT "Funded". The provider confirmed the payment, and this platform's
+  // provider said the money — but the credit is a separate write that runs
+  // after the confirmation and can be refused: a bucket that closed between
+  // the two leaves a payment that says `succeeded` with the credit unlanded and
+  // a quarantine naming why. Nothing on the wire tells the console which of the
+  // two it is looking at, so the label has to be the one thing both cases are
+  // true of. "Paid" is the provider's word; "Funded" would be this console's.
+  succeeded: { label: "Paid", icon: CircleCheck, tone: "success" },
+  failed: { label: "Not funded", icon: CircleX, tone: "destructive" },
+  cancelled: { label: "Not funded — cancelled", icon: CircleSlash, tone: "neutral" },
+  // Deliberately NOT "not funded": see the note above. This platform stopped
+  // waiting; the provider has not spoken last.
+  expired: { label: "We stopped waiting", icon: Clock, tone: "neutral" },
+  partially_refunded: { label: "Partly refunded", icon: Info, tone: "info" },
+  // "Fully refunded" and NOT "Refunded": the label is a phrase a customer reads
+  // and never the contract's own token, and `refunded` capitalised is the token
+  // again. It is also the pair the badge above has to be tellable from — what
+  // the customer keeps changed in one case and completely in the other.
+  refunded: { label: "Fully refunded", icon: CircleSlash, tone: "neutral" },
+  quarantined: { label: "A provider message could not be read", icon: XCircle, tone: "warning" },
+} as const satisfies Record<PaymentIntentState, StatusPresentation>;
+
+/**
+ * The same ten states, as the sentence a screen shows when it has to explain
+ * one. A badge carries a label; a reader who has just come back from a
+ * provider's checkout needs the paragraph, and it is the paragraph that says
+ * out loud that returning from checkout proves nothing.
+ *
+ * Exhaustive for the same reason and in the same way as the map above — the
+ * two are one claim split in two, and a state with a badge and no sentence
+ * would be a state the console renders without explaining.
+ */
+export const PAYMENT_STATE_EXPLANATION = {
+  created:
+    "We have recorded this payment but its checkout is not open yet. Nothing has been charged.",
+  checkout_open:
+    "The provider's checkout is open and the payment is not finished. If you have just come back from it, we are still waiting for the provider to confirm — coming back does not mark anything paid.",
+  requires_action:
+    "Your provider has asked for one more step before this payment can complete. Nothing is charged until the provider reports it.",
+  succeeded:
+    "Your provider confirmed this payment. The amount is credited to this account unless a delivery we could not apply needs an operator's attention — the balance is the answer to how much is there, and it is the only thing that states it.",
+  failed: "Your provider reported that this payment did not go through. Nothing was credited.",
+  cancelled: "This payment was cancelled before it completed. Nothing was credited.",
+  expired:
+    "We stopped waiting for this checkout, so it can no longer be opened. A confirmation arriving late from your provider is still honoured, so this payment may yet be funded — your provider is the only party that says whether you paid.",
+  partially_refunded:
+    "Your provider gave part of this payment back. What you keep changed; what was funded did not.",
+  refunded: "Your provider gave this payment back. What you keep changed; what was funded did not.",
+  quarantined:
+    "One message from your provider authenticated but could not be read, so an operator has to look at it. That is a fact about the message, not about your payment — the payment's status is whatever the money says it is.",
+} as const satisfies Record<PaymentIntentState, string>;
+
+/**
+ * The states in which the provider has not yet spoken about the money, which is
+ * the set a customer who has just returned from a checkout is most likely to be
+ * looking at. `quarantined` is deliberately absent: it is an operator-facing
+ * fact about a delivery and not a payment waiting on anything.
+ */
+export const PAYMENT_AWAITING_PROVIDER_STATES: ReadonlySet<PaymentIntentState> = new Set([
+  "created",
+  "checkout_open",
+  "requires_action",
+]);
+
 export function ledgerDirectionPresentation(
   settledDelta: number,
   heldDelta: number,

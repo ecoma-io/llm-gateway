@@ -2,6 +2,7 @@ package http
 
 import (
 	stdhttp "net/http"
+	"strconv"
 	"strings"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/application"
@@ -22,6 +23,32 @@ import (
 // the defect the whole session surface is built to prevent, and stating the
 // requirement as data lets the tests assert that EVERY unsafe row carries it
 // without restating the rule per handler.
+type guardClass uint8
+
+const (
+	guardNone guardClass = iota
+	guardBrowserUnsafe
+	guardServerToServer
+)
+
+// String names the class where a number would be unreadable: a test failure that
+// said `guarded = 1, want 1 or 2` would send its reader to this file to find out
+// which class was which, and the failure message is the whole value of the test.
+// An unnamed value prints as its number rather than as a name this package did
+// not give it.
+func (g guardClass) String() string {
+	switch g {
+	case guardNone:
+		return "guardNone"
+	case guardBrowserUnsafe:
+		return "guardBrowserUnsafe"
+	case guardServerToServer:
+		return "guardServerToServer"
+	default:
+		return "guardClass(" + strconv.FormatUint(uint64(g), 10) + ")"
+	}
+}
+
 type route struct {
 	method  string
 	path    string
@@ -29,10 +56,16 @@ type route struct {
 	// guard is DERIVED, not authored: routes() sets it from the row's method, so
 	// a row cannot claim to be guarded while its handler is not, and an unsafe
 	// row cannot be added without inheriting the guards. That is the whole
-	// reason it is a field rather than a habit — the alternative, a handler
-	// that calls the guard itself, is a line a future edit can forget on exactly
-	// the operation where forgetting it costs the most.
-	guard bool
+	// reason it is a field rather than a habit — the alternative, a handler that
+	// calls the guard itself, is a line a future edit can forget on exactly the
+	// operation where forgetting it costs the most.
+	//
+	// The one class a row CAN declare is guardServerToServer, which exists
+	// because the derivation would give the provider's delivery endpoint the
+	// browser guards — and those would refuse every real delivery. It is a class
+	// rather than a boolean so the exception is one named value a reader can see
+	// in the table and a test can require.
+	guard guardClass
 }
 
 // routes returns this application's HTTP surface, in the order a reader meets
@@ -54,7 +87,25 @@ type route struct {
 // resolveSession and belongs to neither seam, and it is a seam of its own rather
 // than a member of either because it is wired from a different port — see
 // UsageUseCases.
+//
+// The payment surface travels as PaymentSurface, its own pair of seams, for the
+// same reason again: a console whose top-up screen has no implementation is a
+// missing feature, and a delivery endpoint that cannot authenticate is a
+// boundary that is absent.
+//
+// routes is routesWithPayments with the payment integration unwired, and the
+// split is about what a caller can say rather than about what a route is. The
+// four payment rows are part of the DECLARED surface — the contract test reads
+// this table and requires them — so the table cannot be built without something
+// behind them. A caller that wires a payment surface gets the real thing; a
+// caller that does not gets handlers that refuse, loudly and closed, rather than
+// a table with a hole in it. See unwiredPaymentSurface.
 func routes(app *application.App, readiness persistence.Pinger, sessions SessionUseCases, reads ConsoleReadUseCases, usage UsageUseCases) []route {
+	return routesWithPayments(app, readiness, sessions, reads, usage, unwiredPaymentSurface())
+}
+
+// routesWithPayments is the surface itself, over the seams it was handed.
+func routesWithPayments(app *application.App, readiness persistence.Pinger, sessions SessionUseCases, reads ConsoleReadUseCases, usage UsageUseCases, surface PaymentSurface) []route {
 	product := []route{
 		// Sign-in: the only unauthenticated write, and the only way a session
 		// comes into existence. It carries the origin, content-type and
@@ -95,9 +146,28 @@ func routes(app *application.App, readiness persistence.Pinger, sessions Session
 			path:    "/api-keys",
 			handler: handleMintAPIKey(sessions),
 		},
+		// The top-up: the second write on this surface that moves money, and the
+		// one where the guards are load-bearing for a different reason than the
+		// mint's. The account comes from the session and the request names an
+		// OFFER, never an amount — a browser that could name a price could charge
+		// itself one minor unit or a billion. It carries no idempotency of its
+		// own on the wire, which is why the guards matter here too: a
+		// cross-origin page that could POST this would be opening payments
+		// against a victim's account, and the double-click that the idempotency
+		// key exists for is the caller's own retry rather than this one.
+		//
+		// It sits after POST /api-keys rather than beside its own GET because the
+		// table's order is the reader's, not the wire's: the reads below are
+		// appended to this slice, so the two operations on one path are together
+		// only in the inventory the tests sort.
+		{
+			method:  stdhttp.MethodPost,
+			path:    "/payment-intents",
+			handler: handleBeginCheckout(sessions, surface.Payments),
+		},
 	}
 
-	// The ten reads the contract declares, in the order api/openapi/console.yaml
+	// The reads the contract declares, in the order api/openapi/console.yaml
 	// declares them: the dashboard's composition, then identity, then commerce,
 	// then accounting, then reconciliation. Every one of them is a GET, so
 	// `isUnsafeMethod` below attaches no cross-cutting guards to any of them —
@@ -176,6 +246,31 @@ func routes(app *application.App, readiness persistence.Pinger, sessions Session
 			path:    "/funding-buckets/{funding_bucket_id}/ledger",
 			handler: handleListLedgerEntries(sessions, reads),
 		},
+		// The top-up price list: what this deployment sells, and the vocabulary
+		// POST /payment-intents below is called with. It is a read of
+		// CONFIGURATION rather than of account data — it takes no account, is
+		// not paged and arrives whole — and it precedes the payments themselves
+		// in this list because a chooser is what a customer meets first: the
+		// offer they pick is the one the payment below names.
+		{
+			method:  stdhttp.MethodGet,
+			path:    "/top-up-offers",
+			handler: handleListTopUpOffers(sessions, surface.Payments),
+		},
+		// The account's payments, newest first. The cursor is a payment's own
+		// id, so a page can neither skip a payment nor read one twice, and the
+		// account predicate travels in the query rather than being applied to
+		// rows already fetched.
+		//
+		// Nothing on this row decides anything: a status was written by a signed
+		// delivery the provider sent to the endpoint below, and the console
+		// re-reads a payment after sending a customer to checkout instead of
+		// assuming an answer from the redirect.
+		{
+			method:  stdhttp.MethodGet,
+			path:    "/payment-intents",
+			handler: handleListPayments(sessions, surface.Payments),
+		},
 		// The reconciliation worker's recorded divergences, whole-plane and
 		// newest first. Evidence is rendered as text and never interpreted, and
 		// nothing here repairs anything: a finding is a record, not a path.
@@ -245,15 +340,56 @@ func routes(app *application.App, readiness persistence.Pinger, sessions Session
 		},
 	}
 
+	// The payment provider's delivery endpoint, on its own rather than in
+	// either slice above, because it is the one row on this surface that is not
+	// a console operation: no browser calls it, no session reaches it, and no
+	// account is named in it. Its path is deliberately outside `/api` and free
+	// of the runtime's `/v1/` namespace — it is a third party's endpoint that
+	// happens to be served by this process, and the two things a generator of
+	// this surface must never do with it are expose it to browser code and route
+	// it through the inference path.
+	//
+	// Its guard is EXPLICIT and not derived, because the derivation would give
+	// it guardBrowserUnsafe — POST is unsafe by definition, and that is the
+	// right default for every other row. Here it would be exactly wrong: a
+	// provider has no Origin, no CSRF token and no session cookie, so a browser
+	// guard would refuse every real delivery. The class is stated rather than
+	// inferred so that a reader sees which row takes the exception and why, and
+	// so the test that requires every unsafe row to carry one of the two named
+	// classes has something to require.
+	providerDeliveries := []route{
+		{
+			method:  stdhttp.MethodPost,
+			path:    "/payment-webhooks/{provider}",
+			handler: handleProviderWebhook(surface),
+			guard:   guardServerToServer,
+		},
+	}
+
 	// The cross-cutting guards are attached HERE, from the method, rather than
 	// authored per row. Every unsafe method on this surface clears the origin,
 	// content-type and double-submit checks before its handler runs, and a row
 	// added next year with a POST inherits them by existing — the failure mode
 	// this closes is a money-moving write whose author forgot a check that was
 	// never in the handler to begin with.
+	//
+	// The one exception is a row that declares guardServerToServer, which is a
+	// server-to-server write (the payment provider's webhook) that carries its own
+	// authentication — a cryptographic signature over the raw request body — and
+	// must NOT carry the browser guards: a provider has no Origin, no CSRF cookie,
+	// and no session. That exception is a class rather than a bool false so a
+	// reviewer reading the table sees which row it is and why, and so
+	// TestEveryUnsafeRouteIsGuarded can require the class to be one of the two
+	// named values rather than silently false.
 	table := append(probe, product...)
+	table = append(table, providerDeliveries...)
 	for i := range table {
-		table[i].guard = isUnsafeMethod(table[i].method)
+		if table[i].guard != guardNone {
+			continue
+		}
+		if isUnsafeMethod(table[i].method) {
+			table[i].guard = guardBrowserUnsafe
+		}
 	}
 	return table
 }
@@ -267,7 +403,7 @@ func routes(app *application.App, readiness persistence.Pinger, sessions Session
 // one place that knows the path's full method set.
 func register(mux *stdhttp.ServeMux, rt route) {
 	handler := rt.handler
-	if rt.guard {
+	if rt.guard == guardBrowserUnsafe {
 		handler = guardUnsafeRequest(handler)
 	}
 	mux.HandleFunc(rt.method+" "+rt.path, handler)

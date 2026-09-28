@@ -153,6 +153,31 @@ export const CONSOLE_BEHAVIOUR = {
     showRequestId: true,
     reachable: false,
   },
+  conflict: {
+    // 409, and the console's newest code: the payment operations raise it when
+    // the SERVER's own state refuses a request that is itself perfectly
+    // well-formed. It is not `invalid_request` and the difference is the whole
+    // of the client's next move. `invalid_request` says the REQUEST is wrong —
+    // a cursor past the retained history, a filter a page no longer makes — and
+    // the console answers it by changing the request (drop the cursor, read the
+    // first page). `conflict` says the request is fine and the server is not
+    // going to serve it: an account whose own state does not permit a new
+    // payment, for instance, because the money would land somewhere the account
+    // cannot currently use.
+    //
+    // So there is NO retry affordance, and that is deliberate rather than
+    // cautious. A retry here does not merely fail to help — it invites the
+    // reader to think an edit exists, and the one thing a client must not do
+    // with this code is rebuild the payload and send it again, because there is
+    // no edit that helps. What is unavailable is stated, the correlation is
+    // offered for when somebody can look the refusal up, and nothing on this
+    // screen promises that trying differently would work.
+    title: "This is not available on this account",
+    variant: "warning",
+    recovery: "none",
+    showRequestId: true,
+    reachable: true,
+  },
   upstream_unavailable: {
     // 503. A retry, and the last good data stays on screen: the answer this
     // surface would return is unknown, which is a statement about the answer

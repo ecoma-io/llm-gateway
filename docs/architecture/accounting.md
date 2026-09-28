@@ -268,7 +268,7 @@ direction (ADR 0006 §7):
 | Kind         | Written when                                             | Bucket             | Meaning                                                                     |
 | ------------ | -------------------------------------------------------- | ------------------ | --------------------------------------------------------------------------- |
 | `grant`      | a subscription's grant cycle rolls                       | entitlement cycle  | capacity issued for the cycle                                               |
-| `topup`      | operator today, payment provider later (webhook)         | PAYG               | funding added                                                               |
+| `topup`      | an operator, or a verified provider webhook (B15)        | PAYG               | funding added                                                               |
 | `hold`       | from the reservation's terminal fact, never at admission | entitlement / PAYG | capacity the reservation held, carried by the fact's allocation tail        |
 | `release`    | settlement tail, exhaustion, reaper expiry               | entitlement / PAYG | occupied capacity returned                                                  |
 | `consume`    | settlement                                               | entitlement / PAYG | capacity actually spent                                                     |
@@ -512,7 +512,7 @@ arrive later, and none is stubbed here:
   Data Plane's quota projections and the ledger; `ReconcileBucket` is the
   verdict it will lean on.
 - **Payment processor (B15)** — the provider whose webhooks land as topups;
-  an operator's keyed topup is the same door it will use.
+  an operator's keyed topup is the same door it uses.
 
 One flow the list above was written to wait for has since landed, and has
 left the list for it: **B12's consumer**. The replay loop in

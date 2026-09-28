@@ -30,6 +30,12 @@ import { CONSOLE_BEHAVIOUR, type ApiErrorCode } from "@/lib/failure-matrix";
  * under test: that derivation is a tautology and proves nothing about coverage
  * in either direction. The type ties it to the generated union so the gate
  * holds at the compiler, which is the gate a screen needs it at (ADR 0012 §6).
+ *
+ * Twelve members, and `conflict` is the newest: the payment surface's refusal
+ * of a well-formed request on the server's own state. The list has to carry it
+ * for the same reason the matrix does — this is what makes the coverage claim
+ * below a claim rather than a restatement of whatever the table happens to
+ * contain.
  */
 const CONTRACT_CODES = [
   "not_found",
@@ -40,6 +46,7 @@ const CONTRACT_CODES = [
   "unsupported_version",
   "revision_gap",
   "snapshot_required",
+  "conflict",
   "upstream_unavailable",
   "service_unavailable",
   "internal",

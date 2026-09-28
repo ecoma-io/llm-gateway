@@ -202,11 +202,22 @@ func TestTheScanSeesTheModule(t *testing.T) {
 // The list below is the claim, so it is written out in full: adding an
 // outbound port to this application is a deliberate act with an edit here,
 // which is exactly the moment to ask whether it crosses the plane.
+//
+// `payments` is the fourth port and it is LOCAL INFRASTRUCTURE, not a second
+// seam (B15). The distinction is the one this test exists to force, so the
+// answer belongs here rather than in a review thread: an external payment
+// provider is reached over the public internet and shares nothing with the
+// runtime — it has its own credentials, its own database, its own failure
+// modes, and the inference path does not notice when it is down for a week. It
+// is a third party this application talks to, in the same way the Data Plane's
+// management façade is; what makes the dataplane port a SEAM is that the peer
+// is the other half of this product, owning rows this plane must agree with.
+// A payment provider owns no row of ours.
 func TestTheControlPlaneHasExactlyOneCrossPlaneSeam(t *testing.T) {
 	ports := outboundPorts(t)
-	want := []string{"cache", "dataplane", "persistence"}
+	want := []string{"cache", "dataplane", "payments", "persistence"}
 	if !slices.Equal(ports, want) {
-		t.Errorf("outbound ports are %v, want %v — `dataplane` is the one cross-plane seam and the other two are local infrastructure; a fourth port is either local infrastructure or a new seam, and neither is added silently", ports, want)
+		t.Errorf("outbound ports are %v, want %v — `dataplane` is the one cross-plane seam and the other three are local infrastructure; a further port is either local infrastructure or a new seam, and neither is added silently", ports, want)
 	}
 }
 

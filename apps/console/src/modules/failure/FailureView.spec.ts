@@ -48,7 +48,7 @@ function transportFailure(): TransportFailure {
  * version of this file derived its code list from the table it was asserting
  * about, which is a tautology: `Object.keys` can only return the object's own
  * keys, so "every derived code has a row" is unfalsifiable — it holds for a
- * table declaring all eleven contract codes and for one declaring none, and
+ * table declaring every contract code and for one declaring none, and
  * the only way it can fail is by the table becoming empty, in which case the
  * loop never runs. The claim it NAMES is the one thing the test could not
  * see. Deriving from the table under test is the one derivation that proves
@@ -61,9 +61,14 @@ function transportFailure(): TransportFailure {
  * enumerating a copy of the same list. The union is therefore tied to this one
  * by the COMPILER, below, rather than by JavaScript.
  *
- * The eleven members are the `enum` under
+ * The twelve members are the `enum` under
  * `components.schemas.Error.properties.code` in
  * `api/openapi/shared/errors.yaml`, in the order that document declares them.
+ * `conflict` is the newest of them: it is the Console API's payment surface
+ * refusing a well-formed request because the server's own state says no, and it
+ * is the code that proves this list is a claim rather than a copy — adding a row
+ * to `CONSOLE_BEHAVIOUR` for it without touching this list fails the set
+ * comparison below on the next run.
  */
 const CONTRACT_CODES = [
   "not_found",
@@ -74,6 +79,7 @@ const CONTRACT_CODES = [
   "unsupported_version",
   "revision_gap",
   "snapshot_required",
+  "conflict",
   "upstream_unavailable",
   "service_unavailable",
   "internal",

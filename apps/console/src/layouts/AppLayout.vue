@@ -30,6 +30,7 @@ import {
   Receipt,
   Sun,
   Users,
+  Wallet,
 } from "@lucide/vue";
 import { computed } from "vue";
 import { RouterLink, useRoute, useRouter } from "vue-router";
@@ -43,8 +44,8 @@ const { theme, setTheme } = useTheme();
 
 /**
  * The console's screens, in the order an operator moves through them: what this
- * account is, who is in it, what they may buy, what they have been granted,
- * where the money is, and whether the numbers agree.
+ * account is, who is in it, what they may buy, how they fund it, what they have
+ * been granted, where the money is, and whether the numbers agree.
  *
  * `active` is computed from the route path rather than declared, so a link is
  * current whenever the reader is on its screen — including on a query change
@@ -57,6 +58,22 @@ const navigation = computed<SidebarNavSection[]>(() => [
       { icon: Users, label: "Identity", href: "/identity", active: route.path === "/identity" },
       { icon: BookOpen, label: "Catalog", href: "/catalog", active: route.path === "/catalog" },
       { icon: Receipt, label: "Commerce", href: "/commerce", active: route.path === "/commerce" },
+      // Between buying and accounting, which is the order the money moves in: an
+      // offer is what a customer CHOOSES to buy, a payment is the attempt at
+      // buying it, and the ledger behind `/accounting` is what the provider's
+      // confirmation eventually writes. A reader looking for "how do I add
+      // funds" scans for a word about funding, and "Payments" is the word this
+      // contract uses for the attempt.
+      //
+      // `Wallet` and NOT a card glyph: this console has no card field anywhere,
+      // and an icon of one on the nav would be chrome promising a form that
+      // does not exist and must not.
+      {
+        icon: Wallet,
+        label: "Payments",
+        href: "/payments",
+        active: route.path === "/payments",
+      },
       {
         icon: CircleDollarSign,
         label: "Accounting",

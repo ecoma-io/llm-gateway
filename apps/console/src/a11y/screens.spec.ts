@@ -10,13 +10,13 @@
  *
  * ── Why one file, and why it mounts through the router ───────────────────────
  *
- * The eight screens are audited in one place because the gate is a property of
+ * The nine screens are audited in one place because the gate is a property of
  * the CONSOLE, not of a page: a screen that is added to `router/index.ts` and
  * not to this list would be an unaudited screen, and the roster in
  * `lib/arch/roster.ts` already accepts that a list of exemptions is a claim
  * somebody has to make. Here the claim runs the other way — `SCREENS` below is
  * an exhaustive table over the console's own route list, and a test asserts it
- * still is, so a ninth route cannot land without a ninth audit.
+ * still is, so a tenth route cannot land without a tenth audit.
  *
  * Each screen is audited THROUGH THE SHELL, mounted as `App` over a memory
  * history rather than as a bare page component. That is not ceremony. The
@@ -76,6 +76,8 @@ const seam = vi.hoisted(() => ({
   fetchLedgerEntries: vi.fn(),
   fetchFindings: vi.fn(),
   fetchReconciliationRuns: vi.fn(),
+  fetchTopUpOffers: vi.fn(),
+  fetchPaymentIntents: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async () => {
@@ -97,6 +99,8 @@ import type {
   FundingBucketPage,
   LedgerEntry,
   LedgerEntryPage,
+  PaymentIntent,
+  PaymentIntentPage,
   Plan,
   PlanPage,
   Principal,
@@ -104,6 +108,8 @@ import type {
   ReconciliationRunPage,
   Subscription,
   SubscriptionPage,
+  TopUpOffer,
+  TopUpOfferList,
   User,
   UserPage,
 } from "@ecoma-io/llm-gateway-console-api-client";
@@ -347,6 +353,79 @@ const FINDINGS: FindingPage = {
   has_more: false,
 };
 
+/**
+ * The price list, and the payments it has produced.
+ *
+ * Two offers, because a chooser of one offer is not a chooser. Both carry a
+ * `label`, because `TopUpOffer.label` is required: an offer declared without
+ * one is refused where it is declared, so a deployment cannot serve one and
+ * there is no amount-only button branch left to audit. The two labels are
+ * distinct, and the two amounts differ, so the two buttons are two
+ * distinguishable accessible names rather than one string rendered twice.
+ *
+ * The payments are chosen to reach the branches a green audit would otherwise
+ * skip: a `checkout_open` row, which renders the provider link AND the
+ * waiting-for-confirmation card a customer returning from checkout lands on,
+ * and a `succeeded` row, which renders the paid badge. Both carry a
+ * `checkout_url` because the contract keeps it after the payment completes —
+ * "a customer returning to a payment they started is sent back to this same
+ * URL" — and the fixture is deliberately built so the two rows are told apart
+ * by the control they render: the open one by its live link, the settled one
+ * by the closed-checkout text where that link would have been. A screen that
+ * offered the link on both rows would therefore pass this audit while showing
+ * a customer a way back onto a provider page for a payment that is over, and
+ * the settled row is here precisely to catch that.
+ * The amounts sit well inside the money formatter's exact range on
+ * purpose: an unrenderable figure puts an `aria-label` on a roleless `<span>`,
+ * which is the one `aria-prohibited-attr` judgement this console has made, and
+ * a second one here would be a second claim rather than more coverage.
+ */
+const OFFERS: TopUpOfferList = {
+  items: [
+    {
+      id: "o0000000-0000-4000-8000-0000000000o1",
+      amount_minor_units: 2_500,
+      currency: "EUR",
+      minor_unit_exponent: 2,
+      label: "Small top-up",
+    },
+    {
+      id: "o0000000-0000-4000-8000-0000000000o2",
+      amount_minor_units: 10_000,
+      currency: "EUR",
+      minor_unit_exponent: 2,
+      label: "Large top-up",
+    },
+  ] satisfies TopUpOffer[],
+};
+
+const PAYMENTS: PaymentIntentPage = {
+  items: [
+    {
+      id: "y0000000-0000-4000-8000-0000000000y1",
+      status: "checkout_open",
+      amount_minor_units: 2_500,
+      currency: "EUR",
+      minor_unit_exponent: 2,
+      checkout_url: "https://pay.example.test/checkout/y1",
+      created_at: "2026-09-20T09:00:00Z",
+      expires_at: "2026-09-20T09:30:00Z",
+    },
+    {
+      id: "y0000000-0000-4000-8000-0000000000y2",
+      status: "succeeded",
+      amount_minor_units: 10_000,
+      currency: "EUR",
+      minor_unit_exponent: 2,
+      checkout_url: "https://pay.example.test/checkout/y2",
+      created_at: "2026-09-18T09:00:00Z",
+      expires_at: "2026-09-18T09:30:00Z",
+    },
+  ] satisfies PaymentIntent[],
+  next_cursor: "c-payments-3",
+  has_more: false,
+};
+
 /** Every read the console can make, answered. Anything unmocked resolves `undefined`, which is a failure a screen renders. */
 function answerEveryRead(): void {
   seam.getSessionResult.mockResolvedValue(ok(PRINCIPAL));
@@ -362,6 +441,8 @@ function answerEveryRead(): void {
   seam.fetchLedgerEntries.mockResolvedValue(ok(LEDGER));
   seam.fetchFindings.mockResolvedValue(ok(FINDINGS));
   seam.fetchReconciliationRuns.mockResolvedValue(ok(RUNS));
+  seam.fetchTopUpOffers.mockResolvedValue(ok(OFFERS));
+  seam.fetchPaymentIntents.mockResolvedValue(ok(PAYMENTS));
 }
 
 const mounted: VueWrapper[] = [];
@@ -450,10 +531,10 @@ beforeEach(() => {
 });
 
 /**
- * The eight screens the console has, as a table.
+ * The nine screens the console has, as a table.
  *
  * Exhaustive over the route table by design: the assertion below is what stops
- * a ninth route from landing unaudited. `not-found` is excluded and SAYS SO —
+ * a tenth route from landing unaudited. `not-found` is excluded and SAYS SO —
  * it is the catch-all, and auditing the catch-all tells you about the route
  * that matched nothing rather than about a screen, which is the one case where
  * "all screens" would be a claim rather than a fact.
@@ -464,6 +545,14 @@ const SCREENS: ReadonlyArray<{ readonly path: string; readonly label: string }> 
   { path: "/identity", label: "identity" },
   { path: "/catalog", label: "catalog" },
   { path: "/commerce", label: "commerce" },
+  // Audited with an offer published and payments already on the account, which
+  // is the state that renders the chooser's buttons, the provider link and the
+  // waiting-for-confirmation card. The no-offers state is a different screen
+  // with different markup, and it is audited in `PaymentsPage.spec.ts` rather
+  // than here, where it would make this list's fixtures a special case of one
+  // screen. NOT audited here in a "just returned from checkout" state, because
+  // there is no such state: the return is a re-read, and the re-read is this.
+  { path: "/payments", label: "payments" },
   { path: "/accounting", label: "accounting" },
   { path: "/reconciliation", label: "reconciliation" },
   { path: "/gateway-status", label: "gateway status" },
