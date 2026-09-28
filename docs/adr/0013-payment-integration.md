@@ -1,8 +1,13 @@
 # ADR 0013: Payment integration — what has financial authority, and what merely has a browser
 
-- Status: Accepted
+- Status: Superseded by [ADR 0014](0014-sepay-bank-transfer.md)
 - Date: 2026-09-28
 - Issue: [#128](https://github.com/ecoma-io/llm-gateway/issues/128)
+- Superseded by: [ADR 0014](0014-sepay-bank-transfer.md) (2026-09-29) — the
+  provider and the instrument changed: a hosted checkout session became a bank
+  transfer to a provider-minted virtual account, so the mechanism this record
+  describes is no longer what ships. Its doctrine is unchanged and is not
+  renegotiated; the reasoning below stands as the record of why.
 - Builds on: [ADR 0001](0001-bounded-contexts-and-aggregates.md), [ADR 0004](0004-reserve-and-settle-accounting.md), [ADR 0006](0006-control-plane-and-data-plane.md), [ADR 0008](0008-console-sign-in-identity.md), [ADR 0012](0012-management-console.md)
 
 ## Context

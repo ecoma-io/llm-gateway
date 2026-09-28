@@ -137,12 +137,12 @@ protocols](cross-plane-protocols.md)).
 
 ## The payment chain, end to end
 
-The payment integration (ADR [0013](../adr/0013-payment-integration.md)) is the
-second flow that crosses every layer on this page, and it is worth reading
-downward for a different reason than the fact feed: the fact feed shows how a
-plane boundary is kept, and this shows how a layer boundary is kept when the
-other end of the wire is a third party that does not share this repository's
-vocabulary, its database, or its trust.
+The payment integration (ADR [0014](../adr/0014-sepay-bank-transfer.md), which
+supersedes ADR 0013) is the second flow that crosses every layer on this page,
+and it is worth reading downward for a different reason than the fact feed: the
+fact feed shows how a plane boundary is kept, and this shows how a layer
+boundary is kept when the other end of the wire is a third party that does not
+share this repository's vocabulary, its database, or its trust.
 
 It has two directions, and which one carries financial authority is the whole
 design.
@@ -156,12 +156,15 @@ console (browser)                          POST /payment-intents with an OFFER;
 console-api adapters/inbound/http          the handler — the account comes from the
    │                                       SESSION, never from the body or the path
    ▼
-console-api application                    Payments.BeginCheckout — writes the intent
-   │                                       FIRST, then calls the provider OUTSIDE the
-   │                                       transaction, then records the checkout
+console-api application                    the use case that opens a payment —
+   │                                       writes the intent FIRST, then calls the
+   │                                       provider OUTSIDE the transaction, then
+   │                                       records the destination it returned
    ▼
-console-api ports/outbound/payments        Checkout.OpenCheckout — the interface the
-   │                                       use case is written against
+console-api ports/outbound/payments        Transfers — OpenTransfer(ctx, request)
+   │                                       answers with the provider's transfer
+   │                                       instructions — the virtual account, its
+   │                                       bank and holder, and the QR URL
    ▼
 console-api adapters/outbound/paymentprovider   the provider's endpoint shape, its
                                            headers, its idempotency key, its amount
@@ -222,7 +225,8 @@ it is:
   lost its whitespace, key order and number spellings, and an HMAC over a
   re-serialisation authenticates a message that was never sent.
 - **The two directions are joined by a row, not by a return value.** The
-  customer's browser returning from the hosted checkout reaches the first
-  direction's list and re-reads a status. It cannot set one. The only writer of
-  a status from `checkout_open` to `succeeded` is the second direction, which is
-  the whole of why a redirect is not financial authority.
+  customer's view of a payment — the destination they were given, the QR image
+  beside it and the status above them — re-reads the first direction's row and
+  cannot write it. The only writer of a status from `awaiting_transfer` to
+  `succeeded` is the second direction, which is the whole of why a destination
+  a customer is shown is not financial authority.
