@@ -68,7 +68,7 @@ func TestReadyzGatesOnTheStoreAnswering(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := New(application.New("test"), &answeringPinger{pingErr: tt.pingErr})
+			handler := New(application.New("test"), &answeringPinger{pingErr: tt.pingErr}, newFakeSessionUseCases())
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(stdhttp.MethodGet, "/readyz", nil)
@@ -98,7 +98,7 @@ func TestReadyzGatesOnTheStoreAnswering(t *testing.T) {
 // means to finish, and a lost database turns into a 503 rather than a hang.
 func TestReadyzAsksTheQuestionUnderAShortDeadline(t *testing.T) {
 	pinger := &answeringPinger{}
-	handler := New(application.New("test"), pinger)
+	handler := New(application.New("test"), pinger, newFakeSessionUseCases())
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(stdhttp.MethodGet, "/readyz", nil)
@@ -139,7 +139,7 @@ func TestReadyzLogsTheDependencyAndNothingElse(t *testing.T) {
 		log.SetFlags(flags)
 	})
 
-	handler := New(application.New("test"), &answeringPinger{pingErr: errors.New("ping: " + secret)})
+	handler := New(application.New("test"), &answeringPinger{pingErr: errors.New("ping: " + secret)}, newFakeSessionUseCases())
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(stdhttp.MethodGet, "/readyz", nil)
@@ -170,7 +170,7 @@ func TestReadyzLogsTheDependencyAndNothingElse(t *testing.T) {
 // outage it cannot fix, and the 503 that would have pulled it from traffic
 // would never be read.
 func TestHealthzStaysStaticWhileTheStoreIsDown(t *testing.T) {
-	handler := New(application.New("test"), &answeringPinger{pingErr: errors.New("connection refused")})
+	handler := New(application.New("test"), &answeringPinger{pingErr: errors.New("connection refused")}, newFakeSessionUseCases())
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(stdhttp.MethodGet, "/healthz", nil)
@@ -194,5 +194,20 @@ func TestNewRefusesAServerWithNothingToGateOn(t *testing.T) {
 			t.Error("New() built a handler with no readiness Pinger; /readyz would answer ready with nothing behind it")
 		}
 	}()
-	New(application.New("test"), nil)
+	New(application.New("test"), nil, newFakeSessionUseCases())
+}
+
+// TestNewRefusesAServerWithNoSessionSurface is the same loud door for the
+// authentication boundary. A handler built with no session use cases would
+// answer every product operation as though no guard were needed — and with the
+// origin, content-type and double-submit guards all passing, that is exactly the
+// state a cross-site request is trying to reach. The only honest answer to one
+// is a construction failure.
+func TestNewRefusesAServerWithNoSessionSurface(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("New() built a handler with no session use cases; the session surface is the authentication boundary")
+		}
+	}()
+	New(application.New("test"), &answeringPinger{}, nil)
 }

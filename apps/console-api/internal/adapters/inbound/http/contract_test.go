@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/application"
 )
@@ -24,6 +25,24 @@ import (
 // repository, beside the code it describes. If the two were ever split into
 // different repositories, this is the file that would notice.
 const contractPath = "../../../../../../api/openapi/console.yaml"
+
+// routeTableForTest is the test-local constructor the session surface required,
+// and ADR 0012's Consequences names this exact moment: the moment the
+// panic-on-nil-port discipline gets quietly defeated if nobody says so.
+//
+// The temptation is real. routes() now takes a sessionUseCases, and the
+// contract test needs a route table; so the route table gets a real store, and
+// the test needs a database, and a contract test that needs a database stops
+// running in CI's unit tier. The seam prevents it: sessionUseCases is an
+// interface declared in this package, so a fake of it needs no port, no
+// connection string and no cluster — the dependency the test-local constructor
+// exists to avoid is the one the seam was declared to keep out.
+//
+// The whole table is read, the handlers are never called, so the fake's answers
+// are irrelevant; it is here to satisfy the signature.
+func routeTableForTest() []route {
+	return routes(application.New("test"), &answeringPinger{}, newFakeSessionUseCases())
+}
 
 // TestTheRouteTableIsTheContract is the closure between what this application
 // serves and what its contract promises, asserted in both directions: every
@@ -44,13 +63,47 @@ func TestTheRouteTableIsTheContract(t *testing.T) {
 	declared := contractOperations(t)
 
 	served := []string{}
-	for _, rt := range routes(application.New("test"), &answeringPinger{}) {
+	for _, rt := range routeTableForTest() {
 		served = append(served, rt.method+" "+rt.path)
 	}
 	sort.Strings(served)
 
 	if !slices.Equal(served, declared) {
 		t.Fatalf("the route table serves %v and %s declares %v; the code and the contract have drifted apart", served, contractPath, declared)
+	}
+}
+
+// TestTheContractTestNeedsNoDatabase is the assertion behind the test-local
+// constructor, and it is the one that keeps the constructor honest.
+//
+// A contract test that needs a database stops being a unit test: it stops
+// running in CI's fast tier, it stops running at all on a machine without the
+// fixture, and — worst — it becomes a test people skip rather than a test that
+// fails. The seam keeps that from happening, and this proves it by driving the
+// whole contract comparison in a process that has no way to reach a database:
+// no connection string is read, no port is dialed, and the test finishes in
+// microseconds.
+//
+// The check is a duration bound rather than a fixture absence, because the
+// absence is the thing that is hard to assert directly — nothing in this
+// package can see whether some other package opened a socket. A test that
+// needed a real cluster would take milliseconds to fail, to connect, or to
+// time out; one that needs nothing finishes before the bound. A generous
+// second is two orders of magnitude above what this work costs and three below
+// what a connection attempt costs, so the bound distinguishes them without
+// being a flake.
+func TestTheContractTestNeedsNoDatabase(t *testing.T) {
+	start := time.Now()
+	declared := contractOperations(t)
+	served := []string{}
+	for _, rt := range routeTableForTest() {
+		served = append(served, rt.method+" "+rt.path)
+	}
+	sort.Strings(served)
+	_ = slices.Equal(served, declared)
+
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("reading the contract and building the route table took %v; the constructor is meant to need no store, and a test that opened one would show up as this", elapsed)
 	}
 }
 
