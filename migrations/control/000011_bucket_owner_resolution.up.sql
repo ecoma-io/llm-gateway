@@ -1,0 +1,96 @@
+-- ---------------------------------------------------------------------------
+-- The console's owner resolution for funding buckets: an index on the hop it
+-- walks.
+--
+-- Why this file exists, in one sentence: the console's two accounting reads
+-- resolved "which account owns this bucket" by comparing
+-- funding_buckets.account_id, and a cycle bucket has no account_id — the
+-- owner-xor CHECK forbids it — so those reads were structurally blind to
+-- every entitlement bucket in the plane. The reads now resolve an entitlement
+-- bucket's owner through the entitlement, and this file indexes the hop that
+-- resolution walks.
+--
+-- The chain is two hops:
+--
+--   funding_buckets.entitlement_id
+--     -> control.entitlements (id) -> subscriptions (id)
+--     -> control.subscriptions.account_id
+--
+-- The first hop is a primary-key lookup and costs nothing. The second is the
+-- one that does: entitlements.subscription_id has no index of its own, because
+-- nothing before now ever read entitlements by subscription — the roll writes
+-- them by (subscription, cycle, definition), which the table's uniqueness
+-- constraint covers, and the console's entitlement list resolves its owner
+-- through the same join but starts from entitlements, where subscription_id is
+-- the row's own identity rather than a lookup key. This statement starts from
+-- funding_buckets instead, so subscription_id becomes a lookup and the scan
+-- behind it is a sequential pass of the whole table per candidate bucket.
+--
+-- A candidate bucket per page, the table is small today and the whole thing
+-- would be a pessimal plan rather than a failure. That is not the reason to
+-- index it; the reason is that the plane this lane serves grows one
+-- entitlement per cycle per subscription, forever, and the read is on the
+-- operator's most alarming screen. An index that exists because a read needs
+-- it is a change; an index that exists because the table is small is a debt
+-- with a date on it, and the date is the first month somebody notices the
+-- accounting screen is slow.
+--
+-- The index is shipped HERE, in the same migration as the read that needs it,
+-- rather than appended to 000003 where the table is created. Three reasons,
+-- and the first is the rule: a migration that adds a read's support index and
+-- a migration that adds a read are one change, because between them there is a
+-- window in which a deployed read depends on an index that is not deployed
+-- with it. The second is that 000003 is already applied in every environment
+-- that has ever run this lane, and editing an applied migration is a
+-- history rewrite dressed as an edit. The third is that the index is about the
+-- READ, not about the table: it is the console's authorization predicate's
+-- cost, and it belongs beside the statement that pays it.
+--
+-- Plain CREATE INDEX, not CONCURRENTLY, for the reason this lane's every other
+-- index uses it: this lane builds its schema with plain CREATE INDEX from
+-- 000001 on, and a CONCURRENTLY would be the one index in the database built
+-- differently from all the others for a table that holds one row per
+-- entitlement cycle — small, bounded by subscription count, and never the
+-- fastest-growing table in the plane (ledger_entries is, and this index is
+-- not on it).
+--
+-- Its size is the whole of entitlements duplicated, which is why the
+-- alternative was weighed and rejected: a partial index
+-- `WHERE entitlement_id IS NOT NULL` on funding_buckets would be narrower
+-- (one row per entitlement bucket rather than one per entitlement) and would
+-- have to be written in the disjunction's other branch. It was not chosen
+-- because the other branch of that same disjunction — the PAYG branch, a plain
+-- column comparison — needs no support at all, so the index would serve half
+-- the statement and leave the planner to decide which half to favour on a
+-- cardinality estimate it cannot make well. One index on the hop every cycle
+-- bucket takes, and the two branches left to the planner.
+
+CREATE INDEX entitlements_subscription_id_idx
+    ON control.entitlements (subscription_id);
+
+-- ---------------------------------------------------------------------------
+-- The statement this index serves, quoted here so that the index and the read
+-- it belongs to are reviewable in one place. It is a copy, deliberately: the
+-- executable truth is consoleread_accounting.go's listAccountBuckets, and a
+-- second copy is a comment, not a second implementation. It is here because
+-- the index above is meaningless to a reader without the query that needs it,
+-- and the query is three files away from this lane.
+--
+--   WHERE (
+--           account_id = $1
+--           OR EXISTS (
+--                 SELECT 1
+--                 FROM control.entitlements
+--                 JOIN control.subscriptions
+--                   ON subscriptions.id = entitlements.subscription_id
+--                 WHERE entitlements.id = funding_buckets.entitlement_id
+--                   AND subscriptions.account_id = $1
+--           )
+--     )
+--     AND id > $2
+--   ORDER BY id
+--   LIMIT $3
+--
+-- subscriptions.account_id is already indexed (subscriptions_account_id_idx,
+-- 000003), so the second hop of the chain needed nothing here. The one that did
+-- is the one from entitlements to subscriptions, and it is the one above.

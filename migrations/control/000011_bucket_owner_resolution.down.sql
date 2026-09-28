@@ -1,0 +1,23 @@
+-- The exact inverse of 000011_bucket_owner_resolution.up.sql, and it is one
+-- statement because that migration is one statement: the index is the whole
+-- file, everything else in it is commentary, and a rollback that dropped
+-- anything else would be dropping an object this migration never created.
+--
+-- No IF EXISTS, holding the lane's convention: this runs against a database
+-- whose history says 000011 was applied, so a missing index is an unexpected
+-- fact the rollback should fail on rather than paper over. Nothing is CASCADE,
+-- for the same reason every down file in this lane is written object by object
+-- — a drop that would strand something else must fail loudly rather than
+-- cascade into a neighbour's object.
+--
+-- Rolling this back is safe as a SCHEMA change and is a REGRESSION as a
+-- behaviour change: without the index the read still returns the right rows,
+-- because the index is a cost and not a predicate. What returns is the plan
+-- this migration was written to prevent — a sequential pass of
+-- control.entitlements per candidate funding bucket, on the console's
+-- accounting screens, on a table that grows one row per cycle per
+-- subscription. A rollback is a thing an operator does to undo a change they
+-- believe is wrong, and this one is written so that whoever does it knows what
+-- they are trading rather than discovering it later.
+
+DROP INDEX control.entitlements_subscription_id_idx;

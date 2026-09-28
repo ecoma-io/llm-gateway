@@ -29,7 +29,32 @@ import (
 // carries. It is the contract's own `maximum` for that array, and a dashboard
 // showing three of eleven is honest where one claiming to show all eleven is
 // making a promise this plane will not keep.
+//
+// **The repository returns `limit + 1` rows**, because a paged read needs one
+// row past the page to answer `has_more` without a second query — the keyset's
+// whole reason for existing. `PageOf` is what trims that row back off and turns
+// it into the flag. This use case is not a paged read: it has no cursor, no
+// `next_cursor` and nothing to page to, so it had no `PageOf` to call and the
+// extra row went straight onto the response. An account with six recent
+// subscriptions rendered six against a bound that says five, and nothing
+// checked it — `shared/console.yaml` declares the array with no `maxItems`, so
+// neither end of the contract would have caught it.
 const overviewRecentSubscriptions = 5
+
+// trimOverviewPage drops the row past the bound the repository fetches to
+// detect more.
+//
+// It is a slice and not `PageOf` because there is no cursor to mint: the
+// dashboard's lists are bounded displays, not pages, and minting an opaque
+// keyset for a list the reader cannot advance through would be a cursor for
+// nobody. The one thing a paged read has and this does not is the thing this
+// function exists to supply — a page that is actually the size it claims.
+func trimOverviewPage[T any](rows []T, limit int) []T {
+	if len(rows) <= limit {
+		return rows
+	}
+	return rows[:limit]
+}
 
 // AccountOverview is the dashboard's composed answer.
 //
@@ -152,7 +177,7 @@ func (reads *ConsoleReads) AccountOverview(ctx context.Context, accountID identi
 		if err != nil {
 			return Internal(err)
 		}
-		subscriptions = rows
+		subscriptions = trimOverviewPage(rows, overviewRecentSubscriptions)
 		return nil
 	})
 	go run(func() error {
@@ -169,7 +194,7 @@ func (reads *ConsoleReads) AccountOverview(ctx context.Context, accountID identi
 		if err != nil {
 			return Internal(err)
 		}
-		payg = rows
+		payg = trimOverviewPage(rows, overviewRecentSubscriptions)
 		return nil
 	})
 	go run(func() error {
