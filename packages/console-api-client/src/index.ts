@@ -12,10 +12,17 @@
 // console probes it, which is a one-line change.
 //
 // Every other generated operation IS re-exported, because the console calls
-// all seventeen: the two probes, the three session operations, the
-// server-composed overview, and the eleven paged reads. ADR 0012 §8 scopes the
-// console to exactly the surface `console.yaml` declares, so there is no
-// operation here the console may not call and none is withheld from it.
+// all sixteen: the two probes, the three session operations, the
+// server-composed overview, the one key-minting write, and the nine paged
+// reads. `console.yaml` declares seventeen operationIds, and this file
+// re-exports every one of them but the `getVersion` withheld above. The nine
+// paged reads are the nine `list*` operations, one per `*Page` schema in
+// `shared/console.yaml`; `getAccountOverview` is not among them, because
+// `AccountOverview` is a server-composed projection with no `items`,
+// `next_cursor` or `has_more` and no reference to `PageEnvelope` at all.
+// ADR 0012 §8 scopes the console to exactly the surface `console.yaml`
+// declares, so there is no operation here the console may not call and none is
+// withheld from it.
 //
 // The types are held to a different standard on purpose. `HealthStatus` is
 // published although only the probes above return it, because a type is the

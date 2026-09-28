@@ -61,10 +61,12 @@ catalog, the request explorer and the runtime views are all Data Plane state.
 `api/openapi/dataplane.yaml` declares five operations: `listUsageEvents`,
 `getCurrentAliasGroupVersion`, `getProjectionPosition`,
 `applyProjectionSnapshot`, `applyProjectionChanges`. None lists a request, a
-provider, an alias or a route. The outbound port is seven methods
+provider, an alias or a route. The outbound port declares six methods
 (`WithdrawCredential` — declared and callerless — `CurrentGroupVersion`,
 `ReadUsageEvents`, `ProjectionPosition`, `DeliverSnapshot`, `DeliverChanges`),
-and `GroupVersion` carries three scalars and no model. `public.requests` has a
+across seven declarations, since `CurrentGroupVersion` is on both `Management`
+and the `CatalogReader` that stands beside it; and `GroupVersion` carries three
+scalars and no model. `public.requests` has a
 primary key and no other index in the entire repository. Those screens are
 three layers of work in two Go modules and a contract the proposal never
 mentions.
@@ -147,7 +149,8 @@ What that surface decides, and what it does not:
   record-keeping flip produces, and a credential is a grant of access;
   conflating them means a leaked invitation email is access.
 - **The session is opaque, server-side, and stored hashed.** A 256-bit random
-  id, SHA-256 at rest, in `control.sessions` (next free number: `000010`).
+  id, SHA-256 at rest, in `control.sessions` (shipped as
+  `000010_sessions`; next free number: `000011`).
   Opaque rather than a signed token, so logout is immediate and revocable
   rather than "valid until it expires". Rotated on every privilege change.
   Delivered `HttpOnly; Secure; SameSite=Strict; Path=/`.
@@ -199,10 +202,15 @@ What that surface decides, and what it does not:
   credential in `localStorage`, `sessionStorage` or `IndexedDB` — with one
   named exception already in the tree, `loom:theme` in
   `apps/console/index.html:16`, which is a theme preference and not a
-  credential. Beyond the cookie: an origin check on every unsafe method
-  (`Sec-Fetch-Site` first, `Origin` second), `application/json` required and
-  nothing else accepted, and a double-submit token in a header. Four layers,
-  because `SameSite` is a browser control and not a boundary.
+  credential. That line is a **read** — the pre-paint script's
+  `window.localStorage.getItem("loom:theme")`, which applies the stored theme
+  before the bundle boots — and the file contains no `setItem`: the write is
+  Loom's own runtime at mount, as that script's comment at
+  `apps/console/index.html:8-12` records ("Loom's own runtime re-applies from
+  the same state after mount"). Beyond the cookie: an origin check on every
+  unsafe method (`Sec-Fetch-Site` first, `Origin` second), `application/json`
+  required and nothing else accepted, and a double-submit token in a header.
+  Four layers, because `SameSite` is a browser control and not a boundary.
 
 ### 3. The one-time secret
 
@@ -385,12 +393,12 @@ screens rather than alongside them.
 
 ## Consequences
 
-- **The Control Plane gains a third table and an authentication surface**, and
-  the security rules this product surface asserts stop being aspirations. The
-  existing `verify.sh` control-table assertion is an exact `string_agg`
-  equality, so `sessions` extends that list in the same change — the equality
-  stays an equality, because relaxing it to a containment check would silently
-  unconstrain the twenty-one tables already there.
+- **The Control Plane gains a twenty-second table and an authentication
+  surface**, and the security rules this product surface asserts stop being
+  aspirations. The `verify.sh` control-table assertion is an exact `string_agg`
+  equality, so `000010_sessions` extends that list in the same change — the
+  equality stays an equality, because relaxing it to a containment check would
+  silently unconstrain the twenty-one tables already there.
 - **`contract_test.go` needs a test-local constructor**, and that is the exact
   moment the panic-on-nil-port discipline gets quietly defeated if nobody says
   so. It is named here so the test is written that way from the start.
@@ -406,7 +414,17 @@ screens rather than alongside them.
   `dataplane.yaml` operation and, for the request explorer, a migration that
   indexes `public.requests` on `(account_id, admitted_at)` and
   `(admitted_at, id)` — in the same migration as the read that needs it, as
-  `000008_intake_request_lookup` did.
+  `000009_reconciliation` did when it created
+  `applied_facts_applied_at_idx` on `control.applied_facts (applied_at,
+request_id)` for the windowed sweep. That file's own comment names that
+  index's shape as "the windowed read's own shape — a half-open range on
+  `applied_at`, ordered, with `request_id` carried so the sweep is an index
+  walk rather than a sort", and the index ships in the same migration as the
+  reconciliation sweep that reads it. The Data Plane's
+  `000008_intake_request_lookup` is the same principle on another table — the
+  reaper's lookup by `request_id` into `request_intake` — but it is not a
+  precedent for this one, because it touches neither `public.requests` nor
+  either of the two indexes named here.
 - **A console that renders a Data Plane outage and a bug identically is the
   defect this change is most likely to ship**, and the test that catches it is
   the pair in §6. It is written before the pages, not after.
