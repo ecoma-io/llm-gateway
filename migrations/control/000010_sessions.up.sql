@@ -327,19 +327,12 @@ ALTER TABLE control.users
         CHECK (credential_salt IS NULL OR credential_salt ~ '^[0-9a-f]{32}$'),
     ADD COLUMN credential_iterations integer
         CONSTRAINT users_credential_iterations_positive
-        CHECK (credential_iterations IS NULL OR credential_iterations > 0);
-
--- Whole or absent, all three together. A half-written credential is either an
--- unusable row or a silently weaker one, and both are bugs a later sign-in
--- would report as a wrong password.
---
--- Its own statement rather than a fourth entry in the ADD COLUMN list above,
--- and that is grammar rather than style: `ADD COLUMN` accepts column
--- constraints only, so a table-level CONSTRAINT inside its comma-separated
--- list is a syntax error the engine stops on — named identically to the three
--- above and looking like the fourth of a set, which is exactly the sort of
--- thing that reads as correct and applies as nothing.
-ALTER TABLE control.users
+        CHECK (credential_iterations IS NULL OR credential_iterations > 0),
+    -- Whole or absent, all three together. A half-written credential is
+    -- either an unusable row or a silently weaker one, and both are bugs a
+    -- later sign-in would report as a wrong password. Table-level, not a
+    -- column constraint, because the rule is about the three columns in
+    -- relation and no single column can see the other two.
     ADD CONSTRAINT users_credential_whole
         CHECK (
             (credential_hash IS NULL) = (credential_salt IS NULL)

@@ -2110,7 +2110,7 @@ WITH account AS (
   RETURNING user_id, account_id
 )
 INSERT INTO control.sessions (id, user_id, account_id, token_hash, class, state, created_at, expires_at, last_seen_at)
-SELECT 'c0000000-0000-7000-8000-0000000000c2', id, account_id, repeat('a', 64), 'user', 'active', now(), now() + interval '1 hour', now() FROM first_session"
+SELECT 'c0000000-0000-7000-8000-0000000000c2', user_id, account_id, repeat('a', 64), 'user', 'active', now(), now() + interval '1 hour', now() FROM first_session"
 
 # The class vocabulary is closed at two members, and the third this repository
 # explicitly refused is the point: `admin` is not a class, so a handler that
@@ -2218,74 +2218,60 @@ SELECT 'c0000000-0000-7000-8000-0000000000c8', id, account_id, repeat('f', 64), 
 
 # The credential columns, and the whole-or-absent rule. A digest with no
 # iteration count is a credential nobody can ever verify, and one nobody can
-# verify is indistinguishable from a wrong password only by accident. Every
-# probe below SETS the columns rather than NULLing them, because the rule is
-# about a half-written credential and NULLing proves nothing about it — an
-# UPDATE that touched no row would exit zero and the probe would pass for the
-# wrong reason, which is exactly the failure the suite's own header forbids.
+# verify is indistinguishable from a wrong password only by accident.
+#
+# These four probes SET the columns rather than NULLing them, because the rule
+# is about a half-written credential and NULLing proves nothing about it: an
+# UPDATE that matched no row would exit zero and the probe would pass having
+# proved nothing, which is the one thing the suite's own header forbids of a
+# step. They seed with plain INSERTs rather than the data-modifying CTEs the
+# session probes above use, because a data-modifying CTE's rows are not
+# visible to a SIBLING statement's subquery — an UPDATE whose WHERE reads
+# `SELECT id FROM <the CTE that just inserted it>` matches nothing and exits
+# zero. The probe would have looked like a constraint that does not fire.
 expect_constraint_failure "a credential recorded without its iteration count is refused" users_credential_whole "
-WITH account AS (
-  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
-  VALUES ('a0000000-0000-4000-8000-0000000000c9', 'verify probe', 'active', now(), now())
-  RETURNING id
-), holder AS (
-  INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
-  SELECT 'b0000000-0000-4000-8000-0000000000c9', id, 'half-credential@example.com', 'active', now(), now() FROM account
-  RETURNING id
-)
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000c9', 'verify probe', 'active', now(), now());
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-0000000000c9', 'a0000000-0000-4000-8000-0000000000c9', 'half-credential@example.com', 'active', now(), now());
 UPDATE control.users SET credential_hash = repeat('1', 64), credential_salt = repeat('2', 32)
-WHERE id = (SELECT id FROM holder)"
+WHERE id = 'b0000000-0000-4000-8000-0000000000c9'"
 
 # ...and the salt without a hash, which is the same half-written row from the
 # other side. Two directions as two probes, because a constraint that refused
-# only one would still admit a corrupt row, and the one it refused would read
-# as evidence the rule works.
+# only one would still admit a corrupt row, and the one it did refuse would
+# read as evidence the rule works.
 expect_constraint_failure "a credential salt without its derived key is refused" users_credential_whole "
-WITH account AS (
-  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
-  VALUES ('a0000000-0000-4000-8000-0000000000ca', 'verify probe', 'active', now(), now())
-  RETURNING id
-), holder AS (
-  INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
-  SELECT 'b0000000-0000-4000-8000-0000000000ca', id, 'orphan-salt@example.com', 'active', now(), now() FROM account
-  RETURNING id
-)
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000ca', 'verify probe', 'active', now(), now());
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-0000000000ca', 'a0000000-0000-4000-8000-0000000000ca', 'orphan-salt@example.com', 'active', now(), now());
 UPDATE control.users SET credential_salt = repeat('2', 32)
-WHERE id = (SELECT id FROM holder)"
+WHERE id = 'b0000000-0000-4000-8000-0000000000ca'"
 
 # A column that accepts a value it should refuse is not doing its job, so the
 # shape is probed as a refusal rather than only described. A salt is 16 bytes
 # of hex and a base64 salt is not hex at all — the two are the mistakes a
 # caller actually makes, encoding the wrong alphabet or the wrong width.
 expect_constraint_failure "a credential salt outside the hex shape is refused" users_credential_salt_shape "
-WITH account AS (
-  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
-  VALUES ('a0000000-0000-4000-8000-0000000000cb', 'verify probe', 'active', now(), now())
-  RETURNING id
-), holder AS (
-  INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
-  SELECT 'b0000000-0000-4000-8000-0000000000cb', id, 'bad-salt@example.com', 'active', now(), now() FROM account
-  RETURNING id
-)
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000cb', 'verify probe', 'active', now(), now());
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-0000000000cb', 'a0000000-0000-4000-8000-0000000000cb', 'bad-salt@example.com', 'active', now(), now());
 UPDATE control.users SET credential_salt = 'not-hex-at-all-nor-even-16-bytes-long', credential_hash = repeat('1', 64), credential_iterations = 600000
-WHERE id = (SELECT id FROM holder)"
+WHERE id = 'b0000000-0000-4000-8000-0000000000cb'"
 
 # The iteration count is a column BECAUSE it must be able to rise, so a value
 # that is not a positive count is refused rather than accepted as a
-# zero-iteration derivation — which PBKDF2 would compute and which would be no
+# zero-iteration derivation — which PBKDF2 would compute, and which would be no
 # derivation at all.
 expect_constraint_failure "a credential with no iteration count is refused" users_credential_iterations_positive "
-WITH account AS (
-  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
-  VALUES ('a0000000-0000-4000-8000-0000000000cc', 'verify probe', 'active', now(), now())
-  RETURNING id
-), holder AS (
-  INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
-  SELECT 'b0000000-0000-4000-8000-0000000000cc', id, 'zero-iterations@example.com', 'active', now(), now() FROM account
-  RETURNING id
-)
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000cc', 'verify probe', 'active', now(), now());
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-0000000000cc', 'a0000000-0000-4000-8000-0000000000cc', 'zero-iterations@example.com', 'active', now(), now());
 UPDATE control.users SET credential_hash = repeat('1', 64), credential_salt = repeat('2', 32), credential_iterations = 0
-WHERE id = (SELECT id FROM holder)"
+WHERE id = 'b0000000-0000-4000-8000-0000000000cc'"
 
 # The positive half, and the one that also proves NULL is genuinely allowed: an
 # `invited` identity with no credential at all is a legitimate row (ADR 0012
@@ -2295,17 +2281,13 @@ WHERE id = (SELECT id FROM holder)"
 assert_equals "an invited identity with no credential, and a whole credential, are both accepted" \
 	"$(psql_scalar "$control_db" "
 BEGIN;
-WITH account AS (
-  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
-  VALUES ('a0000000-0000-4000-8000-0000000000cd', 'verify probe', 'active', now(), now())
-  RETURNING id
-), invitee AS (
-  INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
-  SELECT 'b0000000-0000-4000-8000-0000000000cd', id, 'invitee@example.com', 'invited', now(), now() FROM account
-  RETURNING id
-)
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000cd', 'verify probe', 'active', now(), now());
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-0000000000cd', 'a0000000-0000-4000-8000-0000000000cd', 'invitee@example.com', 'invited', now(), now()),
+       ('b0000000-0000-4000-8000-0000000000ce', 'a0000000-0000-4000-8000-0000000000cd', 'credentialed@example.com', 'active', now(), now());
 UPDATE control.users SET credential_hash = repeat('3', 64), credential_salt = repeat('4', 32), credential_iterations = 600000
-WHERE id = (SELECT id FROM invitee);
+WHERE id = 'b0000000-0000-4000-8000-0000000000ce';
 SELECT (SELECT count(*) FROM control.users WHERE credential_hash IS NULL) || '|' || (SELECT count(*) FROM control.users WHERE credential_iterations = 600000);
 ROLLBACK;")" "1|1"
 
