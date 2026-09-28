@@ -36,7 +36,23 @@
 // that with a deliberately indistinguishable `ErrMalformedToken`. It is the
 // single most likely real-world failure of this feature and it is invisible
 // to a test that does not know it exists.
-import { Alert, Button, Card, CopyButton, Stack, TextField } from "@ecoma-io/loom";
+//
+// **Both inputs are named, and neither is named by a prop on `TextField`.**
+// Loom's `TextField` declares no `label` and no `hint` — it sets
+// `inheritAttrs: false` and splits what falls through onto the `<input>` with
+// `useSplitAttrs()`, so a `label` handed to it as a prop is not a name, it is
+// a literal `label="…"` attribute sitting in the DOM naming nothing, and axe's
+// `label` rule reports it critical. `Field` is the component that HAS those
+// props, and it does not stop at rendering them: it renders a real `<label
+// for>` and calls `provideFieldContext()`, which `TextField` picks up through
+// `useFieldControl()` — `aria-labelledby` onto the control, `aria-describedby`
+// onto the hint, one `id` shared by the two. So the wrapper is not a `<label>`
+// tag this form could have written itself; it is the wiring that makes the
+// hint reachable at all, which is why it is used here rather than a bare
+// `aria-label` string that would leave a reader unable to ask what a key name
+// is for. `SignInPage` is the model and the two screens now differ in nothing
+// else.
+import { Alert, Button, Card, CopyButton, Field, Stack, TextField } from "@ecoma-io/loom";
 import { onBeforeUnmount, ref, shallowRef } from "vue";
 
 import { createApiKey } from "@/lib/api";
@@ -112,13 +128,13 @@ async function mint() {
   <Stack gap="md" class="max-w-2xl">
     <Card title="Create an API key" description="Keys are created for this account.">
       <Stack gap="md">
-        <TextField
-          v-model="displayName"
+        <Field
           label="Key name"
           hint="A name you will recognise later. It is not a secret and can be the same as another key's."
           required
-          :disabled="revealed"
-        />
+        >
+          <TextField v-model="displayName" required :disabled="revealed" />
+        </Field>
 
         <Button :loading="minting" :disabled="revealed" @click="mint"> Create key </Button>
 
@@ -143,16 +159,28 @@ async function mint() {
       description="This is the only time the key is shown. It is not stored, not logged and cannot be retrieved again — if you lose it, create another key and revoke this one."
     >
       <Stack gap="md">
-        <TextField
-          :model-value="secret"
-          label="API key"
-          readonly
-          autocomplete="new-password"
-          spellcheck="false"
-          autocapitalize="off"
-          autocorrect="off"
-          name="api-key-secret"
-        />
+        <!--
+          The control that holds the live credential, and the one the whole
+          component exists for. It is named by `Field` for the same reason the
+          mint form's is: the reader has to be able to say which field they
+          are on before they can copy out of it, and an unnamed input makes the
+          copy button the only thing on this panel that announces anything. The
+          label is deliberately a description of the CONTENT rather than the
+          word "token" — a screen reader announces the name of the field when
+          focus lands on it, and this is the one place in the console where a
+          reader focusing a control is necessarily about to handle a secret.
+        -->
+        <Field label="API key">
+          <TextField
+            :model-value="secret"
+            readonly
+            autocomplete="new-password"
+            spellcheck="false"
+            autocapitalize="off"
+            autocorrect="off"
+            name="api-key-secret"
+          />
+        </Field>
 
         <div class="flex items-center gap-2">
           <!--

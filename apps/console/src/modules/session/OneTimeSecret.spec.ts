@@ -1,17 +1,27 @@
-// The one-time secret's four rules, asserted rather than asserted-in-a-comment.
+// The one-time secret's rules, asserted rather than asserted-in-a-comment.
 //
-// ADR 0012 §3 states these as properties of the component, and the
-// component's own docblock claims each is "enforced structurally". A
-// docblock claiming a test that does not exist is worse than one claiming
-// nothing, so each rule gets the test it says it has. Every one of these
-// is a NEGATIVE — the secret must not appear in a place — which is the
-// harder kind to assert, because a test that only checks the happy path
-// passes just as happily when the leak is reintroduced.
+// ADR 0012 §3 states the first four as properties of the component, and the
+// component's own docblock claims each is "enforced structurally". A docblock
+// claiming a test that does not exist is worse than one claiming nothing, so
+// each rule gets the test it says it has. The first four are NEGATIVE — the
+// secret must not appear in a place — which is the harder kind to assert,
+// because a test that only checks the happy path passes just as happily when
+// the leak is reintroduced.
+//
+// The last group is the one that cannot be written as a negative. A screen
+// reader that is told NOTHING when focus lands on a field is a defect with no
+// trace anywhere else: the markup looks fine, the copy button next to the
+// secret still announces itself, and nothing in the file says a human is
+// stranded on an unnamed control. So those are asserted POSITIVELY, by
+// resolving the name a browser would compute, and the rule named is the
+// console's own — `a11y/screens.spec.ts`, whose `label` finding is what
+// surfaced this.
 import { mount } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
 
 import { createApiKey } from "@/lib/api";
+import { audit, describe as describeAudit } from "@/lib/a11y-gate";
 import OneTimeSecret from "@/modules/session/OneTimeSecret.vue";
 import type { MintedApiKey } from "@ecoma-io/llm-gateway-console-api-client";
 
@@ -96,6 +106,54 @@ function heldState(wrapper: ReturnType<typeof mount>): {
     secret: unwrap("secret") as string | undefined,
     revealed: unwrap("revealed") as boolean,
   };
+}
+
+/**
+ * The accessible name of an element, the way a browser computes it.
+ *
+ * Three arguments, and none of them is a preference:
+ *
+ *  - **`HTMLInputElement.labels`**, not a `<label>` found by a selector. The
+ *    association is `for`/`id` resolved by the platform, and reading it through
+ *    the property is the only way this assertion reads the same thing the
+ *    screen reader does. Reaching for `label[for=…]` or
+ *    `input.closest("label")` would each be a re-implementation that can be
+ *    satisfied by markup the browser never connected: an `id` that does not
+ *    match, a `for` pointing at nothing, two rows whose generated ids collide.
+ *    `.labels` is empty in every one of those cases, which is the point.
+ *  - **`aria-label` and `aria-labelledby`, joined in that order**, because that
+ *    is the precedence the accessible name computation gives them and a test
+ *    that only ever looked at `labels` would pass on a control that has both
+ *    and should be heard by the other. `for` and `id` deliberately do NOT
+ *    appear: a control the page NAMED with an id of its own is a real case, and
+ *    a rule that demoted it to an error would be a rule the first author of a
+ *    form would have to work around.
+ *  - **The whole string, not a prefix match.** "Key name *" contains "Key
+ *    name" but is not "Key name", and a `startsWith` would let a component
+ *    quietly append whatever it liked to a name and stay green. The `*` Loom
+ *    renders for `required` is real content in a `<label>` and a screen reader
+ *    really does include it, so it is normalised out HERE and here only.
+ */
+function accessibleName(element: Element): string {
+  const control = element as HTMLInputElement;
+  // `NodeList`, not an array — `Array.from` rather than a spread, which is
+  // iterable but reads as though the platform had handed back something
+  // better than it did. Both spellings return the same list.
+  const fromLabels = Array.from(control.labels ?? []);
+  const fromLabelledBy = (element.getAttribute("aria-labelledby") ?? "")
+    .split(" ")
+    .filter((id) => id.length > 0)
+    .map((id) => element.ownerDocument.getElementById(id)?.textContent ?? "");
+  const names = [
+    ...fromLabels.map((label) => label.textContent ?? ""),
+    element.getAttribute("aria-label") ?? "",
+    ...fromLabelledBy,
+  ];
+  return names
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .replace(/\s*\*\s*$/, " ")
+    .trim();
 }
 
 describe("the one-time secret", () => {
@@ -261,5 +319,103 @@ describe("the one-time secret", () => {
     // structural: the component's only network call is `createApiKey`, and
     // that is the seam's wrapper rather than the generated `mintApiKey`.
     expect(vi.mocked(createApiKey)).toHaveBeenCalledWith("ci key");
+  });
+
+  it("names the mint field, so focus landing on it says what it is", async () => {
+    const wrapper = mount(OneTimeSecret, { attachTo: document.body });
+    // Not "is there a label element nearby" — what a reader HEARS. The defect
+    // this pins is the one where `label` and `hint` were passed to Loom's
+    // `TextField`, which declares neither, so both fell through onto the
+    // `<input>` as literal attributes naming nothing: the DOM looked labelled
+    // to anyone reading the source and the control was silent to everyone
+    // using it.
+    expect(accessibleName(wrapper.get("input").element)).toBe("Key name");
+    wrapper.unmount();
+  });
+
+  it("names the revealed secret, which is the control that holds the credential", async () => {
+    const wrapper = await mountRevealed();
+    // Matched on `name` rather than on position. After the fix the mint form
+    // keeps its input on screen — the `Field` wrapper did not put the revealed
+    // control anywhere the mint form's is not, and a test that said "the second
+    // input" would quietly start asserting about the first one the day the two
+    // panels are reordered.
+    const secret = wrapper.get('input[name="api-key-secret"]');
+    expect(accessibleName(secret.element)).toBe("API key");
+    wrapper.unmount();
+  });
+
+  it("leaves no attribute on either input pretending to name it", async () => {
+    // The part of the old markup that looked right and was not. `label` and
+    // `hint` as props on `TextField` did not vanish when the wrapper was
+    // added; they kept rendering, because `TextField` sets
+    // `inheritAttrs: false` and then spreads what falls through onto the
+    // `<input>` deliberately. This is the assertion that stops the fix being
+    // "added a `<label>` next to a broken one" — which would pass the name
+    // test above while leaving an attribute in the DOM that names nothing and
+    // will confuse the next person to read the rendered markup.
+    const wrapper = await mountRevealed();
+    for (const input of wrapper.findAll("input")) {
+      expect(input.attributes("label"), `a label attribute on ${input.attributes("name")}`).toBe(
+        undefined,
+      );
+      expect(input.attributes("hint"), `a hint attribute on ${input.attributes("name")}`).toBe(
+        undefined,
+      );
+    }
+    wrapper.unmount();
+  });
+
+  it("reaches the mint form's hint from the input, so the row explains itself", async () => {
+    // `Field` is not a `<label>` tag this form could have written itself. It
+    // publishes the hint's id through the field context and `TextField` adopts
+    // it into `aria-describedby`, which is what turns the sentence from
+    // decoration a sighted reader reads into content a reader is TOLD. Dropping
+    // the `hint` prop would keep every test above green and lose it silently,
+    // so the wiring is asserted rather than inherited from the wrapper.
+    const wrapper = mount(OneTimeSecret, { attachTo: document.body });
+    const input = wrapper.get("input");
+    const describedBy = input.attributes("aria-describedby") ?? "";
+    expect(describedBy.length, "the input describes itself with something").not.toBe(0);
+
+    const described = describedBy
+      .split(" ")
+      .filter((id) => id.length > 0)
+      .map((id) => document.getElementById(id));
+    expect(described).not.toContain(null);
+    // Matched on the sentence's own opening rather than on the whole string, so
+    // rewording the hint for a reader is an ordinary edit and deleting it is
+    // not: the assertion is that SOMETHING explains the field, not that this
+    // particular copy is frozen.
+    expect(described!.map((node) => node!.textContent).join(" ")).toMatch(
+      /A name you will recognise later/,
+    );
+    wrapper.unmount();
+  });
+
+  it("names every control it renders, in both states, under the console's own gate", async () => {
+    // The gate is the repo-wide claim; the two assertions above are this
+    // component's. Both are here because they fail differently: the name
+    // assertions are what a reviewer reads to learn what a reader is supposed
+    // to HEAR, and the gate is what stops a future Loom release from changing
+    // what `Field` renders out from under all of it.
+    const minting = mount(OneTimeSecret, { attachTo: document.body });
+    expect(describeAudit(await audit(minting.element), "the mint form")).toBe("");
+    for (const input of minting.findAll("input")) {
+      expect(accessibleName(input.element), "every mint-form input is named").not.toBe("");
+    }
+    minting.unmount();
+    document.body.innerHTML = "";
+
+    // The revealed panel on its own, which the sweep in `a11y/screens.spec.ts`
+    // cannot reach: the identity screen it audits is audited in its loading
+    // state with reads answered, and a key has to be minted for this panel to
+    // exist at all. So the panel's audit is claimed here or not at all.
+    const revealed = await mountRevealed();
+    expect(describeAudit(await audit(revealed.element), "the revealed secret")).toBe("");
+    for (const input of revealed.findAll("input")) {
+      expect(accessibleName(input.element), "every revealed-panel input is named").not.toBe("");
+    }
+    revealed.unmount();
   });
 });
