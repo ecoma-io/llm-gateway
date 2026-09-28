@@ -68,8 +68,13 @@ type FactDimension struct {
 	// RequestID, KindClass and AccountID together are the row's identity,
 	// carrying the same exactly-once boundary applied_facts enforces on its own
 	// key — so a redelivered page or a second writer can produce no second row
-	// for a (fact, account) pair, and a rebuild-by-read from this table and a
-	// rebuild-by-read from applied_facts are the same set.
+	// for a (fact, account) pair, and the two tables record the same fact once
+	// each. They are not the same SET, and the difference is the tenancy rule
+	// rather than a gap: a fact that draws on no bucket of an account has no
+	// row here at all, so a rebuild-by-read from applied_facts sees those facts
+	// and a rebuild-by-read from this table does not. Applied_facts answers
+	// "what did this plane derive"; this table answers "who paid for it", and a
+	// fact nobody paid for is in the first and not the second.
 	//
 	// The account is PART OF THE KEY, not a column beside it, because one fact
 	// can belong to more than one account: a settlement's allocation tail can

@@ -273,26 +273,38 @@ func ParseToken(raw string) (APIKeyID, Secret, error) {
 // ParseToken, which discards them and returns the bare presentation
 // sentinel.
 func validateUUIDForm(s string) error {
+	return validateCanonicalUUIDForm(s, "api key id")
+}
+
+// validateCanonicalUUIDForm is the grammar those producers share, with the
+// noun the message names supplied by the caller rather than written in. The
+// shape is the same for every identifier this package mints — they are all
+// newUUID's output — and the only thing that differs between them is what a
+// refusal should call the thing it refused. A second copy of the shape
+// would be a second grammar, and the copies would drift at the version
+// nibble first, where the drift is invisible until two identifiers disagree
+// about what a canonical identifier is.
+func validateCanonicalUUIDForm(s, noun string) error {
 	if len(s) != 36 {
-		return errors.New("api key id must be 36 characters")
+		return fmt.Errorf("%s must be 36 characters", noun)
 	}
 	for i, r := range s {
 		switch i {
 		case 8, 13, 18, 23:
 			if r != '-' {
-				return errors.New("api key id dashes are misplaced")
+				return fmt.Errorf("%s dashes are misplaced", noun)
 			}
 		case 14:
 			if r != '4' {
-				return errors.New("api key id is not a version 4 uuid")
+				return fmt.Errorf("%s is not a version 4 uuid", noun)
 			}
 		case 19:
 			if r != '8' && r != '9' && r != 'a' && r != 'b' {
-				return errors.New("api key id is not an rfc 4122 variant")
+				return fmt.Errorf("%s is not an rfc 4122 variant", noun)
 			}
 		default:
 			if !isLowerHex(r) {
-				return errors.New("api key id is not lowercase hex")
+				return fmt.Errorf("%s is not lowercase hex", noun)
 			}
 		}
 	}

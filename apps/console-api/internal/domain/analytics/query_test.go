@@ -305,6 +305,37 @@ func TestAnUnresolvableZoneIsRefusedRatherThanDefaulted(t *testing.T) {
 	}
 }
 
+// TestTheProcessZoneIsRefusedRatherThanResolved is the one name in this
+// surface's vocabulary that RESOLVES and is still not a zone.
+//
+// time.LoadLocation accepts "Local" and answers with the zone the server
+// PROCESS is running in, read from the host. That is the failure the refusal
+// exists to prevent, and it is worse than an unresolvable name rather than
+// milder: a caller who sent Mars/Olympus_Mons gets an error, while a caller who
+// sent `Local` would have been served a chart whose hour boundaries depend on
+// the host's TZ, under a label they cannot reproduce from the answer — the
+// response echoes the name it was given, and "Local" resolves to a different
+// zone in the caller's own process than in this one.
+//
+// The premise is asserted rather than assumed, because it is the whole case:
+// the loader ACCEPTS this name, so what the test below is about is this
+// surface's decision and not the standard library's.
+func TestTheProcessZoneIsRefusedRatherThanResolved(t *testing.T) {
+	if _, err := time.LoadLocation("Local"); err != nil {
+		t.Fatalf("time.LoadLocation(%q) error = %v: this case is about a name the loader accepts and this surface refuses, so a build where the loader rejects it is not exercising the same decision", "Local", err)
+	}
+
+	_, err := NewQuery(at(2026, time.September, 1, 0, 0), at(2026, time.September, 2, 0, 0), GranularityHour, "Local")
+	if !errors.Is(err, ErrInvalidTimezone) {
+		t.Errorf("NewQuery() with the process zone: error = %v, want one wrapping %v; the host's own zone is not a name a caller can resolve back to the same zone, and accepting it would cut the buckets on whichever zone the binary happened to be deployed under", err, ErrInvalidTimezone)
+	}
+	// And the refusal is about the NAME rather than about zones failing to
+	// resolve in general: the same query under a real IANA name still serves.
+	if _, err := NewQuery(at(2026, time.September, 1, 0, 0), at(2026, time.September, 2, 0, 0), GranularityHour, "Europe/London"); err != nil {
+		t.Errorf("NewQuery() with a real IANA zone: error = %v, want nil", err)
+	}
+}
+
 // TestBucketBoundsCutTheRangeInTheDisplayZone is the calendar arithmetic, and
 // the cases are the three that a division-based implementation gets wrong.
 //
@@ -683,6 +714,205 @@ func TestFinalBucketPartialIsAFactAboutTheRange(t *testing.T) {
 				t.Errorf("FinalBucketPartial() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// offsetChanges lists the instants in [from, to) at which the zone's offset
+// from UTC changed, found by reading the offset every hour and noting where it
+// differs from the reading before. It is how the sweep below finds the
+// transitions to walk across without the zone database having to publish them:
+// time.Location exposes no transition table, and a test that hard-coded a list
+// of dates would be a list of the transitions someone remembered rather than
+// the ones the zone database actually holds.
+//
+// An hour's resolution is enough because the sweep brackets each instant it
+// finds by fifty hours in both directions, so a reading that lands up to an
+// hour late still straddles the transition it found. The offset is read from
+// the instant's own reading rather than from a formatted clock, so a change
+// that moves only the offset — a zone renaming itself, or a shift that keeps
+// the same wall clock — is still a change here.
+func offsetChanges(location *time.Location, from, to time.Time) []time.Time {
+	var changes []time.Time
+	_, previous := from.In(location).Zone()
+	for instant := from.Add(time.Hour); instant.Before(to); instant = instant.Add(time.Hour) {
+		if _, offset := instant.In(location).Zone(); offset != previous {
+			changes = append(changes, instant.Add(-time.Hour))
+			previous = offset
+		}
+	}
+	return changes
+}
+
+// TestTheWalkSurvivesEveryTransitionTheZoneDatabaseKnows is the sweep the walk
+// needs and the fixtures above could not give it: a range that crosses an
+// offset change, in every zone that has one, at every grain.
+//
+// It exists because the defects it catches are invisible everywhere else. A
+// fall-back repeats a local hour and an early spring-forward deletes one, and
+// an instant truncated by rebuilding its wall clock through time.Date is a
+// CHOICE between the two readings — a choice that can land at or before the
+// instant being stepped from. The walk's loop stops when a step does not
+// advance, so that is not a wrong bucket but a series that ends at the
+// transition: every later bucket missing, the count and the money figures
+// describing different windows, and the envelope still reporting the range it
+// was asked for. Nothing but a walk across a real transition can see it, which
+// is why the assertion is a property of the whole sequence rather than of a
+// bucket anyone can write down.
+//
+// Each zone must contribute at least one transition or the sweep is vacuous
+// for it, and the run must produce a four-figure number of buckets overall, so
+// a walk that returned nothing at all cannot pass by having nothing to check.
+func TestTheWalkSurvivesEveryTransitionTheZoneDatabaseKnows(t *testing.T) {
+	// Zones chosen for the shapes a transition takes rather than for coverage
+	// of the map: a whole-hour fall-back and spring-forward (London, New York),
+	// a spring-forward whose DELETION lands on midnight (Santiago, Havana), a
+	// zone whose offset moves by half an hour (Lord Howe) and one whose moves
+	// by forty-five minutes (Chatham), and Apia, whose window is 2011 because
+	// the transition worth walking there is the calendar day it skipped
+	// outright — a date that did not exist at all, which is the extreme form of
+	// the local midnight that does not exist.
+	//
+	// The window is per zone rather than one shared year for exactly that
+	// reason: a skipped day is a historical event, and a sweep that could only
+	// see this year's transitions could not walk it.
+	windows := []struct {
+		zone     string
+		from, to time.Time
+	}{
+		{"Pacific/Chatham", at(2026, time.January, 1, 0, 0), at(2027, time.January, 1, 0, 0)},
+		{"Europe/London", at(2026, time.January, 1, 0, 0), at(2027, time.January, 1, 0, 0)},
+		{"America/New_York", at(2026, time.January, 1, 0, 0), at(2027, time.January, 1, 0, 0)},
+		{"America/St_Johns", at(2026, time.January, 1, 0, 0), at(2027, time.January, 1, 0, 0)},
+		{"America/Santiago", at(2026, time.January, 1, 0, 0), at(2027, time.January, 1, 0, 0)},
+		{"America/Havana", at(2026, time.January, 1, 0, 0), at(2027, time.January, 1, 0, 0)},
+		{"Australia/Lord_Howe", at(2026, time.January, 1, 0, 0), at(2027, time.January, 1, 0, 0)},
+		{"Australia/Sydney", at(2026, time.January, 1, 0, 0), at(2027, time.January, 1, 0, 0)},
+		{"Pacific/Apia", at(2011, time.December, 1, 0, 0), at(2012, time.January, 1, 0, 0)},
+	}
+	grains := []Granularity{GranularityHour, GranularityDay, GranularityCalendarMonth}
+	bucketsWalked := 0
+
+	for _, window := range windows {
+		zone := window.zone
+		location, err := time.LoadLocation(zone)
+		if err != nil {
+			t.Fatalf("time.LoadLocation(%s) error = %v; the zone database this test reads is not present", zone, err)
+		}
+		transitions := offsetChanges(location, window.from, window.to)
+		if len(transitions) == 0 {
+			t.Errorf("%s changed its offset no times between %s and %s, so the sweep proves nothing about it; drop it from the list or widen the window",
+				zone, window.from.Format(time.RFC3339), window.to.Format(time.RFC3339))
+			continue
+		}
+
+		for _, transition := range transitions {
+			// Fifty hours either side is wider than the longest grain of a
+			// transition's own effect and narrower than the month grain's
+			// buckets, so every grain meets the change with buckets on both
+			// sides of it.
+			from, to := transition.Add(-50*time.Hour), transition.Add(50*time.Hour)
+			for _, grain := range grains {
+				name := zone + " " + string(grain) + " across " + transition.In(location).Format(time.RFC3339)
+				t.Run(name, func(t *testing.T) {
+					bounds := WalkBounds(from, to, grain, location)
+					if len(bounds) == 0 {
+						t.Fatalf("WalkBounds() returned no buckets for [%s, %s)", from.UTC().Format(time.RFC3339), to.UTC().Format(time.RFC3339))
+					}
+					// The bucket CONTAINING the range's start opens the series
+					// — the head is never dropped — and the last bucket
+					// reaches the range's end, so the walk covers what it was
+					// asked about.
+					if bounds[0].Start.After(from) {
+						t.Errorf("the first bucket begins at %s, after the range's start %s — the bucket containing the start is missing",
+							bounds[0].Start.UTC().Format(time.RFC3339), from.UTC().Format(time.RFC3339))
+					}
+					if last := bounds[len(bounds)-1].End; last.Before(to) {
+						t.Errorf("the last bucket ends at %s, before the range's end %s — the walk stopped short:\n%s",
+							last.UTC().Format(time.RFC3339), to.UTC().Format(time.RFC3339), renderBuckets(bounds))
+					}
+					for i, bucket := range bounds {
+						width := bucket.End.Sub(bucket.Start)
+						if width <= 0 {
+							t.Errorf("bucket %d is [%s, %s), which does not advance — a step of zero is where the walk stops, so every bucket after it is missing:\n%s",
+								i, bucket.Start.UTC().Format(time.RFC3339), bucket.End.UTC().Format(time.RFC3339), renderBuckets(bounds))
+							break
+						}
+						// At the hour grain a bucket is one absolute hour in
+						// every zone, which is the whole reason the hour step
+						// is absolute: it is the property that makes a step of
+						// zero impossible rather than merely unlikely.
+						if grain == GranularityHour && width != time.Hour {
+							t.Errorf("bucket %d is %s wide, want exactly one hour in a zone where an hour is an hour:\n%s",
+								i, width, renderBuckets(bounds))
+							break
+						}
+						// A day is 23, 24 or 25 hours wherever a zone keeps
+						// whole hours, and Lord Howe's half-hour shift puts its
+						// 23½-hour day inside the same band.
+						if grain == GranularityDay && (width < 22*time.Hour || width > 26*time.Hour) {
+							t.Errorf("bucket %d is %s wide, outside the 22 to 26 hours a calendar day can be — a day bucket is a day, not a month or a minute:\n%s",
+								i, width, renderBuckets(bounds))
+							break
+						}
+					}
+					for i := 1; i < len(bounds); i++ {
+						if !bounds[i-1].End.Equal(bounds[i].Start) {
+							t.Errorf("buckets %d and %d do not share an edge: %d ends at %s and %d starts at %s",
+								i-1, i, i-1, bounds[i-1].End.UTC().Format(time.RFC3339), i, bounds[i].Start.UTC().Format(time.RFC3339))
+							break
+						}
+					}
+					if counted := CountBuckets(from, to, grain, location); counted != len(bounds) {
+						t.Errorf("CountBuckets() = %d, but WalkBounds() produced %d — the gate and the answer disagree about how many points this range has",
+							counted, len(bounds))
+					}
+
+					// The walk's own arithmetic, asked directly. Every one of
+					// these buckets was TRUNCATED from an instant, and
+					// truncation is a choice about which of a zone's readings
+					// of one wall time to believe: a rebuilt clock asks
+					// time.Date, and time.Date answers with one of the two
+					// instants a repeated hour names and with some instant
+					// near a skipped one. If the answer is not the instant
+					// the bucket that CONTAINS `at` starts at, then the walk
+					// above is not the walk this surface makes for any
+					// instant in the range — the first bucket is open, so a
+					// caller whose range begins mid-transition is served
+					// buckets that do not include their own start. So each
+					// instant walked above is put to truncate and to next
+					// directly, and the pair must bracket it. This is the
+					// assertion that failed when an earlier draft truncated
+					// the day grain by rewinding a whole day: a rewound day
+					// crosses a midnight transition inside its own rewind,
+					// and the walk above never saw it because the walk
+					// anchors on the truncated instant rather than on
+					// every instant inside a bucket.
+					for step := from; step.Before(to); step = step.Add(13 * time.Minute) {
+						start := truncate(step, grain, location)
+						if start.After(step) {
+							t.Errorf("the bucket containing %s begins at %s, after the instant it was truncated from; a boundary the zone reads twice can be answered with the wrong one of the two",
+								step.In(location).Format(time.RFC3339), start.In(location).Format(time.RFC3339))
+							break
+						}
+						if end := next(start, grain, location); !end.After(step) {
+							t.Errorf("the bucket [%s, %s) does not contain the instant %s it was truncated from",
+								start.In(location).Format(time.RFC3339), end.In(location).Format(time.RFC3339), step.In(location).Format(time.RFC3339))
+							break
+						}
+					}
+
+					bucketsWalked += len(bounds)
+				})
+			}
+		}
+	}
+
+	// The vacuity guard: a walk that produced nothing, or a transition scan
+	// that found nothing, would satisfy every assertion above by having
+	// nothing to assert about.
+	if bucketsWalked < 1000 {
+		t.Errorf("the sweep walked %d buckets in total, want the thousands that %d zones' transitions produce — the assertions above prove nothing about a walk this short",
+			bucketsWalked, len(windows))
 	}
 }
 

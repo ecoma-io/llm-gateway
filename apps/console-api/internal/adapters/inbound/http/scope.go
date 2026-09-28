@@ -91,6 +91,20 @@ func NewStaticScoper(table map[string]string) (*StaticScoper, error) {
 		if accountID == "" {
 			return nil, fmt.Errorf("http: the static scope table maps a token to an empty account: a scope that is not an account is not a scope")
 		}
+		// The grammar check the constructor's own doc promises, made where the
+		// value is still configuration. It is asked through the port rather
+		// than here because this package may not name the identity grammar —
+		// which is the same reason the table arrives as text at all.
+		//
+		// The refusal names the ACCOUNT and never the token. The account is
+		// not a secret and is the only thing that identifies the entry: the
+		// table arrives as a map, so its order is Go's and varies between
+		// runs, and an operator told nothing but "one of your account ids is
+		// wrong" has no way to find it. The token is the credential, and a
+		// start-up log line is still a log line.
+		if _, err := persistence.ScopeForConfigured(accountID); err != nil {
+			return nil, fmt.Errorf("http: the static scope table maps a token to the account %q, which this plane cannot resolve: %w", accountID, err)
+		}
 		resolver.digests = append(resolver.digests, scopedDigest{
 			digest:    sha256.Sum256([]byte(token)),
 			accountID: accountID,

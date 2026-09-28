@@ -30,11 +30,13 @@ import (
 
 // scopeAccount and scopeOtherAccount are the two accounts this file's tables
 // map tokens to, named so a case that is about tenancy reads as one. They are
-// UUID-form because the identifier this plane mints is, and a table of
-// identifiers no deployment could hold would be a fixture that says nothing.
+// in the version-4 grammar `identity.NewAccountID` mints, because that is the
+// only identifier this plane can hold: a table of identifiers no deployment
+// could hold would be a fixture that says nothing, and one carrying a version
+// nibble the minter cannot produce would be a fixture the constructor refuses.
 const (
-	scopeAccount      = "018f0000-0000-7000-8000-00000000000a"
-	scopeOtherAccount = "018f0000-0000-7000-8000-00000000000b"
+	scopeAccount      = "018f0000-0000-4000-8000-00000000000a"
+	scopeOtherAccount = "018f0000-0000-4000-8000-00000000000b"
 )
 
 // mustScoper builds a resolver from a table and refuses to continue without one.
@@ -86,6 +88,28 @@ func TestTheStaticScopeTableRefusesToResolveNothing(t *testing.T) {
 			name:    "a token mapped to no account",
 			table:   map[string]string{"console-token": ""},
 			wantSay: "empty account",
+		},
+		{
+			// The account is TEXT here and nowhere else in this plane, so this
+			// is the one place a typo in it can still be caught. Everywhere
+			// below the constructor the scope has already been built from the
+			// string, and an account id that is not one reaches a `uuid` cast
+			// inside a statement — which is a 500 for a caller whose credential
+			// is perfectly valid, on a deployment that could have refused to
+			// start instead.
+			name:    "an account that is not an identifier at all",
+			table:   map[string]string{"console-token": "the-account-nobody-typed-carefully"},
+			wantSay: "account id",
+		},
+		{
+			// And the near miss, which is the shape a real typo takes: the
+			// right characters in the wrong grammar. It is here because a
+			// check that only counted characters would accept it, and the
+			// constructor's promise is the identifier's grammar rather than
+			// its length.
+			name:    "an account id one version nibble away from the mint's",
+			table:   map[string]string{"console-token": "018f0000-0000-7000-8000-000000000001"},
+			wantSay: "version 4 uuid",
 		},
 	}
 

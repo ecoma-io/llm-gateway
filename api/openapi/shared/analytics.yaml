@@ -248,7 +248,20 @@ components:
           minimum: 0
           description: >-
             Requests that reached a settlement of record AND were attributed to
-            this account, in this bucket. A zero-priced settle settles for
+            this account, in this bucket.
+
+            "In this bucket" is placed by the APPLY clock — the instant this
+            plane recorded the usage fact, which is the same clock
+            `requests_with_usage_facts` is placed by and the same one this
+            fragment's rule 4 requires every bucketed figure to name. The pair
+            is therefore one population sliced by one clock, and their ratio is
+            the share of this account's fact-producing requests that reached a
+            charge. The settlement's own creation instant is NOT the clock
+            here: a fact applied in this bucket whose settlement was created
+            moments later, in the next one, counts here and its money is
+            bucketed there.
+
+            A zero-priced settle settles for
             nothing and is a settlement of record, but it names no funding
             bucket — the account is derived from the allocation tail, and an
             empty tail derives no account. Such a request is therefore counted
@@ -355,13 +368,19 @@ components:
             most 2161 buckets, and that is the bound: 90 days is 2160
             hours, and the first bucket of a range is the bucket
             CONTAINING its start rather than one clipped to it, so a
-            caller asking for 09:00 on 1 June to 09:00 on 30 August has
-            2161 of them — the first holding half an hour. A bound of
-            2160 would refuse that range, and would refuse every
-            unaligned range in the last hour of the maximum window. The
-            bound is stated here rather than requested as a parameter
-            because it is a property of the answer, not a preference of
-            the caller.
+            caller asking for 09:30 on 1 June to 09:30 on 30 August has
+            2161 of them — the first holding the last half hour of the
+            09:00 bucket, and the last being the 09:00 bucket the range
+            ends inside. A range starting at 09:00 has 2160, because
+            then the first bucket IS the range's own first hour; the
+            extra one comes from the range being unaligned, not from
+            the maximum window being one hour longer than it looks. A
+            bound of 2160 would refuse the unaligned range, and would
+            refuse every unaligned range in the last hour of the
+            maximum window — a caller shortening their range by an hour
+            to get past a bound they were never told about. The bound is
+            stated here rather than requested as a parameter because it
+            is a property of the answer, not a preference of the caller.
           items:
             $ref: "#/components/schemas/AnalyticsSeriesPoint"
         requests_with_usage_facts:
@@ -378,7 +397,18 @@ components:
           type: integer
           format: int64
           minimum: 0
-          description: The range total of `series[].requests_settled`.
+          description: >-
+            The range total of `series[].requests_settled`. Read the series
+            field for what it counts and which clock placed it — and note that
+            it is the APPLY clock on both sides of the pair: a request is
+            counted in this series because this plane recorded its usage fact
+            then, whether or not its settlement was created in the same bucket.
+            `settled_amount_minor_units` is the money that settled, placed by
+            the settlement's own clock, so the two are counted over one range
+            and not over one instant — and the money's window is the range's
+            own while this total is the series', which is a bucket wider at
+            each end. Both facts are stated where the money is defined; the
+            pair is not a ratio of two figures cut the same way.
         settled_amount_minor_units:
           type: integer
           format: int64
@@ -386,6 +416,19 @@ components:
           description: >-
             What the range COST, summed over the settlements of record it
             contains.
+
+            "The range" here is exactly `range.start_at` inclusive to
+            `range.end_at` exclusive, the window the range object states.
+            The SERIES is a bucket wider at each end, deliberately: its
+            first bucket is the calendar bucket CONTAINING the range's
+            start and its last is the one the range's end falls inside, so
+            the counts summed from it and the money summed over the range
+            cover two windows that agree everywhere except those two
+            partial buckets. Both are the range's answer and neither is
+            wrong; a caller combining them — the average settlement, the
+            cost per settled request — is combining two windows, and a
+            caller who wants one window throughout should read the series
+            and take its own sums from it.
 
             BUCKETED BY `settlements.created_at` — the database clock, at the
             instant the settlement was booked. Never by the fact's

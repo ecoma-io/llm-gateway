@@ -1246,7 +1246,13 @@ paths:
           description: >-
             A bound does not satisfy the contract: a range longer than 90 days,
             a `from` at or after `to`, a granularity outside the enumeration, an
-            instant that is not RFC 3339, or an unknown query parameter.
+            instant that is not RFC 3339, a `timezone` that does not resolve to
+            an IANA zone, a parameter present but empty, or a parameter this
+            operation does not define. `timezone` is optional and its default is
+            `UTC`, but a caller that SENDS it must send a zone: an empty value
+            is a parameter the caller set and this surface will not guess the
+            meaning of, which is a different request from the one that omits the
+            parameter altogether.
           headers:
             X-Request-Id:
               $ref: "./shared/console.yaml#/components/headers/RequestID"
@@ -1285,7 +1291,30 @@ paths:
         "500":
           $ref: "./shared/errors.yaml#/components/responses/InternalError"
         "503":
-          $ref: "./shared/errors.yaml#/components/responses/ServiceUnavailable"
+          description: >-
+            The read did not finish inside this operation's own per-request
+            deadline, so the answer would have been a truncated series — a
+            chart showing real activity having stopped at whatever instant the
+            deadline landed on. It is a retry-later answer and not a
+            differently-shaped one: the same request, asked again, is answered
+            normally, and the range is unchanged. The code is
+            `service_unavailable`.
+
+            This is deliberately not the readiness probe's 503. That one means
+            the service may not receive traffic because a dependency is not
+            answering; this one means the service is up, this one read
+            overran its budget, and the caller should retry — backing the whole
+            surface off on a single slow report would be reading this answer as
+            that one.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
 components:
   securitySchemes:
     consoleCredential:

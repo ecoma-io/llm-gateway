@@ -45,6 +45,30 @@ func ScopeFor(accountID string) RequestScope {
 	return RequestScope{AccountID: identity.AccountID(accountID)}
 }
 
+// ScopeForConfigured is ScopeFor for an identifier that arrived as TEXT — a
+// deployment's own configuration naming which account a credential speaks for
+// — and it refuses one the account grammar does not accept.
+//
+// The distinction from ScopeFor is where the string came from and not how
+// strict this is. An identifier read from the database is a `uuid` column and
+// the database has already answered the question; an identifier written by
+// hand in an environment variable has had nobody check it, and its first use
+// is a cast failure inside a query — every request answered with a server
+// fault because an operator mistyped a configuration value. This is the
+// constructor that lets a deployment find that out at start-up, and it is why
+// ScopeFor's own note says the resolver is the layer that decides what a
+// malformed identifier means: the resolver is the layer that holds it as text.
+//
+// The grammar check itself stays in the domain and is reached through here, so
+// the transport refuses a bad identifier without ever naming the type it is
+// not allowed to name.
+func ScopeForConfigured(accountID string) (RequestScope, error) {
+	if err := identity.ValidateAccountID(accountID); err != nil {
+		return RequestScope{}, err
+	}
+	return ScopeFor(accountID), nil
+}
+
 // Scoper turns a presented bearer token into the account it speaks for.
 //
 // It exists as a PORT and not as a function in the application because the

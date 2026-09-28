@@ -42,6 +42,22 @@
 --   funding buckets the fact's own allocation tail names. A request whose
 --   fact draws on no bucket of the account belongs to no account, which is
 --   what makes the scope a tenancy rule rather than a filter.
+--
+--   AND IT STARTS EMPTY, WITH NO BACKFILL, WHICH A READER MUST BE TOLD.
+--   applied_facts holds every fact this plane has ever applied and this table
+--   holds none of them: nothing populates it except the ingestion transaction
+--   of a fact applied after this migration runs. So the day after 000012, a
+--   report on an account that has been settling for months answers "no
+--   derivations", and at the surface that answer is indistinguishable from a
+--   brand-new account's — AccountHasDerivations is a statement about THIS
+--   table, not about the account's history. There is no backfill here on
+--   purpose and not by omission: a backfill is a second writer to a
+--   Control-Plane table (docs/architecture/analytics.md §7), and re-deriving
+--   the account of a past fact means re-reading an allocation tail whose
+--   buckets may since have been deleted. The gap closes by time passing: the
+--   difference between "no derivations" and "this plane was not recording yet"
+--   is a question about the ledger, and the analytics surface has no settlement
+--   read to answer it with.
 
 -- ---------------------------------------------------------------------------
 -- The account a usage fact belongs to, one row per (fact, account).
@@ -98,7 +114,7 @@ CREATE TABLE control.analytics_fact_dimensions (
 );
 
 COMMENT ON TABLE control.analytics_fact_dimensions IS
-    'Analytics (B16): the account one applied usage fact belongs to, denormalized so the read model can scope to an account at all. Derived state — reconstructable from the fact''s own allocation tail joined to control.funding_buckets, and an authority for nothing. Populated inside the ingestion transaction on txCtx, in the same unit of work as the settlement or the disposition the fact produced, so a fact and the account it belongs to cannot be committed apart.';
+    'Analytics (B16): the account one applied usage fact belongs to, denormalized so the read model can scope to an account at all. Derived state — reconstructable from the fact''s own allocation tail joined to control.funding_buckets, and an authority for nothing. Populated inside the ingestion transaction on txCtx, in the same unit of work as the settlement or the disposition the fact produced, so a fact and the account it belongs to cannot be committed apart. Created EMPTY and never backfilled: only facts applied after this migration carry a row, so a report asks about the account''s derivations SINCE 000012 and not about its history.';
 COMMENT ON COLUMN control.analytics_fact_dimensions.account_id IS
     'The account whose funding buckets the fact''s allocation tail names, resolved at apply time. Not a request parameter and not a caller-supplied value: the read model has no account filter a caller could tamper with, because the scope is applied in the statement rather than after it. NOT NULL because funding_buckets.account_id is nullable, and a read scoped through that column would silently drop every entitlement-funded fact.';
 COMMENT ON COLUMN control.analytics_fact_dimensions.applied_at IS

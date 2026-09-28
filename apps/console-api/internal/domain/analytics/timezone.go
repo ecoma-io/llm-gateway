@@ -25,6 +25,17 @@ func resolveLocation(name string) (*time.Location, error) {
 	if name == "" {
 		return time.UTC, nil
 	}
+	// "Local" is the one name time.LoadLocation answers that is not a zone in
+	// the database: it means the SERVER PROCESS's own zone, read from the
+	// host. Accepting it would answer with bucket edges that depend on where
+	// the binary happens to run and on the host's TZ, and would echo a
+	// `range.timezone` that a caller cannot resolve back to the same zone —
+	// the field documents an IANA name and this is not one. It is refused for
+	// the same reason an unresolvable name is: the caller asked for a zone and
+	// this plane cannot give them the one they asked for.
+	if name == "Local" {
+		return nil, fmt.Errorf("%w: %q is not an IANA zone name — it names the server process's own zone, which the caller cannot know and cannot reproduce from the answer", ErrInvalidTimezone, name)
+	}
 	location, err := time.LoadLocation(name)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %q does not resolve to an IANA zone", ErrInvalidTimezone, name)

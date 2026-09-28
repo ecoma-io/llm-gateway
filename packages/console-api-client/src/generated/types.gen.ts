@@ -62,7 +62,9 @@ export type AnalyticsSeriesPoint = {
    */
   requests_with_usage_facts: number;
   /**
-   * Requests that reached a settlement of record AND were attributed to this account, in this bucket. A zero-priced settle settles for nothing and is a settlement of record, but it names no funding bucket — the account is derived from the allocation tail, and an empty tail derives no account. Such a request is therefore counted in a platform-wide view and in no account's report, which is the tenancy rule stated in §5 applied literally: a fact that draws on no bucket of an account belongs to no account. A caller needing free-model traffic counted needs a platform-scoped view, which this endpoint deliberately is not.
+   * Requests that reached a settlement of record AND were attributed to this account, in this bucket.
+   * "In this bucket" is placed by the APPLY clock — the instant this plane recorded the usage fact, which is the same clock `requests_with_usage_facts` is placed by and the same one this fragment's rule 4 requires every bucketed figure to name. The pair is therefore one population sliced by one clock, and their ratio is the share of this account's fact-producing requests that reached a charge. The settlement's own creation instant is NOT the clock here: a fact applied in this bucket whose settlement was created moments later, in the next one, counts here and its money is bucketed there.
+   * A zero-priced settle settles for nothing and is a settlement of record, but it names no funding bucket — the account is derived from the allocation tail, and an empty tail derives no account. Such a request is therefore counted in a platform-wide view and in no account's report, which is the tenancy rule stated in §5 applied literally: a fact that draws on no bucket of an account belongs to no account. A caller needing free-model traffic counted needs a platform-scoped view, which this endpoint deliberately is not.
    */
   requests_settled: number;
 };
@@ -91,7 +93,7 @@ export type AnalyticsUsageResponse = {
   final_bucket_partial: boolean;
   /**
    * One point per bucket in the range, in ascending order, with no bucket omitted. A bucket with no activity is present with zero figures rather than absent, so a caller renders a gap-free series without having to fill holes and invent a rule for which holes to fill.
-   * At the maximum range of 90 days the finest grain yields at most 2161 buckets, and that is the bound: 90 days is 2160 hours, and the first bucket of a range is the bucket CONTAINING its start rather than one clipped to it, so a caller asking for 09:00 on 1 June to 09:00 on 30 August has 2161 of them — the first holding half an hour. A bound of 2160 would refuse that range, and would refuse every unaligned range in the last hour of the maximum window. The bound is stated here rather than requested as a parameter because it is a property of the answer, not a preference of the caller.
+   * At the maximum range of 90 days the finest grain yields at most 2161 buckets, and that is the bound: 90 days is 2160 hours, and the first bucket of a range is the bucket CONTAINING its start rather than one clipped to it, so a caller asking for 09:30 on 1 June to 09:30 on 30 August has 2161 of them — the first holding the last half hour of the 09:00 bucket, and the last being the 09:00 bucket the range ends inside. A range starting at 09:00 has 2160, because then the first bucket IS the range's own first hour; the extra one comes from the range being unaligned, not from the maximum window being one hour longer than it looks. A bound of 2160 would refuse the unaligned range, and would refuse every unaligned range in the last hour of the maximum window — a caller shortening their range by an hour to get past a bound they were never told about. The bound is stated here rather than requested as a parameter because it is a property of the answer, not a preference of the caller.
    */
   series: Array<AnalyticsSeriesPoint>;
   /**
@@ -99,11 +101,12 @@ export type AnalyticsUsageResponse = {
    */
   requests_with_usage_facts: number;
   /**
-   * The range total of `series[].requests_settled`.
+   * The range total of `series[].requests_settled`. Read the series field for what it counts and which clock placed it — and note that it is the APPLY clock on both sides of the pair: a request is counted in this series because this plane recorded its usage fact then, whether or not its settlement was created in the same bucket. `settled_amount_minor_units` is the money that settled, placed by the settlement's own clock, so the two are counted over one range and not over one instant — and the money's window is the range's own while this total is the series', which is a bucket wider at each end. Both facts are stated where the money is defined; the pair is not a ratio of two figures cut the same way.
    */
   requests_settled: number;
   /**
    * What the range COST, summed over the settlements of record it contains.
+   * "The range" here is exactly `range.start_at` inclusive to `range.end_at` exclusive, the window the range object states. The SERIES is a bucket wider at each end, deliberately: its first bucket is the calendar bucket CONTAINING the range's start and its last is the one the range's end falls inside, so the counts summed from it and the money summed over the range cover two windows that agree everywhere except those two partial buckets. Both are the range's answer and neither is wrong; a caller combining them — the average settlement, the cost per settled request — is combining two windows, and a caller who wants one window throughout should read the series and take its own sums from it.
    * BUCKETED BY `settlements.created_at` — the database clock, at the instant the settlement was booked. Never by the fact's `occurred_at`: that is the runtime's clock, clocks disagree between processes, and ordering one plane's records by another plane's timestamps is how a modest skew becomes a fact filed outside the window it belongs to. This is the one attribution axis a money figure may use, and it is this plane's own.
    * Summed from settlement headers, never from per-request re-derivations. A re-derived per-request amount is a ROUNDED figure — the derivation applies one ceiling over a request's summed raw cost — and the sum of rounded figures is not the rounded total. Adding one such figure per request overstates the total, and overstates it in proportion to volume: a thousand one-minor-unit requests settle for one minor unit between them, and a naive sum of their per-request ceilings would bill a thousand. The settlement header is the authority here precisely because it is written once and summed, with no rounding anywhere in the aggregate.
    */
@@ -586,7 +589,7 @@ export type UserPage = PageEnvelope & {
 
 export type Error = {
   /**
-   * A stable machine-readable category for the failure, shared by both surfaces that return this envelope. `cursor_expired` and `upstream_unavailable` are produced by the Data Plane management API today, as are the three projection codes (`unsupported_version`, `revision_gap`, `snapshot_required`); `service_unavailable` is produced by the Console API's readiness probe. They are named here rather than in the document alone so a caller of either surface has one vocabulary for both.
+   * A stable machine-readable category for the failure, shared by both surfaces that return this envelope. `cursor_expired` and `upstream_unavailable` are produced by the Data Plane management API today, as are the three projection codes (`unsupported_version`, `revision_gap`, `snapshot_required`); `service_unavailable` is produced by the Console API's readiness probe and by the usage report whose read outran its own per-request deadline — two conditions that share the code because both are retry-later answers, and each operation's own 503 description says which one it is. They are named here rather than in the document alone so a caller of either surface has one vocabulary for both.
    */
   code:
     | "not_found"
@@ -1576,7 +1579,7 @@ export type GetUsageData = {
 
 export type GetUsageErrors = {
   /**
-   * A bound does not satisfy the contract: a range longer than 90 days, a `from` at or after `to`, a granularity outside the enumeration, an instant that is not RFC 3339, or an unknown query parameter.
+   * A bound does not satisfy the contract: a range longer than 90 days, a `from` at or after `to`, a granularity outside the enumeration, an instant that is not RFC 3339, a `timezone` that does not resolve to an IANA zone, a parameter present but empty, or a parameter this operation does not define. `timezone` is optional and its default is `UTC`, but a caller that SENDS it must send a zone: an empty value is a parameter the caller set and this surface will not guess the meaning of, which is a different request from the one that omits the parameter altogether.
    */
   400: ErrorEnvelope;
   /**
@@ -1596,7 +1599,8 @@ export type GetUsageErrors = {
    */
   500: ErrorEnvelope;
   /**
-   * The service is up and not ready: one of its own dependencies is not answering yet — for the Console API, its database. The condition is expected to clear, so a caller retries later rather than differently, and the code is `service_unavailable`. Which dependency is missing is the operator's fact, logged against the request identifier, never the client's.
+   * The read did not finish inside this operation's own per-request deadline, so the answer would have been a truncated series — a chart showing real activity having stopped at whatever instant the deadline landed on. It is a retry-later answer and not a differently-shaped one: the same request, asked again, is answered normally, and the range is unchanged. The code is `service_unavailable`.
+   * This is deliberately not the readiness probe's 503. That one means the service may not receive traffic because a dependency is not answering; this one means the service is up, this one read overran its budget, and the caller should retry — backing the whole surface off on a single slow report would be reading this answer as that one.
    */
   503: ErrorEnvelope;
 };

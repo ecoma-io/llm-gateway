@@ -23,6 +23,28 @@ type (
 	APIKeyID string
 )
 
+// ValidateAccountID reports whether a string is an account identifier in the
+// canonical form this grammar mints, and is the check for an identifier that
+// arrived as TEXT rather than as a column: a deployment's configuration file
+// naming which account a credential speaks for, where a typo is an operator
+// mistake and not a hostile input.
+//
+// It exists because the difference between the two answers is a surface that
+// refuses to start and a surface that starts and answers every request with an
+// error. The persistence column is a `uuid`, so an identifier read from the
+// database is the database's own guarantee and needs no check; a string from a
+// configuration file carries no such guarantee, and the first use of a bad one
+// is a cast failure deep inside a query — which is a 500 for a caller whose
+// credential is perfectly valid, on a deployment that could have refused at
+// start-up.
+//
+// It is the same grammar the mint enforces, deliberately: an identifier this
+// accepts and a mint cannot produce would be an identifier nothing else in the
+// plane agrees with.
+func ValidateAccountID(id string) error {
+	return validateCanonicalUUIDForm(id, "account id")
+}
+
 // NewAccountID mints a random account identifier.
 func NewAccountID() (AccountID, error) {
 	id, err := newUUID()

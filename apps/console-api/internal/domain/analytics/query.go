@@ -207,10 +207,15 @@ func WalkBounds(from, to time.Time, granularity Granularity, location *time.Loca
 		end := next(start, granularity, location)
 		bounds = append(bounds, Bucket{Start: start, End: end})
 		if !end.After(start) {
-			// Unreachable for a real zone: hour, day and month all
-			// advance. It is here because the walk's only exit that is not
-			// the range's end is this check, and a walk that cannot advance
-			// would otherwise spin for the life of the process.
+			// Every arm of next advances — see its own note — so this is
+			// expected to be unreachable, and it is a break rather than a
+			// continue because a walk that cannot advance must not spin for
+			// the life of the process. What it must NOT be is the silent
+			// truncation it used to be: an arm that stopped advancing used to
+			// end the series at a daylight-saving transition and report the
+			// rest of the range as a range with nothing in it, which is why
+			// the domain tests now walk every transition the zone database
+			// knows about rather than trusting this line.
 			break
 		}
 		start = end
@@ -256,37 +261,215 @@ func truncate(at time.Time, granularity Granularity, location *time.Location) ti
 		// clock reads is a local reading, and a zone whose offset is a
 		// half hour would place the boundary at :30 rather than at :00 if
 		// the arithmetic were done on the UTC instant instead.
-		return time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), 0, 0, 0, location)
+		//
+		// It is the instant REWOUND BY THE MINUTES it stands past its local
+		// hour rather than a wall clock rebuilt through time.Date, and the
+		// difference is the whole reason this is written the long way. An
+		// hour that occurs twice — the one a fall-back repeats — makes
+		// time.Date's answer a CHOICE between two instants an hour apart, and
+		// the one it picks is not necessarily the one `at` fell in: asked for
+		// 01:00 on the day London goes back, it answers the second occurrence,
+		// so the boundary would land AFTER the instant being truncated and the
+		// bucket that contains `at` would be missing from the series. A rewind
+		// cannot pass the instant it started from, and it keeps the offset
+		// `at` was actually read in, so the bucket it names is the one `at` is
+		// in rather than the one it would be in under another offset's clock.
+		return at.Add(-time.Duration(local.Minute())*time.Minute -
+			time.Duration(local.Second())*time.Second -
+			time.Duration(local.Nanosecond()))
 	case GranularityDay:
-		return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, location)
+		// The local day's own first instant, asked of the zone through the
+		// wall clock that names it and NOT rewound by arithmetic — the
+		// opposite choice from the hour arm, and the width is why. A day is
+		// long enough for a transition to fall inside the span a rewind takes
+		// back, and when one does the rewind lands in the PREVIOUS local day:
+		// an instant at 02:05 on the morning London springs forward rewinds by
+		// two local hours into 23:00 of the day before, which is a boundary
+		// that does not contain the instant it was asked for. The fast path is
+		// taken only when the rebuilt midnight is BOTH at or before `at` and
+		// the first instant of the date it names — the second test is what
+		// separates a midnight that is really where the date begins from one
+		// the zone skipped (which resolves to an instant still in the previous
+		// local day, an hour short of where the date begins) and from one a
+		// fall-back names twice (where the rebuild may answer with the second
+		// occurrence).
+		onDate := onSameDate(at, location)
+		midnight := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, location)
+		if !midnight.After(at) && startsSpan(midnight, onDate) {
+			return midnight
+		}
+		// The zone's own answer it is, then: the first instant whose local date
+		// is this one, found from the instant being truncated, which is on that
+		// date by definition.
+		return firstInside(at, 30*time.Hour, onDate)
 	case GranularityCalendarMonth:
-		return time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, location)
+		// The same shape as the day arm, one month wide, and the same two-part
+		// fast path: the first of the month is a midnight a zone can skip or
+		// repeat exactly as any other is.
+		onMonth := onSameMonth(at, location)
+		first := time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, location)
+		if !first.After(at) && startsSpan(first, onMonth) {
+			return first
+		}
+		return firstInside(at, 32*24*time.Hour, onMonth)
 	default:
 		return local.UTC()
 	}
 }
 
+// onSameDate reports whether an instant falls on the same local calendar date
+// as the reference instant, in the display zone. It is the definition of the
+// day grain's span, written once and passed to the boundary helpers rather than
+// recomputed beside them, because a search and its fast-path test disagreeing
+// about what a day IS would produce a bucket whose start and end are days
+// under two different rules.
+func onSameDate(reference time.Time, location *time.Location) func(time.Time) bool {
+	at := reference.In(location)
+	return func(candidate time.Time) bool {
+		other := candidate.In(location)
+		return other.Year() == at.Year() && other.Month() == at.Month() && other.Day() == at.Day()
+	}
+}
+
+// onSameMonth is onSameDate for the month grain: the span is the local calendar
+// month, which is the day rule lifted one field.
+func onSameMonth(reference time.Time, location *time.Location) func(time.Time) bool {
+	at := reference.In(location)
+	return func(candidate time.Time) bool {
+		other := candidate.In(location)
+		return other.Year() == at.Year() && other.Month() == at.Month()
+	}
+}
+
+// startsSpan reports whether an instant is the FIRST instant of the span it
+// falls in — whether it is a calendar boundary rather than a moment inside one.
+//
+// The test is one nanosecond deep and that is the whole of it: an instant opens
+// a span exactly when the instant before it belongs to a different one. It is
+// here because a rebuilt wall clock cannot answer the question by itself. The
+// zone database resolves a local midnight that does not exist to some instant
+// near it and a midnight that exists twice to one of the two, and neither
+// answer is a statement about which instant the date BEGINS at; asking the
+// clock what it read a nanosecond earlier is.
+func startsSpan(at time.Time, inside func(time.Time) bool) bool {
+	return inside(at) && !inside(at.Add(-time.Nanosecond))
+}
+
+// firstInside returns the earliest instant in [limit-span, limit] that
+// inside reports true for, and is the backward half of the boundary arithmetic:
+// it answers "where did this span BEGIN", where boundaryAfter answers "where did
+// it END". The caller guarantees the predicate holds at limit — it is the
+// instant whose own span is being found — and the window is generous by
+// construction, so the search is only ever reached for the transitions.
+func firstInside(limit time.Time, span time.Duration, inside func(time.Time) bool) time.Time {
+	lo, hi := limit.Add(-span), limit
+	for hi.Sub(lo) > time.Nanosecond {
+		mid := lo.Add(hi.Sub(lo) / 2)
+		if inside(mid) {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+	return hi
+}
+
 // next returns the start of the bucket after the one starting at start, at
-// this grain, in the display zone. The calendar arithmetic is done on the LOCAL reading and
-// the result is re-zoned by time.Date's own resolution of the location, which
-// is what makes a daylight-saving transition produce a 23- or 25-hour day
-// rather than a day that is silently 24 hours of the wrong length.
+// this grain, in the display zone.
+//
+// EVERY ARM ADVANCES, and that is a property the walk depends on rather than a
+// happy accident: the walk's loop exits on the range's end, and its only other
+// exit is the guard against a step that does not move. An arm that returned
+// `start` would therefore not merely add a degenerate bucket — it would END the
+// series there, and a fall-back is exactly where a naive calendar step stops
+// moving.
+//
+// The hour arm is absolute and the day and month arms are the zone's own
+// boundary, and the difference is not an inconsistency: a clock hour is a fixed
+// span in every zone, so the hour's end is arithmetic, while a calendar day is
+// a set of instants the ZONE decides the edges of. Asking a zone database
+// "which instant begins the next date" by rebuilding a wall clock is only
+// correct when that wall clock names exactly one instant, and midnight is
+// precisely where it may not: it can be skipped by a spring-forward, and it can
+// be named twice by a fall-back. So the calendar arms ask the zone instead —
+// see boundaryAfter — and time.Date's answer is used only as the fast path when
+// it is already provably on the far side of the edge.
 func next(start time.Time, granularity Granularity, location *time.Location) time.Time {
 	local := start.In(location)
 	switch granularity {
 	case GranularityHour:
-		return time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), 0, 0, 0, location).Add(time.Hour)
+		// An hour is an hour long in every zone, so the step is absolute and
+		// the calendar is consulted only where the walk is anchored. Deriving
+		// it from the wall clock instead would ask time.Date to resolve an
+		// hour that a fall-back makes ambiguous, and its answer is as likely
+		// to be the occurrence BEFORE the one stepped from as the one after —
+		// which is a step of zero, a series that ends at the transition, and a
+		// range whose remaining days are reported as nothing happening.
+		return start.Add(time.Hour)
 	case GranularityDay:
-		// A new calendar day, not "24 hours later": the two differ by an
-		// hour twice a year and the difference is the entire reason the
-		// bucket carries an end rather than a width.
-		return time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, location)
+		// A new calendar day, not "24 hours later": the two differ by an hour
+		// twice a year and the difference is the entire reason the bucket
+		// carries an end rather than a width.
+		onDate := onSameDate(start, location)
+		candidate := time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, location)
+		if candidate.After(start) && startsSpan(candidate, onDate) {
+			return candidate
+		}
+		// The fast path is unavailable, which means the wall clock naming the
+		// next midnight resolved to an instant that is not where the next date
+		// begins: Santiago and Havana spring forward at midnight, and there
+		// time.Date answers with an instant still inside the day being closed,
+		// an hour short of the transition — a day that ends before it is over,
+		// whose last hour is counted in no bucket at all. A whole day is not
+		// the answer either: 24 hours from here is right by accident where the
+		// day really is 23 or 25 hours long. The boundary belongs to the zone,
+		// so the zone is asked for it.
+		return boundaryAfter(start, 30*time.Hour, onDate)
 	case GranularityCalendarMonth:
 		// Day zero of the next month, which time.Date normalises to that
 		// month's first, and the start day is always the first so there is
 		// nothing to clip: a bucket never starts mid-month.
-		return time.Date(local.Year(), local.Month()+1, 1, 0, 0, 0, 0, location)
+		onMonth := onSameMonth(start, location)
+		candidate := time.Date(local.Year(), local.Month()+1, 1, 0, 0, 0, 0, location)
+		if candidate.After(start) && startsSpan(candidate, onMonth) {
+			return candidate
+		}
+		// The same two ways a rebuilt first-of-the-month can fail as a
+		// midnight can — a zone can skip it or name it twice — and the same
+		// answer, because a month is a calendar span like any other. The
+		// window is a month plus two days, which no month length reaches.
+		return boundaryAfter(start, 32*24*time.Hour, onMonth)
 	default:
 		return start.Add(time.Hour)
 	}
+}
+
+// boundaryAfter returns the first instant after start whose local reading the
+// zone places outside the calendar span `inside` describes — the end of the day
+// or of the month start is in.
+//
+// It exists because a calendar boundary is a fact about a zone and not a
+// formula. The span is asked of the zone's own clock, one instant at a time,
+// and the answer is exact to the nanosecond rather than to whatever offset a
+// rebuilt wall clock happened to resolve to. `span` bounds the search: a local
+// date is at most a transition's own width away, and the widest a zone has ever
+// moved a calendar is the day Samoa skipped, so the two callers' windows are
+// generous by construction. Only the transitions reach this at all — every
+// ordinary day and every ordinary month takes its caller's fast path — so the
+// search's cost is off the series' hot path by design.
+func boundaryAfter(start time.Time, span time.Duration, inside func(time.Time) bool) time.Time {
+	// `inside(start)` is true by the caller's own definition and the window's
+	// far end is outside the span by construction, so the search is bracketed
+	// before it takes a single step: the invariant below is that the predicate
+	// is true at lo and false at hi.
+	lo, hi := start, start.Add(span)
+	for hi.Sub(lo) > time.Nanosecond {
+		mid := lo.Add(hi.Sub(lo) / 2)
+		if inside(mid) {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return hi
 }

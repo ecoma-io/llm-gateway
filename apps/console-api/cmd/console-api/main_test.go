@@ -77,8 +77,11 @@ func (s answeringStore) Ping(context.Context) error { return s.pingErr }
 // readiness test that started failing on an unrelated panic would be a test
 // that has stopped being about readiness.
 const (
-	testScopeToken   = "console-test-token"
-	testScopeAccount = "018f0000-0000-7000-8000-000000000001"
+	testScopeToken = "console-test-token"
+	// In the version-4 grammar identity.NewAccountID mints: the scope table is
+	// validated where it is still configuration, so an account id the minter
+	// could not have produced is a deployment that refuses to start.
+	testScopeAccount = "018f0000-0000-4000-8000-000000000001"
 )
 
 // stubAnalytics is the read model: no derived rows, so the use case it backs

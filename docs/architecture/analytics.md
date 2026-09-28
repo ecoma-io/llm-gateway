@@ -336,7 +336,23 @@ The non-goals, restated as the concrete items the reviews surfaced:
   contract change, not an analytics feature
 - no token metrics — and the reason is stronger than "not derivable" (§10.2)
 - no per-model or per-provider spend — forward-only, and it would need B12's wire
-- no rebuild writer, backfill endpoint, or export file
+- no rebuild writer, backfill endpoint, or export file — **and this one has a
+  consequence a reader has to be told rather than left to discover**:
+  `control.analytics_fact_dimensions` is created empty by `000012` and nothing
+  populates it except the ingestion transaction of a fact applied _after_ that
+  migration. Facts this plane applied before it — every fact in `applied_facts`
+  today — carry no attribution and never will. A report run the day after
+  `000012` answers "no derivations" for an account that has been settling for
+  months, and that answer is indistinguishable at the surface from a new
+  account's: `AccountHasDerivations` is a statement about this table, not about
+  the account's history. There is no backfill in B16 because a backfill is a
+  second writer to a Control-Plane table (§7) and reconstructing the account of
+  a past fact means re-reading an allocation tail whose buckets may since have
+  been deleted. The gap closes only by time passing: the difference between "no
+  derivations" and "we were not recording then" is a question about the ledger,
+  and this surface does not answer it — it has no settlement read at all, which
+  is why the exclusion is recorded here rather than left for a reader to infer
+  from an empty chart.
 - no currency value — issue #63; amounts stay integer minor units
 - no audit log — read access is **not** recorded, and no documentation may imply
   that server-side scope is accountability
