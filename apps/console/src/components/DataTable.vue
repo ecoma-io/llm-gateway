@@ -69,8 +69,32 @@ const props = withDefaults(
      * than a case every caller has to intercept.
      */
     state?: "ready" | "loading" | "empty";
-    /** The sentence shown when there are no rows and nothing is in flight. */
+    /**
+     * The sentence shown when there are no rows and nothing is in flight.
+     *
+     * ONE SENTENCE, and that is a bound on meaning rather than on length. A
+     * cell in a table is read one row at a time; a screen-reader user moving
+     * through a list that happens to be empty hears that cell once, in place of
+     * every row it expected. The explanation of a domain — what a subscription
+     * is, that a pay-as-you-go balance lives on another screen — is a paragraph
+     * ABOUT the list, so a screen that put it here made a reader who is not on
+     * this screen read the whole of it before the list they came for. A
+     * first version rendered a two-sentence paragraph in this cell, and the
+     * console reads better for a sentence here and the paragraph under the
+     * table where a reader can see it as a caption on the data rather than as
+     * the contents of a row.
+     */
     emptyMessage?: string;
+    /**
+     * An optional second sentence about the empty list, in the same cell.
+     *
+     * Separate from `emptyMessage` rather than appended to it, because only the
+     * first is the ANSWER. Splitting them lets a screen write the answer and the
+     * explanation as two, and keeps the answer readable by a screen reader that
+     * only reads that cell — a joined string has no such boundary, and the
+     * habit of joining is how a cell came to carry a paragraph.
+     */
+    note?: string;
     /**
      * The pager, as real links. Absent on a screen that renders one page, and
      * never a page count: see the file header.
@@ -94,6 +118,7 @@ const props = withDefaults(
   {
     state: "ready",
     emptyMessage: "There is nothing to show yet.",
+    note: undefined,
     pages: undefined,
     pagesLabel: undefined,
     role: "table",
@@ -352,7 +377,12 @@ function tabbable(rowIndex: number, columnIndex: number): boolean {
       >
         <tr v-if="isEmpty">
           <td :colspan="columns.length" class="px-3 py-6 text-muted-foreground">
-            {{ state === "loading" ? "Loading…" : emptyMessage }}
+            <span class="block">
+              {{ state === "loading" ? "Loading…" : emptyMessage }}
+            </span>
+            <span v-if="note" class="mt-2 block text-xs">
+              {{ note }}
+            </span>
           </td>
         </tr>
         <tr v-for="(row, rowIndex) in isEmpty ? [] : rows" :key="rowIndex">

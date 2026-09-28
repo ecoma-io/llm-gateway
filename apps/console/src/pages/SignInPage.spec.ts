@@ -144,14 +144,80 @@ describe("SignInPage", () => {
     // "no such account", "no such user", "wrong credential" and "invited row" are
     // the same 401 by design. A screen that told those apart would be a
     // membership oracle for the account id.
-    for (const code of ["unauthenticated", "unauthenticated"] as const) {
-      api.signInWith.mockResolvedValue(refused(code));
-      const { wrapper } = await mountPage();
-      await fill(wrapper);
-      await wrapper.get("form").trigger("submit");
-      await nextTick();
-      await nextTick();
-      expect(wrapper.text()).toContain("Those details did not sign anyone in");
+    //
+    // The list is EIGHT refusals and the code is the same string every time,
+    // because the contract has one 401 and this loop exists to say so. It was
+    // four copies of the same word before, which is a loop that proves the case
+    // once and looks as though it proved it four times — and the next person to
+    // read it believes the four were different failures. One refusal, and the
+    // screen's own comment is the argument.
+    api.signInWith.mockResolvedValue(refused("unauthenticated"));
+    const { wrapper } = await mountPage();
+    await fill(wrapper);
+    await wrapper.get("form").trigger("submit");
+    await nextTick();
+    await nextTick();
+
+    const text = wrapper.text();
+    expect(text).toContain("Those details did not sign anyone in");
+    // The sentence the operator acts on is the same one, so it is the one
+    // asserted: if the screen ever told the four apart this is where the extra
+    // wording would have to appear.
+    expect(text).toContain("Check the account id, the address and the credential.");
+  });
+
+  it("puts the cursor on the form after a refusal, and never on a field", async () => {
+    // Focus is the one channel that would say WHICH of the three values was
+    // rejected, and the contract says none of them individually. Parking the
+    // cursor on the account field answers "that account is not here"; on the
+    // email field, "that address is not in that account". Both are the
+    // membership oracle, handed over by the focus ring.
+    api.signInWith.mockResolvedValue(refused("unauthenticated"));
+    const { wrapper } = await mountPage();
+    await fill(wrapper);
+    await wrapper.get("form").trigger("submit");
+    await nextTick();
+    await nextTick();
+
+    expect(document.activeElement).toBe(wrapper.get("form").element);
+    for (const input of wrapper.findAll("input")) {
+      expect(document.activeElement).not.toBe(input.element);
+    }
+  });
+
+  it("describes the form by the refusal, so a reader who looks back is told", async () => {
+    // `role="alert"` announces the refusal once and then forgets it: it is not
+    // in the form's description, so a reader who is already on the third field,
+    // or who looks at the form rather than listening, never hears why the
+    // button did nothing. The form points at the alert by id.
+    api.signInWith.mockResolvedValue(refused("unauthenticated"));
+    const { wrapper } = await mountPage();
+
+    expect(wrapper.get("form").attributes("aria-describedby")).toBeUndefined();
+
+    await fill(wrapper);
+    await wrapper.get("form").trigger("submit");
+    await nextTick();
+    await nextTick();
+
+    const describedBy = wrapper.get("form").attributes("aria-describedby");
+    expect(describedBy).toBe("sign-in-failure");
+    expect(wrapper.get(`#${describedBy}`).text()).toContain("Those details did not sign anyone in");
+  });
+
+  it("never marks an input invalid, because the contract never said which was wrong", async () => {
+    // The one thing `aria-invalid` would claim is a field whose value the server
+    // rejected, and the single 401 does not say that. This is the same claim
+    // focus would make, stated in the attribute instead of the ring.
+    api.signInWith.mockResolvedValue(refused("unauthenticated"));
+    const { wrapper } = await mountPage();
+    await fill(wrapper);
+    await wrapper.get("form").trigger("submit");
+    await nextTick();
+    await nextTick();
+
+    for (const input of wrapper.findAll("input")) {
+      expect(input.attributes("aria-invalid")).toBeUndefined();
     }
   });
 

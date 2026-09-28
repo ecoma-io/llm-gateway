@@ -60,6 +60,23 @@ export interface ListRead<TPage extends PagedRead, TQuery> {
    * link the operator was handed — the URL is user input.
    */
   readonly vocabulary: Readonly<Record<string, readonly string[]>>;
+  /**
+   * Whether this list's read may go out at all.
+   *
+   * A read with a PATH parameter can only be made once that parameter exists.
+   * The accounting screen's ledger takes a bucket, and before the reader has
+   * chosen one there is no bucket to put in the path — so the list must not ask,
+   * or the console sends `{"funding_bucket_id": ""}` and the server answers for
+   * a bucket the reader never named. A `v-if` around the table is NOT the same
+   * thing: it hides the result and still fires the request, which is how a
+   * screen ends up rendering "choose a bucket" over a read that failed for a
+   * bucket that does not exist.
+   *
+   * A function rather than a boolean so the gate is re-read on every reload
+   * decision, not captured once at setup. Defaults to always-on, so a list with
+   * no precondition says nothing about having one.
+   */
+  readonly enabled?: () => boolean;
 }
 
 /**
@@ -96,8 +113,9 @@ export function usePagedList<TPage extends PagedRead, TQuery>(
   declaration: ListRead<TPage, TQuery>,
 ) {
   type TRow = TPage extends { readonly items: readonly (infer TItem)[] } ? TItem : never;
-  const { query, filter, after, setFilter, restartWithoutCursor } = useQueryState(
+  const { query, filter, after, setFilter, restartWithoutCursor, carryOver } = useQueryState(
     declaration.shape,
+    declaration.vocabulary,
   );
 
   const resource = useResource<TPage>(
@@ -111,9 +129,11 @@ export function usePagedList<TPage extends PagedRead, TQuery>(
     // The console's own answer to a cursor the server will not place: drop it
     // and read the first page. `restartWithoutCursor` is a REPLACE rather than a
     // push, so a Back that returned to a position the server refuses is a loop
-    // the reader cannot escape. Wiring it here is what makes it true on every
-    // list instead of on the one that remembered to.
-    { onCursorLost: restartWithoutCursor },
+    // the reader cannot escape — and it is handed the keys this list does not
+    // own, so dropping one list's cursor cannot take a neighbouring list's
+    // selection with it. Wiring it here is what makes that true on every list
+    // instead of on the one that remembered to.
+    { onCursorLost: () => restartWithoutCursor(carryOver()) },
   );
 
   /**
@@ -128,25 +148,59 @@ export function usePagedList<TPage extends PagedRead, TQuery>(
 
   const rows = computed<readonly TRow[]>(() => resource.data.value?.items ?? []);
 
-  const pages = computed(() => pagerFor(page.value, query.value, declaration.shape));
+  const pages = computed(() =>
+    pagerFor(page.value, query.value, declaration.shape, declaration.vocabulary),
+  );
 
   /**
-   * Reload whenever the position changes. `flush: "sync"` is deliberate: the
-   * watcher must not fire while a previous component's teardown is still
-   * running, or a route change that both ends one list and starts another
-   * leaves the old one reading on.
+   * The one place a read is issued from, so the gate cannot be forgotten on one
+   * of the three callers. `resource.run` is not exposed raw; a screen gets
+   * `run`, which asks this first.
+   */
+  function reload(): void {
+    if (declaration.enabled?.() === false) return;
+    void resource.run();
+  }
+
+  /**
+   * Reload whenever the POSITION changes — the filters and the cursor, which is
+   * the whole of `query`.
+   *
+   * The read's own `data` is deliberately NOT in the watch source, and that is
+   * not an oversight: a successful run ASSIGNS a freshly parsed object to
+   * `data`, so observing it makes every load re-trigger the load that produced
+   * it. That is a self-sustaining loop rather than a double fetch — measured at
+   * 61 reads in 200 ms from one `mount()`, still climbing, terminating only
+   * when the test's own circuit breaker threw. The reload this watcher wants
+   * has exactly one cause, and the cause is the position, which is what is
+   * observed.
+   *
+   * `flush: "sync"` is deliberate: the watcher must not fire while a previous
+   * component's teardown is still running, or a route change that both ends one
+   * list and starts another leaves the old one reading on.
    */
   watch(
-    () => [query.value, resource.data.value] as const,
+    () => query.value,
     () => {
-      void resource.run();
+      reload();
     },
     { flush: "sync" },
   );
 
-  onMounted(() => {
-    void resource.run();
-  });
+  // The gate is watched as well as consulted. A screen whose precondition is
+  // satisfied by a click — the reader choosing a bucket — has nothing to
+  // navigate, so nothing in `query` changes and the position watcher above
+  // would never fire. Without this the first read of the ledger happens only
+  // when the reader changes a filter.
+  watch(
+    () => declaration.enabled?.() ?? true,
+    (allowed) => {
+      if (allowed) reload();
+    },
+    { flush: "sync" },
+  );
+
+  onMounted(reload);
 
   return {
     data: computed<ListPage<TPage, TRow> | undefined>(
@@ -159,6 +213,11 @@ export function usePagedList<TPage extends PagedRead, TQuery>(
     pages,
     filter,
     setFilter,
-    run: resource.run,
+    /**
+     * Reload, through the same gate the watchers use. A Retry button calling
+     * this cannot fire a read the screen has already decided is not allowed to
+     * make, which a raw `resource.run` would.
+     */
+    run: reload,
   };
 }

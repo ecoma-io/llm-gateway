@@ -97,6 +97,11 @@ export type {
   MintedApiKey,
   Money,
   Options,
+  // The envelope every paged read returns, published for the same reason
+  // `Error` is above: the console's pager names `next_cursor` and `has_more`,
+  // and a hand-written mirror of an envelope the generator owns is a second
+  // place a contract change would have to be remembered.
+  PageEnvelope,
   Plan,
   PlanPage,
   PriceSnapshot,

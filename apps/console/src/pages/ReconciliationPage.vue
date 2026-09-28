@@ -202,7 +202,8 @@ function subjectText(finding: Finding): string {
         :rows="findings.rows.value"
         :state="findings.loading.value ? 'loading' : 'empty'"
         :pages="findings.pages.value"
-        empty-message="No finding matches those filters. That is the answer a healthy system gives."
+        empty-message="No finding matches those filters."
+        note="That is the answer a healthy system gives."
       >
         <template #severity="{ row }: { row: Finding }">
           <StatusBadge :status="FINDING_SEVERITY_PRESENTATION[row.severity]" />

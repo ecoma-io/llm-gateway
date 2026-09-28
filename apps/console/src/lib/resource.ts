@@ -53,19 +53,26 @@ export function useResource<T>(
    *
    * `run` takes a generation number and a call writes only if its own is still
    * the current one, so the counter has to ADVANCE too — a double click is a
-   * second generation, not a second call sharing the first's number.
+   * second generation, not a second call sharing the first's number. Every
+   * call claims one, and every call is therefore both unstoppable once issued
+   * and stoppable by any later one.
    *
-   * `latest` is the one caller that does not take a number, and it is always
-   * treated as current. So a plain call issued after a `latest` one is the
-   * SUPERSEDED call and does not land, which is the inversion: a screen that
-   * wants the last click to win rather than the first to settle passes
-   * `latest: true` and gets it. Nothing in the console does, and
-   * `resource.spec.ts` fails if a caller appears.
+   * There is deliberately no way to ask for a read that no later read can
+   * supersede. An option that did would need a generation value no `++` could
+   * ever produce, and the first version of this module had one: a `latest`
+   * branch that took `Number.MAX_SAFE_INTEGER` without incrementing. It was
+   * unreachable in the direction it promised — the counter was a small integer
+   * and could never equal the sentinel, so a `latest` call discarded its own
+   * answer and left `loading` stuck on forever. The test that tried to pin the
+   * behaviour it was described as having is what proved it, and nothing ever
+   * called it, so it is gone rather than repaired: a knob with no caller is
+   * not an extension point, it is a second code path that only exists to be
+   * wrong.
    */
   let generation = 0;
 
-  async function run(options_: { readonly latest?: boolean } = {}): Promise<void> {
-    const mine = options_.latest === true ? Number.MAX_SAFE_INTEGER : ++generation;
+  async function run(): Promise<void> {
+    const mine = ++generation;
     loading.value = true;
     try {
       const result = await load();

@@ -27,23 +27,23 @@
 import { computed } from "vue";
 import { useRoute, useRouter, type LocationQuery, type LocationQueryRaw } from "vue-router";
 
+import type { PageEnvelope } from "@ecoma-io/llm-gateway-console-api-client";
+
 import type { PageLink } from "@/components/data-table";
 
 /**
- * The three fields every paged read returns, named once.
+ * The three fields every paged read returns, narrowed to the two the pager is
+ * allowed to read.
  *
- * The contract's `PageEnvelope` is not re-exported by the API client package —
- * every concrete page type is `PageEnvelope & { items: … }` and the envelope
- * itself is an implementation detail of those intersections. This is the same
- * three fields, structurally, so a generated page satisfies it without a cast,
- * and a future contract change to the envelope stops a screen from type-checking
- * rather than being absorbed by a loose structural type here.
+ * `PageEnvelope` is the CONTRACT's own type, imported rather than restated. A
+ * hand-written mirror of it here would be a second place a contract change had
+ * to be remembered: the cast in `lib/paged-list.ts` casts a generated page to
+ * this, so a mirror that drifted from the envelope would not fail anywhere — it
+ * would be satisfied by any object with two of the right fields. Taking the
+ * generated type and narrowing it to the two fields the pager reads keeps the
+ * drift at zero, and `has_more` stays the contract's own description of itself.
  */
-export interface PagedRead {
-  readonly next_cursor: string;
-  readonly has_more: boolean;
-}
-
+export type PagedRead = Pick<PageEnvelope, "next_cursor" | "has_more">;
 /**
  * The query keys a screen is allowed to carry, and which of them are cursors.
  *
@@ -55,6 +55,22 @@ export interface PagedRead {
 export interface QueryShape {
   /** The filter keys, in the order they appear in the address bar. Any value not here is dropped. */
   readonly filters: readonly string[];
+  /**
+   * The address-bar key this list's cursor rides in.
+   *
+   * `after` by default, and named rather than assumed because ONE ROUTE CAN CARRY
+   * MORE THAN ONE LIST. The accounting screen holds a bucket list and a ledger,
+   * and both want a cursor; with a single route-global `after` the pager on the
+   * bucket list writes its cursor, and the ledger — watching the same route —
+   * reads it and sends it against its own operation. That is a cursor the server
+   * issued for a different collection, which the contract answers with `400
+   * invalid_request`, which the console answers by dropping the cursor, which
+   * loses the reader's place on a list they were not even reading.
+   *
+   * Two lists on one route therefore have to disagree here, and a list that
+   * does not is silently sharing a cursor with whichever list is beside it.
+   */
+  readonly cursor?: string;
 }
 
 /** Reads one string query parameter, or `undefined` when it is absent or blank. */
@@ -76,22 +92,28 @@ export function pagerFor(
   page: PagedRead | undefined,
   current: Readonly<LocationQuery>,
   shape: QueryShape,
+  vocabulary: Readonly<Record<string, readonly string[]>> = {},
 ): readonly PageLink[] {
   if (!page) return [];
 
   const links: PageLink[] = [];
-  const after = readParam(current, "after");
+  const after = readParam(current, cursorKey(shape));
   if (after !== undefined) {
-    links.push({ label: "First", to: routeTo(undefined, current, shape) });
+    links.push({ label: "First", to: routeTo(undefined, current, shape, vocabulary) });
   }
   if (page.has_more) {
     links.push({
       label: "Next",
-      to: routeTo(page.next_cursor, current, shape),
+      to: routeTo(page.next_cursor, current, shape, vocabulary),
       current: after === undefined,
     });
   }
   return links;
+}
+
+/** The address-bar key a list's cursor rides in; see `QueryShape.cursor`. */
+function cursorKey(shape: QueryShape): string {
+  return shape.cursor ?? "after";
 }
 
 /**
@@ -106,13 +128,19 @@ export function routeTo(
   cursor: string | undefined,
   current: Readonly<LocationQuery>,
   shape: QueryShape,
+  vocabulary: Readonly<Record<string, readonly string[]>> = {},
 ): string {
   const query: LocationQueryRaw = {};
   for (const key of shape.filters) {
-    const value = readParam(current, key);
+    // Validated on the way OUT as well as on the way in. A pager link is the
+    // one string a reader copies and shares, and a link carrying a value the
+    // contract does not admit is a link that hands the next person a control
+    // showing nothing selected.
+    const value = filterValue(current, key, vocabulary);
     if (value !== undefined) query[key] = value;
   }
-  if (cursor !== undefined) query.after = cursor;
+  const key = cursorKey(shape);
+  if (cursor !== undefined) query[key] = cursor;
   const search = new URLSearchParams(query as Record<string, string>).toString();
   return search === "" ? "" : `?${search}`;
 }
@@ -144,7 +172,36 @@ export function listQuery<TFilters>(
  * entry so Back undoes it, and it DROPS the cursor because the cursor the
  * reader is holding was issued against the filter they just left.
  */
-export function useQueryState(shape: QueryShape) {
+/**
+ * The current value of one filter, or `undefined` when it is unset or is not a
+ * value the contract admits.
+ *
+ * Validated, not merely read, and the same rule `listQuery` applies to the
+ * request. Without it a hand-edited `?status=not-a-status` reached a segmented
+ * control as a bound value that matched no segment: the request went out
+ * unfiltered (the vocabulary check below caught it there) while the control
+ * showed NOTHING selected. A filter the console cannot render is not a filter,
+ * and a control in that state misreports the request it is about to make.
+ */
+export function filterValue(
+  query: Readonly<LocationQuery>,
+  key: string,
+  vocabulary: Readonly<Record<string, readonly string[]>>,
+): string | undefined {
+  const value = readParam(query, key);
+  if (value === undefined) return undefined;
+  const allowed = vocabulary[key];
+  // A key with no vocabulary is one a screen manages itself — the accounting
+  // screen's `bucket` — so it is passed through. Only a key that DECLARED a
+  // closed set can be found outside it.
+  if (allowed === undefined) return value;
+  return allowed.includes(value) ? value : undefined;
+}
+
+export function useQueryState(
+  shape: QueryShape,
+  vocabulary: Readonly<Record<string, readonly string[]>> = {},
+) {
   const route = useRoute();
   const router = useRouter();
 
@@ -165,13 +222,13 @@ export function useQueryState(shape: QueryShape) {
     void navigation.catch(() => undefined);
   }
 
-  /** The current value of one filter, or `undefined` when it is unset. */
+  /** The current value of one filter, validated against the vocabulary. */
   function filter(key: string): string | undefined {
-    return readParam(query.value, key);
+    return filterValue(query.value, key, vocabulary);
   }
 
-  /** The opaque cursor for this position, sent back verbatim. */
-  const after = computed(() => readParam(query.value, "after"));
+  /** The opaque cursor for this position, sent back verbatim, from this list's own key. */
+  const after = computed(() => readParam(query.value, cursorKey(shape)));
 
   /**
    * Change one filter, keeping the others and dropping the cursor.
@@ -179,9 +236,16 @@ export function useQueryState(shape: QueryShape) {
    * The value is written as-is when it is a real one and REMOVED when it is the
    * empty string, so a filter control that means "no filter" produces the URL
    * a shared link would have rather than `?state=`.
+   *
+   * `carryOver` is what keeps a filter change from destroying the screen around
+   * it: it holds every query key this list does NOT own, so changing the
+   * ledger's kind on the accounting screen leaves the bucket the reader picked
+   * alone. The keys a list does not own are still someone else's, and a filter
+   * control that rebuilt the query from its own shape alone would silently
+   * reset a neighbouring table.
    */
-  function setFilter(key: string, value: string): void {
-    const next: Record<string, string> = {};
+  function setFilter(key: string, value: string, carryOver: Readonly<LocationQueryRaw> = {}): void {
+    const next: LocationQueryRaw = { ...carryOver };
     for (const name of shape.filters) {
       const existing = filter(name);
       if (existing !== undefined) next[name] = existing;
@@ -197,15 +261,48 @@ export function useQueryState(shape: QueryShape) {
    * This is the `400 invalid_request` the contract documents, and the console's
    * answer is to drop the cursor and reload the first page — the position the
    * cursor named no longer exists under any filter the reader still has.
+   *
+   * ONLY the cursor is dropped. `carryOver` carries every key this list does not
+   * own, and an earlier version rebuilt the query from `shape.filters` alone: on
+   * the accounting screen, where `bucket` selects which table is shown rather
+   * than filtering one, a `cursor_expired` on the LEDGER navigated to a URL
+   * with no `bucket` in it — the selected bucket gone, the ledger section
+   * replaced by "choose a bucket", and a `replace` so Back could not undo it.
+   * The failure was on one list and the damage was to the screen.
    */
-  function restartWithoutCursor(): void {
-    const next: Record<string, string> = {};
+  function restartWithoutCursor(carryOver: Readonly<LocationQueryRaw> = {}): void {
+    const next: LocationQueryRaw = { ...carryOver };
     for (const name of shape.filters) {
       const existing = filter(name);
       if (existing !== undefined) next[name] = existing;
     }
+    delete next[cursorKey(shape)];
     navigate(next, true);
   }
 
-  return { query, filter, after, setFilter, navigate, restartWithoutCursor };
+  /**
+   * The query keys this list does NOT own, for a screen that hosts more than
+   * one list on one route.
+   *
+   * A key is this list's if it is one of the filters the list declared or the
+   * cursor it reads; everything else in the address bar belongs to somebody
+   * else and is carried through a navigation untouched. The accounting screen
+   * is the case that needs it: the bucket list declares no filters at all, so
+   * without this every action on the ledger would have rebuilt the URL from
+   * `kind` alone and dropped the reader's selected bucket.
+   */
+  function carryOver(): LocationQueryRaw {
+    const mine = new Set([...shape.filters, cursorKey(shape)]);
+    const others: LocationQueryRaw = {};
+    for (const [key, value] of Object.entries(query.value)) {
+      if (mine.has(key)) continue;
+      // An array value is a repeated key; a list never declares one, and a
+      // repeated parameter cannot be handed back as a single string without
+      // changing the URL the reader is looking at.
+      if (typeof value === "string") others[key] = value;
+    }
+    return others;
+  }
+
+  return { query, filter, after, setFilter, navigate, restartWithoutCursor, carryOver };
 }

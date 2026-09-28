@@ -85,8 +85,23 @@ function grantedAmount(row: Entitlement): { minor_units: number } | undefined {
  * A scheduled cancellation is DATA, not a state (the contract says so on the
  * field), so it gets a column of its own: a reader looking for "when does this
  * end" must not have to read a `cancel_at` inside a `cancelled` badge.
+ *
+ * The explanation appears only when a `cancel_at` is actually in the future.
+ * A year is not a substitute for that test: the console has no clock the
+ * contract trusts, and the previous version compared against
+ * `getUTCFullYear() - 1` and so described an `Ends` of 2025 — already past — as
+ * "the subscription stays active and usable until that instant passes". It is
+ * the ONLY moment that decides whether the sentence is true, and it is a field
+ * on the row rather than a number the page invents.
  */
-const pendingCancellation = computed(() => subscriptions.rows.value.length);
+const pendingCancellation = computed(() =>
+  subscriptions.rows.value.some(
+    (row) =>
+      row.cancel_at !== null &&
+      row.cancel_at !== undefined &&
+      row.cancel_at > new Date().toISOString(),
+  ),
+);
 </script>
 
 <template>
@@ -116,7 +131,8 @@ const pendingCancellation = computed(() => subscriptions.rows.value.length);
         :rows="subscriptions.rows.value"
         :state="subscriptions.loading.value ? 'loading' : 'empty'"
         :pages="subscriptions.pages.value"
-        empty-message="This account has no subscription. A subscription is a recurring arrangement; a pay-as-you-go balance is a different one and is on the accounting screen."
+        empty-message="This account has no subscription."
+        note="A subscription is a recurring arrangement on a plan version. A pay-as-you-go balance is a different kind of thing, and it is on the accounting screen."
       >
         <template #state="{ row }: { row: Subscription }">
           <StatusBadge :status="SUBSCRIPTION_STATE_PRESENTATION[row.state]" />
@@ -129,9 +145,9 @@ const pendingCancellation = computed(() => subscriptions.rows.value.length);
         </template>
       </DataTable>
 
-      <p v-if="pendingCancellation > 0" class="text-xs text-muted-foreground">
-        An "Ends" of {{ new Date().getUTCFullYear() - 1 }} or later is a scheduled cancellation: the
-        subscription stays active and usable until that instant passes.
+      <p v-if="pendingCancellation" class="text-xs text-muted-foreground">
+        An "Ends" date in the future is a scheduled cancellation, not a state: the subscription
+        stays active and usable until that instant passes.
       </p>
     </section>
 
@@ -153,7 +169,8 @@ const pendingCancellation = computed(() => subscriptions.rows.value.length);
         :rows="entitlements.rows.value"
         :state="entitlements.loading.value ? 'loading' : 'empty'"
         :pages="entitlements.pages.value"
-        empty-message="No grant has been made to this account. A grant is per cycle and expires with its period."
+        empty-message="No grant has been made to this account."
+        note="A grant is one cycle of one plan, and it expires with its period."
       >
         <template #scope="{ row }: { row: Entitlement }">
           <span v-if="row.scope !== undefined" class="font-mono text-xs">{{ row.scope }}</span>

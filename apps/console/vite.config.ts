@@ -20,17 +20,34 @@ export default defineConfig({
   },
   server: {
     // The console talks to its backend same-origin (src/lib/api.ts): one
-    // origin in production, and in development the dev server proxies the two
-    // contract probes to the Control Plane API on :8080 — so `pnpm
-    // dev:console-api` + `pnpm dev:console` work together with no CORS on the
-    // API and no env override. The runtime's :8081 is deliberately absent from
-    // this list: an inference request is not a browser call, and a console
-    // that could reach `/v1/*` through its own origin would be the hop the
-    // plane split removes (ADR 0006 §4). Point the console at a console-api
-    // elsewhere with `VITE_API_BASE_URL`.
+    // origin in production, and in development every path the console asks for
+    // is proxied to the Control Plane API on :8080 — so `pnpm dev:console-api`
+    // + `pnpm dev:console` work together with no CORS on the API and no env
+    // override. The runtime's :8081 is deliberately absent from this list: an
+    // inference request is not a browser call, and a console that could reach
+    // `/v1/*` through its own origin would be the hop the plane split removes
+    // (ADR 0006 §4). Point the console at a console-api elsewhere with
+    // `VITE_API_BASE_URL`.
+    //
+    // The list is the console-api's route table, not a guess: the three probes,
+    // `/auth` (sign-in, the session read, sign-out), `/account`, `/users`,
+    // `/api-keys`, `/plans`, `/subscriptions`, `/entitlements`,
+    // `/funding-buckets` (whose prefix also covers that bucket's ledger) and
+    // `/reconciliation`. A path added to api/openapi/console.yaml without a
+    // rule here is a dev-server 404 that looks exactly like a backend failure.
     proxy: {
       "/healthz": "http://localhost:8080",
       "/readyz": "http://localhost:8080",
+      "/version": "http://localhost:8080",
+      "/auth": "http://localhost:8080",
+      "/account": "http://localhost:8080",
+      "/users": "http://localhost:8080",
+      "/api-keys": "http://localhost:8080",
+      "/plans": "http://localhost:8080",
+      "/subscriptions": "http://localhost:8080",
+      "/entitlements": "http://localhost:8080",
+      "/funding-buckets": "http://localhost:8080",
+      "/reconciliation": "http://localhost:8080",
     },
   },
   test: {

@@ -19,6 +19,7 @@ const api = vi.hoisted(() => ({
   getReadiness: vi.fn(),
   getSessionResult: vi.fn(),
   fetchAccountOverview: vi.fn(),
+  signOutOfSession: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => api);
@@ -60,6 +61,20 @@ function mountApp() {
   });
 }
 
+/**
+ * The sign-out control, found by what it SAYS rather than by a test id.
+ *
+ * `:has-text()` is Testing Library's and not available through a `VueWrapper`,
+ * so this walks the shell's buttons and takes the one whose own text is the
+ * label. A selector that could only ever match the one button would prove
+ * nothing about which button the click lands on.
+ */
+function signOutButton(wrapper: ReturnType<typeof mountApp>) {
+  const button = wrapper.findAll("button").find((candidate) => candidate.text() === "Sign out");
+  if (!button) throw new Error("the shell rendered no Sign out button");
+  return button;
+}
+
 describe("application shell", () => {
   beforeEach(async () => {
     // Theme's state is deliberately shared by Loom for an application's
@@ -70,6 +85,9 @@ describe("application shell", () => {
     api.getHealth.mockResolvedValue({ data: { status: "ok" } });
     api.getReadiness.mockResolvedValue({ data: { status: "ok" } });
     api.getSessionResult.mockResolvedValue({ ok: true, data: PRINCIPAL });
+    // The session ends idempotently, so a resolved `null` is what the server
+    // sends for its 204 and what the client turns the empty body into.
+    api.signOutOfSession.mockResolvedValue({ ok: true, data: null });
     // The shell test is about the chrome, not the dashboard's figures; the
     // dashboard's own spec owns what it renders.
     api.fetchAccountOverview.mockResolvedValue({
@@ -150,6 +168,45 @@ describe("application shell", () => {
     expect(wrapper.text()).toContain("Signed in as ops@example.test");
     expect(wrapper.find("button").exists()).toBe(true);
     expect(wrapper.text()).toContain("Sign out");
+  });
+
+  it("signs the visitor out on a click, which the one above never proved", async () => {
+    // "Sign out" appearing is not a way out. This clicks the control, which is
+    // the only thing that proves the session is ended server-side and the
+    // console is no longer wearing a signed-in shell: a button that renders the
+    // words and does nothing is the failure ADR 0012 §2 names, and asserting on
+    // the text is how one ships.
+    const wrapper = mountApp();
+    await flushPromises();
+    setActivePinia(pinia);
+    expect(useSessionStore().signedIn).toBe(true);
+
+    await signOutButton(wrapper).trigger("click");
+    await flushPromises();
+
+    expect(api.signOutOfSession).toHaveBeenCalledTimes(1);
+    expect(useSessionStore().signedIn).toBe(false);
+    expect(router.currentRoute.value.path).toBe("/sign-in");
+  });
+
+  it("drops the local session even when the sign-out call fails", async () => {
+    // The server's call is idempotent, so this is safe to run from a button and
+    // from a 401 handler alike — and the local state is cleared either way,
+    // because a console left wearing a signed-in shell after the sign-out failed
+    // is the defect this one rule exists to prevent.
+    api.signOutOfSession.mockResolvedValue({
+      ok: false,
+      failure: { kind: "transport", error: new TypeError() },
+    });
+    const wrapper = mountApp();
+    await flushPromises();
+    setActivePinia(pinia);
+
+    await signOutButton(wrapper).trigger("click");
+    await flushPromises();
+
+    expect(useSessionStore().signedIn).toBe(false);
+    expect(router.currentRoute.value.path).toBe("/sign-in");
   });
 
   it("selects and persists a dark theme through a Loom Button interaction", async () => {

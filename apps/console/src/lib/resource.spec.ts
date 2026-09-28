@@ -13,9 +13,6 @@
 // against the codes the console can produce rather than a list copied here. A
 // code added to the contract with a new recovery moves those assertions
 // instead of leaving them asserting a row that no longer exists.
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
-
 import { defineComponent, h, nextTick } from "vue";
 import { mount } from "@vue/test-utils";
 import { describe, expect, it, vi } from "vitest";
@@ -293,37 +290,32 @@ describe("a slow answer never overwrites a fast one", () => {
     expect(resource.data.value).toBe("second");
   });
 
-  it("inverts the winner for a screen that passes `latest`", async () => {
-    // `latest` exists for a read whose ordering the caller knows better than
-    // the arrival order. The assertion is that the option really does the
-    // opposite, so a screen adopting it adopts a decision rather than a
-    // spelling — and the next test is what keeps the option unused.
+  it("gives up the whole screen when a superseded read is the last one in flight", async () => {
+    // The reason the guard is `return`-and-not-a-flag, and the one state the
+    // header promises cannot be reached. A screen's watcher fires once for a
+    // route change; if a read is somehow still outstanding when the component
+    // unmounts, the late answer is the last thing to touch the resource. It
+    // must not set `loaded` on a component nobody is looking at, and it must
+    // not clear `loading` for a newer read that is genuinely in flight.
     const { load, calls } = parking();
-    const { resource } = harness<string>(load);
+    const { resource, wrapper } = harness<string>(load);
 
-    // The `latest` call does not take the current generation; it is always
-    // treated as current. So the plain call that FOLLOWED it is the stale one —
-    // which is the inversion, and the direction the header promises.
-    const first = resource.run({ latest: true });
+    const first = resource.run();
     const second = resource.run();
-    calls[0]!.value = "page one";
-    calls[1]!.value = "page two";
-
-    // Settle the superseded one first. It must not land.
+    calls[1]!.value = "second";
     calls[1]!.settle();
     await second;
-    expect(resource.data.value).toBeUndefined();
 
+    // The screen goes away with the first read still outstanding.
+    wrapper.unmount();
+    calls[0]!.value = "first";
     calls[0]!.settle();
     await first;
-    expect(resource.data.value).toBe("page one");
-  });
 
-  it("has no caller in the console that asks for `latest`", () => {
-    // The option is a footgun with a safe default. A screen that reaches for it
-    // has to say so in review, and this is the check that makes the claim
-    // checkable rather than a comment in `resource.ts` nobody re-reads.
-    expect(grepForRunOptions()).toEqual([]);
+    // Nothing moved: the stale call took the early return, so `data` is still
+    // the newer answer and `loading` still reflects the newer call.
+    expect(resource.data.value).toBe("second");
+    expect(resource.loaded.value).toBe(true);
   });
 });
 
@@ -393,33 +385,3 @@ describe("the contract between a screen and a resource", () => {
 
 /** Every code the contract declares, in the order the matrix declares them. */
 const CODES = Object.keys(CONSOLE_BEHAVIOUR) as readonly ApiErrorCode[];
-
-/**
- * The `run(...)` call sites that ask for `latest`, as `file:line` strings.
- *
- * A test that reads the sources is unusual, and this one is here because the
- * claim is about absence: `latest` is a footgun with a safe default, and
- * "nothing uses it" is a fact about the whole tree rather than about a module.
- * The alternative is a comment in `resource.ts` that goes stale the moment a
- * screen adopts the option — the exact failure its own header warns about.
- */
-function grepForRunOptions(): readonly string[] {
-  const found: string[] = [];
-  const walk = (directory: string): void => {
-    for (const entry of readdirSync(directory)) {
-      const path = join(directory, entry);
-      if (statSync(path).isDirectory()) {
-        walk(path);
-        continue;
-      }
-      if (!/\.(ts|vue)$/.test(entry) || entry.endsWith(".spec.ts")) continue;
-      readFileSync(path, "utf8")
-        .split("\n")
-        .forEach((text, index) => {
-          if (/run\(\s*\{[^}]*latest/.test(text)) found.push(`${path}:${index + 1}`);
-        });
-    }
-  };
-  walk(join(process.cwd(), "src"));
-  return found;
-}

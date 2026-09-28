@@ -43,7 +43,7 @@ import type {
 
 const buckets = usePagedList<FundingBucketPage, ListFundingBucketsData["query"]>({
   read: (query) => fetchFundingBuckets({ query }),
-  shape: { filters: [] },
+  shape: { filters: [], cursor: "after" },
   vocabulary: {},
 });
 
@@ -62,9 +62,6 @@ const buckets = usePagedList<FundingBucketPage, ListFundingBucketsData["query"]>
  * only declared filters, so a page change on the bucket list is a bare `?after`
  * and never a bucket id this screen did not choose.
  */
-const { filter, setFilter } = useQueryState({ filters: ["bucket", "kind"] });
-const selectedBucketId = computed(() => filter("bucket") ?? "");
-
 const LEDGER_KINDS: readonly LedgerEntry["kind"][] = [
   "grant",
   "topup",
@@ -73,6 +70,16 @@ const LEDGER_KINDS: readonly LedgerEntry["kind"][] = [
   "consume",
   "adjustment",
 ];
+
+const { filter, setFilter } = useQueryState(
+  { filters: ["bucket", "kind"] },
+  // `kind` is validated against the ledger's own closed vocabulary, so a
+  // hand-edited `?kind=not-a-kind` leaves the segmented control with nothing
+  // marked — the request is unfiltered, and the control now says so too.
+  // `bucket` has no vocabulary: the screen chooses it, from a list it read.
+  { kind: LEDGER_KINDS },
+);
+const selectedBucketId = computed(() => filter("bucket") ?? "");
 
 /**
  * The ledger read, which is the one read on this surface with a path parameter
@@ -94,9 +101,22 @@ const ledger = usePagedList<LedgerEntryPage, ListLedgerEntriesData["query"]>({
   // carries — so a kind change drops the cursor, which is the whole reason a
   // cursor carries a filter fingerprint. `bucket` is NOT declared: the screen
   // sets it when the reader picks a bucket, and a filter control that could set
-  // it back would let the two tables disagree.
-  shape: { filters: ["kind"] },
+  // it back would let the two tables disagree — which is also why it is
+  // CARRIED through the ledger's own navigations rather than dropped.
+  //
+  // The ledger's cursor is `ledger_after`, not `after`. Both tables are on this
+  // one route, and a single route-global cursor key means the bucket list's
+  // Next writes a position the ledger then sends against its own operation —
+  // a cursor the server issued for a different collection, answered with `400
+  // invalid_request`. A shared key would have been the bug; the second key is
+  // the fix, and the two tables now position independently.
+  shape: { filters: ["kind"], cursor: "ledger_after" },
   vocabulary: { kind: LEDGER_KINDS },
+  // The gate, stated here where the comment above explains it. Without it the
+  // composable read on mount with an EMPTY path id, and the server answered for
+  // a bucket the reader had not named — while the section rendered "choose a
+  // bucket", so the screen was reporting its own state as a server fact.
+  enabled: () => selectedBucketId.value !== "",
 });
 
 const kindOptions = [
@@ -167,7 +187,8 @@ const bucketColumns: readonly DataTableColumn[] = [
         :rows="buckets.rows.value"
         :state="buckets.loading.value ? 'loading' : 'empty'"
         :pages="buckets.pages.value"
-        empty-message="This account holds no funding bucket. A bucket is money set aside for spend, and it comes from a plan's cycle or from a top-up — never from the other."
+        empty-message="This account holds no funding bucket."
+        note="A bucket is money set aside for spend. It comes from a plan's cycle or from a top-up — never from the other."
       >
         <template #balances="{ row }: { row: FundingBucket }">
           <span class="inline-flex items-center gap-2">

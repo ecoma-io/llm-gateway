@@ -22,7 +22,7 @@
 // password manager is the right place for a password and this component is
 // explicitly not it.
 import { Alert, Button, Card, Field, Stack, TextField } from "@ecoma-io/loom";
-import { computed, ref } from "vue";
+import { computed, nextTick, ref, useTemplateRef } from "vue";
 import { useRoute, useRouter, RouterLink } from "vue-router";
 
 import { signInWith } from "@/lib/api";
@@ -41,6 +41,47 @@ const password = ref("");
 
 const submitting = ref(false);
 const failure = ref<{ title: string; message: string } | undefined>(undefined);
+
+/**
+ * The id the alert publishes and the form points its own `aria-describedby` at.
+ *
+ * The alert is a REGION and not an error message for a field, and the two
+ * things are genuinely different. The contract answers every wrong input with
+ * one 401 that does not say which of the three was wrong, so there is no field
+ * whose value was rejected — there is a form that was refused — and
+ * `aria-invalid` on any input would be the console guessing, which is the
+ * membership oracle the single failure exists to prevent.
+ *
+ * What the reader still needs is to FIND the answer once it is there, and
+ * `role="alert"` alone does not do that: an alert is announced when it appears
+ * and is not in the form's own description afterwards, so a reader who is
+ * already on the third field, or who looks back at the form rather than
+ * listening, never hears why the button did nothing. Describing the FORM by the
+ * alert is the fix that claims nothing — it says the form has a reason
+ * attached, which is true, and it names no field.
+ */
+const FAILURE_ALERT_ID = "sign-in-failure";
+const form = useTemplateRef<HTMLFormElement>("form");
+
+/**
+ * Put the cursor where the answer to the form is, once there is one.
+ *
+ * The FORM, and never a field. Parking the cursor on the first blank input
+ * would assert which of the three values the server rejected, and the server
+ * said nothing of the kind: one 401 covers a missing account, an address not
+ * in it, a wrong credential and an invited row. A cursor on the account field
+ * would answer "that account is not here" and one on the email field would
+ * answer "that address is not in that account" — the membership oracle this
+ * screen exists to refuse, handed over by the focus ring. Naming a REGION is
+ * the only claim here the contract supports. `tabindex="-1"` on the form is
+ * what makes that possible without adding a stop to the Tab order, and the
+ * reason this is not the account field is written down rather than left to the
+ * next person, who will have the same idea.
+ */
+async function announceFailure(): Promise<void> {
+  await nextTick();
+  form.value?.focus();
+}
 
 /**
  * The one sentence every refused sign-in gets.
@@ -127,6 +168,7 @@ async function submit() {
         title: isSignInRecovery ? refusedTitle : (behaviour?.title ?? refusedTitle),
         message: refusedMessage,
       };
+      void announceFailure();
       return;
     }
 
@@ -168,7 +210,14 @@ async function submit() {
     </Card>
 
     <Card v-else title="Sign in" description="Sign in to the console for your account.">
-      <form novalidate class="flex flex-col gap-4" @submit.prevent="submit">
+      <form
+        ref="form"
+        novalidate
+        tabindex="-1"
+        :aria-describedby="failure ? FAILURE_ALERT_ID : undefined"
+        class="flex flex-col gap-4"
+        @submit.prevent="submit"
+      >
         <!--
           No per-field error is rendered, and that is the design rather than an
           omission. The contract answers every wrong input with one 401 that
@@ -209,7 +258,16 @@ async function submit() {
           />
         </Field>
 
-        <Alert v-if="failure" variant="warning" :title="failure.title">
+        <!--
+          The id is MINE, not Loom's: Loom's `Alert` publishes a `role` and a
+          tone and nothing this form can point at, so the wiring the form needs
+          has to hang off an element this screen owns. `role="alert"` is left
+          as Loom renders it, and is a real difference from the form's
+          description: an alert interrupts a reader who is anywhere on the page,
+          whereas the `aria-describedby` above is what a reader who returns to
+          the form is told about it by.
+        -->
+        <Alert v-if="failure" :id="FAILURE_ALERT_ID" variant="warning" :title="failure.title">
           {{ failure.message }}
         </Alert>
 
