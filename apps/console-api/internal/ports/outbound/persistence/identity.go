@@ -117,6 +117,40 @@ type Users interface {
 	// account may act is the post-credential verdict, and folding account
 	// state in here would leak it before any credential was checked.
 	ByAccountAndEmail(ctx context.Context, accountID identity.AccountID, email string) (identity.User, error)
+
+	// CredentialByAccountAndEmail returns the LIVE user's row TOGETHER WITH
+	// its stored credential, or ErrNotFound.
+	//
+	// It is a separate method from ByAccountAndEmail rather than a second
+	// return on it, and the reason is the migration that made the difference
+	// exist: 000010 added three columns to `users`, and the credential is
+	// NOT part of identity.User. The aggregate deliberately does not carry
+	// verification material — a domain value that held a password digest
+	// would hand it to every reader of every user, including the ones that
+	// render a list — so the row has more columns than the aggregate has
+	// fields, and reading a user no longer reads its credential.
+	//
+	// ONE statement, and that is the whole of why this is its own method
+	// rather than a caller's two: the credential must belong to the SAME
+	// row the user came from. Two queries would let a row be removed, or a
+	// credential re-set, between them, and the sign-in that answered would
+	// authenticate a user against a credential the database no longer
+	// pairs with them. Every predicate ByAccountAndEmail names applies
+	// here unchanged — the same `state <> 'removed'` filter, the same
+	// totality from the same partial unique index — because a sign-in
+	// resolving a tombstone is the same defect whichever method it used.
+	//
+	// A user with NO credential resolves, with a nil digest. That is not a
+	// partial answer: an `invited` row legitimately has none (ADR 0012 §2 —
+	// an invitation is record-keeping, a credential is a grant of access),
+	// and the schema's whole-or-absent CHECK is what guarantees a
+	// credential that is present is also complete. What an invited row may
+	// DO is the caller's admission decision, decided after this returns.
+	CredentialByAccountAndEmail(
+		ctx context.Context,
+		accountID identity.AccountID,
+		email string,
+	) (identity.User, *identity.CredentialDigest, error)
 }
 
 // APIKeys persists the API key's ownership record — display metadata,

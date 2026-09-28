@@ -108,6 +108,7 @@ func (f *fakeAccounts) TransitionState(_ context.Context, id identity.AccountID,
 // the domain sentinel.
 type fakeUsers struct {
 	rows           map[identity.UserID]identity.User
+	credentials    map[identity.UserID]identity.CredentialDigest
 	firstCreateErr error
 	consumed       bool
 	failNextSwaps  int
@@ -163,6 +164,31 @@ func (f *fakeUsers) ByAccountAndEmail(_ context.Context, accountID identity.Acco
 		}
 	}
 	return identity.User{}, fmt.Errorf("fake: user %s/%s: %w", accountID, email, persistence.ErrNotFound)
+}
+
+// CredentialByAccountAndEmail mirrors the port's rule that the credential
+// belongs to the SAME row the user came from, which is why the fake resolves
+// the user and the digest in one pass over its own store rather than looking
+// the second up by a second key.
+//
+// A live user with no entry in `credentials` returns a nil digest, and that is
+// the case the `invited` row exercises: the row is found, and what it may
+// authenticate is the caller's decision rather than this port's. A test that
+// wanted the two answers to differ would have to write a partial credential,
+// which the schema's whole-or-absent CHECK forbids and this fake therefore
+// does not offer.
+func (f *fakeUsers) CredentialByAccountAndEmail(_ context.Context, accountID identity.AccountID, email string) (identity.User, *identity.CredentialDigest, error) {
+	for id, u := range f.rows {
+		if u.AccountID != accountID || u.Email != email || u.State == identity.UserRemoved {
+			continue
+		}
+		digest, ok := f.credentials[id]
+		if !ok {
+			return u, nil, nil
+		}
+		return u, &digest, nil
+	}
+	return identity.User{}, nil, fmt.Errorf("fake: user %s/%s: %w", accountID, email, persistence.ErrNotFound)
 }
 
 // fakeKeys keeps the API-key ownership records, counts its swaps, and can
