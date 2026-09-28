@@ -2,7 +2,6 @@ package openaicompatible
 
 import (
 	"errors"
-	"fmt"
 	"strings"
 	"testing"
 )
@@ -154,6 +153,6 @@ func TestTheBudgetIsNotAProductionVolume(t *testing.T) {
 	// a total below the per-frame bound would make every single frame a
 	// refusal.
 	if maxStreamBodyOctets < maxSSELineOctets*16 {
-		t.Fatal(fmt.Sprintf("maxStreamBodyOctets = %d allows fewer than 16 full-size frames, so a legal stream of maximum frames could be refused for being a stream at all", maxStreamBodyOctets))
+		t.Fatalf("maxStreamBodyOctets = %d allows fewer than 16 full-size frames, so a legal stream of maximum frames could be refused for being a stream at all", maxStreamBodyOctets)
 	}
 }
