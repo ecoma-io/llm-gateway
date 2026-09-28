@@ -64,27 +64,35 @@ const (
 // answered around, because a probe with no store behind it is exactly the
 // static /readyz this replaces.
 //
-// sessions is the four session operations, behind the narrow seam in wire.go.
-// A nil sessions is refused for the same reason and with the same reasoning as
-// a nil readiness: the session surface is this service's authentication
-// boundary, and a server that started with none would answer every product
-// operation as though every caller were signed in — which, with the origin,
-// content-type and double-submit guards all passing, is exactly the state a
-// CSRF attack is trying to produce.
+// sessions is the four session operations and reads is the ten product reads,
+// behind the two narrow seams in wire.go and readwire_seam.go. Both are refused
+// for the same reason and with different reasoning behind it. A nil sessions
+// is a server that would answer every product operation as though every caller
+// were signed in — which, with the origin, content-type and double-submit
+// guards all passing, is exactly the state a CSRF attack is trying to produce.
+// A nil reads is a console whose ten screens render nothing, which is a
+// missing feature rather than a wrong answer. Neither is worth continuing past,
+// and neither is worth answering at request time either: a handler that reached
+// a nil seam would panic on the floor of a request goroutine, where the stack
+// names a request rather than the wiring that caused it. This is where the
+// stack would have said which screen is missing.
 //
 // The surface itself is declared in routes.go and mounted here; this function
 // owns everything around it — the middleware, the two fallbacks below, and the
 // order they are composed in.
-func New(app *application.App, readiness persistence.Pinger, sessions sessionUseCases) stdhttp.Handler {
+func New(app *application.App, readiness persistence.Pinger, sessions sessionUseCases, reads consoleReadUseCases) stdhttp.Handler {
 	if readiness == nil {
 		panic("http: New requires a readiness Pinger; /readyz has nothing to gate on without one")
 	}
 	if sessions == nil {
 		panic("http: New requires the session use cases; the session surface is this service's authentication boundary")
 	}
+	if reads == nil {
+		panic("http: New requires the console read use cases; ten product screens have nothing to render without them")
+	}
 	mux := stdhttp.NewServeMux()
 
-	table := routes(app, readiness, sessions)
+	table := routes(app, readiness, sessions, reads)
 	for _, rt := range table {
 		register(mux, rt)
 	}

@@ -45,8 +45,10 @@ type route struct {
 // The session use cases travel as the narrow seam in wire.go rather than as the
 // application type, for the reason in that file: the import rule forbids this
 // package from reaching internal/domain, so the seam speaks in the plain fields
-// the wire itself needs.
-func routes(app *application.App, readiness persistence.Pinger, sessions sessionUseCases) []route {
+// the wire itself needs. The ten read use cases travel as their own seam beside
+// them rather than as members of the session one, because the two have
+// different consequences when they are absent — see consoleReadUseCases.
+func routes(app *application.App, readiness persistence.Pinger, sessions sessionUseCases, reads consoleReadUseCases) []route {
 	product := []route{
 		// Sign-in: the only unauthenticated write, and the only way a session
 		// comes into existence. It carries the origin, content-type and
@@ -88,6 +90,104 @@ func routes(app *application.App, readiness persistence.Pinger, sessions session
 			handler: handleMintAPIKey(sessions),
 		},
 	}
+
+	// The ten reads the contract declares, in the order api/openapi/console.yaml
+	// declares them: the dashboard's composition, then identity, then commerce,
+	// then accounting, then reconciliation. Every one of them is a GET, so
+	// `isUnsafeMethod` below attaches no cross-cutting guards to any of them —
+	// the origin, content-type and double-submit guards exist for a request that
+	// CHANGES something, and a read that changed something would be a different
+	// defect. The session cookie, applied by resolveSession inside each handler,
+	// is the only guard a read needs, and it is applied by the handler rather
+	// than the table because a read is not "unguarded" until a live principal
+	// is behind it: the three probes above are the only rows on this surface
+	// that are reachable without one.
+	//
+	// Reads sit in their own slice rather than appended to the product rows so
+	// that the two halves of the surface — the session operations that establish
+	// and end a caller, and the screens that need one — stay legible in the
+	// table as the contract states them.
+	readsOnly := []route{
+		// The dashboard's one server-side composition. Its account is the
+		// session's, and nothing here computes a figure: the counts are stored
+		// columns and the two lists are bounded rows.
+		{
+			method:  stdhttp.MethodGet,
+			path:    "/account/overview",
+			handler: handleGetAccountOverview(sessions, reads),
+		},
+		// The account's console users, keyset-paged, with the account predicate
+		// in the statement rather than applied to rows already fetched.
+		{
+			method:  stdhttp.MethodGet,
+			path:    "/users",
+			handler: handleListUsers(sessions, reads),
+		},
+		// The account's keys, keyset-paged. Every row is an ownership record;
+		// the POST above is the only place a credential exists.
+		{
+			method:  stdhttp.MethodGet,
+			path:    "/api-keys",
+			handler: handleListAPIKeys(sessions, reads),
+		},
+		// The plan catalogue. Not account-scoped — a plan is what every account
+		// buys from — so this is the one list that takes no account at all,
+		// while still requiring a session like every other product read.
+		{
+			method:  stdhttp.MethodGet,
+			path:    "/plans",
+			handler: handleListPlans(sessions, reads),
+		},
+		// What the account has bought. A scheduled cancellation is data beside
+		// an unchanged state, never a state of its own.
+		{
+			method:  stdhttp.MethodGet,
+			path:    "/subscriptions",
+			handler: handleListSubscriptions(sessions, reads),
+		},
+		// The grants the account's subscriptions materialised. No balance here:
+		// what remains of a grant is drawn on a funding bucket.
+		{
+			method:  stdhttp.MethodGet,
+			path:    "/entitlements",
+			handler: handleListEntitlements(sessions, reads),
+		},
+		// The account's buckets with their three cached balances, rendered and
+		// never derived by the client. Both bucket kinds are on this one list,
+		// and `kind` is what tells them apart.
+		{
+			method:  stdhttp.MethodGet,
+			path:    "/funding-buckets",
+			handler: handleListFundingBuckets(sessions, reads),
+		},
+		// One bucket's ledger. The only path parameter on the whole surface, and
+		// it names a bucket rather than an account: a bucket the session's
+		// account does not own is a row the query did not return, so the
+		// question a caller asked of a foreign bucket and of a bucket that does
+		// not exist is the same question and gets the same empty page.
+		{
+			method:  stdhttp.MethodGet,
+			path:    "/funding-buckets/{funding_bucket_id}/ledger",
+			handler: handleListLedgerEntries(sessions, reads),
+		},
+		// The reconciliation worker's recorded divergences, whole-plane and
+		// newest first. Evidence is rendered as text and never interpreted, and
+		// nothing here repairs anything: a finding is a record, not a path.
+		{
+			method:  stdhttp.MethodGet,
+			path:    "/reconciliation/findings",
+			handler: handleListFindings(sessions, reads),
+		},
+		// The pass history, whole-plane and newest first. A pass with no
+		// finished_at is a pass that started and never finished, rendered as
+		// such because a wedged worker and an idle one look identical otherwise.
+		{
+			method:  stdhttp.MethodGet,
+			path:    "/reconciliation/runs",
+			handler: handleListReconciliationRuns(sessions, reads),
+		},
+	}
+	product = append(product, readsOnly...)
 
 	probe := []route{
 		// Liveness: the process is up and its loop is turning. Anything about
