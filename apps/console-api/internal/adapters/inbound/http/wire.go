@@ -35,10 +35,10 @@ const (
 	principalClassOperator PrincipalClass = "operator"
 )
 
-// principal is the wire shape of Principal, mirroring the contract's schema.
+// Principal is the wire shape of Principal, mirroring the contract's schema.
 // It carries no credential, no session token and no secret: it is who the
 // session belongs to, and the header the console renders.
-type principal struct {
+type Principal struct {
 	Class            PrincipalClass `json:"class"`
 	AccountID        string         `json:"account_id"`
 	UserID           string         `json:"user_id,omitempty"`
@@ -58,12 +58,12 @@ type signInRequest struct {
 	Password  string `json:"password"`
 }
 
-// signInResponse mirrors SignInResponse: the principal and nothing else. The
+// signInResponse mirrors SignInResponse: the Principal and nothing else. The
 // credential is in a Set-Cookie header, because a JSON body cannot set a
 // cookie — so there is no token in this body to replay and nothing in it to
 // cache.
 type signInResponse struct {
-	Principal principal `json:"principal"`
+	Principal Principal `json:"Principal"`
 }
 
 // mintAPIKeyRequest mirrors MintAPIKeyRequest — the operator's chosen label.
@@ -82,10 +82,18 @@ const (
 	apiKeyStateRevoked apiKeyState = "revoked"
 )
 
-// apiKeyRecord mirrors the contract's APIKey — the ownership record as every
-// read but the mint returns it. The credential is absent, not null: this plane
-// stores no plaintext and no digest, and the Data Plane's credential record is
-// written only by the Data Plane (ADR 0006 §8).
+// apiKeyRecord mirrors the contract's APIKey — the ownership record as it goes
+// on the wire. The credential is absent, not null: this plane stores no
+// plaintext and no digest, and the Data Plane's credential record is written
+// only by the Data Plane (ADR 0006 §8).
+//
+// It is the WIRE spelling, deliberately not the seam's. The seam carries
+// APIKeyRecord, whose State is a plain string because it comes off storage, and
+// this one renders it into the contract's closed enum — renderAPIKey is the only
+// conversion between them, and the mint is the only other caller. Keeping the
+// two apart is what lets the seam's rows be named from the composition root,
+// which is the only place allowed to know about both a domain aggregate and a
+// wire shape.
 type apiKeyRecord struct {
 	ID          string      `json:"id"`
 	AccountID   string      `json:"account_id"`
@@ -111,6 +119,20 @@ type apiKeyRecord struct {
 type mintedAPIKeyResponse struct {
 	Record apiKeyRecord
 	Token  string
+}
+
+// renderMintedAPIKey joins a seam's mint result into the DTO that puts the
+// credential on the wire. It is the mint's only conversion, and it exists as a
+// function so the handler and its tests take the same path: the two structs are
+// no longer field-identical — the seam's record carries a string state and this
+// one carries the contract's enum — so a Go type conversion between them is
+// no longer available, and a conversion written twice would be two places for
+// the two shapes to drift.
+func renderMintedAPIKey(result MintedAPIKeyResult) mintedAPIKeyResponse {
+	return mintedAPIKeyResponse{
+		Record: renderAPIKey(result.Record),
+		Token:  result.Token,
+	}
 }
 
 // MarshalJSON emits the credential exactly once. The contract's MintedAPIKey
@@ -169,7 +191,7 @@ func quoteJSON(value string) (string, error) {
 // signatures settle, only the call sites in sessionHandlers.go re-point, and
 // nothing above them changes.
 //
-// The seam takes the principal as the plain fields the wire needs (an account
+// The seam takes the Principal as the plain fields the wire needs (an account
 // id string, a user id) rather than a domain type, for the import-rule reason at
 // the top of this file.
 
@@ -179,13 +201,13 @@ func quoteJSON(value string) (string, error) {
 // which it was.
 type sessionUseCases interface {
 	// SignIn resolves (account id, email) over live rows, checks the
-	// credential, and returns the session it created together with the principal
+	// credential, and returns the session it created together with the Principal
 	// it belongs to. Every pre-credential failure is one uniform answer, so a
 	// refusal here never distinguishes a missing account from a missing user
 	// from a wrong password from an `invited` row.
 	SignIn(ctx context.Context, in SignInInput) (SessionResult, error)
 
-	// Session resolves a live session to the principal it belongs to. A missing,
+	// Session resolves a live session to the Principal it belongs to. A missing,
 	// expired or revoked session is reported as not found, because to the
 	// client it is one fact and the client cannot act on the difference.
 	Session(ctx context.Context, token SessionToken) (SessionResult, error)
@@ -194,9 +216,9 @@ type sessionUseCases interface {
 	// no live session is not an error, so the handler answers 204 either way.
 	SignOut(ctx context.Context, token SessionToken) error
 
-	// MintAPIKey creates a key's ownership record for the principal's account
+	// MintAPIKey creates a key's ownership record for the Principal's account
 	// and returns the record together with its credential, the one time the
-	// credential exists anywhere. The account comes from the principal — never
+	// credential exists anywhere. The account comes from the Principal — never
 	// from the request — so there is no account for a caller to name.
 	MintAPIKey(ctx context.Context, in MintAPIKeyInput) (MintedAPIKeyResult, error)
 }
@@ -210,25 +232,25 @@ type SignInInput struct {
 	Password  string
 }
 
-// SessionResult is a live session's answer: the principal it names and the
+// SessionResult is a live session's answer: the Principal it names and the
 // plaintext token that addresses it. The token is returned to the transport
 // only so it can be written into a Set-Cookie; it is never serialized, never
 // logged, and never persisted here.
 type SessionResult struct {
-	Principal principal
+	Principal Principal
 	Token     SessionToken
 	// ExpiresAt is the moment the session stops being accepted. It is rendered
-	// into the principal so a client may show it, and it is enforced by the
+	// into the Principal so a client may show it, and it is enforced by the
 	// application on every use — a client's clock is not consulted.
 	ExpiresAt time.Time
 }
 
 // MintAPIKeyInput is a mint's request across the seam. The account is not an
-// input: it is the principal's, carried inside the principal, so a caller has
+// input: it is the Principal's, carried inside the Principal, so a caller has
 // no field in which to name another account's.
 type MintAPIKeyInput struct {
-	Principal principal
-	// The creator is the session's own user, derived from the principal; there
+	Principal Principal
+	// The creator is the session's own user, derived from the Principal; there
 	// is no request field for it either.
 	DisplayName string
 }
@@ -238,7 +260,14 @@ type MintAPIKeyInput struct {
 // transport can copy it into its bespoke DTO at the boundary — the
 // application.MintedKey refusal stands, and this struct is where the copy
 // lands.
+//
+// The record is the seam's APIKeyRecord rather than the wire's apiKeyRecord,
+// for the reason the two are kept apart: the implementation lives in the
+// composition root, which is the one place the import rule lets name both a
+// domain aggregate and a wire shape, and a result it cannot construct is a
+// result no implementation can return. The handler renders it with the same
+// renderAPIKey the read side uses, so the enum is spelled in one place.
 type MintedAPIKeyResult struct {
-	Record apiKeyRecord
+	Record APIKeyRecord
 	Token  string
 }

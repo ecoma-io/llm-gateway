@@ -122,7 +122,7 @@ func newFakeConsoleReadUseCases() *fakeConsoleReadUseCases {
 // newFakeSessionWithReadUseCases returns a handler whose reads are this fake, so
 // a test can assert the account id the handler forwarded. The session behind it
 // is the live one: the reads' account comes from the session, and a test that
-// wanted the two to disagree would set its own principal.
+// wanted the two to disagree would set its own Principal.
 func newFakeSessionWithReadUseCases(reads *fakeConsoleReadUseCases) stdhttp.Handler {
 	return New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), reads)
 }

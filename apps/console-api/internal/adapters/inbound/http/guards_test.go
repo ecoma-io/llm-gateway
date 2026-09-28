@@ -534,8 +534,8 @@ func TestTheProductResponseIsUncacheable(t *testing.T) {
 		})
 	}
 
-	// The session read is a product response too: it returns a principal, which
-	// is account data, and a cached principal is another account's header on a
+	// The session read is a product response too: it returns a Principal, which
+	// is account data, and a cached Principal is another account's header on a
 	// shared machine.
 	read := httptest.NewRequest(stdhttp.MethodGet, "/auth/session", nil)
 	read.AddCookie(&stdhttp.Cookie{Name: sessionCookieName, Value: string(mustToken())})

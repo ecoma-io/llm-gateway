@@ -150,7 +150,7 @@ func TestSignOutClearsBothCookiesWhateverItFound(t *testing.T) {
 // twice produces the same bytes — the determinism a struct tag would give for
 // free and a hand-rolled assembly has to keep.
 func TestTheMintedKeyDTORendersTheSecretExactlyOnce(t *testing.T) {
-	dto := mintedAPIKeyResponse(liveMintedKey())
+	dto := renderMintedAPIKey(liveMintedKey())
 
 	encoded, err := json.Marshal(dto)
 	if err != nil {
@@ -198,7 +198,7 @@ func TestTheMintedKeyDTORendersTheSecretExactlyOnce(t *testing.T) {
 func TestTheMintDTOEscapesItsStrings(t *testing.T) {
 	minted := liveMintedKey()
 	minted.Record.DisplayName = `ci "quoted" \ back` + "\n" + "second line"
-	dto := mintedAPIKeyResponse(minted)
+	dto := renderMintedAPIKey(minted)
 
 	encoded, err := json.Marshal(dto)
 	if err != nil {

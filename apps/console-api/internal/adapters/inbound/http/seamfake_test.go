@@ -16,7 +16,7 @@ import (
 // Every use case records the call it received and returns a configured answer,
 // so a test can assert both what a handler asked for (the account id came from
 // the session, not the request) and what it answered. The defaults are a live
-// session for a fixed principal, because that is the state in which most of the
+// session for a fixed Principal, because that is the state in which most of the
 // surface is interesting; a test that wants otherwise sets a field.
 type fakeSessionUseCases struct {
 	// signIn is the answer SignIn returns. The zero value's error is nil, so a
@@ -71,7 +71,7 @@ func (f *fakeSessionUseCases) MintAPIKey(_ context.Context, in MintAPIKeyInput) 
 // account came from the session" has something real to compare against.
 func liveSessionResult() SessionResult {
 	return SessionResult{
-		Principal: principal{
+		Principal: Principal{
 			Class:     principalClassUser,
 			AccountID: "11111111-1111-4111-8111-111111111111",
 			UserID:    "22222222-2222-4222-8222-222222222222",
@@ -91,12 +91,12 @@ func mustToken() SessionToken { return newSessionToken() }
 // a well-formed mint answer, for a test that wants a 201 without building one.
 func liveMintedKey() MintedAPIKeyResult {
 	return MintedAPIKeyResult{
-		Record: apiKeyRecord{
+		Record: APIKeyRecord{
 			ID:          "33333333-3333-4333-8333-333333333333",
 			AccountID:   "11111111-1111-4111-8111-111111111111",
 			DisplayName: "ci",
 			Prefix:      "gw_33333333",
-			State:       apiKeyStateActive,
+			State:       string(apiKeyStateActive),
 			CreatedAt:   "2026-09-28T12:00:00Z",
 		},
 		Token: "gw_33333333-3333-4333-8333-333333333333_secretpart",

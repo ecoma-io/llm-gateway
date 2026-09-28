@@ -146,7 +146,7 @@ func cleanPath(p string) string {
 // deliberate divergence from writeJSON. The three probes are the surface's
 // documented exemption from the no-store rule (the contract's NoStore header
 // says so, and names them by enumeration): a probe carries no account data, no
-// principal and no one-time secret, so caching it is harmless. Sending
+// Principal and no one-time secret, so caching it is harmless. Sending
 // no-store on a probe would be a small, defensible over-approximation — but it
 // would also mean the probes no longer match the contract's headers, and a
 // header that contradicts the document is a defect a client-side test cannot

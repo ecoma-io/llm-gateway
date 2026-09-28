@@ -139,7 +139,7 @@ func handleSignIn(useCases sessionUseCases) stdhttp.HandlerFunc {
 		mintSessionCookie(w, result.Token)
 		mintRequestTokenCookie(w, requestToken)
 
-		// The body carries the principal and nothing else. A JSON body cannot
+		// The body carries the Principal and nothing else. A JSON body cannot
 		// set a cookie, so the credential exists in exactly one place on this
 		// response — the Set-Cookie — and there is no second copy for a cache to
 		// keep.
@@ -185,16 +185,16 @@ func (signInError) response() (int, string, string) {
 // enumerate anything by asking.
 func handleSession(useCases sessionUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-		principal, ok := resolveSession(w, r, useCases)
+		Principal, ok := resolveSession(w, r, useCases)
 		if !ok {
 			return
 		}
-		writeJSON(w, stdhttp.StatusOK, principal)
+		writeJSON(w, stdhttp.StatusOK, Principal)
 	}
 }
 
 // resolveSession is the one place a session is read out of a request and
-// resolved to a principal, so that every operation which needs one does it
+// resolved to a Principal, so that every operation which needs one does it
 // identically and the four failure reasons cannot drift into four answers.
 //
 // Guard 1 lives here: an absent, malformed, expired or revoked cookie is one
@@ -205,11 +205,11 @@ func handleSession(useCases sessionUseCases) stdhttp.HandlerFunc {
 // It writes the refusal itself and reports false, so a handler's failure path is
 // a two-line early return rather than a repeated error construction that could
 // drift.
-func resolveSession(w stdhttp.ResponseWriter, r *stdhttp.Request, useCases sessionUseCases) (principal, bool) {
+func resolveSession(w stdhttp.ResponseWriter, r *stdhttp.Request, useCases sessionUseCases) (Principal, bool) {
 	token, ok := sessionFromRequest(r)
 	if !ok {
 		writeError(w, r, unauthenticatedError{})
-		return principal{}, false
+		return Principal{}, false
 	}
 	result, err := useCases.Session(r.Context(), token)
 	if err != nil {
@@ -219,7 +219,7 @@ func resolveSession(w stdhttp.ResponseWriter, r *stdhttp.Request, useCases sessi
 		// answer is the same, so asking would learn nothing and looking would
 		// be a temptation to start answering differently.
 		writeError(w, r, unauthenticatedError{})
-		return principal{}, false
+		return Principal{}, false
 	}
 	return result.Principal, true
 }
@@ -272,7 +272,7 @@ func handleSignOut(useCases sessionUseCases) stdhttp.HandlerFunc {
 // because there is no account to name: ADR 0012 §2 puts the account predicate in
 // the query, so the key lands under the caller's own account by construction and
 // there is no cross-account key for a caller to aim at. Its creator is the
-// session's own user, taken from the same principal.
+// session's own user, taken from the same Principal.
 //
 // The credential reaches the wire through mintedAPIKeyResponse's bespoke
 // MarshalJSON, exactly once, and the response is marked no-store by writeJSON so
@@ -320,6 +320,6 @@ func handleMintAPIKey(useCases sessionUseCases) stdhttp.HandlerFunc {
 		// sign-in above: the result and the DTO are the record and the token
 		// under the same two names, and restating them would be a second place
 		// to get one wrong.
-		writeJSON(w, stdhttp.StatusCreated, mintedAPIKeyResponse(minted))
+		writeJSON(w, stdhttp.StatusCreated, renderMintedAPIKey(minted))
 	}
 }

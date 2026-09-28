@@ -61,7 +61,7 @@ func routes(app *application.App, readiness persistence.Pinger, sessions session
 			path:    "/auth/sign-in",
 			handler: handleSignIn(sessions),
 		},
-		// The principal this session belongs to. The console calls it on every
+		// The Principal this session belongs to. The console calls it on every
 		// load, before it renders anything; a 200 is the only proof of
 		// authentication the client ever has, and it is the cookie guard doing
 		// that work. No cross-cutting guards, because GET is safe by definition
@@ -99,7 +99,7 @@ func routes(app *application.App, readiness persistence.Pinger, sessions session
 	// CHANGES something, and a read that changed something would be a different
 	// defect. The session cookie, applied by resolveSession inside each handler,
 	// is the only guard a read needs, and it is applied by the handler rather
-	// than the table because a read is not "unguarded" until a live principal
+	// than the table because a read is not "unguarded" until a live Principal
 	// is behind it: the three probes above are the only rows on this surface
 	// that are reachable without one.
 	//

@@ -14,7 +14,7 @@ import (
 // rules this surface is built to hold rather than a habit worth restating at
 // each call site:
 //
-//   - resolveSession first. The account comes from the principal it returns and
+//   - resolveSession first. The account comes from the Principal it returns and
 //     from nowhere else — no path segment, no query parameter, no body field —
 //     and a caller with no live session never reaches the use case at all.
 //
@@ -383,12 +383,12 @@ func handleListReconciliationRuns(sessions sessionUseCases, reads ConsoleReadUse
 	}
 }
 
-// accountOf is the one place a session principal becomes the account id a
+// accountOf is the one place a session Principal becomes the account id a
 // product read is scoped to. It is a function rather than a field read at each
 // call site so the rule is stated once: the account comes from the session and
 // from nowhere else, and a handler that wanted a different account would have
 // to go through here to get one.
-func accountOf(p principal) string { return p.AccountID }
+func accountOf(p Principal) string { return p.AccountID }
 
 // The render conversions. Each is the seam's row as the contract's schema, field
 // for field, and each is a conversion rather than a struct literal for the
@@ -397,10 +397,16 @@ func accountOf(p principal) string { return p.AccountID }
 // to get one wrong — a field added on one side and forgotten on the other
 // compiles and is silently zero on the wire.
 
-// renderAPIKey converts a key's ownership record. The credential is absent
-// from both sides of this conversion and that is not an oversight: the mint's
-// DTO is the only place a token exists, and a list that could return one would
-// have made "shown once" a property of the client rather than the system.
+// renderAPIKey converts a key's ownership record from the seam's row into the
+// wire DTO. The credential is absent from both sides of this conversion and that
+// is not an oversight: the mint's DTO is the only place a token exists, and a
+// list that could return one would have made "shown once" a property of the
+// client rather than the system.
+//
+// It is the only place the contract's closed `active | revoked` enum is spelled,
+// and it now serves the mint as well as the read — the mint's record crosses
+// the seam as the same APIKeyRecord, so the two callers convert through one
+// function and a third spelling of the state could not be added beside it.
 func renderAPIKey(row APIKeyRecord) apiKeyRecord {
 	return apiKeyRecord{
 		ID:          row.ID,

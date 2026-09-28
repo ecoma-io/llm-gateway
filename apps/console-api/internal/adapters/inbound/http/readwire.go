@@ -79,7 +79,26 @@ func wireTime(at string) string { return at }
 // exact layout wireTime's callers promise, so the seam either renders a value
 // that is a date-time or panics at the boundary rather than writing a field
 // the contract types as one.
+//
+// The empty string is the ONE value it accepts without parsing, and it is
+// accepted deliberately rather than as a tolerance. Two spellings of absence
+// exist on this surface and they are not interchangeable: a field tagged
+// `omitempty` is DROPPED when it is empty, and a field typed `[string, "null"]`
+// renders an explicit null — which is what wireInstants exists to do. So an
+// absent instant arrives here as the empty string precisely so the tag can
+// drop the field, and validating it would make the absent case a panic. The
+// panic this function exists to prevent is a MALFORMED instant — a timestamp
+// that is present and unparseable, which is a value nothing can render and a
+// bug a client would see as a wrong type.
+//
+// The distinction is enforced in both directions by the schema: a present
+// instant is a date-time, and a record either has the column or has not been
+// written yet. A record missing its created_at cannot be constructed, because
+// the column is NOT NULL.
 func mustWireTime(at string) string {
+	if at == "" {
+		return ""
+	}
 	if _, err := time.Parse(time.RFC3339, at); err != nil {
 		panic("console-api http: a read DTO carried a timestamp that is not RFC 3339: " + at)
 	}
@@ -147,12 +166,14 @@ type userRecord struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
-// apiKeyRecord is NOT declared here: wire.go already holds it, as the contract's
-// APIKey shape, for the mint's response to join. Declaring a second one here
-// would be two spellings of one schema, and a field added to one and forgotten
-// on the other would compile and be silently absent from the wire. The read
-// side reuses that single type — renderAPIKey in readhandlers.go converts into
-// it — so the key shape exists once on this side of the boundary.
+// apiKeyRecord is NOT declared here, and neither is a second APIKey schema
+// beside the seam's APIKeyRecord. wire.go holds the WIRE spelling, with the
+// contract's closed state enum and its JSON tags; readwire_seam.go holds the
+// SEAM's, in plain fields with State a string because it comes off storage.
+// Declaring a third would be three spellings of one schema, and a field added
+// to one and forgotten on the others would compile and be silently absent from
+// the wire. The two convert through renderAPIKey — the only place the enum is
+// spelled — so the key shape exists once on each side of that one boundary.
 
 // planRecord mirrors the contract's Plan.
 //
