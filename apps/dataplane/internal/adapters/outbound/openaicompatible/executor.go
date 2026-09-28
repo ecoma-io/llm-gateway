@@ -117,6 +117,21 @@ func New(target Target) *Executor {
 // oversized body is an unreadable answer, not a limit to surface.
 const maxCompletionBodyOctets = 32 << 20
 
+// maxStreamBodyOctets bounds the TOTAL octets the streaming path will read
+// from one provider, across every frame.
+//
+// maxSSELineOctets bounds one frame and a provider that speaks them honestly
+// is bounded by its own output limits; this bounds the other failure, which
+// is a stream that never ends. Without it the streaming path is the one path
+// in the runtime with no total read bound: a provider that emits frames
+// forever is followed forever, and the runtime holds the call open for as
+// long as the client keeps reading. Thirty-two mebibytes is orders of
+// magnitude above any real completion — the largest answer this runtime would
+// ever be asked to forward — and the ceiling is a refusal, not a truncation:
+// the stream ends the way a broken stream ends, the walk records it as a
+// failed attempt, and no partial answer is charged as though it were whole.
+const maxStreamBodyOctets = 32 << 20
+
 // maxRefusalEnvelopeOctets bounds how much of a refusal body is read before
 // the redaction pass. Refusal envelopes are small; anything past this is
 // dropped unread, and the class still stands on the status.
