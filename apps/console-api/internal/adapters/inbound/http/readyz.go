@@ -26,11 +26,17 @@ const readinessPingTimeout = 5 * time.Second
 // The one check is the thing this process cannot serve the console without:
 // its database answering. The Data Plane is never among the dependencies —
 // this service is ready when it can serve the console, and it can do that
-// while the runtime is down — and the cache joins the gate when a caller
-// first reads through one. Liveness stays ungated on /healthz, so an
-// orchestrator restarting on the process probe never kills this process for
-// a dependency it is on its way to reach; this is the endpoint traffic
-// control reads, and 503 here is the service saying "not yet", not "never".
+// while the runtime is down — and the cache is never among them either, by the
+// port's own rule and not by accident of who reads what today:
+// `ports/outbound/cache/cache.go` says an entry is "never authoritative for
+// either plane — it is a cache, and losing it costs a recomputation and
+// nothing else", so a cache restart must not take every replica out of the
+// load balancer. If a future release ever reads through one, that port is where
+// the argument has to be won, not this comment. Liveness stays ungated on
+// /healthz, so an orchestrator restarting on the process probe never kills
+// this process for a dependency it is on its way to reach; this is the
+// endpoint traffic control reads, and 503 here is the service saying "not
+// yet", not "never".
 //
 // A failed check logs exactly one line naming the dependency and nothing else
 // about it — no driver prose, no stack — because the envelope already told
