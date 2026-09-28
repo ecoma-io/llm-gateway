@@ -249,16 +249,28 @@ func NewRefill(refillID, fundingBucketID string, amount, atRevision int64) (Refi
 // it is needed — never precomputed into a seed-time rank. A rank frozen at
 // seed time would go stale the first time a publication moved a period end,
 // and the waterfall would draw from a bucket the account's grants no longer
-// name first. The function is also the canonical lock order: every writer
-// that touches more than one of an account's rows touches them in this order,
-// so two writers can never deadlock across the set. Admission and return call
-// this one function; there is no second ordering anywhere in the runtime. The
-// final funding-bucket tiebreak is what makes the order total — two
-// projections can share every other input (one entitlement, two buckets) and
-// the lock order still needs to pick one first — and the adapter's SQL walks
-// this same order (`named_scope DESC, period_end ASC NULLS LAST,
-// subscription_created_at ASC, entitlement_id ASC, funding_bucket_id ASC`);
-// the two spellings are one order, and the integration suite proves it.
+// name first. The final funding-bucket tiebreak is what makes the order total —
+// two projections can share every other input (one entitlement, two buckets)
+// and the order still needs to pick one first.
+//
+// THE LIVE ORDER IS NOT THIS ONE. The runtime's waterfall runs in SQL, in
+// `projectionWalk` (`adapters/outbound/postgres/accountingrepo.go`), and
+// admission and return never call this function — it has no caller outside its
+// own tests. This is the domain's statement of the order ADR 0003 reads, kept
+// as the reference the SQL is written against, and it is two keys short of the
+// SQL's: the SQL leads with `(q.scope_kind = 'payg_balance')` so that
+// entitlements drain before a PAYG balance explicitly rather than by a
+// coincidence of `named_scope` sorting, and this function has no
+// `scope_kind` input. `Projection` does not carry the kind, so the gap is in
+// the type as much as in the sort.
+//
+// The two are therefore NOT one order, and no test proves they are. A future
+// caller that wires the projection seed or a return path through this function
+// would get a different order from the walk, on exactly the rows the leading
+// key separates. Close the gap — carry `scope_kind` on `Projection` and lead
+// the sort with it — before giving this function a caller. Until then the SQL
+// is the canonical order and the canonical lock order, and this comment is
+// where that is recorded.
 func ByWaterfall(projections []Projection) []Projection {
 	ordered := make([]Projection, len(projections))
 	copy(ordered, projections)

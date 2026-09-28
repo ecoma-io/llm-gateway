@@ -176,6 +176,42 @@ func TestTheLoopNamesAnUnreplayablePositionAndStandsBy(t *testing.T) {
 	}
 }
 
+// A pass that applied facts says so, and says how many. This is the
+// observability half of the loop's job, and it is the half that makes a
+// stopped loop a diagnosable state: /readyz gates on the database, which
+// answers perfectly whether or not this loop is turning, so "the consumer is
+// not applying pages" has to be legible in the log or it is invisible. A
+// page that reports zero and no more is the same pass with nothing to do, and
+// it is reported too — the difference between "turning" and "stopped" is a
+// line that keeps arriving, which only holds if the empty pass is one too.
+func TestTheLoopReportsEveryPassIncludingAnEmptyOne(t *testing.T) {
+	empty := `{"events":[],"next_cursor":"cursor-1","has_more":false}`
+	full := `{"events":[{"append_seq":3,"request_id":"req-1","kind":"unbillable_orphaned","schema_version":1,"occurred_at":"2026-09-24T10:11:12Z","payload":{"allocations":[]}}],"next_cursor":"cursor-2","has_more":false}`
+	feed := newQueuedFeed(t, empty, full)
+	client := dataplaneadapter.New(feed.server.Client(), feed.server.URL, seamCredential)
+	world := newSeamWorld("cursor-1")
+	ingestion := application.NewFactIngestion(client, seamStore{world: world}, seamCursor{world: world}, seamApplier{world: world})
+
+	var logs syncBuffer
+	previous := log.Default().Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	stop := runLoop(t, context.Background(), ingestion, 5*time.Millisecond, 5*time.Second)
+	defer stop()
+
+	await(t, func() bool { return strings.Contains(logs.String(), "applied 1 facts") })
+	await(t, func() bool { return strings.Contains(logs.String(), "applied 0 facts") })
+
+	seen := logs.String()
+	if !strings.Contains(seen, "applied 0 facts") {
+		t.Fatalf("logs = %q, want the empty pass reported as well — a line that only appears when there is work to report cannot show that the loop stopped", seen)
+	}
+	if !strings.Contains(seen, "applied 1 facts") {
+		t.Fatalf("logs = %q, want the pass that applied a fact to name its count", seen)
+	}
+}
+
 // syncBuffer is the captured log: the loop writes it from its own goroutine
 // and the test reads it from this one, so the guard is the buffer's, not the
 // parties'.

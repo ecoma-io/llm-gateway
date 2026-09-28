@@ -194,6 +194,16 @@ type Sink interface {
 	// the gateway's own observation of what the client received. The routing
 	// stage reads it after a call returns, to settle a post-commitment death
 	// on what was forwarded rather than on what the provider generated.
+	//
+	// Every current consumer COUNTS rather than reads: `settleBasis` takes
+	// the delivered token figure, and nothing anywhere parses these bytes.
+	// An adapter that accumulates them without a total bound is therefore
+	// retaining an answer the settlement only ever needed the length of, and
+	// a future consumer that does need the content is a change to this
+	// contract and not an extension of it — which is why the read-side bound
+	// in the openai-compatible adapter is a refusal rather than a truncation,
+	// and why it is the adapter's own bound rather than one this port imposes
+	// on every implementation.
 	Delivered() []byte
 }
 

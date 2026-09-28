@@ -3,6 +3,7 @@ package openaicompatible
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 
@@ -16,12 +17,19 @@ import (
 // dispatch ids, blank lines — is skipped on sight, and each data line is one
 // chunk's JSON, which is exactly the unit the sink receives.
 //
-// One line at a time is also the memory shape: bufio.Scanner never holds
-// more than the current frame, and a frame longer than maxSSELineOctets is
-// not a chunk anyone sent on purpose — it surfaces as the scanner's error,
-// which the stream loop classifies where it stands.
+// A per-frame wall is not a total one, so the reader carries its own budget
+// and spends it as it reads. maxSSELineOctets bounds one frame; this bounds
+// every frame together, which is the only bound that stops a provider that
+// emits frames forever from being followed forever. The budget counts the
+// bytes the provider SENT rather than the payloads this reader hands on, so a
+// stream padded with comments and blank lines spends it the same as one
+// padded with data — a caller cannot buy unbounded reading with framing. The
+// read that crosses the budget is not returned: the stream ends at the frame
+// boundary it stopped on, and the loop classifies it exactly as it classifies
+// the oversized single frame, because from here out it is the same event.
 type sseReader struct {
 	scanner *bufio.Scanner
+	budget  int64
 }
 
 // maxSSELineOctets is the frame-size wall. Provider chunks run to a few
@@ -33,15 +41,23 @@ const maxSSELineOctets = 1 << 20
 // it. It is matched whitespace-blind — see next.
 const doneSentinel = "[DONE]"
 
+// errStreamBudgetExhausted is the stream that outgrew its total budget. It is
+// a sentinel rather than a message so the loop can classify it beside the
+// scanner's own error, and both are the same event to a caller: a stream that
+// cannot be read to its end, mid-answer, with whatever was already forwarded
+// already forwarded.
+var errStreamBudgetExhausted = errors.New("openaicompatible: the stream outgrew its total budget")
+
 func newSSEReader(r io.Reader) *sseReader {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxSSELineOctets)
-	return &sseReader{scanner: scanner}
+	return &sseReader{scanner: scanner, budget: maxStreamBodyOctets}
 }
 
 // next returns the next data line's payload. done is the [DONE] sentinel;
 // io.EOF is the stream's end as the provider left it; any other error is a
-// stream that can no longer be read, the oversized frame included.
+// stream that can no longer be read, the oversized frame and the exhausted
+// budget included.
 //
 // Emptiness and the sentinel are read whitespace-blind: a whitespace-only
 // data line, or a trailing space or tab after the sentinel, is the
@@ -50,6 +66,13 @@ func newSSEReader(r io.Reader) *sseReader {
 // take. The payload itself travels as the line carries it.
 func (r *sseReader) next() (payload []byte, done bool, err error) {
 	for r.scanner.Scan() {
+		// The line's size, not the payload's: framing a stream out is as
+		// expensive to read as the data in it, and a caller must not be able
+		// to spend the budget with lines this reader throws away.
+		r.budget -= int64(len(r.scanner.Bytes())) + 1
+		if r.budget < 0 {
+			return nil, false, errStreamBudgetExhausted
+		}
 		line := r.scanner.Text()
 		if line == "" || strings.HasPrefix(line, ":") {
 			continue

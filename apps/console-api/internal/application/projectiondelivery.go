@@ -86,14 +86,22 @@ func NewProjectionDelivery(log persistence.ProjectionLog, consumer dataplane.Pro
 // half failed; the process's ticker decides what a failed cycle costs (a log
 // line and a wait), because the protocol's answer to every transient failure
 // is the next cycle.
-func (p *ProjectionDelivery) Reconcile(ctx context.Context, force bool) error {
+//
+// The count is a position, not a tally: it is the log revision the mirror is
+// at once the cycle ended, so a cycle that delivered nothing reports the
+// revision it read and one that delivered a thousand reports the thousandth.
+// A caller that wants "how much did this cycle move" subtracts the revision
+// the previous cycle reported. It is returned on every path including the
+// error paths, because a failed cycle after a partial drain has still moved
+// the mirror and an operator reading the line needs to know where it stopped.
+func (p *ProjectionDelivery) Reconcile(ctx context.Context, force bool) (uint64, error) {
 	head, err := p.log.Head(ctx)
 	if err != nil {
-		return fmt.Errorf("application: projection reconcile: read the log's head: %w", err)
+		return 0, fmt.Errorf("application: projection reconcile: read the log's head: %w", err)
 	}
 	position, err := p.consumer.ProjectionPosition(ctx)
 	if err != nil {
-		return fmt.Errorf("application: projection reconcile: read the mirror's position: %w", err)
+		return 0, fmt.Errorf("application: projection reconcile: read the mirror's position: %w", err)
 	}
 
 	joins := position.Bootstrapped &&
@@ -109,11 +117,19 @@ func (p *ProjectionDelivery) Reconcile(ctx context.Context, force bool) error {
 		// producer assumed.
 		from, err = p.bootstrap(ctx)
 		if err != nil {
-			return err
+			return from, err
 		}
 	}
 
-	return p.drain(ctx, head.Epoch, from)
+	// A drain that fails part-way has still moved the mirror as far as its
+	// last acknowledged batch, so the position is reported rather than zero:
+	// the next cycle resumes from the mirror's own durable position, and an
+	// operator reading this cycle's line needs the same number.
+	reached, err := p.drain(ctx, head.Epoch, from)
+	if err != nil {
+		return reached, err
+	}
+	return reached, nil
 }
 
 // bootstrap cuts a snapshot at the log's head and delivers it. The returned
@@ -141,23 +157,31 @@ func (p *ProjectionDelivery) bootstrap(ctx context.Context) (uint64, error) {
 }
 
 // drain delivers the log's entries from `from` forward, in batches, until
-// the feed is empty. The epoch starts as the one the cycle's opening head
-// read named, and is re-read after every heal: a heal cuts its snapshot
-// against the log as it stands at that moment, and if the timeline's epoch
-// was re-minted under the loop's feet — the operator step ADR 0007's restore
-// procedure names — the batches this loop assembles afterwards must speak
-// the re-minted word, not the dead one the cycle started with.
-func (p *ProjectionDelivery) drain(ctx context.Context, epoch string, from uint64) error {
+// the feed is empty, and returns the revision the mirror actually reached —
+// on every path, including the ones that fail. The epoch starts as the one
+// the cycle's opening head read named, and is re-read after every heal: a
+// heal cuts its snapshot against the log as it stands at that moment, and if
+// the timeline's epoch was re-minted under the loop's feet — the operator step
+// ADR 0007's restore procedure names — the batches this loop assembles
+// afterwards must speak the re-minted word, not the dead one the cycle started
+// with.
+//
+// The returned revision is the mirror's own committed position, never a local
+// guess: every successful delivery replaces `from` with the acknowledgement it
+// returned, and a heal replaces it with the snapshot's boundary. A drain that
+// stops anywhere therefore reports where the mirror really is, which is the
+// only number that is true on the next cycle's first read.
+func (p *ProjectionDelivery) drain(ctx context.Context, epoch string, from uint64) (uint64, error) {
 	for {
 		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("application: projection drain: %w", err)
+			return from, fmt.Errorf("application: projection drain: %w", err)
 		}
 		changes, err := p.log.ChangesAfter(ctx, from, projection.MaxChangesPerBatch)
 		if err != nil {
-			return fmt.Errorf("application: projection drain: read the log after revision %d: %w", from, err)
+			return from, fmt.Errorf("application: projection drain: read the log after revision %d: %w", from, err)
 		}
 		if len(changes) == 0 {
-			return nil
+			return from, nil
 		}
 
 		batch, err := projection.NewBatch(epoch, from, changes)
@@ -171,11 +195,11 @@ func (p *ProjectionDelivery) drain(ctx context.Context, epoch string, from uint6
 			// realistic way — the corruption fails this process loudly
 			// instead of being delivered as a batch the consumer must
 			// refuse.
-			return fmt.Errorf("application: projection drain: assemble the batch after revision %d: %w", from, err)
+			return from, fmt.Errorf("application: projection drain: assemble the batch after revision %d: %w", from, err)
 		}
 		message, err := json.Marshal(batch)
 		if err != nil {
-			return fmt.Errorf("application: projection drain: render the batch after revision %d: %w", from, err)
+			return from, fmt.Errorf("application: projection drain: render the batch after revision %d: %w", from, err)
 		}
 
 		ack, err := p.consumer.DeliverChanges(ctx, message)
@@ -188,7 +212,7 @@ func (p *ProjectionDelivery) drain(ctx context.Context, epoch string, from uint6
 				// authority on where the mirror now stands.
 				from, err = p.bootstrap(ctx)
 				if err != nil {
-					return err
+					return from, err
 				}
 				// The snapshot was cut against the log as it stands now, so
 				// the epoch is re-read with it. Without this, a timeline
@@ -197,7 +221,7 @@ func (p *ProjectionDelivery) drain(ctx context.Context, epoch string, from uint6
 				// deadline the only thing that ever stops it.
 				head, err := p.log.Head(ctx)
 				if err != nil {
-					return fmt.Errorf("application: projection drain: re-read the log's head after the heal: %w", err)
+					return from, fmt.Errorf("application: projection drain: re-read the log's head after the heal: %w", err)
 				}
 				epoch = head.Epoch
 				continue
@@ -206,7 +230,7 @@ func (p *ProjectionDelivery) drain(ctx context.Context, epoch string, from uint6
 			// grammar refusal of a message this process built, an unknown
 			// answer — fails the cycle with its cause named. The next tick
 			// retries it; the error is the operator's signal either way.
-			return fmt.Errorf("application: projection drain: deliver the batch through revision %d: %w", batch.LastRevision(), err)
+			return from, fmt.Errorf("application: projection drain: deliver the batch through revision %d: %w", batch.LastRevision(), err)
 		}
 		from = ack.AppliedRevision
 	}
