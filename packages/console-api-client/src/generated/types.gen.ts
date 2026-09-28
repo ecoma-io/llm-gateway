@@ -4,6 +4,437 @@ export type ClientOptions = {
   baseUrl: `${string}://${string}` | (string & {});
 };
 
+/**
+ * A key's ownership record as every read but the mint returns it. The credential is absent, not null: this plane stores no plaintext and no digest, and the Data Plane's credential record is written only by the Data Plane (ADR 0006 §8).
+ */
+export type ApiKey = {
+  id: string;
+  account_id: string;
+  /**
+   * The console identity that minted it, or null when minted without one.
+   */
+  created_by?: string | null;
+  display_name: string;
+  prefix: string;
+  state: "active" | "revoked";
+  created_at: string;
+  updated_at?: string;
+  revoked_at?: string | null;
+};
+
+export type ApiKeyPage = PageEnvelope & {
+  items: Array<ApiKey>;
+};
+
+export type Account = {
+  id: string;
+  /**
+   * A presentation name. It is not unique, nothing makes it immutable, and it is never a key — which is why sign-in asks for the account's id and not its name.
+   */
+  name: string;
+  state: "active" | "suspended" | "closed";
+  created_at: string;
+  updated_at: string;
+};
+
+/**
+ * The dashboard's one composition: figures that live in three bounded contexts, assembled **server-side** into a single operation. This is the BFF composition ADR 0012 §1 settles — a use case in `internal/application` returning a projection this contract declares, never arithmetic across three responses in a page component, and never a new package. The account comes from the session.
+ */
+export type AccountOverview = {
+  account: Account;
+  /**
+   * How many live users the account has. It is a **count of a filtered, bounded set** — invited plus active, excluding removed — and is the one figure on this schema that is a number about the collection rather than about one row. It is cheap because the predicate is indexed, and it is here rather than inferred by paging a list because an operator reading "12 users" should not have to page eleven screens to learn there are twelve.
+   */
+  user_count?: number;
+  /**
+   * How many keys are currently active. Revoked keys are counted separately in the key list, never here: a dashboard that said "12 keys" with twelve revoked among them would be describing history as if it were capacity.
+   */
+  active_api_key_count?: number;
+  /**
+   * The account's subscriptions, most recent first, bounded by the contract's own `maximum` rather than by a total. A dashboard showing three of eleven is honest; one claiming to show all eleven is making a promise this plane will not keep.
+   */
+  subscriptions?: Array<Subscription>;
+  /**
+   * The account's PAYG buckets with their three balances, rendered and never computed.
+   */
+  payg_balances?: Array<FundingBucket>;
+  /**
+   * How many reconciliation findings are open. It is a whole-plane fact and therefore the one number here that is not the account's alone: an operator reading it learns how the system is doing, not what this customer owes.
+   */
+  open_finding_count?: number;
+};
+
+/**
+ * A bucket's three cached balances, exactly as `domain/accounting/bucket.go` states them:
+ *
+ * settled   = Σ grants/topups − Σ consumes + Σ adjustment settled_deltas
+ * held      = Σ holds − Σ releases − Σ consumes + Σ adjustment held_deltas
+ * available = settled − held
+ *
+ * They are returned as three separate figures rather than one "balance", because they answer three different questions and an operator who is shown a single number is shown a number that answers none of them. They are a **projection**: the console renders them and never derives one, because a client that computed `available` from the others would be doing the ledger's algebra in the browser, and a disagreement between the two would have no authority behind it. If the cache and the legs ever disagree, the legs win (`Reconcile`'s standing rule).
+ */
+export type Balances = {
+  settled: Money;
+  held: Money;
+  available: Money;
+};
+
+/**
+ * An opaque position in one collection's order. It is safe to store and to send back verbatim; it is not safe to interpret, and neither the console nor a generated client may decode, compare, order or synthesise one. A cursor this surface cannot place — malformed, forged, or carrying a filter the request no longer makes — is refused with `400 invalid_request`.
+ */
+export type Cursor = string;
+
+/**
+ * One live quota grant materialised from exactly one (subscription, cycle, grant definition). The row is immutable after the roll except its terminal state flip, and it carries **no balance column** — capacity is drawn down in Accounting's buckets and the runtime's quota projections, and a balance here would be a third copy of the same number with no rebuild story. A console that showed "remaining" from this row would be showing nothing at all; the remaining figure lives on the bucket, and the two are deliberately separate reads.
+ */
+export type Entitlement = {
+  id: string;
+  subscription_id: string;
+  grant_definition_id?: string;
+  /**
+   * Which cycle of the subscription this grant is for. A retried roll cannot grant a cycle twice — the schema's `entitlements_grant_once_per_cycle` makes the triple unique, and this number is the third of it.
+   */
+  cycle: number;
+  /**
+   * The alias-group **name** the grant is scoped to. The pinned scope is a version id, resolved through the Data Plane that owns the catalog; this is the name an operator reads, and the console does not resolve the version itself.
+   */
+  scope?: string;
+  /**
+   * The only dimension today, `cost`. It is an enum with one member rather than a free string because the second one is a compatibility surface: a `requests` or `tokens` dimension would change what every number in this API means, and that has not happened.
+   */
+  dimension?: "cost";
+  granted_minor_units?: number;
+  scope_version_id?: string;
+  state: "active" | "expired";
+  period_start: string;
+  period_end: string;
+  created_at?: string;
+};
+
+export type EntitlementPage = PageEnvelope & {
+  items: Array<Entitlement>;
+};
+
+/**
+ * One recorded divergence. A finding's identity is `(check_kind, subject_kind, subject_id)` and nothing else — not a message, not a timestamp, and not a run id — so the same divergence seen by two passes is one row whose `last_seen_at` moved, not a second row. That is what makes the table bounded and what makes a re-run over unchanged data open zero findings.
+ * The `observed` evidence is opaque to the console: it is structured JSON written by the check that found the divergence, and a new check is a new evidence shape rather than a migration. It is rendered as text, never interpreted, and never summed.
+ */
+export type Finding = {
+  id: string;
+  /**
+   * Which invariant was violated. A closed vocabulary this plane owns rather than free text, and two checks with different names are different findings even about the same subject.
+   */
+  check_kind: string;
+  /**
+   * What the invariant was violated on. `control_plane` is the literal subject for a feed-wide signal, which is why it is a member of the enum and not a sentinel an operator has to recognise.
+   */
+  subject_kind: "funding_bucket" | "settlement" | "request" | "control_plane";
+  subject_id: string;
+  /**
+   * How much it matters, **written once and never moved**. A finding whose severity were editable would let a reader re-grade the evidence instead of resolving it, which is the one thing this table exists to make hard.
+   */
+  severity: "info" | "warning" | "critical";
+  status: "open" | "acknowledged" | "resolved";
+  /**
+   * The evidence the check compared, as this plane's checks wrote it. Every writer is one of this plane's own checks — never a provider blob, never a raw prompt, never a fact payload — and its shape is not this contract's to fix.
+   */
+  observed?: {
+    [key: string]: unknown;
+  };
+  /**
+   * One sentence for the human who resolves the finding. Prose, never a payload: the figures belong in `observed`, where they can be compared.
+   */
+  detail?: string;
+  /**
+   * When the **first** pass saw this divergence.
+   */
+  detected_at: string;
+  /**
+   * When the most recent pass saw it still true.
+   */
+  last_seen_at: string;
+  resolved_at?: string | null;
+};
+
+export type FindingPage = PageEnvelope & {
+  items: Array<Finding>;
+};
+
+/**
+ * One bucket: the authoritative capacity projection for exactly one entitlement cycle or one account's PAYG balance. Exactly one owner, ever — `kind` says which, and the schema pins the same rule.
+ */
+export type FundingBucket = {
+  id: string;
+  /**
+   * `entitlement` buckets belong to one entitlement cycle; `account` buckets are a PAYG balance. The two are never one bucket, because a cycle that rolls must not take the PAYG balance with it.
+   */
+  kind: "entitlement" | "account";
+  /**
+   * Present exactly when `kind` is `entitlement`.
+   */
+  entitlement_id?: string | null;
+  /**
+   * Present exactly when `kind` is `account`. For an entitlement bucket this is the owning account too, and the console resolves it through the entitlement — the account id is in the row either way, because the authorization predicate is evaluated against it.
+   */
+  account_id?: string | null;
+  status: "active" | "closed";
+  balances: Balances;
+  /**
+   * The optimistic-concurrency counter. It moves on every leg, and a write carries the version it read so a stale one is refused rather than merged.
+   */
+  version: number;
+  opened_at?: string | null;
+  closed_at?: string | null;
+  created_at: string;
+  updated_at?: string;
+};
+
+export type FundingBucketPage = PageEnvelope & {
+  items: Array<FundingBucket>;
+};
+
+/**
+ * One immutable bucket leg: the ledger's unit of record. Legs are listed **per bucket** — one operation for one bucket's history, never one for all buckets — because a ledger is a fact about where money went, and a merged list of every bucket's legs is a question about money this plane has no index to answer. The bucket id is therefore a path segment on this one operation, and it is the only place a resource id appears in a path: it names a bucket, and a bucket the session's account does not own is a 404 the query did not return.
+ */
+export type LedgerEntry = {
+  id: string;
+  funding_bucket_id: string;
+  /**
+   * The six kinds the domain declares, with their own semantics (`domain/accounting/ledger.go:27-54`). `consume` is the only kind carrying a price snapshot, and `adjustment` the only one whose deltas are free values — an explicit operator correction with a reason, never an overdraw or a credit mechanism.
+   */
+  kind: "grant" | "topup" | "hold" | "release" | "consume" | "adjustment";
+  /**
+   * The leg's position in its bucket, allocated by the store inside the transaction that writes it. It is the keyset this list pages on, and it is strictly increasing per bucket, so a page can neither skip a leg nor read one twice.
+   */
+  sequence: number;
+  settled_delta: Money;
+  held_delta: Money;
+  settlement_id?: string | null;
+  reservation_id?: string | null;
+  /**
+   * The topup's idempotency key, when the leg is a `topup`. A retry carrying the same key books once.
+   */
+  command_key?: string | null;
+  /**
+   * The consume leg's price provenance, copied **by value** from the revision the leg was priced against: the revision id travels as a textual reference and the two unit prices as copied values, not as a foreign key, because a settlement must be derivable from the fact alone and a price re-derived from a moving table is not provenance. Present exactly on `consume` legs.
+   */
+  price?: PriceSnapshot | null;
+  /**
+   * One sentence for the human who reads the correction. Prose, never evidence, and never a payload — the figures belong in the deltas above, where they can be compared.
+   */
+  adjustment_reason?: string | null;
+  /**
+   * The operator who wrote an `adjustment` leg. Present on adjustments and nowhere else; a correction without one is not a correction, it is a bug with a reason attached.
+   */
+  operator_id?: string | null;
+  created_at: string;
+};
+
+export type LedgerEntryPage = PageEnvelope & {
+  items: Array<LedgerEntry>;
+};
+
+/**
+ * Mint a key's ownership record. The plaintext is not an input and cannot be: it does not exist until this call returns it, which is what makes the one-time rendering below a property of the system rather than of the console's care.
+ */
+export type MintApiKeyRequest = {
+  /**
+   * The operator-chosen label shown in the console. Trimmed, and bounded in runes so a name's worth does not depend on its script.
+   */
+  display_name: string;
+};
+
+/**
+ * A key's ownership record **and** its credential, together, exactly once. The `token` field is the only time the plaintext exists anywhere outside the mint's return value: it is not persisted anywhere, not derivable from anything this response also carries, and not recoverable by any later call. Losing it means minting a new key, which is the intended cost of losing it.
+ * Every response carrying this schema — this one and the reads below — is sent with `Cache-Control: no-store`, so that a shared proxy, a browser's disk cache or the back button does not turn a one-time secret into a durable one. The console renders the token once, in a field the user must copy, and clears it when that view unmounts.
+ */
+export type MintedApiKey = {
+  id: string;
+  account_id: string;
+  display_name: string;
+  /**
+   * The public lookup hint baked into every presentation of the token: brand plus key id. It is derived from the id, carries no secret, and is what a console shows an operator so they can tell two of their keys apart.
+   */
+  prefix: string;
+  state: "active" | "revoked";
+  created_at: string;
+  revoked_at?: string | null;
+  /**
+   * The credential, in full, this once. Never stored, never logged, never in a URL, and never re-served.
+   */
+  token: string;
+};
+
+/**
+ * An amount in minor units with **no currency field**, because the ledger stores money as int64 minor units and the currency of an account's buckets is a decision the contract has not yet made (#63). This is stated on the schema rather than left for a client to discover: a number rendered without a unit is worse than a number that refuses to render, and a client that guesses a currency here will guess it wrong.
+ */
+export type Money = {
+  /**
+   * The amount. Sign is meaningful on a `delta` and never on a balance: a balance is what the bucket holds, and this plane refuses to store a negative one.
+   */
+  minor_units: number;
+};
+
+export type PageEnvelope = {
+  /**
+   * The rows on this page. May be empty, and an empty first page is a legitimate answer — an account with no users is not an error.
+   */
+  items: Array<unknown>;
+  next_cursor: Cursor;
+  /**
+   * Whether rows exist past this page. This — not the page's length — is the only honest end-of-collection signal, because a short page is also what a concurrent write produces. A page shorter than the requested limit with `has_more: true` is a normal page, and a client that treats a short page as the end is the bug this field exists to prevent.
+   */
+  has_more: boolean;
+};
+
+export type Plan = {
+  id: string;
+  name: string;
+  created_at: string;
+  updated_at?: string;
+};
+
+export type PlanPage = PageEnvelope & {
+  items: Array<Plan>;
+};
+
+export type PriceSnapshot = {
+  /**
+   * The pricing revision this leg was priced against.
+   */
+  revision_id: string;
+  input_unit_price: Money;
+  output_unit_price: Money;
+};
+
+/**
+ * Who the session belongs to. This is what the console renders in its header and what every product operation authorizes against; it carries no credential, no session token and no secret, and it is the only account identifier any product operation consults.
+ */
+export type Principal = {
+  class: PrincipalClass;
+  /**
+   * The account the session acts for. It is derived from the session row, never from the request path or a query parameter.
+   */
+  account_id: string;
+  /**
+   * The signed-in console identity. Present exactly when `class` is `user`.
+   */
+  user_id?: string;
+  /**
+   * The staff identity. Present exactly when `class` is `operator`. A text reference rather than a users-row id, because the operator surface is not built and the ledger's operator grammar is a decision that has not been made (`domain/accounting/ids.go:55-58`).
+   */
+  operator_id?: string;
+  /**
+   * The signed-in identity's address, for display in the console header. It is returned because the user is already authenticated and it is their own address; it is never a lookup key and never appears in a URL.
+   */
+  email?: string;
+  /**
+   * When this session stops being accepted. A client that renders a countdown from it is reading a fact the server also enforces; the value is not a licence to keep calling, because the server's check does not consult the client's clock.
+   */
+  session_expires_at?: string;
+};
+
+/**
+ * What a session's holder is authorised as. There are two classes and not three roles: `user` acts for one account and may read its identity, commerce and accounting surfaces; `operator` is the staff class that administers accounts across accounts. The split is two because a three-role model would need a permission matrix this product has no use for yet, and a role an operator screen can misconfigure is worse than one role it cannot misconfigure. Adding a third class later is a new enum member and a new predicate, not a migration of this one.
+ */
+export type PrincipalClass = "user" | "operator";
+
+/**
+ * One reconciliation pass: the half-open window it swept, when it started, how it ended, and the three counters that say what it did. A run whose `finished_at` is null is a pass that started and never finished, which is a fact worth rendering rather than hiding — it is indistinguishable from an idle worker if it is not.
+ */
+export type ReconciliationRun = {
+  id: number;
+  scope: string;
+  status: "running" | "completed" | "failed";
+  /**
+   * Inclusive.
+   */
+  window_from: string;
+  /**
+   * Exclusive, and the high-water mark the **next** pass opens from. The console renders both halves of a half-open window, because a window rendered as an inclusive pair is a window an operator cannot tell from one that overlapped the last.
+   */
+  window_to: string;
+  started_at: string;
+  finished_at?: string | null;
+  buckets_scanned: number;
+  findings_opened: number;
+  /**
+   * What a re-run shows: the same divergence seen again is a re-confirmation, not a new finding. An operator reading a run with a high `findings_unchanged` is looking at a healthy pass, and a console that did not show the figure would make it look like a broken one.
+   */
+  findings_unchanged: number;
+};
+
+export type ReconciliationRunPage = PageEnvelope & {
+  items: Array<ReconciliationRun>;
+};
+
+/**
+ * The one unauthenticated write this surface accepts. Three inputs, and the order they are collected in is the design rather than the form's layout: the account's id discriminates, the email resolves within it, and the credential is checked against the row that pair names (ADR 0008 §2). An "email first, choose the account after" flow would have nothing to verify between the two, so its chooser would sit before authentication and answer "which accounts does this address belong to" to anyone who knows the address.
+ */
+export type SignInRequest = {
+  /**
+   * The account's id. It is the only identifier the account has, and it is asked for because it is the discriminator that makes the email resolution total.
+   */
+  account_id: string;
+  /**
+   * The identity's address. Resolution is scoped to `(account_id, email)` over live rows, and never to the address alone.
+   */
+  email: string;
+  /**
+   * The identity's credential. It is never stored, never logged, and never carried in a URL; the request body is not logged at all, on any path, at any level.
+   */
+  password: string;
+};
+
+/**
+ * The one successful sign-in. It carries the principal and nothing else — no token, no secret, nothing a caller could replay to skip the cookie. The credential is in a `Set-Cookie` header, and a JSON body cannot set one.
+ */
+export type SignInResponse = {
+  principal: Principal;
+};
+
+export type Subscription = {
+  id: string;
+  account_id: string;
+  plan_version_id: string;
+  state: "pending" | "active" | "suspended" | "cancelled" | "expired";
+  starts_at?: string;
+  /**
+   * Null exactly while the subscription is `pending`, and non-null in every other state.
+   */
+  current_period_start?: string | null;
+  current_period_end?: string | null;
+  /**
+   * When a scheduled cancellation takes effect. A scheduled cancellation is **data, not a state**: the subscription stays `active` and usable until this instant passes, which is why the state enum has no "cancelling" member and why an operator looking at a `cancelled` subscription is looking at one that has already stopped.
+   */
+  cancel_at?: string | null;
+  created_at: string;
+  updated_at?: string;
+};
+
+export type SubscriptionPage = PageEnvelope & {
+  items: Array<Subscription>;
+};
+
+export type User = {
+  id: string;
+  account_id: string;
+  /**
+   * The address, normalised to lowercase. It is unique per account across live rows, so a removed user's address may be invited again; a console that filtered on it across accounts would be leaking membership of an account the reader may not be in.
+   */
+  email: string;
+  /**
+   * `invited` is a live state with no credential behind it: an invited row resolves to exactly one user and authenticates nobody, because the activation is what establishes that the human who now holds the address is the human the invitation named (ADR 0012 §2, amending ADR 0008).
+   */
+  state: "invited" | "active" | "removed";
+  created_at: string;
+  updated_at: string;
+};
+
+export type UserPage = PageEnvelope & {
+  items: Array<User>;
+};
+
 export type Error = {
   /**
    * A stable machine-readable category for the failure, shared by both surfaces that return this envelope. `cursor_expired` and `upstream_unavailable` are produced by the Data Plane management API today, as are the three projection codes (`unsupported_version`, `revision_gap`, `snapshot_required`); `service_unavailable` is produced by the Console API's readiness probe. They are named here rather than in the document alone so a caller of either surface has one vocabulary for both.
@@ -49,6 +480,17 @@ export type Version = {
    */
   version: string;
 };
+
+/**
+ * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+ */
+export type PageAfter = Cursor;
+
+/**
+ * The largest number of rows to return. A page shorter than this does not mean the collection is exhausted — `has_more` says that, because a short page is also what a concurrent write produces.
+ * The bounds are enforced rather than approximated: a value below `minimum`, above `maximum`, or not an integer at all is refused with `400 invalid_request`, and a value inside the bounds is served as asked. Nothing is clamped. A caller that asked for a larger page than this operation will return has asked a question the contract does not answer, and the smaller page it would otherwise get is one it cannot tell apart from a page this collection capped itself.
+ */
+export type PageLimit = number;
 
 /**
  * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
@@ -175,3 +617,780 @@ export type GetVersionResponses = {
 };
 
 export type GetVersionResponse = GetVersionResponses[keyof GetVersionResponses];
+
+export type SignInData = {
+  body: SignInRequest;
+  path?: never;
+  query?: never;
+  url: "/auth/sign-in";
+};
+
+export type SignInErrors = {
+  /**
+   * The request is well-formed HTTP and its inputs do not satisfy the contract — an address that is not plausible, an account id that is not a UUID, a field that is missing or too long. The message names the offending field and never whether the account exists: a credential that has not been checked cannot be the thing the answer is about.
+   */
+  400: ErrorEnvelope;
+  /**
+   * The credential did not match, or the identity it would authenticate is not in a state that may authenticate. One answer for every cause, deliberately.
+   */
+  401: ErrorEnvelope;
+  /**
+   * The credential matched and the account it belongs to is suspended or closed. It is a **403** and not a 401 because the caller has proved who they are; what it learns is about their own account, which they are entitled to know.
+   */
+  403: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * The request did not arrive as `application/json`. This operation accepts no other encoding, and a form post — the one thing a hostile page can make a browser send cross-origin without a preflight — is refused here rather than parsed.
+   */
+  415: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+};
+
+export type SignInError = SignInErrors[keyof SignInErrors];
+
+export type SignInResponses = {
+  /**
+   * The credential matched. The session cookie is set; the body carries who the session belongs to and nothing else.
+   */
+  200: SignInResponse;
+};
+
+export type SignInResponse2 = SignInResponses[keyof SignInResponses];
+
+export type SignOutData = {
+  body?: never;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path?: never;
+  query?: never;
+  url: "/auth/session";
+};
+
+export type SignOutErrors = {
+  /**
+   * The request's `Origin` is not this surface's own origin, or an unsafe method arrived without the double-submit token this surface sets on every rendered form. `SameSite=Strict` is the first line of defence and this is the second: a cookie is not sent on a cross-site request, but a same-site one from a compromised sibling subdomain is, and a token the page must echo is something a sibling origin cannot read. The status is 403 with the `invalid_request` code — the request is well-formed HTTP and is refused for being untrusted, not malformed.
+   */
+  403: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * An unsafe method arrived with a body the contract does not accept — a form encoding, or a content type this surface does not parse. The refusal is what makes `SameSite=Strict` load-bearing rather than merely cautious: a simple form post crosses origins without a preflight and without a custom content type, so a cookie is the only thing standing between a form on another site and a money-moving write here. Requiring a content type no HTML form can produce is the check that removes the ambiguity entirely.
+   */
+  415: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+};
+
+export type SignOutError = SignOutErrors[keyof SignOutErrors];
+
+export type SignOutResponses = {
+  /**
+   * There is no session, and there is now certainly not one. The cookie is cleared either way.
+   */
+  204: void;
+};
+
+export type SignOutResponse = SignOutResponses[keyof SignOutResponses];
+
+export type GetSessionData = {
+  body?: never;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path?: never;
+  query?: never;
+  url: "/auth/session";
+};
+
+export type GetSessionErrors = {
+  /**
+   * The request carried no session this service accepts, or the session named has ended. Unlike the Data Plane's management surface — which rejects a browser session and a customer API key alike because neither is a service identity (ADR 0006 §9) — this surface's whole caller population is browsers, so `unauthenticated` here means exactly what it says: sign in again. The answer is the same whether the cookie was absent, expired, revoked, or never existed, and the response names nothing about which, because a difference is a disclosure to anyone willing to send cookies.
+   */
+  401: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+};
+
+export type GetSessionError = GetSessionErrors[keyof GetSessionErrors];
+
+export type GetSessionResponses = {
+  /**
+   * The session is live and names this principal.
+   */
+  200: Principal;
+};
+
+export type GetSessionResponse = GetSessionResponses[keyof GetSessionResponses];
+
+export type GetAccountOverviewData = {
+  body?: never;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path?: never;
+  query?: never;
+  url: "/account/overview";
+};
+
+export type GetAccountOverviewErrors = {
+  /**
+   * The request carried no session this service accepts, or the session named has ended. Unlike the Data Plane's management surface — which rejects a browser session and a customer API key alike because neither is a service identity (ADR 0006 §9) — this surface's whole caller population is browsers, so `unauthenticated` here means exactly what it says: sign in again. The answer is the same whether the cookie was absent, expired, revoked, or never existed, and the response names nothing about which, because a difference is a disclosure to anyone willing to send cookies.
+   */
+  401: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+};
+
+export type GetAccountOverviewError = GetAccountOverviewErrors[keyof GetAccountOverviewErrors];
+
+export type GetAccountOverviewResponses = {
+  /**
+   * The composed overview.
+   */
+  200: AccountOverview;
+};
+
+export type GetAccountOverviewResponse =
+  GetAccountOverviewResponses[keyof GetAccountOverviewResponses];
+
+export type ListUsersData = {
+  body?: never;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path?: never;
+  query?: {
+    /**
+     * Restrict to one lifecycle state. Omit for every live user.
+     */
+    state?: "invited" | "active" | "removed";
+    /**
+     * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     */
+    after?: Cursor;
+    /**
+     * The largest number of rows to return. A page shorter than this does not mean the collection is exhausted — `has_more` says that, because a short page is also what a concurrent write produces.
+     * The bounds are enforced rather than approximated: a value below `minimum`, above `maximum`, or not an integer at all is refused with `400 invalid_request`, and a value inside the bounds is served as asked. Nothing is clamped. A caller that asked for a larger page than this operation will return has asked a question the contract does not answer, and the smaller page it would otherwise get is one it cannot tell apart from a page this collection capped itself.
+     */
+    limit?: number;
+  };
+  url: "/users";
+};
+
+export type ListUsersErrors = {
+  /**
+   * A parameter does not satisfy the contract — a `limit` outside its bounds, a cursor this surface cannot place, or a cursor carrying a filter the request no longer makes. Refused rather than served against the new filter.
+   */
+  400: ErrorEnvelope;
+  /**
+   * The request carried no session this service accepts, or the session named has ended. Unlike the Data Plane's management surface — which rejects a browser session and a customer API key alike because neither is a service identity (ADR 0006 §9) — this surface's whole caller population is browsers, so `unauthenticated` here means exactly what it says: sign in again. The answer is the same whether the cookie was absent, expired, revoked, or never existed, and the response names nothing about which, because a difference is a disclosure to anyone willing to send cookies.
+   */
+  401: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+};
+
+export type ListUsersError = ListUsersErrors[keyof ListUsersErrors];
+
+export type ListUsersResponses = {
+  /**
+   * One page of the account's users.
+   */
+  200: UserPage;
+};
+
+export type ListUsersResponse = ListUsersResponses[keyof ListUsersResponses];
+
+export type ListApiKeysData = {
+  body?: never;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path?: never;
+  query?: {
+    /**
+     * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     */
+    after?: Cursor;
+    /**
+     * The largest number of rows to return. A page shorter than this does not mean the collection is exhausted — `has_more` says that, because a short page is also what a concurrent write produces.
+     * The bounds are enforced rather than approximated: a value below `minimum`, above `maximum`, or not an integer at all is refused with `400 invalid_request`, and a value inside the bounds is served as asked. Nothing is clamped. A caller that asked for a larger page than this operation will return has asked a question the contract does not answer, and the smaller page it would otherwise get is one it cannot tell apart from a page this collection capped itself.
+     */
+    limit?: number;
+  };
+  url: "/api-keys";
+};
+
+export type ListApiKeysErrors = {
+  /**
+   * A pagination parameter does not satisfy the contract.
+   */
+  400: ErrorEnvelope;
+  /**
+   * The request carried no session this service accepts, or the session named has ended. Unlike the Data Plane's management surface — which rejects a browser session and a customer API key alike because neither is a service identity (ADR 0006 §9) — this surface's whole caller population is browsers, so `unauthenticated` here means exactly what it says: sign in again. The answer is the same whether the cookie was absent, expired, revoked, or never existed, and the response names nothing about which, because a difference is a disclosure to anyone willing to send cookies.
+   */
+  401: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+};
+
+export type ListApiKeysError = ListApiKeysErrors[keyof ListApiKeysErrors];
+
+export type ListApiKeysResponses = {
+  /**
+   * One page of the account's keys.
+   */
+  200: ApiKeyPage;
+};
+
+export type ListApiKeysResponse = ListApiKeysResponses[keyof ListApiKeysResponses];
+
+export type MintApiKeyData = {
+  body: MintApiKeyRequest;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path?: never;
+  query?: never;
+  url: "/api-keys";
+};
+
+export type MintApiKeyErrors = {
+  /**
+   * The body does not satisfy the contract — a missing or blank display name, or a content type this operation does not parse.
+   */
+  400: ErrorEnvelope;
+  /**
+   * The request carried no session this service accepts, or the session named has ended. Unlike the Data Plane's management surface — which rejects a browser session and a customer API key alike because neither is a service identity (ADR 0006 §9) — this surface's whole caller population is browsers, so `unauthenticated` here means exactly what it says: sign in again. The answer is the same whether the cookie was absent, expired, revoked, or never existed, and the response names nothing about which, because a difference is a disclosure to anyone willing to send cookies.
+   */
+  401: ErrorEnvelope;
+  /**
+   * The request's `Origin` is not this surface's own origin, or an unsafe method arrived without the double-submit token this surface sets on every rendered form. `SameSite=Strict` is the first line of defence and this is the second: a cookie is not sent on a cross-site request, but a same-site one from a compromised sibling subdomain is, and a token the page must echo is something a sibling origin cannot read. The status is 403 with the `invalid_request` code — the request is well-formed HTTP and is refused for being untrusted, not malformed.
+   */
+  403: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * An unsafe method arrived with a body the contract does not accept — a form encoding, or a content type this surface does not parse. The refusal is what makes `SameSite=Strict` load-bearing rather than merely cautious: a simple form post crosses origins without a preflight and without a custom content type, so a cookie is the only thing standing between a form on another site and a money-moving write here. Requiring a content type no HTML form can produce is the check that removes the ambiguity entirely.
+   */
+  415: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+};
+
+export type MintApiKeyError = MintApiKeyErrors[keyof MintApiKeyErrors];
+
+export type MintApiKeyResponses = {
+  /**
+   * The key and its credential. The `token` field is the plaintext, and this is the only response that will ever carry it.
+   */
+  201: MintedApiKey;
+};
+
+export type MintApiKeyResponse = MintApiKeyResponses[keyof MintApiKeyResponses];
+
+export type ListPlansData = {
+  body?: never;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path?: never;
+  query?: {
+    /**
+     * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     */
+    after?: Cursor;
+    /**
+     * The largest number of rows to return. A page shorter than this does not mean the collection is exhausted — `has_more` says that, because a short page is also what a concurrent write produces.
+     * The bounds are enforced rather than approximated: a value below `minimum`, above `maximum`, or not an integer at all is refused with `400 invalid_request`, and a value inside the bounds is served as asked. Nothing is clamped. A caller that asked for a larger page than this operation will return has asked a question the contract does not answer, and the smaller page it would otherwise get is one it cannot tell apart from a page this collection capped itself.
+     */
+    limit?: number;
+  };
+  url: "/plans";
+};
+
+export type ListPlansErrors = {
+  /**
+   * A pagination parameter does not satisfy the contract.
+   */
+  400: ErrorEnvelope;
+  /**
+   * The request carried no session this service accepts, or the session named has ended. Unlike the Data Plane's management surface — which rejects a browser session and a customer API key alike because neither is a service identity (ADR 0006 §9) — this surface's whole caller population is browsers, so `unauthenticated` here means exactly what it says: sign in again. The answer is the same whether the cookie was absent, expired, revoked, or never existed, and the response names nothing about which, because a difference is a disclosure to anyone willing to send cookies.
+   */
+  401: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+};
+
+export type ListPlansError = ListPlansErrors[keyof ListPlansErrors];
+
+export type ListPlansResponses = {
+  /**
+   * One page of plans.
+   */
+  200: PlanPage;
+};
+
+export type ListPlansResponse = ListPlansResponses[keyof ListPlansResponses];
+
+export type ListSubscriptionsData = {
+  body?: never;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path?: never;
+  query?: {
+    /**
+     * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     */
+    after?: Cursor;
+    /**
+     * The largest number of rows to return. A page shorter than this does not mean the collection is exhausted — `has_more` says that, because a short page is also what a concurrent write produces.
+     * The bounds are enforced rather than approximated: a value below `minimum`, above `maximum`, or not an integer at all is refused with `400 invalid_request`, and a value inside the bounds is served as asked. Nothing is clamped. A caller that asked for a larger page than this operation will return has asked a question the contract does not answer, and the smaller page it would otherwise get is one it cannot tell apart from a page this collection capped itself.
+     */
+    limit?: number;
+  };
+  url: "/subscriptions";
+};
+
+export type ListSubscriptionsErrors = {
+  /**
+   * A pagination parameter does not satisfy the contract.
+   */
+  400: ErrorEnvelope;
+  /**
+   * The request carried no session this service accepts, or the session named has ended. Unlike the Data Plane's management surface — which rejects a browser session and a customer API key alike because neither is a service identity (ADR 0006 §9) — this surface's whole caller population is browsers, so `unauthenticated` here means exactly what it says: sign in again. The answer is the same whether the cookie was absent, expired, revoked, or never existed, and the response names nothing about which, because a difference is a disclosure to anyone willing to send cookies.
+   */
+  401: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+};
+
+export type ListSubscriptionsError = ListSubscriptionsErrors[keyof ListSubscriptionsErrors];
+
+export type ListSubscriptionsResponses = {
+  /**
+   * One page of the account's subscriptions.
+   */
+  200: SubscriptionPage;
+};
+
+export type ListSubscriptionsResponse =
+  ListSubscriptionsResponses[keyof ListSubscriptionsResponses];
+
+export type ListEntitlementsData = {
+  body?: never;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path?: never;
+  query?: {
+    /**
+     * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     */
+    after?: Cursor;
+    /**
+     * The largest number of rows to return. A page shorter than this does not mean the collection is exhausted — `has_more` says that, because a short page is also what a concurrent write produces.
+     * The bounds are enforced rather than approximated: a value below `minimum`, above `maximum`, or not an integer at all is refused with `400 invalid_request`, and a value inside the bounds is served as asked. Nothing is clamped. A caller that asked for a larger page than this operation will return has asked a question the contract does not answer, and the smaller page it would otherwise get is one it cannot tell apart from a page this collection capped itself.
+     */
+    limit?: number;
+  };
+  url: "/entitlements";
+};
+
+export type ListEntitlementsErrors = {
+  /**
+   * A pagination parameter does not satisfy the contract.
+   */
+  400: ErrorEnvelope;
+  /**
+   * The request carried no session this service accepts, or the session named has ended. Unlike the Data Plane's management surface — which rejects a browser session and a customer API key alike because neither is a service identity (ADR 0006 §9) — this surface's whole caller population is browsers, so `unauthenticated` here means exactly what it says: sign in again. The answer is the same whether the cookie was absent, expired, revoked, or never existed, and the response names nothing about which, because a difference is a disclosure to anyone willing to send cookies.
+   */
+  401: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+};
+
+export type ListEntitlementsError = ListEntitlementsErrors[keyof ListEntitlementsErrors];
+
+export type ListEntitlementsResponses = {
+  /**
+   * One page of entitlements.
+   */
+  200: EntitlementPage;
+};
+
+export type ListEntitlementsResponse = ListEntitlementsResponses[keyof ListEntitlementsResponses];
+
+export type ListFundingBucketsData = {
+  body?: never;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path?: never;
+  query?: {
+    /**
+     * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     */
+    after?: Cursor;
+    /**
+     * The largest number of rows to return. A page shorter than this does not mean the collection is exhausted — `has_more` says that, because a short page is also what a concurrent write produces.
+     * The bounds are enforced rather than approximated: a value below `minimum`, above `maximum`, or not an integer at all is refused with `400 invalid_request`, and a value inside the bounds is served as asked. Nothing is clamped. A caller that asked for a larger page than this operation will return has asked a question the contract does not answer, and the smaller page it would otherwise get is one it cannot tell apart from a page this collection capped itself.
+     */
+    limit?: number;
+  };
+  url: "/funding-buckets";
+};
+
+export type ListFundingBucketsErrors = {
+  /**
+   * A pagination parameter does not satisfy the contract.
+   */
+  400: ErrorEnvelope;
+  /**
+   * The request carried no session this service accepts, or the session named has ended. Unlike the Data Plane's management surface — which rejects a browser session and a customer API key alike because neither is a service identity (ADR 0006 §9) — this surface's whole caller population is browsers, so `unauthenticated` here means exactly what it says: sign in again. The answer is the same whether the cookie was absent, expired, revoked, or never existed, and the response names nothing about which, because a difference is a disclosure to anyone willing to send cookies.
+   */
+  401: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+};
+
+export type ListFundingBucketsError = ListFundingBucketsErrors[keyof ListFundingBucketsErrors];
+
+export type ListFundingBucketsResponses = {
+  /**
+   * One page of the account's buckets.
+   */
+  200: FundingBucketPage;
+};
+
+export type ListFundingBucketsResponse =
+  ListFundingBucketsResponses[keyof ListFundingBucketsResponses];
+
+export type ListLedgerEntriesData = {
+  body?: never;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path: {
+    /**
+     * The bucket whose history is wanted.
+     */
+    funding_bucket_id: string;
+  };
+  query?: {
+    /**
+     * Restrict to one leg kind — `consume` for spend, `topup` or `grant` for funding, `hold` and `release` for the reservation cycle. Omit for the whole history.
+     */
+    kind?: "grant" | "topup" | "hold" | "release" | "consume" | "adjustment";
+    /**
+     * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     */
+    after?: Cursor;
+    /**
+     * The largest number of rows to return. A page shorter than this does not mean the collection is exhausted — `has_more` says that, because a short page is also what a concurrent write produces.
+     * The bounds are enforced rather than approximated: a value below `minimum`, above `maximum`, or not an integer at all is refused with `400 invalid_request`, and a value inside the bounds is served as asked. Nothing is clamped. A caller that asked for a larger page than this operation will return has asked a question the contract does not answer, and the smaller page it would otherwise get is one it cannot tell apart from a page this collection capped itself.
+     */
+    limit?: number;
+  };
+  url: "/funding-buckets/{funding_bucket_id}/ledger";
+};
+
+export type ListLedgerEntriesErrors = {
+  /**
+   * A parameter does not satisfy the contract — a `kind` outside the enum, a `limit` outside its bounds, or a cursor carrying a filter the request no longer makes.
+   */
+  400: ErrorEnvelope;
+  /**
+   * The request carried no session this service accepts, or the session named has ended. Unlike the Data Plane's management surface — which rejects a browser session and a customer API key alike because neither is a service identity (ADR 0006 §9) — this surface's whole caller population is browsers, so `unauthenticated` here means exactly what it says: sign in again. The answer is the same whether the cookie was absent, expired, revoked, or never existed, and the response names nothing about which, because a difference is a disclosure to anyone willing to send cookies.
+   */
+  401: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+};
+
+export type ListLedgerEntriesError = ListLedgerEntriesErrors[keyof ListLedgerEntriesErrors];
+
+export type ListLedgerEntriesResponses = {
+  /**
+   * One page of the bucket's legs, oldest first.
+   */
+  200: LedgerEntryPage;
+};
+
+export type ListLedgerEntriesResponse =
+  ListLedgerEntriesResponses[keyof ListLedgerEntriesResponses];
+
+export type ListFindingsData = {
+  body?: never;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path?: never;
+  query?: {
+    /**
+     * Restrict to one status. Omit for every finding, open and closed.
+     */
+    status?: "open" | "acknowledged" | "resolved";
+    /**
+     * Restrict to one severity.
+     */
+    severity?: "info" | "warning" | "critical";
+    /**
+     * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     */
+    after?: Cursor;
+    /**
+     * The largest number of rows to return. A page shorter than this does not mean the collection is exhausted — `has_more` says that, because a short page is also what a concurrent write produces.
+     * The bounds are enforced rather than approximated: a value below `minimum`, above `maximum`, or not an integer at all is refused with `400 invalid_request`, and a value inside the bounds is served as asked. Nothing is clamped. A caller that asked for a larger page than this operation will return has asked a question the contract does not answer, and the smaller page it would otherwise get is one it cannot tell apart from a page this collection capped itself.
+     */
+    limit?: number;
+  };
+  url: "/reconciliation/findings";
+};
+
+export type ListFindingsErrors = {
+  /**
+   * A filter or pagination parameter does not satisfy the contract.
+   */
+  400: ErrorEnvelope;
+  /**
+   * The request carried no session this service accepts, or the session named has ended. Unlike the Data Plane's management surface — which rejects a browser session and a customer API key alike because neither is a service identity (ADR 0006 §9) — this surface's whole caller population is browsers, so `unauthenticated` here means exactly what it says: sign in again. The answer is the same whether the cookie was absent, expired, revoked, or never existed, and the response names nothing about which, because a difference is a disclosure to anyone willing to send cookies.
+   */
+  401: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+};
+
+export type ListFindingsError = ListFindingsErrors[keyof ListFindingsErrors];
+
+export type ListFindingsResponses = {
+  /**
+   * One page of findings.
+   */
+  200: FindingPage;
+};
+
+export type ListFindingsResponse = ListFindingsResponses[keyof ListFindingsResponses];
+
+export type ListReconciliationRunsData = {
+  body?: never;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path?: never;
+  query?: {
+    /**
+     * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     */
+    after?: Cursor;
+    /**
+     * The largest number of rows to return. A page shorter than this does not mean the collection is exhausted — `has_more` says that, because a short page is also what a concurrent write produces.
+     * The bounds are enforced rather than approximated: a value below `minimum`, above `maximum`, or not an integer at all is refused with `400 invalid_request`, and a value inside the bounds is served as asked. Nothing is clamped. A caller that asked for a larger page than this operation will return has asked a question the contract does not answer, and the smaller page it would otherwise get is one it cannot tell apart from a page this collection capped itself.
+     */
+    limit?: number;
+  };
+  url: "/reconciliation/runs";
+};
+
+export type ListReconciliationRunsErrors = {
+  /**
+   * A pagination parameter does not satisfy the contract.
+   */
+  400: ErrorEnvelope;
+  /**
+   * The request carried no session this service accepts, or the session named has ended. Unlike the Data Plane's management surface — which rejects a browser session and a customer API key alike because neither is a service identity (ADR 0006 §9) — this surface's whole caller population is browsers, so `unauthenticated` here means exactly what it says: sign in again. The answer is the same whether the cookie was absent, expired, revoked, or never existed, and the response names nothing about which, because a difference is a disclosure to anyone willing to send cookies.
+   */
+  401: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+};
+
+export type ListReconciliationRunsError =
+  ListReconciliationRunsErrors[keyof ListReconciliationRunsErrors];
+
+export type ListReconciliationRunsResponses = {
+  /**
+   * One page of runs, newest first.
+   */
+  200: ReconciliationRunPage;
+};
+
+export type ListReconciliationRunsResponse =
+  ListReconciliationRunsResponses[keyof ListReconciliationRunsResponses];
