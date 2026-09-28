@@ -2,17 +2,22 @@
 // public surface, and the only one a browser reaches.
 //
 // It owns transport concerns — routing, middleware, request identifiers and
-// wire errors — then calls the application for use-case work. Product endpoints
-// do not exist yet: liveness stays infrastructure-level, readiness gates on the
+// wire errors — then calls the application for use-case work. The three probes
+// stay infrastructure-level: liveness is ungated, readiness gates on the
 // Control Plane's own store through the narrow port the probe needs, and
-// GET /version proves the HTTP → application → response path every domain
-// endpoint will follow. The public contract is api/openapi/console.yaml; it
-// changes before this package does, never after.
+// GET /version proves the HTTP → application → response path. The session
+// surface is the product half and it ships before any other (ADR 0012 §2): a
+// management operation that lands ahead of sign-in mints live credentials for
+// anyone who asks. The public contract is api/openapi/console.yaml; it changes
+// before this package does, never after.
 //
 // Nothing here decides a business rule. A handler translates a request into a
 // call, and the application's answer or typed error back into a response; the
 // one thing this package owns outright is the shape of the wire — status,
-// envelope, headers — which is what an inbound adapter is for.
+// envelope, headers — which is what an inbound adapter is for. What it also owns
+// is the four request guards an unsafe method must clear, which are transport
+// facts about where a request came from and never use-case decisions; see
+// session.go.
 package http
 
 import (
@@ -59,18 +64,39 @@ const (
 // answered around, because a probe with no store behind it is exactly the
 // static /readyz this replaces.
 //
+// sessions is the four session operations and reads is the ten product reads,
+// behind the two narrow seams in wire.go and readwire_seam.go. Both are refused
+// for the same reason and with different reasoning behind it. A nil sessions
+// is a server that would answer every product operation as though every caller
+// were signed in — which, with the origin, content-type and double-submit
+// guards all passing, is exactly the state a CSRF attack is trying to produce.
+// A nil reads is a console whose ten screens render nothing, which is a
+// missing feature rather than a wrong answer. Neither is worth continuing past,
+// and neither is worth answering at request time either: a handler that reached
+// a nil seam would panic on the floor of a request goroutine, where the stack
+// names a request rather than the wiring that caused it. This is where the
+// stack would have said which screen is missing.
+//
 // The surface itself is declared in routes.go and mounted here; this function
 // owns everything around it — the middleware, the two fallbacks below, and the
 // order they are composed in.
-func New(app *application.App, readiness persistence.Pinger) stdhttp.Handler {
+func New(app *application.App, readiness persistence.Pinger, sessions SessionUseCases, reads ConsoleReadUseCases) stdhttp.Handler {
 	if readiness == nil {
 		panic("http: New requires a readiness Pinger; /readyz has nothing to gate on without one")
 	}
+	if sessions == nil {
+		panic("http: New requires the session use cases; the session surface is this service's authentication boundary")
+	}
+	if reads == nil {
+		panic("http: New requires the console read use cases; ten product screens have nothing to render without them")
+	}
 	mux := stdhttp.NewServeMux()
 
-	for _, rt := range routes(app, readiness) {
+	table := routes(app, readiness, sessions, reads)
+	for _, rt := range table {
 		register(mux, rt)
 	}
+	mountCompanions(mux, table)
 
 	// The fallback every other path and method lands on. Unmatched paths are
 	// not an operation in api/openapi/console.yaml, but their envelope is
@@ -115,10 +141,45 @@ func cleanPath(p string) string {
 // like, shared by /healthz and /readyz so the two cannot drift apart; the
 // shape and trailing newline are exactly what api/openapi/console.yaml
 // documents.
+//
+// It deliberately does NOT set `Cache-Control: no-store`, which is the one
+// deliberate divergence from writeJSON. The three probes are the surface's
+// documented exemption from the no-store rule (the contract's NoStore header
+// says so, and names them by enumeration): a probe carries no account data, no
+// Principal and no one-time secret, so caching it is harmless. Sending
+// no-store on a probe would be a small, defensible over-approximation — but it
+// would also mean the probes no longer match the contract's headers, and a
+// header that contradicts the document is a defect a client-side test cannot
+// distinguish from a bug. The exemption lives in one function, so the three
+// probes take it together and a fourth, product endpoint added later cannot
+// inherit it by accident — product responses go through writeJSON, which always
+// sets no-store.
+// The exemption is expressed as a HEADER CLEAR rather than as the absence of a
+// call: a probe that reached a writeJSON-shaped handler for any reason — a
+// future refactor, a route that forgets which writer it uses — would otherwise
+// silently acquire a header the contract does not promise. Clearing it here
+// makes the exemption the property of the PROBE, not of the writer that happens
+// to be called today, so a fourth probe inherits it and no product response can
+// inherit it by accident.
 func writeStatus(w stdhttp.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Del("Cache-Control")
 	w.WriteHeader(stdhttp.StatusOK)
 	_, _ = w.Write([]byte("{\"status\":\"ok\"}\n"))
+}
+
+// writeProbeJSON is the probe-shaped writer for /version, which the contract
+// tags as a probe and declares with no Cache-Control header for the same reason
+// /healthz and /readyz are exempt: a build version is not account data. It
+// renders a value rather than a fixed status body, so it cannot be writeStatus,
+// and it shares writeStatus's exemption for the same reason.
+func writeProbeJSON(w stdhttp.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Del("Cache-Control")
+	w.WriteHeader(stdhttp.StatusOK)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		log.Printf("%s probe JSON write failed: %T", serviceName, err)
+	}
 }
 
 // versionResponse is the one wire shape for a version answer, mirroring the
@@ -194,13 +255,49 @@ func errorResponse(err error) (status int, code string, message string) {
 	switch applicationError.Code {
 	case application.CodeNotFound:
 		return stdhttp.StatusNotFound, string(application.CodeNotFound), applicationError.Message
+	case application.CodeInvalidRequest:
+		// 400 invalid_request, and the message is forwarded rather than replaced
+		// by a fixed one. CodeInvalidRequest says the request is well-formed HTTP
+		// and its inputs do not satisfy the contract — a limit outside the
+		// bounds, a cursor this surface cannot place, a cursor carried under
+		// filters the request no longer makes — and the contract promises the
+		// caller which one it was. It has already been reduced to that
+		// category by the layer below, which is the only layer that could name
+		// an account, and the answers themselves name no account: a page size
+		// and a cursor.
+		//
+		// This branch did not exist and the omission was a live defect rather
+		// than a gap: a `limit=abc` on any of the nine lists classified as
+		// CodeInvalidRequest, fell to the default, and answered 500 `internal`
+		// — a server fault for a value the server was told about and chose not
+		// to read, on a surface whose contract states plainly that "not an
+		// integer at all" is `400 invalid_request`. A generated client reads 500
+		// as retryable and a malformed page size is not retryable.
+		return stdhttp.StatusBadRequest, string(application.CodeInvalidRequest), applicationError.Message
 	default:
 		return stdhttp.StatusInternalServerError, string(application.CodeInternal), internalErrorMessage
 	}
 }
 
+// writeJSON is the one place a response body is written, and it marks every one
+// of them uncacheable.
+//
+// `Cache-Control: no-store` is the reason the file has a session surface at
+// all (ADR 0012 §3): a minted credential is returned exactly once, and a
+// response a browser or a shared proxy was allowed to keep turns that once into
+// a durable copy — in a disk cache, in the back-forward cache, in a corporate
+// proxy's store. There is no way to revoke a copy nobody told the server about,
+// so the response that must not be kept is marked uncacheable at the only place
+// that can guarantee it. Setting it here rather than per handler is what makes
+// it a property of the surface instead of a discipline every future handler has
+// to remember.
+//
+// The three probes are the one exemption, by enumeration, and they are exempt in
+// writeStatus rather than here — see there for why an exemption is safer
+// written once than filtered per call.
 func writeJSON(w stdhttp.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		// Status and headers are already on the wire; a retry cannot repair a

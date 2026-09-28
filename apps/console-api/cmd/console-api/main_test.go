@@ -36,7 +36,7 @@ func TestNewHandlerGatesReadinessOnTheStoreItWasGiven(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := newHandler("v0.1.0", answeringStore{pingErr: tt.pingErr})
+			handler := newHandler("v0.1.0", answeringStore{pingErr: tt.pingErr}, refuseEverySessionUseCase{}, refuseEveryConsoleRead{})
 
 			rec := httptest.NewRecorder()
 			handler.ServeHTTP(rec, httptest.NewRequest(stdhttp.MethodGet, "/readyz", nil))
@@ -51,7 +51,7 @@ func TestNewHandlerGatesReadinessOnTheStoreItWasGiven(t *testing.T) {
 	// store is a dependency of the probe, not a replacement for the
 	// application.
 	rec := httptest.NewRecorder()
-	newHandler("v0.1.0", answeringStore{}).ServeHTTP(rec, httptest.NewRequest(stdhttp.MethodGet, "/version", nil))
+	newHandler("v0.1.0", answeringStore{}, refuseEverySessionUseCase{}, refuseEveryConsoleRead{}).ServeHTTP(rec, httptest.NewRequest(stdhttp.MethodGet, "/version", nil))
 	if got := rec.Body.String(); got != "{\"version\":\"v0.1.0\"}\n" {
 		t.Errorf("GET /version: body = %q, want the stamped version", got)
 	}

@@ -42,6 +42,15 @@ import (
 // the reason the migration header gives: every writer is one of this plane's
 // own checks, never a provider blob, never a raw prompt, never a fact payload.
 type Finding struct {
+	// ID is the row's own identity, allocated by the store. The port states
+	// that a finding's DEDUP identity is (CheckKind, SubjectKind, SubjectID)
+	// and not this — a row has both, and the keyset below pages on this one
+	// because it is unique and, being a GENERATED ALWAYS AS IDENTITY column,
+	// in allocation order. Ordering by DetectedAt instead would be two
+	// passes' clocks colliding on one divergence, which is the non-total key
+	// this plane refuses to page on everywhere else.
+	ID int64
+
 	// CheckKind names the invariant that was violated. It is part of the
 	// finding's identity, so it is a closed vocabulary this plane owns rather
 	// than free text, and two checks with different names are different
@@ -77,6 +86,18 @@ type Finding struct {
 	// window to the microsecond — and neither is part of the identity.
 	DetectedAt time.Time
 	LastSeenAt time.Time
+
+	// Status and ResolvedAt are the row's lifecycle, written by Restatus and
+	// by nothing else. A read returns both as they stand rather than
+	// normalising them: a pass that started and never finished has no
+	// ResolvedAt, and so does an open finding, and a reader that filled the
+	// gap with a zero instant would be presenting an absence as a date.
+	//
+	// A finding written through Open carries neither — the schema's defaults
+	// are status 'open' and a NULL resolution, and the port says so — so
+	// these are read-side fields in every sense.
+	Status     string
+	ResolvedAt *time.Time
 }
 
 // ReconciliationFindings is where a detected divergence is recorded, and it is
@@ -130,6 +151,55 @@ type ReconciliationFindings interface {
 	// number and the only one the worker logs, because it is the only figure
 	// here that is a fact about the whole plane rather than about one subject.
 	OpenCount(ctx context.Context) (int, error)
+}
+
+// AccountFindings is the console's read of what the worker found, and it is
+// the read half of a port that has no repair half.
+//
+// Every member here is a SELECT. That is not a restraint exercised at each
+// call site — the interface has no method that could write one — and the
+// absence is the design the package header states: a finding is evidence, not
+// a repair path. Acknowledging one records an operator's decision, and a
+// correction to an append-only ledger is a NEW adjustment leg carrying an
+// operator_id, whose grammar is a decision that has not been made
+// (accounting.OperatorID). Nothing on this page resolves, refunds or
+// adjusts, and a member added later that did would be a repair path wearing a
+// read's name.
+//
+// No total. OpenCount above is the worker's own headline, a fact about the
+// whole plane; the list below returns a page and never a count of it.
+type AccountFindings interface {
+	// List returns at most page.Limit findings, newest first, keyed on id.
+	//
+	// There is no account predicate here and there cannot be one: a
+	// finding's subject may be a funding bucket, a settlement, a request, or
+	// the literal control_plane for a feed-wide signal, and findings are not
+	// scoped to one account. What the console's operator may read is a
+	// question about the operator's CLASS, and it is answered above this port
+	// — the findings are a whole-plane fact in the same way open_finding_count
+	// is, and the contract says so in those words.
+	//
+	// The id is the keyset rather than detected_at: it is unique, and
+	// detected_at is two passes' clocks colliding on one divergence.
+	List(ctx context.Context, page FindingPage) ([]Finding, error)
+}
+
+// FindingPage is the findings list's request: the optional status and
+// severity filters, the keyset position, and a page size.
+type FindingPage struct {
+	// Status is one finding status, or empty for every finding open and
+	// closed.
+	Status string
+
+	// Severity is one severity, or empty for every severity.
+	Severity string
+
+	// After is the exclusive lower bound on the id. The zero value is the
+	// beginning of the table.
+	After int64
+
+	// Limit is the number of rows wanted; the adapter asks for one more.
+	Limit int
 }
 
 // Run is one reconciliation pass: the half-open window it swept, when it
@@ -208,6 +278,29 @@ type ReconciliationRuns interface {
 	// pass that started and never ended is still the high-water mark the
 	// next pass must not move backwards from.
 	Latest(ctx context.Context) (Run, error)
+}
+
+// AccountRuns is the console's read of the pass history.
+//
+// Read-only, for the same reason AccountFindings is: a run is a record of a
+// detection pass, and nothing an operator looking at one may do to it is a
+// repair. A run whose FinishedAt is nil is returned as it stands rather than
+// hidden — a wedged worker and an idle one are otherwise indistinguishable.
+//
+// The id is both the identity and the keyset. It is a GENERATED ALWAYS AS
+// IDENTITY column, so id order is allocation order, and Latest above already
+// orders by it for the reason the high-water mark needs to.
+type AccountRuns interface {
+	// List returns at most page.Limit runs, newest first, keyed on id. No
+	// account predicate, for the reason AccountFindings has none: a pass
+	// sweeps the plane.
+	List(ctx context.Context, page RunPage) ([]Run, error)
+}
+
+// RunPage is the runs list's request: a keyset position and a page size.
+type RunPage struct {
+	After int64
+	Limit int
 }
 
 // RunCounters is one pass's tally, kept to its own type so Finish's signature

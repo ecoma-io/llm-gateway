@@ -13,8 +13,8 @@
 # else, so the boundary between the two planes is legible in the client's type
 # surface rather than only in this comment.
 #
-# The gateway's product domains (accounts, keys, subscriptions, usage) are not
-# designed yet. When one arrives, its contract changes here first and the
+# The gateway's product domains (accounts, keys, subscriptions, usage) are
+# not designed yet. When one arrives, its contract changes here first and the
 # implementation follows it, never the reverse — see AGENTS.md, "The API
 # contract is the OpenAPI document".
 openapi: 3.1.0
@@ -22,15 +22,33 @@ info:
   title: Ecoma LLM Gateway — Console API
   version: 0.1.0
   description: >-
-    Health and readiness probes plus the common HTTP boundary of the Ecoma LLM
-    Gateway's Control Plane API, which serves the console. Every response
-    returns X-Request-Id, and every failure — including the ones no operation
-    declares, a 404 for an unmatched path and a 500 for an unclassifiable
-    implementation failure — returns the ErrorEnvelope. A readiness probe
-    taken while the Control Plane's own dependencies are not answering returns
-    HTTP 503 and the `service_unavailable` code. The Control Plane's
-    product endpoints are not designed yet; this document carries the surface
-    that exists and the process every later endpoint follows.
+    The Control Plane's public surface, and the only one of the gateway's
+    three contracts a browser reaches. Every response returns X-Request-Id,
+    and every failure — including the ones no operation declares, a 404 for
+    an unmatched path and a 500 for an unclassifiable implementation failure
+    — returns the ErrorEnvelope. A readiness probe taken while the Control
+    Plane's own dependencies are not answering returns HTTP 503 and the
+    `service_unavailable` code.
+
+    The surface has two halves that meet at the session cookie. The
+    **session surface** — sign-in, the current principal, sign-out — is the
+    only part reachable without one, and the only part that writes nothing but
+    the session itself. The **product surface** is everything else, and every
+    operation on it requires a session and authorizes against the account that
+    session names.
+
+    The account is never a path segment and never a query parameter the
+    caller sets. It comes from the session, always; a resource the session's
+    account does not own is a 404 the query did not return, not a 403 a filter
+    turned into one. Unsafe methods additionally require a same-origin
+    `Origin` and a JSON content type, which no cross-site HTML form can
+    produce. Product responses carrying a credential, a balance or a private
+    ledger are sent `Cache-Control: no-store`.
+
+    The product schemas this document references live in
+    `./shared/console.yaml`, alongside the session types — one fragment rather
+    than a second document, because the repository holds exactly three OpenAPI
+    documents, one per application (AGENTS.md rule 2).
 servers:
   - url: /
 tags:
@@ -40,6 +58,40 @@ tags:
       trio, and each document declares its own copy of the tag because each
       document is read on its own; the tag is where a reader sees that they are
       one convention rather than three unrelated endpoints.
+  - name: session
+    description: >-
+      The session surface. Sign-in, the current principal and sign-out — the
+      three operations reachable without a session, and the only three that
+      do. Sign-in is the sole unauthenticated write on this surface: it
+      creates the session cookie every other operation requires.
+  - name: account
+    description: >-
+      The session's own account: its dashboard, its plan catalogue, and the
+      funding buckets its money lives in. Every operation is scoped to the
+      session's account server-side.
+  - name: identity
+    description: >-
+      Who can act for the account: its console users and its API keys. The
+      credential an API key is minted with is returned exactly once, at mint.
+  - name: commerce
+    description: >-
+      What the account has bought: plans and their versions, subscriptions,
+      and the entitlements each subscription cycle materialised. Read-only in
+      this change; the roll that creates entitlements is a worker, and a
+      console that could write a subscription would be a second place where
+      one is created.
+  - name: accounting
+    description: >-
+      Where the account's money is: its funding buckets with their three
+      cached balances, and one bucket's ledger. Balances are rendered, never
+      derived by the client; a correction to an append-only ledger is an
+      operator's act and there is no operation for one here.
+  - name: reconciliation
+    description: >-
+      The divergences the reconciliation worker found and the passes it made.
+      Read-only: acknowledging a finding records an operator's decision, and
+      that write is a separate change with its own contract. A finding is
+      evidence, not a repair path, and nothing on this surface refunds anyone.
 paths:
   /healthz:
     get:
@@ -76,10 +128,10 @@ paths:
       summary: Readiness of the Control Plane API service
       description: >-
         Returns 200 when the service may receive traffic, and 503 while one of
-        the Control Plane's own dependencies is not answering — its database
-        today, with the cache joining when a caller first reads through one.
-        The Data Plane is never among them: this service is ready when it can
-        serve the console, whether or not the runtime is reachable.
+        the Control Plane's own dependencies is not answering — its database,
+        and only its database. The Data Plane is never among them: this
+        service is ready when it can serve the console, whether or not the
+        runtime is reachable.
       parameters:
         - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
       responses:
@@ -100,6 +152,7 @@ paths:
           $ref: "./shared/errors.yaml#/components/responses/InternalError"
         "503":
           $ref: "./shared/errors.yaml#/components/responses/ServiceUnavailable"
+
   /version:
     get:
       operationId: getVersion
@@ -122,6 +175,889 @@ paths:
             application/json:
               schema:
                 $ref: "./shared/probes.yaml#/components/schemas/Version"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # The session surface.
+  #
+  # Three operations, and the third is the only one reachable without a
+  # session. They sit at fixed paths with no account in them, because the
+  # account comes from the cookie these three establish.
+  # ---------------------------------------------------------------------------
+
+  /auth/sign-in:
+    post:
+      operationId: signIn
+      tags:
+        - session
+      summary: Exchange an account id, an email and a credential for a session
+      description: >-
+        The only unauthenticated write on this surface, and the only way a
+        session comes into existence. On success it returns a principal in the
+        body and sets the session cookie in the header — the credential is in
+        the `Set-Cookie` and in nothing else, because a JSON body cannot set a
+        cookie.
+
+        Resolution is `(account_id, email)` over live rows, and never email
+        alone: the address can be live in two accounts, so an email-only
+        lookup is a guess between two live identities (ADR 0008 §1). An
+        `invited` row resolves to exactly one user and **authenticates
+        nobody** — the activation is what establishes that the human who now
+        holds the address is the human the invitation named, and an invited
+        row has not had one (ADR 0012 §2, amending ADR 0008).
+
+        Every failure — no such account, no such user, a removed user, a
+        wrong credential, an `invited` row — returns the **same** 401 with the
+        **same** body. They are not distinguished, by status, by code, by
+        message, or by wall time: a difference is a disclosure to anyone
+        willing to submit guesses, and the one answer keeps the account's own
+        existence off the wire. The account's lifecycle verdict is made after
+        the credential matches, and says `suspended` or `closed` distinctly —
+        authentication before authorisation, the same step order the API-key
+        path uses.
+
+        The request body is never logged, at any level, on any path. A
+        sign-in that failed still costs the credential comparison, and the
+        comparison is constant-time, so the wall time of a rejection does not
+        answer whether the account exists.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "./shared/console.yaml#/components/schemas/SignInRequest"
+      responses:
+        "200":
+          description: >-
+            The credential matched. The session cookie is set; the body
+            carries who the session belongs to and nothing else.
+          headers:
+            Set-Cookie:
+              $ref: "./shared/console.yaml#/components/headers/SessionCookie"
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/SignInResponse"
+        "400":
+          description: >-
+            The request is well-formed HTTP and its inputs do not satisfy the
+            contract — an address that is not plausible, an account id that is
+            not a UUID, a field that is missing or too long. The message names
+            the offending field and never whether the account exists: a
+            credential that has not been checked cannot be the thing the
+            answer is about.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "401":
+          description: >-
+            The credential did not match, or the identity it would authenticate
+            is not in a state that may authenticate. One answer for every
+            cause, deliberately.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "403":
+          description: >-
+            The credential matched and the account it belongs to is suspended
+            or closed. It is a **403** and not a 401 because the caller has
+            proved who they are; what it learns is about their own account,
+            which they are entitled to know.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "415":
+          description: >-
+            The request did not arrive as `application/json`. This operation
+            accepts no other encoding, and a form post — the one thing a
+            hostile page can make a browser send cross-origin without a
+            preflight — is refused here rather than parsed.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+
+  /auth/session:
+    get:
+      operationId: getSession
+      tags:
+        - session
+      summary: The principal this session belongs to
+      description: >-
+        What the console calls on every load, before it renders anything, to
+        know whether to show a signed-in shell or a sign-in form. It reads the
+        cookie, resolves the session row, and answers with the principal — no
+        account data, no balances, nothing an unauthenticated caller could
+        enumerate by asking.
+
+        A 200 here is the only proof of authentication the client ever has,
+        and the client treats it as one: the browser is not a security
+        boundary, and every product operation re-checks the session
+        server-side regardless of what this said.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The session is live and names this principal.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/Principal"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+    delete:
+      operationId: signOut
+      tags:
+        - session
+      summary: End this session
+      description: >-
+        Ends the session the cookie names and clears the cookie. It is
+        **idempotent**: signing out twice is not an error, and signing out
+        with no session is not an error either. A sign-out that failed would
+        leave a session alive on a machine the user believes they signed out
+        of, so the second call answers 204 whether or not there was anything
+        to end — and a caller who cares can read the cookie's absence as the
+        answer.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "204":
+          description: >-
+            There is no session, and there is now certainly not one. The cookie
+            is cleared either way.
+          headers:
+            Set-Cookie:
+              $ref: "./shared/console.yaml#/components/headers/SessionCookie"
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+        "403":
+          $ref: "./shared/console.yaml#/components/responses/CrossOriginRequest"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "415":
+          $ref: "./shared/console.yaml#/components/responses/NonJSONRequest"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # The dashboard: one composition, server-side.
+  # ---------------------------------------------------------------------------
+
+  /account/overview:
+    get:
+      operationId: getAccountOverview
+      tags:
+        - account
+      summary: The session's account, composed for the dashboard
+      description: >-
+        The BFF composition ADR 0012 §1 settles, in its first form: figures
+        that live in three bounded contexts, assembled **server-side** into
+        one operation with one account scope. It exists because the dashboard
+        needs all three and a client that composed them would be doing three
+        round trips to reimplement a join — and a client that computed a
+        figure from three responses would be doing the plane's arithmetic in
+        the browser, where a disagreement has no authority behind it.
+
+        The composition is a use case in `internal/application`, not a new
+        layer, and the operation is declared here so the contract and the
+        implementation are the same review.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The composed overview.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/AccountOverview"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # Identity: users and API keys.
+  # ---------------------------------------------------------------------------
+
+  /users:
+    get:
+      operationId: listUsers
+      tags:
+        - identity
+      summary: The account's console users
+      description: >-
+        The account's live users, keyset-paginated. A page carries no total —
+        see `./shared/console.yaml` on why — so a console renders "more" from
+        `has_more` and never a count it did not get. The `state` filter is
+        optional; omitting it returns invited and active together, which is
+        what a member list is, while the schema keeps `removed` reachable for
+        an operator who is auditing an address that was retired.
+
+        The list is the account's users and **only** the account's. The
+        account comes from the session, and the query carries the predicate
+        with it — not as a filter applied afterwards, but as a `WHERE` clause,
+        so another account's row is a row the query never returned.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+        - name: state
+          in: query
+          required: false
+          description: >-
+            Restrict to one lifecycle state. Omit for every live user.
+          schema:
+            type: string
+            enum:
+              - invited
+              - active
+              - removed
+        - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
+        - $ref: "./shared/console.yaml#/components/parameters/PageLimit"
+      responses:
+        "200":
+          description: One page of the account's users.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/UserPage"
+        "400":
+          description: >-
+            A parameter does not satisfy the contract — a `limit` outside its
+            bounds, a cursor this surface cannot place, or a cursor carrying a
+            filter the request no longer makes. Refused rather than served
+            against the new filter.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+
+  /api-keys:
+    get:
+      operationId: listAPIKeys
+      tags:
+        - identity
+      summary: The account's API keys
+      description: >-
+        The account's keys, keyset-paginated, newest last. Every key here is
+        an **ownership record**: no plaintext, no digest. The credential a key
+        was minted with is not in this table, was never stored in it, and is
+        not recoverable from it — the one time it exists is the mint's
+        response.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+        - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
+        - $ref: "./shared/console.yaml#/components/parameters/PageLimit"
+      responses:
+        "200":
+          description: One page of the account's keys.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/APIKeyPage"
+        "400":
+          description: A pagination parameter does not satisfy the contract.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+    post:
+      operationId: mintAPIKey
+      tags:
+        - identity
+      summary: Mint an API key, and return its credential exactly once
+      description: >-
+        Creates a key's ownership record and returns its credential — the only
+        time the plaintext exists anywhere. It is not persisted, not
+        derivable from anything else in the response, and not recoverable by
+        any later call: losing it means minting another key, which is the
+        intended cost of losing it.
+
+        The mint takes **no idempotency key**, and that is the design rather
+        than an omission. A replay of this request must mint a second key
+        rather than return the first's credential again, because returning it
+        again would make "shown once" a property of the client rather than of
+        the system — a double-clicked button is a second key, and an operator
+        with two keys can revoke one. The alternative, an idempotency key
+        whose replay returns the original plaintext, would keep the secret
+        recoverable for as long as the key record lived, which is precisely
+        what minting it once is meant to prevent.
+
+        It is the one write on this surface that produces a secret, and it
+        carries the same guards every unsafe method does: a same-origin
+        `Origin`, a JSON content type, and a session whose account is the one
+        the key would belong to. The creator is the session's own user, and
+        the query's account predicate is what stops a key landing under an
+        account the caller did not name — because there is no account to
+        name.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "./shared/console.yaml#/components/schemas/MintAPIKeyRequest"
+      responses:
+        "201":
+          description: >-
+            The key and its credential. The `token` field is the plaintext,
+            and this is the only response that will ever carry it.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/MintedAPIKey"
+        "400":
+          description: >-
+            The body does not satisfy the contract — a missing or blank
+            display name, or a content type this operation does not parse.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
+        "403":
+          $ref: "./shared/console.yaml#/components/responses/CrossOriginRequest"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "415":
+          $ref: "./shared/console.yaml#/components/responses/NonJSONRequest"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # Commerce: what the account bought.
+  # ---------------------------------------------------------------------------
+
+  /plans:
+    get:
+      operationId: listPlans
+      tags:
+        - commerce
+      summary: The plan catalogue
+      description: >-
+        Every plan the Control Plane offers, with its versions. A plan is not
+        account-scoped — it is the catalogue every account buys from — so this
+        operation returns the whole thing and pages it, rather than returning
+        "the plans this account uses", which is a different question answered
+        by the subscriptions list.
+
+        Read-only. Publishing, retiring and adding a grant definition are
+        commercial acts with their own review, and a console that could
+        publish a plan would be a second place a price becomes real.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+        - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
+        - $ref: "./shared/console.yaml#/components/parameters/PageLimit"
+      responses:
+        "200":
+          description: One page of plans.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/PlanPage"
+        "400":
+          description: A pagination parameter does not satisfy the contract.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+
+  /subscriptions:
+    get:
+      operationId: listSubscriptions
+      tags:
+        - commerce
+      summary: The account's subscriptions
+      description: >-
+        The account's subscriptions, keyset-paginated. A subscription's state
+        and its `cancel_at` are separate on purpose: a scheduled cancellation
+        is **data, not a state** — the subscription stays `active` and usable
+        until that instant passes — so a console that rendered "cancelled" for
+        a row carrying a future `cancel_at` would be describing a decision
+        that has not taken effect yet, and one that renders the two
+        separately is telling the operator the truth about both.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+        - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
+        - $ref: "./shared/console.yaml#/components/parameters/PageLimit"
+      responses:
+        "200":
+          description: One page of the account's subscriptions.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/SubscriptionPage"
+        "400":
+          description: A pagination parameter does not satisfy the contract.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+
+  /entitlements:
+    get:
+      operationId: listEntitlements
+      tags:
+        - commerce
+      summary: The entitlements the account's subscriptions materialised
+      description: >-
+        One row per (subscription, cycle, grant definition) triple the roll
+        has produced. An entitlement is a **grant**, not a balance: what
+        remains of it is drawn on a funding bucket, and this surface has a
+        separate operation for those. A console that showed "remaining" here
+        would be showing nothing — there is no such column, deliberately,
+        because a third copy of the same number with no rebuild story is how
+        two consoles start disagreeing about what a customer bought.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+        - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
+        - $ref: "./shared/console.yaml#/components/parameters/PageLimit"
+      responses:
+        "200":
+          description: One page of entitlements.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/EntitlementPage"
+        "400":
+          description: A pagination parameter does not satisfy the contract.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # Accounting: where the money is.
+  # ---------------------------------------------------------------------------
+
+  /funding-buckets:
+    get:
+      operationId: listFundingBuckets
+      tags:
+        - accounting
+      summary: The account's funding buckets, with their three balances
+      description: >-
+        Every bucket the account owns — its entitlement cycles and its PAYG
+        balance — each with the three cached balances the domain defines
+        (`settled`, `held`, `available`). The console **renders** them and
+        never derives one from the others: a client computing `available` as
+        `settled − held` would be doing the ledger's algebra in the browser,
+        and a disagreement between the two would have no authority behind it.
+        They are a projection, and if the cache and the legs ever disagree the
+        legs win.
+
+        The two bucket kinds are told apart by `kind`, because they behave
+        differently: an entitlement bucket's lifetime is its cycle's and it
+        closes when the cycle ends, while an account bucket is the PAYG
+        balance and does not roll. A list that merged them would render two
+        sets of figures with incompatible meanings side by side.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+        - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
+        - $ref: "./shared/console.yaml#/components/parameters/PageLimit"
+      responses:
+        "200":
+          description: One page of the account's buckets.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/FundingBucketPage"
+        "400":
+          description: A pagination parameter does not satisfy the contract.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+
+  /funding-buckets/{funding_bucket_id}/ledger:
+    get:
+      operationId: listLedgerEntries
+      tags:
+        - accounting
+      summary: One bucket's ledger, oldest first
+      description: >-
+        The legs of **one** bucket, in its own sequence order. This is the
+        only operation on the surface that names a resource in its path, and
+        the id it names is a bucket — a bucket the session's account does not
+        own is a 404 the query did not return, exactly as if it did not
+        exist.
+
+        The path is per bucket rather than "all legs" because a ledger is a
+        fact about where money went, and a merged list of every bucket's legs
+        would be a question about money this plane has no index to answer.
+        The sequence is the keyset: it is allocated by the store inside the
+        transaction that writes each leg, it is strictly increasing per
+        bucket, and a page keyed on it can neither skip a leg nor read one
+        twice. The `direction` filter exists because operators read a ledger
+        for two different questions — what came in, and what went out — and
+        the two are not the same read.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+        - name: funding_bucket_id
+          in: path
+          required: true
+          description: The bucket whose history is wanted.
+          schema:
+            type: string
+            format: uuid
+        - name: kind
+          in: query
+          required: false
+          description: >-
+            Restrict to one leg kind — `consume` for spend, `topup` or
+            `grant` for funding, `hold` and `release` for the reservation
+            cycle. Omit for the whole history.
+          schema:
+            type: string
+            enum:
+              - grant
+              - topup
+              - hold
+              - release
+              - consume
+              - adjustment
+        - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
+        - $ref: "./shared/console.yaml#/components/parameters/PageLimit"
+      responses:
+        "200":
+          description: One page of the bucket's legs, oldest first.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/LedgerEntryPage"
+        "400":
+          description: >-
+            A parameter does not satisfy the contract — a `kind` outside the
+            enum, a `limit` outside its bounds, or a cursor carrying a filter
+            the request no longer makes.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # Reconciliation: what the worker found.
+  # ---------------------------------------------------------------------------
+
+  /reconciliation/findings:
+    get:
+      operationId: listFindings
+      tags:
+        - reconciliation
+      summary: The divergences the worker has recorded
+      description: >-
+        The recorded findings, newest first, with the `observed` evidence each
+        one compared. The evidence is rendered as text and **never
+        interpreted** — it is structured JSON written by the check that found
+        the divergence, its shape is that check's business, and a client that
+        summed or re-aggregated it would be producing a figure no check
+        asserted.
+
+        Read-only, and the reason is not conservatism: a finding is evidence,
+        not a repair path. Acknowledging one records an operator's decision
+        and is a separate write with its own contract. Nothing here refunds
+        anybody, and a correction to an append-only ledger is a **new
+        adjustment leg** naming the entry it corrects — an operator's act with
+        an `operator_id` on it, never a button on a findings table.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+        - name: status
+          in: query
+          required: false
+          description: >-
+            Restrict to one status. Omit for every finding, open and closed.
+          schema:
+            type: string
+            enum:
+              - open
+              - acknowledged
+              - resolved
+        - name: severity
+          in: query
+          required: false
+          description: Restrict to one severity.
+          schema:
+            type: string
+            enum:
+              - info
+              - warning
+              - critical
+        - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
+        - $ref: "./shared/console.yaml#/components/parameters/PageLimit"
+      responses:
+        "200":
+          description: One page of findings.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/FindingPage"
+        "400":
+          description: A filter or pagination parameter does not satisfy the contract.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+
+  /reconciliation/runs:
+    get:
+      operationId: listReconciliationRuns
+      tags:
+        - reconciliation
+      summary: The passes the worker has made
+      description: >-
+        The run history, newest first. A run whose `finished_at` is null is a
+        pass that started and never finished — a fact worth rendering rather
+        than hiding, because a wedged worker and an idle one are otherwise
+        indistinguishable. The half-open window is returned as its two halves
+        because a window rendered as an inclusive pair is one an operator
+        cannot tell from one that overlapped the last.
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+        - $ref: "./shared/console.yaml#/components/parameters/PageAfter"
+        - $ref: "./shared/console.yaml#/components/parameters/PageLimit"
+      responses:
+        "200":
+          description: One page of runs, newest first.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/console.yaml#/components/schemas/ReconciliationRunPage"
+        "400":
+          description: A pagination parameter does not satisfy the contract.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "./shared/console.yaml#/components/responses/Unauthenticated"
         "404":
           $ref: "./shared/errors.yaml#/components/responses/NotFound"
         "405":

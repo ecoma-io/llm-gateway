@@ -3,15 +3,57 @@
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from "./client";
 import { client } from "./client.gen";
 import type {
+  GetAccountOverviewData,
+  GetAccountOverviewErrors,
+  GetAccountOverviewResponses,
   GetHealthData,
   GetHealthErrors,
   GetHealthResponses,
   GetReadinessData,
   GetReadinessErrors,
   GetReadinessResponses,
+  GetSessionData,
+  GetSessionErrors,
+  GetSessionResponses,
   GetVersionData,
   GetVersionErrors,
   GetVersionResponses,
+  ListApiKeysData,
+  ListApiKeysErrors,
+  ListApiKeysResponses,
+  ListEntitlementsData,
+  ListEntitlementsErrors,
+  ListEntitlementsResponses,
+  ListFindingsData,
+  ListFindingsErrors,
+  ListFindingsResponses,
+  ListFundingBucketsData,
+  ListFundingBucketsErrors,
+  ListFundingBucketsResponses,
+  ListLedgerEntriesData,
+  ListLedgerEntriesErrors,
+  ListLedgerEntriesResponses,
+  ListPlansData,
+  ListPlansErrors,
+  ListPlansResponses,
+  ListReconciliationRunsData,
+  ListReconciliationRunsErrors,
+  ListReconciliationRunsResponses,
+  ListSubscriptionsData,
+  ListSubscriptionsErrors,
+  ListSubscriptionsResponses,
+  ListUsersData,
+  ListUsersErrors,
+  ListUsersResponses,
+  MintApiKeyData,
+  MintApiKeyErrors,
+  MintApiKeyResponses,
+  SignInData,
+  SignInErrors,
+  SignInResponses,
+  SignOutData,
+  SignOutErrors,
+  SignOutResponses,
 } from "./types.gen";
 
 export type Options<
@@ -48,7 +90,7 @@ export const getHealth = <ThrowOnError extends boolean = false>(
 /**
  * Readiness of the Control Plane API service
  *
- * Returns 200 when the service may receive traffic, and 503 while one of the Control Plane's own dependencies is not answering — its database today, with the cache joining when a caller first reads through one. The Data Plane is never among them: this service is ready when it can serve the console, whether or not the runtime is reachable.
+ * Returns 200 when the service may receive traffic, and 503 while one of the Control Plane's own dependencies is not answering — its database, and only its database. The Data Plane is never among them: this service is ready when it can serve the console, whether or not the runtime is reachable.
  */
 export const getReadiness = <ThrowOnError extends boolean = false>(
   options?: Options<GetReadinessData, ThrowOnError>,
@@ -70,3 +112,208 @@ export const getVersion = <ThrowOnError extends boolean = false>(
     url: "/version",
     ...options,
   });
+
+/**
+ * Exchange an account id, an email and a credential for a session
+ *
+ * The only unauthenticated write on this surface, and the only way a session comes into existence. On success it returns a principal in the body and sets the session cookie in the header — the credential is in the `Set-Cookie` and in nothing else, because a JSON body cannot set a cookie.
+ * Resolution is `(account_id, email)` over live rows, and never email alone: the address can be live in two accounts, so an email-only lookup is a guess between two live identities (ADR 0008 §1). An `invited` row resolves to exactly one user and **authenticates nobody** — the activation is what establishes that the human who now holds the address is the human the invitation named, and an invited row has not had one (ADR 0012 §2, amending ADR 0008).
+ * Every failure — no such account, no such user, a removed user, a wrong credential, an `invited` row — returns the **same** 401 with the **same** body. They are not distinguished, by status, by code, by message, or by wall time: a difference is a disclosure to anyone willing to submit guesses, and the one answer keeps the account's own existence off the wire. The account's lifecycle verdict is made after the credential matches, and says `suspended` or `closed` distinctly — authentication before authorisation, the same step order the API-key path uses.
+ * The request body is never logged, at any level, on any path. A sign-in that failed still costs the credential comparison, and the comparison is constant-time, so the wall time of a rejection does not answer whether the account exists.
+ */
+export const signIn = <ThrowOnError extends boolean = false>(
+  options: Options<SignInData, ThrowOnError>,
+): RequestResult<SignInResponses, SignInErrors, ThrowOnError> =>
+  (options.client ?? client).post<SignInResponses, SignInErrors, ThrowOnError>({
+    url: "/auth/sign-in",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * End this session
+ *
+ * Ends the session the cookie names and clears the cookie. It is **idempotent**: signing out twice is not an error, and signing out with no session is not an error either. A sign-out that failed would leave a session alive on a machine the user believes they signed out of, so the second call answers 204 whether or not there was anything to end — and a caller who cares can read the cookie's absence as the answer.
+ */
+export const signOut = <ThrowOnError extends boolean = false>(
+  options?: Options<SignOutData, ThrowOnError>,
+): RequestResult<SignOutResponses, SignOutErrors, ThrowOnError> =>
+  (options?.client ?? client).delete<SignOutResponses, SignOutErrors, ThrowOnError>({
+    url: "/auth/session",
+    ...options,
+  });
+
+/**
+ * The principal this session belongs to
+ *
+ * What the console calls on every load, before it renders anything, to know whether to show a signed-in shell or a sign-in form. It reads the cookie, resolves the session row, and answers with the principal — no account data, no balances, nothing an unauthenticated caller could enumerate by asking.
+ * A 200 here is the only proof of authentication the client ever has, and the client treats it as one: the browser is not a security boundary, and every product operation re-checks the session server-side regardless of what this said.
+ */
+export const getSession = <ThrowOnError extends boolean = false>(
+  options?: Options<GetSessionData, ThrowOnError>,
+): RequestResult<GetSessionResponses, GetSessionErrors, ThrowOnError> =>
+  (options?.client ?? client).get<GetSessionResponses, GetSessionErrors, ThrowOnError>({
+    url: "/auth/session",
+    ...options,
+  });
+
+/**
+ * The session's account, composed for the dashboard
+ *
+ * The BFF composition ADR 0012 §1 settles, in its first form: figures that live in three bounded contexts, assembled **server-side** into one operation with one account scope. It exists because the dashboard needs all three and a client that composed them would be doing three round trips to reimplement a join — and a client that computed a figure from three responses would be doing the plane's arithmetic in the browser, where a disagreement has no authority behind it.
+ * The composition is a use case in `internal/application`, not a new layer, and the operation is declared here so the contract and the implementation are the same review.
+ */
+export const getAccountOverview = <ThrowOnError extends boolean = false>(
+  options?: Options<GetAccountOverviewData, ThrowOnError>,
+): RequestResult<GetAccountOverviewResponses, GetAccountOverviewErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    GetAccountOverviewResponses,
+    GetAccountOverviewErrors,
+    ThrowOnError
+  >({ url: "/account/overview", ...options });
+
+/**
+ * The account's console users
+ *
+ * The account's live users, keyset-paginated. A page carries no total — see `./shared/console.yaml` on why — so a console renders "more" from `has_more` and never a count it did not get. The `state` filter is optional; omitting it returns invited and active together, which is what a member list is, while the schema keeps `removed` reachable for an operator who is auditing an address that was retired.
+ * The list is the account's users and **only** the account's. The account comes from the session, and the query carries the predicate with it — not as a filter applied afterwards, but as a `WHERE` clause, so another account's row is a row the query never returned.
+ */
+export const listUsers = <ThrowOnError extends boolean = false>(
+  options?: Options<ListUsersData, ThrowOnError>,
+): RequestResult<ListUsersResponses, ListUsersErrors, ThrowOnError> =>
+  (options?.client ?? client).get<ListUsersResponses, ListUsersErrors, ThrowOnError>({
+    url: "/users",
+    ...options,
+  });
+
+/**
+ * The account's API keys
+ *
+ * The account's keys, keyset-paginated, newest last. Every key here is an **ownership record**: no plaintext, no digest. The credential a key was minted with is not in this table, was never stored in it, and is not recoverable from it — the one time it exists is the mint's response.
+ */
+export const listApiKeys = <ThrowOnError extends boolean = false>(
+  options?: Options<ListApiKeysData, ThrowOnError>,
+): RequestResult<ListApiKeysResponses, ListApiKeysErrors, ThrowOnError> =>
+  (options?.client ?? client).get<ListApiKeysResponses, ListApiKeysErrors, ThrowOnError>({
+    url: "/api-keys",
+    ...options,
+  });
+
+/**
+ * Mint an API key, and return its credential exactly once
+ *
+ * Creates a key's ownership record and returns its credential — the only time the plaintext exists anywhere. It is not persisted, not derivable from anything else in the response, and not recoverable by any later call: losing it means minting another key, which is the intended cost of losing it.
+ * The mint takes **no idempotency key**, and that is the design rather than an omission. A replay of this request must mint a second key rather than return the first's credential again, because returning it again would make "shown once" a property of the client rather than of the system — a double-clicked button is a second key, and an operator with two keys can revoke one. The alternative, an idempotency key whose replay returns the original plaintext, would keep the secret recoverable for as long as the key record lived, which is precisely what minting it once is meant to prevent.
+ * It is the one write on this surface that produces a secret, and it carries the same guards every unsafe method does: a same-origin `Origin`, a JSON content type, and a session whose account is the one the key would belong to. The creator is the session's own user, and the query's account predicate is what stops a key landing under an account the caller did not name — because there is no account to name.
+ */
+export const mintApiKey = <ThrowOnError extends boolean = false>(
+  options: Options<MintApiKeyData, ThrowOnError>,
+): RequestResult<MintApiKeyResponses, MintApiKeyErrors, ThrowOnError> =>
+  (options.client ?? client).post<MintApiKeyResponses, MintApiKeyErrors, ThrowOnError>({
+    url: "/api-keys",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * The plan catalogue
+ *
+ * Every plan the Control Plane offers, with its versions. A plan is not account-scoped — it is the catalogue every account buys from — so this operation returns the whole thing and pages it, rather than returning "the plans this account uses", which is a different question answered by the subscriptions list.
+ * Read-only. Publishing, retiring and adding a grant definition are commercial acts with their own review, and a console that could publish a plan would be a second place a price becomes real.
+ */
+export const listPlans = <ThrowOnError extends boolean = false>(
+  options?: Options<ListPlansData, ThrowOnError>,
+): RequestResult<ListPlansResponses, ListPlansErrors, ThrowOnError> =>
+  (options?.client ?? client).get<ListPlansResponses, ListPlansErrors, ThrowOnError>({
+    url: "/plans",
+    ...options,
+  });
+
+/**
+ * The account's subscriptions
+ *
+ * The account's subscriptions, keyset-paginated. A subscription's state and its `cancel_at` are separate on purpose: a scheduled cancellation is **data, not a state** — the subscription stays `active` and usable until that instant passes — so a console that rendered "cancelled" for a row carrying a future `cancel_at` would be describing a decision that has not taken effect yet, and one that renders the two separately is telling the operator the truth about both.
+ */
+export const listSubscriptions = <ThrowOnError extends boolean = false>(
+  options?: Options<ListSubscriptionsData, ThrowOnError>,
+): RequestResult<ListSubscriptionsResponses, ListSubscriptionsErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    ListSubscriptionsResponses,
+    ListSubscriptionsErrors,
+    ThrowOnError
+  >({ url: "/subscriptions", ...options });
+
+/**
+ * The entitlements the account's subscriptions materialised
+ *
+ * One row per (subscription, cycle, grant definition) triple the roll has produced. An entitlement is a **grant**, not a balance: what remains of it is drawn on a funding bucket, and this surface has a separate operation for those. A console that showed "remaining" here would be showing nothing — there is no such column, deliberately, because a third copy of the same number with no rebuild story is how two consoles start disagreeing about what a customer bought.
+ */
+export const listEntitlements = <ThrowOnError extends boolean = false>(
+  options?: Options<ListEntitlementsData, ThrowOnError>,
+): RequestResult<ListEntitlementsResponses, ListEntitlementsErrors, ThrowOnError> =>
+  (options?.client ?? client).get<ListEntitlementsResponses, ListEntitlementsErrors, ThrowOnError>({
+    url: "/entitlements",
+    ...options,
+  });
+
+/**
+ * The account's funding buckets, with their three balances
+ *
+ * Every bucket the account owns — its entitlement cycles and its PAYG balance — each with the three cached balances the domain defines (`settled`, `held`, `available`). The console **renders** them and never derives one from the others: a client computing `available` as `settled − held` would be doing the ledger's algebra in the browser, and a disagreement between the two would have no authority behind it. They are a projection, and if the cache and the legs ever disagree the legs win.
+ * The two bucket kinds are told apart by `kind`, because they behave differently: an entitlement bucket's lifetime is its cycle's and it closes when the cycle ends, while an account bucket is the PAYG balance and does not roll. A list that merged them would render two sets of figures with incompatible meanings side by side.
+ */
+export const listFundingBuckets = <ThrowOnError extends boolean = false>(
+  options?: Options<ListFundingBucketsData, ThrowOnError>,
+): RequestResult<ListFundingBucketsResponses, ListFundingBucketsErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    ListFundingBucketsResponses,
+    ListFundingBucketsErrors,
+    ThrowOnError
+  >({ url: "/funding-buckets", ...options });
+
+/**
+ * One bucket's ledger, oldest first
+ *
+ * The legs of **one** bucket, in its own sequence order. This is the only operation on the surface that names a resource in its path, and the id it names is a bucket — a bucket the session's account does not own is a 404 the query did not return, exactly as if it did not exist.
+ * The path is per bucket rather than "all legs" because a ledger is a fact about where money went, and a merged list of every bucket's legs would be a question about money this plane has no index to answer. The sequence is the keyset: it is allocated by the store inside the transaction that writes each leg, it is strictly increasing per bucket, and a page keyed on it can neither skip a leg nor read one twice. The `direction` filter exists because operators read a ledger for two different questions — what came in, and what went out — and the two are not the same read.
+ */
+export const listLedgerEntries = <ThrowOnError extends boolean = false>(
+  options: Options<ListLedgerEntriesData, ThrowOnError>,
+): RequestResult<ListLedgerEntriesResponses, ListLedgerEntriesErrors, ThrowOnError> =>
+  (options.client ?? client).get<ListLedgerEntriesResponses, ListLedgerEntriesErrors, ThrowOnError>(
+    { url: "/funding-buckets/{funding_bucket_id}/ledger", ...options },
+  );
+
+/**
+ * The divergences the worker has recorded
+ *
+ * The recorded findings, newest first, with the `observed` evidence each one compared. The evidence is rendered as text and **never interpreted** — it is structured JSON written by the check that found the divergence, its shape is that check's business, and a client that summed or re-aggregated it would be producing a figure no check asserted.
+ * Read-only, and the reason is not conservatism: a finding is evidence, not a repair path. Acknowledging one records an operator's decision and is a separate write with its own contract. Nothing here refunds anybody, and a correction to an append-only ledger is a **new adjustment leg** naming the entry it corrects — an operator's act with an `operator_id` on it, never a button on a findings table.
+ */
+export const listFindings = <ThrowOnError extends boolean = false>(
+  options?: Options<ListFindingsData, ThrowOnError>,
+): RequestResult<ListFindingsResponses, ListFindingsErrors, ThrowOnError> =>
+  (options?.client ?? client).get<ListFindingsResponses, ListFindingsErrors, ThrowOnError>({
+    url: "/reconciliation/findings",
+    ...options,
+  });
+
+/**
+ * The passes the worker has made
+ *
+ * The run history, newest first. A run whose `finished_at` is null is a pass that started and never finished — a fact worth rendering rather than hiding, because a wedged worker and an idle one are otherwise indistinguishable. The half-open window is returned as its two halves because a window rendered as an inclusive pair is one an operator cannot tell from one that overlapped the last.
+ */
+export const listReconciliationRuns = <ThrowOnError extends boolean = false>(
+  options?: Options<ListReconciliationRunsData, ThrowOnError>,
+): RequestResult<ListReconciliationRunsResponses, ListReconciliationRunsErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    ListReconciliationRunsResponses,
+    ListReconciliationRunsErrors,
+    ThrowOnError
+  >({ url: "/reconciliation/runs", ...options });

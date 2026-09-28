@@ -108,6 +108,7 @@ func (f *fakeAccounts) TransitionState(_ context.Context, id identity.AccountID,
 // the domain sentinel.
 type fakeUsers struct {
 	rows           map[identity.UserID]identity.User
+	credentials    map[identity.UserID]identity.CredentialDigest
 	firstCreateErr error
 	consumed       bool
 	failNextSwaps  int
@@ -147,6 +148,47 @@ func (f *fakeUsers) TransitionState(_ context.Context, id identity.UserID, from,
 	u.UpdatedAt = at
 	f.rows[id] = u
 	return true, nil
+}
+
+// ByAccountAndEmail mirrors the port's totality rule rather than its query:
+// it filters live rows and, on a live match, returns that one row. A removed
+// row resolves to nothing even when its address is still in the table, which
+// is the trap ADR 0008 §Context-2 names — and the fake can be made to
+// return TWO rows for one pair only if a test deliberately builds the
+// unfiltered situation the index prevents, which it cannot, because the
+// live filter is applied here rather than assumed away.
+func (f *fakeUsers) ByAccountAndEmail(_ context.Context, accountID identity.AccountID, email string) (identity.User, error) {
+	for _, u := range f.rows {
+		if u.AccountID == accountID && u.Email == email && u.State != identity.UserRemoved {
+			return u, nil
+		}
+	}
+	return identity.User{}, fmt.Errorf("fake: user %s/%s: %w", accountID, email, persistence.ErrNotFound)
+}
+
+// CredentialByAccountAndEmail mirrors the port's rule that the credential
+// belongs to the SAME row the user came from, which is why the fake resolves
+// the user and the digest in one pass over its own store rather than looking
+// the second up by a second key.
+//
+// A live user with no entry in `credentials` returns a nil digest, and that is
+// the case the `invited` row exercises: the row is found, and what it may
+// authenticate is the caller's decision rather than this port's. A test that
+// wanted the two answers to differ would have to write a partial credential,
+// which the schema's whole-or-absent CHECK forbids and this fake therefore
+// does not offer.
+func (f *fakeUsers) CredentialByAccountAndEmail(_ context.Context, accountID identity.AccountID, email string) (identity.User, *identity.CredentialDigest, error) {
+	for id, u := range f.rows {
+		if u.AccountID != accountID || u.Email != email || u.State == identity.UserRemoved {
+			continue
+		}
+		digest, ok := f.credentials[id]
+		if !ok {
+			return u, nil, nil
+		}
+		return u, &digest, nil
+	}
+	return identity.User{}, nil, fmt.Errorf("fake: user %s/%s: %w", accountID, email, persistence.ErrNotFound)
 }
 
 // fakeKeys keeps the API-key ownership records, counts its swaps, and can

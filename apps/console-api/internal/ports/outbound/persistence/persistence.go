@@ -34,6 +34,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+
+	"github.com/ecoma-io/llm-gateway/apps/console-api/internal/domain/identity"
 )
 
 // ErrNotFound is the repositories' miss sentinel: a lookup whose subject does
@@ -168,4 +170,129 @@ type Store interface {
 	// context lost its transaction, breaking the gapless counter and the
 	// log/mirror atomicity the projection's correctness rests on.
 	InUnitOfWork(ctx context.Context) bool
+}
+
+// The console's read surface: the query shapes ADR 0012 §1 and §2 settle for
+// the ten Control-Plane read operations, in the port's own vocabulary.
+//
+// Three rules every member below carries, and none of them is a style choice:
+//
+//   - The account predicate is in the WHERE clause, and it is the FIRST
+//     argument. A resource the session's account does not own is a row the
+//     query never returned, which is the same answer — zero rows, at the
+//     same cost — a genuinely absent row gives. That equivalence is the whole
+//     reason the predicate is a clause and not a filter applied afterwards: a
+//     post-fetch check answers in a different time for "not yours" than for
+//     "not there", and a 403 turns the difference into a confirmation oracle.
+//     There is deliberately no forbidden sentinel on this page of the port.
+//   - Keyset, never OFFSET. The reason is accounting.Sweep's own comment, and
+//     it is a correctness one: OFFSET re-reads and re-discards every row
+//     already passed, and a pass that pages by OFFSET while rows land
+//     concurrently can both skip a row and read one twice. Every keyset
+//     below is a UNIQUE sort key, so the cursor is total and a page can
+//     neither drop nor repeat a row.
+//   - No total. A page is a page, and the caller learns what follows it from
+//     fetching limit+1. There is no count member on a list, and a count
+//     added to one later would be a number that is wrong the instant it is
+//     written.
+//
+// The cursor a caller holds is opaque to it and to this package: the
+// application layer mints and places it, and only the sort key crosses this
+// boundary. A filter fingerprint rides beside it there, which is why no
+// member below takes a fingerprint — the fingerprint is compared against the
+// request's own filters before any of these is called, and a mismatch never
+// reaches a query.
+
+// Page bounds. The wire contract names them, and the adapter is the last place
+// that can refuse a value outside them, so they live here rather than being
+// restated at each call site: a list that clamped would be answering a
+// question the contract says it does not answer.
+const (
+	// MinPageLimit and MaxPageLimit are the contract's own bounds, and
+	// DefaultPageLimit its own default. A caller that asked for a larger page
+	// than MaxPageLimit asked a question this surface does not answer, and
+	// the smaller page it would otherwise get is one it cannot tell apart
+	// from a page the collection capped itself.
+	MinPageLimit     = 1
+	MaxPageLimit     = 200
+	DefaultPageLimit = 50
+)
+
+// UserPage is the users list's own request: the lifecycle state to restrict
+// to, the keyset position, and the page size.
+//
+// State is empty for "every live user" — invited and active together, which
+// is what a member list is — and a removed row is reachable by naming it,
+// because an operator auditing a retired address needs to see it.
+type UserPage struct {
+	// State is one lifecycle state, or empty for every live user. It is a
+	// string rather than identity.UserState so that "no filter" is
+	// representable without a zero-value constant, which the domain's
+	// vocabulary deliberately has none of.
+	State string
+
+	// After is the exclusive lower bound on the keyset. The zero value is the
+	// beginning of the list, not a cursor that matches nothing.
+	After identity.UserID
+
+	// Limit is the number of rows wanted; the adapter asks for one more.
+	Limit int
+}
+
+// APIKeyPage is the api-keys list's request: a keyset position and a page
+// size. The list is unfiltered by design — an account's keys are a small,
+// bounded set an operator reads whole, and a state filter here would be a
+// filter the account predicate has nothing to do with.
+type APIKeyPage struct {
+	After identity.APIKeyID
+	Limit int
+}
+
+// AccountUsers is the console's account-scoped read of the members list.
+//
+// It is not a member on Users, and the reason is mechanical rather than
+// architectural: the identity port file is being extended for the session
+// surface in parallel with this one, and two agents editing one interface is
+// a merge a reviewer has to unpick. The query is the same query Users would
+// carry — the same table, the same columns, the same keyset — and a reader
+// looking for what a user list can do reads both files.
+//
+// CountLiveForAccount is the one count on the console's read surface, and it
+// is there because the dashboard's projection names it (user_count) and the
+// contract states the reason: an operator reading "12 users" should not have
+// to page eleven screens to learn there are twelve. It counts a filtered,
+// bounded set — invited plus active, excluding removed — and it is not a
+// page total: no list below returns one, and a count that is not asked for is
+// not computed.
+type AccountUsers interface {
+	// ListForAccount returns at most page.Limit of the account's users, in
+	// id order after page.After, and the account predicate in the query's
+	// WHERE clause. The id is the keyset and it is unique, so a page can
+	// neither skip a user nor read one twice; ids are uuid v7, so the order
+	// is very nearly mint order.
+	ListForAccount(ctx context.Context, accountID identity.AccountID, page UserPage) ([]identity.User, error)
+
+	// CountLiveForAccount returns how many of the account's users are
+	// invited or active. Removed rows are excluded and the answer is the
+	// dashboard's figure, never a page's.
+	CountLiveForAccount(ctx context.Context, accountID identity.AccountID) (int, error)
+}
+
+// AccountAPIKeys is the console's account-scoped read of the keys list, for
+// the same reason AccountUsers stands beside Users.
+//
+// Every key is an ownership record: no plaintext, no digest, and nothing
+// recoverable from a row. The credential a key was minted with exists once,
+// in the mint's response, and no member here can return it.
+type AccountAPIKeys interface {
+	// ListForAccount returns at most page.Limit of the account's keys, oldest
+	// first, keyed on id. The account predicate is in the WHERE clause, so
+	// another account's key is a row the query never returned.
+	ListForAccount(ctx context.Context, accountID identity.AccountID, page APIKeyPage) ([]identity.APIKey, error)
+
+	// CountActiveForAccount returns how many of the account's keys are
+	// currently active. Revoked keys are counted in the key list and never
+	// here: a dashboard that said "12 keys" with twelve revoked among them
+	// would be describing history as if it were capacity.
+	CountActiveForAccount(ctx context.Context, accountID identity.AccountID) (int, error)
 }

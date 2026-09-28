@@ -39,8 +39,11 @@
 #      its binding to the key's own id, every foreign key including the
 #      creator edge's same-account rule, the funding buckets' owner
 #      exclusivity and balance projection, the ledger's per-kind algebra and
-#      idempotency keys, and the append-only, write-once, owner-match and
-#      leg-provenance triggers;
+#      idempotency keys, the append-only, write-once, owner-match and
+#      leg-provenance triggers, and the session surface's token-digest
+#      uniqueness and shape, the class vocabulary, the revocation/expiry
+#      pairings, the composite account edge and the whole-or-absent
+#      credential rule;
 #   9. PostgreSQL transaction semantics hold (rolled-back work leaves
 #      nothing behind, committed work survives);
 #  10. a migration that fails mid-file rolls back whole, records its target
@@ -493,11 +496,18 @@ assert_equals "the ownership namespace exists in the Control Plane's database" \
 assert_equals "the namespace carries the ownership comment, byte for byte" \
 	"$(psql_scalar "$control_db" "SELECT obj_description('$control_db'::regnamespace, 'pg_namespace')")" \
 	"Control Plane ownership namespace (ADR 0006 §7); owned by apps/console-api."
-assert_equals "the namespace holds exactly the identity, commerce, projection, accounting, ingestion and reconciliation schemas' twenty-one tables" \
-	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "21"
-assert_equals "the control tables are the identity, commerce, projection, accounting, ingestion and reconciliation foundations' set" \
+# The list is an EXACT equality and stays one, and that is the whole point of
+# the assertion rather than an incidental strictness: relaxed to a containment
+# or LIKE check it would silently unconstrain the twenty-one tables already in
+# it, and a table that appears without anybody reading the diff is precisely
+# the failure a control-plane schema change can least afford. ADR 0012's
+# Consequences names this by name. `sessions` extends the list in the same
+# change that creates the table, and the count moves with it.
+assert_equals "the namespace holds exactly the identity, commerce, projection, accounting, ingestion, reconciliation and session schemas' twenty-two tables" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "22"
+assert_equals "the control tables are the identity, commerce, projection, accounting, ingestion, reconciliation and session foundations' set" \
 	"$(psql_scalar "$control_db" "SELECT string_agg(tablename, ',' ORDER BY tablename COLLATE \"C\") FROM pg_tables WHERE schemaname = 'control'")" \
-	"account_payg,accounts,api_keys,applied_facts,entitlements,funding_buckets,ingestion_cursor,ledger_entries,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,quarantined_facts,reconciliation_findings,reconciliation_runs,settlements,subscriptions,users"
+	"account_payg,accounts,api_keys,applied_facts,entitlements,funding_buckets,ingestion_cursor,ledger_entries,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,quarantined_facts,reconciliation_findings,reconciliation_runs,sessions,settlements,subscriptions,users"
 assert_equals "the projection counter is a seeded singleton with a timeline epoch" \
 	"$(psql_scalar "$control_db" "SELECT count(*) FROM control.projection_revision WHERE id = 1 AND last_revision = (SELECT count(*) FROM control.accounts) AND epoch IS NOT NULL")" \
 	"1"
@@ -2073,6 +2083,231 @@ WHERE check_kind = 'identity_rewrite_probe'"
 expect_constraint_failure "a DELETE from the findings table is refused" \
 "control.reconciliation_findings rows are never removed" \
 "DELETE FROM control.reconciliation_findings"
+
+# The session surface (000010, ADR 0012 §2). Every probe below seeds an
+# account, a user and any rows it needs inside its own explicit transaction,
+# so nothing depends on a row an earlier probe left behind.
+
+# The token digest's uniqueness is the claim the whole opaque-session design
+# rests on, and the probe is the reverse of what a timing oracle would need: a
+# SECOND row carrying the first row's digest is refused, which is what makes
+# the cookie lookup a direct index hit rather than a scan. A hash collision is
+# not the case under test — two sessions whose 256-bit tokens share a digest
+# are not the failure mode. What is under test is a duplicate insert, which is
+# what a mint bug, a retried request or a copied row would produce.
+expect_constraint_failure "a second session may not carry an existing token digest" sessions_token_hash_key "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000c1', 'verify probe', 'active', now(), now())
+  RETURNING id
+), holder AS (
+  INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+  SELECT 'b0000000-0000-4000-8000-0000000000c1', id, 'sessions@example.com', 'active', now(), now() FROM account
+  RETURNING id, account_id
+), first_session AS (
+  INSERT INTO control.sessions (id, user_id, account_id, token_hash, class, state, created_at, expires_at, last_seen_at)
+  SELECT 'c0000000-0000-7000-8000-0000000000c1', id, account_id, repeat('a', 64), 'user', 'active', now(), now() + interval '1 hour', now() FROM holder
+  RETURNING user_id, account_id
+)
+INSERT INTO control.sessions (id, user_id, account_id, token_hash, class, state, created_at, expires_at, last_seen_at)
+SELECT 'c0000000-0000-7000-8000-0000000000c2', user_id, account_id, repeat('a', 64), 'user', 'active', now(), now() + interval '1 hour', now() FROM first_session"
+
+# The class vocabulary is closed at two members, and the third this repository
+# explicitly refused is the point: `admin` is not a class, so a handler that
+# invented one fails here rather than minting a row nobody can authorize.
+expect_constraint_failure "a session class outside the vocabulary is refused" sessions_class_valid "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000c2', 'verify probe', 'active', now(), now())
+  RETURNING id
+), holder AS (
+  INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+  SELECT 'b0000000-0000-4000-8000-0000000000c2', id, 'class-vocab@example.com', 'active', now(), now() FROM account
+  RETURNING id, account_id
+)
+INSERT INTO control.sessions (id, user_id, account_id, token_hash, class, state, created_at, expires_at, last_seen_at)
+SELECT 'c0000000-0000-7000-8000-0000000000c3', id, account_id, repeat('b', 64), 'admin', 'active', now(), now() + interval '1 hour', now() FROM holder"
+
+# The pairing, in the direction that is not merely the NOT NULL: a session
+# marked revoked with no revoked_at is a writer that crashed between the two
+# writes, and the row would otherwise read as live forever.
+expect_constraint_failure "a revoked session with no revocation instant is refused" sessions_revocation_consistency "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000c3', 'verify probe', 'active', now(), now())
+  RETURNING id
+), holder AS (
+  INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+  SELECT 'b0000000-0000-4000-8000-0000000000c3', id, 'revocation@example.com', 'active', now(), now() FROM account
+  RETURNING id, account_id
+)
+INSERT INTO control.sessions (id, user_id, account_id, token_hash, class, state, created_at, expires_at, last_seen_at, revoked_at)
+SELECT 'c0000000-0000-7000-8000-0000000000c4', id, account_id, repeat('c', 64), 'user', 'revoked', now(), now() + interval '1 hour', now(), NULL FROM holder"
+
+# The shape check is the load-bearing half of "we store the digest, never the
+# token": a row holding the token itself is a usable cookie sitting in the
+# table, and the token is not 64 hex characters, so the check refuses it. The
+# positive probe below then proves the shape is not over-tight — a real digest
+# is accepted, which is the half a refusal-only assertion never shows.
+expect_constraint_failure "a session row holding a token rather than a digest is refused" sessions_token_hash_shape "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000c4', 'verify probe', 'active', now(), now())
+  RETURNING id
+), holder AS (
+  INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+  SELECT 'b0000000-0000-4000-8000-0000000000c4', id, 'digest-shape@example.com', 'active', now(), now() FROM account
+  RETURNING id, account_id
+)
+INSERT INTO control.sessions (id, user_id, account_id, token_hash, class, state, created_at, expires_at, last_seen_at)
+SELECT 'c0000000-0000-7000-8000-0000000000c5', id, account_id, 'ses_3f7c1d0e9a5b4c2d8e6f1a0b9c8d7e6f', 'user', 'active', now(), now() + interval '1 hour', now() FROM holder"
+
+assert_equals "a real token digest, and a live session with no revocation, are both accepted" \
+	"$(psql_scalar "$control_db" "
+BEGIN;
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000c5', 'verify probe', 'active', now(), now())
+  RETURNING id
+), holder AS (
+  INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+  SELECT 'b0000000-0000-4000-8000-0000000000c5', id, 'digest-live@example.com', 'active', now(), now() FROM account
+  RETURNING id, account_id
+)
+INSERT INTO control.sessions (id, user_id, account_id, token_hash, class, state, created_at, expires_at, last_seen_at)
+SELECT 'c0000000-0000-7000-8000-0000000000c6', id, account_id, repeat('d', 64), 'user', 'active', now(), now() + interval '1 hour', now() FROM holder;
+SELECT (SELECT count(*) FROM control.sessions WHERE token_hash = repeat('d', 64)) || '|' || (SELECT count(*) FROM control.sessions WHERE revoked_at IS NULL);
+ROLLBACK;")" "1|1"
+
+# The composite account edge, and the one the single-column reference could
+# never have caught: a session whose account is NOT its user's. This is the
+# exact leak ADR 0012 §2 refuses to build, pinned from the schema side.
+expect_constraint_failure "a session may not name an account its user is not a member of" sessions_user_id_account_id_fkey "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000c6', 'verify probe', 'active', now(), now())
+  RETURNING id
+), other_account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000c7', 'verify probe', 'active', now(), now())
+  RETURNING id
+), holder AS (
+  INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+  SELECT 'b0000000-0000-4000-8000-0000000000c6', id, 'cross-account@example.com', 'active', now(), now() FROM account
+  RETURNING id
+)
+INSERT INTO control.sessions (id, user_id, account_id, token_hash, class, state, created_at, expires_at, last_seen_at)
+SELECT 'c0000000-0000-7000-8000-0000000000c7', holder.id, other_account.id, repeat('e', 64), 'user', 'active', now(), now() + interval '1 hour', now()
+FROM holder, other_account"
+
+# An expiry at or before creation is a session that granted nothing, and the
+# orderings are what stop a clock bug from writing a row whose own instants
+# cannot be true at once.
+expect_constraint_failure "a session that expires at or before its creation is refused" sessions_expiry_order "
+WITH account AS (
+  INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+  VALUES ('a0000000-0000-4000-8000-0000000000c8', 'verify probe', 'active', now(), now())
+  RETURNING id
+), holder AS (
+  INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+  SELECT 'b0000000-0000-4000-8000-0000000000c7', id, 'expiry-order@example.com', 'active', now(), now() FROM account
+  RETURNING id, account_id
+)
+INSERT INTO control.sessions (id, user_id, account_id, token_hash, class, state, created_at, expires_at, last_seen_at)
+SELECT 'c0000000-0000-7000-8000-0000000000c8', id, account_id, repeat('f', 64), 'user', 'active', now(), now(), now() FROM holder"
+
+# The credential columns, and the whole-or-absent rule. A digest with no
+# iteration count is a credential nobody can ever verify, and one nobody can
+# verify is indistinguishable from a wrong password only by accident.
+#
+# These four probes SET the columns rather than NULLing them, because the rule
+# is about a half-written credential and NULLing proves nothing about it: an
+# UPDATE that matched no row would exit zero and the probe would pass having
+# proved nothing, which is the one thing the suite's own header forbids of a
+# step. They seed with plain INSERTs rather than the data-modifying CTEs the
+# session probes above use, because a data-modifying CTE's rows are not
+# visible to a SIBLING statement's subquery — an UPDATE whose WHERE reads
+# `SELECT id FROM <the CTE that just inserted it>` matches nothing and exits
+# zero. The probe would have looked like a constraint that does not fire.
+expect_constraint_failure "a credential recorded without its iteration count is refused" users_credential_whole "
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000c9', 'verify probe', 'active', now(), now());
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-0000000000c9', 'a0000000-0000-4000-8000-0000000000c9', 'half-credential@example.com', 'active', now(), now());
+UPDATE control.users SET credential_hash = repeat('1', 64), credential_salt = repeat('2', 32)
+WHERE id = 'b0000000-0000-4000-8000-0000000000c9'"
+
+# ...and the salt without a hash, which is the same half-written row from the
+# other side. Two directions as two probes, because a constraint that refused
+# only one would still admit a corrupt row, and the one it did refuse would
+# read as evidence the rule works.
+expect_constraint_failure "a credential salt without its derived key is refused" users_credential_whole "
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000ca', 'verify probe', 'active', now(), now());
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-0000000000ca', 'a0000000-0000-4000-8000-0000000000ca', 'orphan-salt@example.com', 'active', now(), now());
+UPDATE control.users SET credential_salt = repeat('2', 32)
+WHERE id = 'b0000000-0000-4000-8000-0000000000ca'"
+
+# A column that accepts a value it should refuse is not doing its job, so the
+# shape is probed as a refusal rather than only described. A salt is 16 bytes
+# of hex and a base64 salt is not hex at all — the two are the mistakes a
+# caller actually makes, encoding the wrong alphabet or the wrong width.
+expect_constraint_failure "a credential salt outside the hex shape is refused" users_credential_salt_shape "
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000cb', 'verify probe', 'active', now(), now());
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-0000000000cb', 'a0000000-0000-4000-8000-0000000000cb', 'bad-salt@example.com', 'active', now(), now());
+UPDATE control.users SET credential_salt = 'not-hex-at-all-nor-even-16-bytes-long', credential_hash = repeat('1', 64), credential_iterations = 600000
+WHERE id = 'b0000000-0000-4000-8000-0000000000cb'"
+
+# The iteration count is a column BECAUSE it must be able to rise, so a value
+# that is not a positive count is refused rather than accepted as a
+# zero-iteration derivation — which PBKDF2 would compute, and which would be no
+# derivation at all.
+expect_constraint_failure "a credential with no iteration count is refused" users_credential_iterations_positive "
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000cc', 'verify probe', 'active', now(), now());
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-0000000000cc', 'a0000000-0000-4000-8000-0000000000cc', 'zero-iterations@example.com', 'active', now(), now());
+UPDATE control.users SET credential_hash = repeat('1', 64), credential_salt = repeat('2', 32), credential_iterations = 0
+WHERE id = 'b0000000-0000-4000-8000-0000000000cc'"
+
+# The positive half, and the one that also proves NULL is genuinely allowed: an
+# `invited` identity with no credential at all is a legitimate row (ADR 0012
+# §2 — an invitation is record-keeping, a credential is a grant of access), and
+# a whole credential on an `active` row is accepted. Between them they say the
+# check constrains the half-written case rather than forbidding the column.
+assert_equals "an invited identity with no credential, and a whole credential, are both accepted" \
+	"$(psql_scalar "$control_db" "
+BEGIN;
+INSERT INTO control.accounts (id, name, state, created_at, updated_at)
+VALUES ('a0000000-0000-4000-8000-0000000000cd', 'verify probe', 'active', now(), now());
+INSERT INTO control.users (id, account_id, email, state, created_at, updated_at)
+VALUES ('b0000000-0000-4000-8000-0000000000cd', 'a0000000-0000-4000-8000-0000000000cd', 'invitee@example.com', 'invited', now(), now()),
+       ('b0000000-0000-4000-8000-0000000000ce', 'a0000000-0000-4000-8000-0000000000cd', 'credentialed@example.com', 'active', now(), now());
+UPDATE control.users SET credential_hash = repeat('3', 64), credential_salt = repeat('4', 32), credential_iterations = 600000
+WHERE id = 'b0000000-0000-4000-8000-0000000000ce';
+SELECT (SELECT count(*) FROM control.users WHERE credential_hash IS NULL) || '|' || (SELECT count(*) FROM control.users WHERE credential_iterations = 600000);
+ROLLBACK;")" "1|1"
+
+# The sweep index, asserted from the catalogue rather than trusted to a plan:
+# a partial index that lost its predicate would be over the whole table, and
+# that is the shape the header's growth argument explicitly does not make. The
+# predicate is read out of pg_index, which is where a migration that rewrote
+# it would leave the difference.
+assert_equals "the live-session expiry index is partial over unrevoked rows" \
+	"$(psql_scalar "$control_db" "SELECT pg_get_expr(indexprs, indrelid) IS NULL AND pg_get_expr(indpred, indrelid) LIKE '%revoked_at IS NULL%' FROM pg_index WHERE indexrelid = 'control.sessions_live_expiry_idx'::regclass")" \
+	"t"
+
+# The token lookup's index, asserted the same way and for a stronger reason:
+# the unique constraint IS the sign-in access path, and a lookup that scanned
+# would be a timing oracle on the cookie. The assertion names the constraint,
+# so a future migration that dropped it and re-added it as a bare index would
+# fail here rather than quietly become the scan the design forbids.
+assert_equals "the token digest's unique constraint is a b-tree over that one column" \
+	"$(psql_scalar "$control_db" "SELECT (SELECT count(*) FROM pg_index WHERE indrelid = 'control.sessions'::regclass AND indisunique AND pg_get_indexdef(indexrelid) LIKE '%(token_hash)%') || '|' || (SELECT amname FROM pg_class JOIN pg_am ON pg_class.relam = pg_am.oid WHERE pg_class.oid = 'control.sessions_token_hash_key'::regclass)")" \
+	"1|btree"
 
 step "9/12 PostgreSQL transaction semantics hold"
 # Two probes, because the migration safety model rests on both: DDL rolled

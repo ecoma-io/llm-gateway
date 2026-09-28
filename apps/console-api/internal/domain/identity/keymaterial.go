@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -143,6 +144,45 @@ func (d Digest) Hex() string {
 // the full comparison has run.
 func EqualDigests(a, b Digest) bool {
 	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
+}
+
+// ErrDigestShape reports a stored digest that is not the canonical text form:
+// not lowercase hex of exactly Digest's width. Every digest this system stores
+// — a session row's token_hash, a credential projection's — is lowercase hex,
+// and the columns that hold them carry a shape CHECK saying so.
+var ErrDigestShape = errors.New("identity: digest is not lowercase hex of the required width")
+
+// DigestFromHex is the inverse of Hex, and it lives here rather than in an
+// adapter for the same reason Hex lives here: a digest's text form is this
+// type's business, and an adapter that reimplemented the decode would be a
+// second definition of the encoding that the two could disagree about.
+//
+// It is STRICT where encoding/json and strconv are lenient. `hex.DecodeString`
+// accepts uppercase, and a decoder that did the same would answer "yes" for
+// two spellings of one digest — which matters here because the value being
+// decoded is what a lookup is keyed on, and a canonicalisation applied on the
+// way out but not on the way in is a way for two rows to compare equal as
+// bytes and differ as text. The width is checked for the same reason: a short
+// digest padded to Digest's width would match a different session's row.
+func DigestFromHex(encoded string) (Digest, error) {
+	var d Digest
+	if len(encoded) != hex.EncodedLen(len(d)) {
+		return Digest{}, fmt.Errorf("identity: %w: %d characters, want %d", ErrDigestShape, len(encoded), hex.EncodedLen(len(d)))
+	}
+	for i := range encoded {
+		// Uppercase is refused rather than folded: the canonical form is
+		// lowercase, and accepting both would make the text form of a stored
+		// digest depend on which writer produced it.
+		if c := encoded[i]; c >= 'A' && c <= 'F' {
+			return Digest{}, fmt.Errorf("identity: %w: uppercase hex", ErrDigestShape)
+		}
+	}
+	decoded, err := hex.DecodeString(encoded)
+	if err != nil {
+		return Digest{}, fmt.Errorf("identity: %w: %v", ErrDigestShape, err)
+	}
+	copy(d[:], decoded)
+	return d, nil
 }
 
 // TokenPrefix renders the public token prefix for a key id: brand and id,

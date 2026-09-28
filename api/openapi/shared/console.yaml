@@ -1,0 +1,1328 @@
+# The console's own fragments: the session surface's types, the read
+# projections each screen renders, and the pagination every list speaks.
+#
+# This is a fragment, not a fourth document. `api/openapi/console.yaml`
+# references it by relative path exactly as it references `errors.yaml` and
+# `probes.yaml` (AGENTS.md rule 2: the repository holds exactly three OpenAPI
+# documents, one per application). It is split out of `console.yaml` itself
+# because the console's product surface is large and a reader who wants the
+# shape of a funding bucket should not scroll past the session's cookie
+# attributes to find it — and because the three documents stay independently
+# readable, which is the property the split is for.
+#
+# Two rules run through every schema here, and both are the repository's
+# rather than the console's:
+#
+#   - **No total, ever.** No list operation here declares one. A total over a
+#     table this plane is still growing is a number that is wrong the instant
+#     it is written, and an operator who reads it is reading a count nobody
+#     recomputed. `has_more` and `next_cursor` are the whole of what a page
+#     says about what follows it; a row count is what a list screen can do
+#     without. The Data Plane's own `Page` says the same about the facts it
+#     serves (`shared/usage-facts.yaml`).
+#
+#   - **An account is never a path segment.** No path below takes
+#     `/accounts/{account_id}/…`, and no query parameter takes an account id
+#     the caller could set to somebody else's. The account comes from the
+#     session cookie and from nowhere else. The reason is not style: a path
+#     segment is written into every proxy's access log, every `Referer` header
+#     on every outbound navigation, and every browser history entry, so an
+#     account-scoped path records which customer each operator was reading in
+#     a place none of them chose to put it. A resource the session's account
+#     does not own is therefore a 404 the query simply did not return, never a
+#     403 a filter turned into one.
+components:
+  parameters:
+    PageAfter:
+      name: after
+      in: query
+      required: false
+      description: >-
+        An opaque cursor naming the position after which rows are wanted.
+        Omit it to begin at the first row. The value is never interpreted by
+        the caller and never by the console: pass back the `next_cursor` of
+        the previous page, or nothing. A cursor carrying a filter the request
+        no longer makes is refused with `400 invalid_request` rather than
+        served against the new filter, because a page reached through a
+        mismatched cursor is a page whose rows belong to a question the caller
+        is no longer asking.
+      schema:
+        $ref: "#/components/schemas/Cursor"
+    PageLimit:
+      name: limit
+      in: query
+      required: false
+      description: >-
+        The largest number of rows to return. A page shorter than this does
+        not mean the collection is exhausted — `has_more` says that, because a
+        short page is also what a concurrent write produces.
+
+        The bounds are enforced rather than approximated: a value below
+        `minimum`, above `maximum`, or not an integer at all is refused with
+        `400 invalid_request`, and a value inside the bounds is served as
+        asked. Nothing is clamped. A caller that asked for a larger page than
+        this operation will return has asked a question the contract does not
+        answer, and the smaller page it would otherwise get is one it cannot
+        tell apart from a page this collection capped itself.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+
+  headers:
+    SessionCookie:
+      description: >-
+        The session cookie, set on sign-in and cleared on sign-out. It is
+        `HttpOnly`, `Secure` and `SameSite=Strict`, scoped to `Path=/`, and
+        carries no credential material in a form the page can read: the
+        browser's script never sees the value, so a cross-site scripting bug
+        in any dependency exfiltrates nothing. The value is an opaque
+        256-bit identifier; the session row it names stores only its SHA-256
+        digest, so a database disclosure alone does not yield a usable
+        cookie. The `Secure` attribute means the cookie is not sent over
+        plaintext HTTP at all, which is why a development deployment behind a
+        plain-HTTP proxy cannot sign in — that is the intended failure, not a
+        configuration to work around.
+      schema:
+        type: string
+        example: "ses_3f7c1d0e9a5b4c2d8e6f1a0b9c8d7e6f"
+    RequestID:
+      $ref: "./probes.yaml#/components/headers/RequestId"
+    NoStore:
+      description: >-
+        `Cache-Control: no-store`. Sent on **every** response on this surface
+        except the three probes, and the reason is the one-time secret rather
+        than a general caution: a minted credential is returned exactly once,
+        and a response a browser or a shared proxy was allowed to keep turns
+        that once into a durable copy — in a disk cache, in the back-forward
+        cache, in a corporate proxy's store, in a support screenshot's
+        source. There is no way to revoke a copy nobody told the server
+        about, so the response that must not be kept is marked uncacheable at
+        the only place that can guarantee it.
+
+        The probes are exempt because they carry no account data and caching
+        them is harmless, which is also why they are exempt by enumeration
+        rather than by a rule: a reader sees three exempt paths rather than
+        having to evaluate a policy.
+      schema:
+        type: string
+        example: no-store
+
+  responses:
+    Unauthenticated:
+      description: >-
+        The request carried no session this service accepts, or the session
+        named has ended. Unlike the Data Plane's management surface — which
+        rejects a browser session and a customer API key alike because
+        neither is a service identity (ADR 0006 §9) — this surface's whole
+        caller population is browsers, so `unauthenticated` here means
+        exactly what it says: sign in again. The answer is the same whether
+        the cookie was absent, expired, revoked, or never existed, and the
+        response names nothing about which, because a difference is a
+        disclosure to anyone willing to send cookies.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "./errors.yaml#/components/schemas/ErrorEnvelope"
+    Forbidden:
+      description: >-
+        The session is valid and identified, and the operation is one this
+        principal's class may not perform — the write half of a surface whose
+        read half it may. It is deliberately NOT the answer for a resource
+        belonging to another account: a cross-account resource is a `404`, the
+        same answer a resource that does not exist gives, because a `403`
+        there confirms the resource is real to someone who may not have it.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "./errors.yaml#/components/schemas/ErrorEnvelope"
+    CrossOriginRequest:
+      description: >-
+        The request's `Origin` is not this surface's own origin, or an unsafe
+        method arrived without the double-submit token this surface sets on
+        every rendered form. `SameSite=Strict` is the first line of defence
+        and this is the second: a cookie is not sent on a cross-site request,
+        but a same-site one from a compromised sibling subdomain is, and a
+        token the page must echo is something a sibling origin cannot read.
+        The status is 403 with the `invalid_request` code — the request is
+        well-formed HTTP and is refused for being untrusted, not malformed.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "./errors.yaml#/components/schemas/ErrorEnvelope"
+    NonJSONRequest:
+      description: >-
+        An unsafe method arrived with a body the contract does not accept —
+        a form encoding, or a content type this surface does not parse. The
+        refusal is what makes `SameSite=Strict` load-bearing rather than
+        merely cautious: a simple form post crosses origins without a
+        preflight and without a custom content type, so a cookie is the only
+        thing standing between a form on another site and a money-moving
+        write here. Requiring a content type no HTML form can produce is the
+        check that removes the ambiguity entirely.
+      headers:
+        X-Request-Id:
+          $ref: "./probes.yaml#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "./errors.yaml#/components/schemas/ErrorEnvelope"
+
+  schemas:
+    Cursor:
+      type: string
+      minLength: 1
+      maxLength: 512
+      description: >-
+        An opaque position in one collection's order. It is safe to store and
+        to send back verbatim; it is not safe to interpret, and neither the
+        console nor a generated client may decode, compare, order or
+        synthesise one. A cursor this surface cannot place — malformed,
+        forged, or carrying a filter the request no longer makes — is
+        refused with `400 invalid_request`.
+
+    PrincipalClass:
+      type: string
+      enum:
+        - user
+        - operator
+      description: >-
+        What a session's holder is authorised as. There are two classes and
+        not three roles: `user` acts for one account and may read its
+        identity, commerce and accounting surfaces; `operator` is the
+        staff class that administers accounts across accounts. The split is
+        two because a three-role model would need a permission matrix this
+        product has no use for yet, and a role an operator screen can
+        misconfigure is worse than one role it cannot misconfigure. Adding a
+        third class later is a new enum member and a new predicate, not a
+        migration of this one.
+
+    Principal:
+      type: object
+      description: >-
+        Who the session belongs to. This is what the console renders in its
+        header and what every product operation authorizes against; it
+        carries no credential, no session token and no secret, and it is the
+        only account identifier any product operation consults.
+      required:
+        - class
+        - account_id
+      properties:
+        class:
+          $ref: "#/components/schemas/PrincipalClass"
+        account_id:
+          type: string
+          format: uuid
+          description: >-
+            The account the session acts for. It is derived from the session
+            row, never from the request path or a query parameter.
+        user_id:
+          type: string
+          format: uuid
+          description: >-
+            The signed-in console identity. Present exactly when `class` is
+            `user`.
+        operator_id:
+          type: string
+          description: >-
+            The staff identity. Present exactly when `class` is `operator`. A
+            text reference rather than a users-row id, because the operator
+            surface is not built and the ledger's operator grammar is a
+            decision that has not been made
+            (`domain/accounting/ids.go:55-58`).
+        email:
+          type: string
+          format: email
+          description: >-
+            The signed-in identity's address, for display in the console
+            header. It is returned because the user is already authenticated
+            and it is their own address; it is never a lookup key and never
+            appears in a URL.
+        session_expires_at:
+          type: string
+          format: date-time
+          description: >-
+            When this session stops being accepted. A client that renders a
+            countdown from it is reading a fact the server also enforces; the
+            value is not a licence to keep calling, because the server's
+            check does not consult the client's clock.
+
+    SignInRequest:
+      type: object
+      description: >-
+        The one unauthenticated write this surface accepts. Three inputs, and
+        the order they are collected in is the design rather than the form's
+        layout: the account's id discriminates, the email resolves within it,
+        and the credential is checked against the row that pair names
+        (ADR 0008 §2). An "email first, choose the account after" flow would
+        have nothing to verify between the two, so its chooser would sit
+        before authentication and answer "which accounts does this address
+        belong to" to anyone who knows the address.
+      required:
+        - account_id
+        - email
+        - password
+      properties:
+        account_id:
+          type: string
+          format: uuid
+          description: The account's id. It is the only identifier the
+            account has, and it is asked for because it is the discriminator
+            that makes the email resolution total.
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: >-
+            The identity's address. Resolution is scoped to
+            `(account_id, email)` over live rows, and never to the address
+            alone.
+        password:
+          type: string
+          format: password
+          minLength: 1
+          maxLength: 1024
+          description: >-
+            The identity's credential. It is never stored, never logged, and
+            never carried in a URL; the request body is not logged at all, on
+            any path, at any level.
+
+    SignInResponse:
+      type: object
+      description: >-
+        The one successful sign-in. It carries the principal and nothing
+        else — no token, no secret, nothing a caller could replay to skip the
+        cookie. The credential is in a `Set-Cookie` header, and a JSON body
+        cannot set one.
+      required:
+        - principal
+      properties:
+        principal:
+          $ref: "#/components/schemas/Principal"
+      additionalProperties: false
+
+    MintAPIKeyRequest:
+      type: object
+      description: >-
+        Mint a key's ownership record. The plaintext is not an input and
+        cannot be: it does not exist until this call returns it, which is
+        what makes the one-time rendering below a property of the system
+        rather than of the console's care.
+      required:
+        - display_name
+      properties:
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: >-
+            The operator-chosen label shown in the console. Trimmed, and
+            bounded in runes so a name's worth does not depend on its script.
+      additionalProperties: false
+
+    MintedAPIKey:
+      type: object
+      description: >-
+        A key's ownership record **and** its credential, together, exactly
+        once. The `token` field is the only time the plaintext exists
+        anywhere outside the mint's return value: it is not persisted
+        anywhere, not derivable from anything this response also carries,
+        and not recoverable by any later call. Losing it means minting a new
+        key, which is the intended cost of losing it.
+
+        Every response carrying this schema — this one and the reads
+        below — is sent with `Cache-Control: no-store`, so that a shared
+        proxy, a browser's disk cache or the back button does not turn a
+        one-time secret into a durable one. The console renders the token
+        once, in a field the user must copy, and clears it when that view
+        unmounts.
+      required:
+        - id
+        - account_id
+        - display_name
+        - prefix
+        - state
+        - created_at
+        - token
+      properties:
+        id:
+          type: string
+          format: uuid
+        account_id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+        prefix:
+          type: string
+          description: >-
+            The public lookup hint baked into every presentation of the
+            token: brand plus key id. It is derived from the id, carries no
+            secret, and is what a console shows an operator so they can tell
+            two of their keys apart.
+        state:
+          type: string
+          enum:
+            - active
+            - revoked
+        created_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: [string, "null"]
+          format: date-time
+        token:
+          type: string
+          description: >-
+            The credential, in full, this once. Never stored, never logged,
+            never in a URL, and never re-served.
+      additionalProperties: false
+
+    APIKey:
+      type: object
+      description: >-
+        A key's ownership record as every read but the mint returns it. The
+        credential is absent, not null: this plane stores no plaintext and no
+        digest, and the Data Plane's credential record is written only by the
+        Data Plane (ADR 0006 §8).
+      required:
+        - id
+        - account_id
+        - display_name
+        - prefix
+        - state
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        account_id:
+          type: string
+          format: uuid
+        created_by:
+          type: [string, "null"]
+          format: uuid
+          description: >-
+            The console identity that minted it, or null when minted without
+            one.
+        display_name:
+          type: string
+        prefix:
+          type: string
+        state:
+          type: string
+          enum:
+            - active
+            - revoked
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: [string, "null"]
+          format: date-time
+      additionalProperties: false
+
+    Account:
+      type: object
+      required:
+        - id
+        - name
+        - state
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          description: >-
+            A presentation name. It is not unique, nothing makes it
+            immutable, and it is never a key — which is why sign-in asks for
+            the account's id and not its name.
+        state:
+          type: string
+          enum:
+            - active
+            - suspended
+            - closed
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    User:
+      type: object
+      required:
+        - id
+        - account_id
+        - email
+        - state
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        account_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+          description: >-
+            The address, normalised to lowercase. It is unique per account
+            across live rows, so a removed user's address may be invited
+            again; a console that filtered on it across accounts would be
+            leaking membership of an account the reader may not be in.
+        state:
+          type: string
+          enum:
+            - invited
+            - active
+            - removed
+          description: >-
+            `invited` is a live state with no credential behind it: an
+            invited row resolves to exactly one user and authenticates
+            nobody, because the activation is what establishes that the human
+            who now holds the address is the human the invitation named
+            (ADR 0012 §2, amending ADR 0008).
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    Money:
+      type: object
+      description: >-
+        An amount in minor units with **no currency field**, because the
+        ledger stores money as int64 minor units and the currency of an
+        account's buckets is a decision the contract has not yet made
+        (#63). This is stated on the schema rather than left for a client to
+        discover: a number rendered without a unit is worse than a number that
+        refuses to render, and a client that guesses a currency here will
+        guess it wrong.
+      required:
+        - minor_units
+      properties:
+        minor_units:
+          type: integer
+          format: int64
+          description: >-
+            The amount. Sign is meaningful on a `delta` and never on a
+            balance: a balance is what the bucket holds, and this plane
+            refuses to store a negative one.
+      additionalProperties: false
+
+    Balances:
+      type: object
+      description: >-
+        A bucket's three cached balances, exactly as
+        `domain/accounting/bucket.go` states them:
+
+            settled   = Σ grants/topups − Σ consumes + Σ adjustment settled_deltas
+            held      = Σ holds − Σ releases − Σ consumes + Σ adjustment held_deltas
+            available = settled − held
+
+        They are returned as three separate figures rather than one
+        "balance", because they answer three different questions and an
+        operator who is shown a single number is shown a number that answers
+        none of them. They are a **projection**: the console renders them and
+        never derives one, because a client that computed `available` from the
+        others would be doing the ledger's algebra in the browser, and a
+        disagreement between the two would have no authority behind it. If the
+        cache and the legs ever disagree, the legs win
+        (`Reconcile`'s standing rule).
+      required:
+        - settled
+        - held
+        - available
+      properties:
+        settled:
+          $ref: "#/components/schemas/Money"
+        held:
+          $ref: "#/components/schemas/Money"
+        available:
+          $ref: "#/components/schemas/Money"
+      additionalProperties: false
+
+    FundingBucket:
+      type: object
+      description: >-
+        One bucket: the authoritative capacity projection for exactly one
+        entitlement cycle or one account's PAYG balance. Exactly one owner,
+        ever — `kind` says which, and the schema pins the same rule.
+      required:
+        - id
+        - kind
+        - status
+        - balances
+        - version
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum:
+            - entitlement
+            - account
+          description: >-
+            `entitlement` buckets belong to one entitlement cycle; `account`
+            buckets are a PAYG balance. The two are never one bucket, because
+            a cycle that rolls must not take the PAYG balance with it.
+        entitlement_id:
+          type: [string, "null"]
+          format: uuid
+          description: Present exactly when `kind` is `entitlement`.
+        account_id:
+          type: [string, "null"]
+          format: uuid
+          description: >-
+            Present exactly when `kind` is `account`. For an entitlement
+            bucket this is the owning account too, and the console resolves
+            it through the entitlement — the account id is in the row either
+            way, because the authorization predicate is evaluated against it.
+        status:
+          type: string
+          enum:
+            - active
+            - closed
+        balances:
+          $ref: "#/components/schemas/Balances"
+        version:
+          type: integer
+          format: int64
+          description: >-
+            The optimistic-concurrency counter. It moves on every leg, and a
+            write carries the version it read so a stale one is refused
+            rather than merged.
+        opened_at:
+          type: [string, "null"]
+          format: date-time
+        closed_at:
+          type: [string, "null"]
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    LedgerEntry:
+      type: object
+      description: >-
+        One immutable bucket leg: the ledger's unit of record. Legs are
+        listed **per bucket** — one operation for one bucket's history, never
+        one for all buckets — because a ledger is a fact about where money
+        went, and a merged list of every bucket's legs is a question about
+        money this plane has no index to answer. The bucket id is therefore a
+        path segment on this one operation, and it is the only place a
+        resource id appears in a path: it names a bucket, and a bucket the
+        session's account does not own is a 404 the query did not return.
+      required:
+        - id
+        - funding_bucket_id
+        - kind
+        - sequence
+        - settled_delta
+        - held_delta
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        funding_bucket_id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum:
+            - grant
+            - topup
+            - hold
+            - release
+            - consume
+            - adjustment
+          description: >-
+            The six kinds the domain declares, with their own semantics
+            (`domain/accounting/ledger.go:27-54`). `consume` is the only kind
+            carrying a price snapshot, and `adjustment` the only one whose
+            deltas are free values — an explicit operator correction with a
+            reason, never an overdraw or a credit mechanism.
+        sequence:
+          type: integer
+          format: int64
+          description: >-
+            The leg's position in its bucket, allocated by the store inside
+            the transaction that writes it. It is the keyset this list pages
+            on, and it is strictly increasing per bucket, so a page can
+            neither skip a leg nor read one twice.
+        settled_delta:
+          $ref: "#/components/schemas/Money"
+        held_delta:
+          $ref: "#/components/schemas/Money"
+        settlement_id:
+          type: [string, "null"]
+          format: uuid
+        reservation_id:
+          type: [string, "null"]
+          format: uuid
+        command_key:
+          type: [string, "null"]
+          description: >-
+            The topup's idempotency key, when the leg is a `topup`. A retry
+            carrying the same key books once.
+        price:
+          oneOf:
+            - $ref: "#/components/schemas/PriceSnapshot"
+            - type: "null"
+          description: >-
+            The consume leg's price provenance, copied **by value** from the
+            revision the leg was priced against: the revision id travels as a
+            textual reference and the two unit prices as copied values, not
+            as a foreign key, because a settlement must be derivable from the
+            fact alone and a price re-derived from a moving table is not
+            provenance. Present exactly on `consume` legs.
+        adjustment_reason:
+          type: [string, "null"]
+          description: >-
+            One sentence for the human who reads the correction. Prose, never
+            evidence, and never a payload — the figures belong in the deltas
+            above, where they can be compared.
+        operator_id:
+          type: [string, "null"]
+          description: >-
+            The operator who wrote an `adjustment` leg. Present on adjustments
+            and nowhere else; a correction without one is not a correction, it
+            is a bug with a reason attached.
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    PriceSnapshot:
+      type: object
+      required:
+        - revision_id
+        - input_unit_price
+        - output_unit_price
+      properties:
+        revision_id:
+          type: string
+          description: The pricing revision this leg was priced against.
+        input_unit_price:
+          $ref: "#/components/schemas/Money"
+        output_unit_price:
+          $ref: "#/components/schemas/Money"
+      additionalProperties: false
+
+    Plan:
+      type: object
+      required:
+        - id
+        - name
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    PlanVersion:
+      type: object
+      description: >-
+        One version of a plan's terms. A plan has many versions and only one
+        current; a subscription pins the version it bought, so retiring a
+        version never changes what a live subscriber was sold.
+      required:
+        - id
+        - plan_id
+        - version_number
+        - state
+        - period
+      properties:
+        id:
+          type: string
+          format: uuid
+        plan_id:
+          type: string
+          format: uuid
+        version_number:
+          type: integer
+          minimum: 1
+        state:
+          type: string
+          enum:
+            - draft
+            - published
+            - retired
+          description: >-
+            `published` is the only state that accepts new subscriptions;
+            `retired` is what a superseded version becomes, and it is
+            deliberately **not** terminal in the way `revoked` is — an
+            existing subscription continues on a retired version, because
+            purchased scope never changes retroactively (ADR 0003).
+        period:
+          type: string
+          enum:
+            - calendar_month
+            - fixed_term
+        recurring_price_minor_units:
+          type: [integer, "null"]
+          format: int64
+          description: >-
+            The recurring price, or null on a fixed-term version where there
+            is no recurrence. The same minor-units-with-no-currency caveat as
+            every other money value here applies.
+        published_at:
+          type: [string, "null"]
+          format: date-time
+        retired_at:
+          type: [string, "null"]
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    Subscription:
+      type: object
+      required:
+        - id
+        - account_id
+        - plan_version_id
+        - state
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        account_id:
+          type: string
+          format: uuid
+        plan_version_id:
+          type: string
+          format: uuid
+        state:
+          type: string
+          enum:
+            - pending
+            - active
+            - suspended
+            - cancelled
+            - expired
+        starts_at:
+          type: string
+          format: date-time
+        current_period_start:
+          type: [string, "null"]
+          format: date-time
+          description: >-
+            Null exactly while the subscription is `pending`, and non-null in
+            every other state.
+        current_period_end:
+          type: [string, "null"]
+          format: date-time
+        cancel_at:
+          type: [string, "null"]
+          format: date-time
+          description: >-
+            When a scheduled cancellation takes effect. A scheduled
+            cancellation is **data, not a state**: the subscription stays
+            `active` and usable until this instant passes, which is why the
+            state enum has no "cancelling" member and why an operator looking
+            at a `cancelled` subscription is looking at one that has already
+            stopped.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    Entitlement:
+      type: object
+      description: >-
+        One live quota grant materialised from exactly one
+        (subscription, cycle, grant definition). The row is immutable after
+        the roll except its terminal state flip, and it carries **no balance
+        column** — capacity is drawn down in Accounting's buckets and the
+        runtime's quota projections, and a balance here would be a third copy
+        of the same number with no rebuild story. A console that showed
+        "remaining" from this row would be showing nothing at all; the
+        remaining figure lives on the bucket, and the two are deliberately
+        separate reads.
+      required:
+        - id
+        - subscription_id
+        - cycle
+        - state
+        - period_start
+        - period_end
+      properties:
+        id:
+          type: string
+          format: uuid
+        subscription_id:
+          type: string
+          format: uuid
+        grant_definition_id:
+          type: string
+          format: uuid
+        cycle:
+          type: integer
+          minimum: 1
+          description: >-
+            Which cycle of the subscription this grant is for. A retried roll
+            cannot grant a cycle twice — the schema's
+            `entitlements_grant_once_per_cycle` makes the triple unique, and
+            this number is the third of it.
+        scope:
+          type: string
+          description: >-
+            The alias-group **name** the grant is scoped to. The pinned scope
+            is a version id, resolved through the Data Plane that owns the
+            catalog; this is the name an operator reads, and the console does
+            not resolve the version itself.
+        dimension:
+          type: string
+          enum:
+            - cost
+          description: >-
+            The only dimension today, `cost`. It is an enum with one member
+            rather than a free string because the second one is a
+            compatibility surface: a `requests` or `tokens` dimension would
+            change what every number in this API means, and that has not
+            happened.
+        granted_minor_units:
+          type: integer
+          format: int64
+        scope_version_id:
+          type: string
+          format: uuid
+        state:
+          type: string
+          enum:
+            - active
+            - expired
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+
+    Finding:
+      type: object
+      description: >-
+        One recorded divergence. A finding's identity is
+        `(check_kind, subject_kind, subject_id)` and nothing else — not a
+        message, not a timestamp, and not a run id — so the same divergence
+        seen by two passes is one row whose `last_seen_at` moved, not a second
+        row. That is what makes the table bounded and what makes a re-run
+        over unchanged data open zero findings.
+
+        The `observed` evidence is opaque to the console: it is structured
+        JSON written by the check that found the divergence, and a new check
+        is a new evidence shape rather than a migration. It is rendered as
+        text, never interpreted, and never summed.
+      required:
+        - id
+        - check_kind
+        - subject_kind
+        - subject_id
+        - severity
+        - status
+        - detected_at
+        - last_seen_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        check_kind:
+          type: string
+          description: >-
+            Which invariant was violated. A closed vocabulary this plane owns
+            rather than free text, and two checks with different names are
+            different findings even about the same subject.
+        subject_kind:
+          type: string
+          enum:
+            - funding_bucket
+            - settlement
+            - request
+            - control_plane
+          description: >-
+            What the invariant was violated on. `control_plane` is the
+            literal subject for a feed-wide signal, which is why it is a
+            member of the enum and not a sentinel an operator has to
+            recognise.
+        subject_id:
+          type: string
+        severity:
+          type: string
+          enum:
+            - info
+            - warning
+            - critical
+          description: >-
+            How much it matters, **written once and never moved**. A finding
+            whose severity were editable would let a reader re-grade the
+            evidence instead of resolving it, which is the one thing this
+            table exists to make hard.
+        status:
+          type: string
+          enum:
+            - open
+            - acknowledged
+            - resolved
+        observed:
+          type: object
+          additionalProperties: true
+          description: >-
+            The evidence the check compared, as this plane's checks wrote it.
+            Every writer is one of this plane's own checks — never a provider
+            blob, never a raw prompt, never a fact payload — and its shape is
+            not this contract's to fix.
+        detail:
+          type: string
+          description: >-
+            One sentence for the human who resolves the finding. Prose, never
+            a payload: the figures belong in `observed`, where they can be
+            compared.
+        detected_at:
+          type: string
+          format: date-time
+          description: When the **first** pass saw this divergence.
+        last_seen_at:
+          type: string
+          format: date-time
+          description: When the most recent pass saw it still true.
+        resolved_at:
+          type: [string, "null"]
+          format: date-time
+      additionalProperties: false
+
+    ReconciliationRun:
+      type: object
+      description: >-
+        One reconciliation pass: the half-open window it swept, when it
+        started, how it ended, and the three counters that say what it did. A
+        run whose `finished_at` is null is a pass that started and never
+        finished, which is a fact worth rendering rather than hiding — it is
+        indistinguishable from an idle worker if it is not.
+      required:
+        - id
+        - scope
+        - status
+        - window_from
+        - window_to
+        - started_at
+        - buckets_scanned
+        - findings_opened
+        - findings_unchanged
+      properties:
+        id:
+          type: integer
+          format: int64
+        scope:
+          type: string
+        status:
+          type: string
+          enum:
+            - running
+            - completed
+            - failed
+        window_from:
+          type: string
+          format: date-time
+          description: Inclusive.
+        window_to:
+          type: string
+          format: date-time
+          description: >-
+            Exclusive, and the high-water mark the **next** pass opens from.
+            The console renders both halves of a half-open window, because a
+            window rendered as an inclusive pair is a window an operator
+            cannot tell from one that overlapped the last.
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: [string, "null"]
+          format: date-time
+        buckets_scanned:
+          type: integer
+          format: int64
+        findings_opened:
+          type: integer
+          format: int64
+        findings_unchanged:
+          type: integer
+          format: int64
+          description: >-
+            What a re-run shows: the same divergence seen again is a
+            re-confirmation, not a new finding. An operator reading a run with
+            a high `findings_unchanged` is looking at a healthy pass, and a
+            console that did not show the figure would make it look like a
+            broken one.
+      additionalProperties: false
+
+    AccountOverview:
+      type: object
+      description: >-
+        The dashboard's one composition: figures that live in three bounded
+        contexts, assembled **server-side** into a single operation. This is
+        the BFF composition ADR 0012 §1 settles — a use case in
+        `internal/application` returning a projection this contract declares,
+        never arithmetic across three responses in a page component, and never
+        a new package. The account comes from the session.
+      required:
+        - account
+      properties:
+        account:
+          $ref: "#/components/schemas/Account"
+        user_count:
+          type: integer
+          description: >-
+            How many live users the account has. It is a **count of a
+            filtered, bounded set** — invited plus active, excluding removed —
+            and is the one figure on this schema that is a number about the
+            collection rather than about one row. It is cheap because the
+            predicate is indexed, and it is here rather than inferred by
+            paging a list because an operator reading "12 users" should not
+            have to page eleven screens to learn there are twelve.
+        active_api_key_count:
+          type: integer
+          description: >-
+            How many keys are currently active. Revoked keys are counted
+            separately in the key list, never here: a dashboard that said
+            "12 keys" with twelve revoked among them would be describing
+            history as if it were capacity.
+        subscriptions:
+          type: array
+          description: >-
+            The account's subscriptions, most recent first, bounded by the
+            contract's own `maximum` rather than by a total. A dashboard
+            showing three of eleven is honest; one claiming to show all
+            eleven is making a promise this plane will not keep.
+          items:
+            $ref: "#/components/schemas/Subscription"
+        payg_balances:
+          type: array
+          description: >-
+            The account's PAYG buckets with their three balances, rendered
+            and never computed.
+          items:
+            $ref: "#/components/schemas/FundingBucket"
+        open_finding_count:
+          type: integer
+          description: >-
+            How many reconciliation findings are open. It is a whole-plane
+            fact and therefore the one number here that is not the account's
+            alone: an operator reading it learns how the system is doing, not
+            what this customer owes.
+      additionalProperties: false
+
+    # -------------------------------------------------------------------------
+    # Pages.
+    #
+    # One shape, six uses, and the shape is the point: every list on this
+    # surface answers with the same three facts and nothing else. `items` is
+    # the page, `next_cursor` is where to continue, `has_more` says whether
+    # continuing is worth it — and there is deliberately no fourth field.
+    #
+    # The absence of `total` is not an oversight and not a simplification.
+    # Computing one over a table this plane is still growing means either a
+    # second query whose answer is a different instant from the page's, or a
+    # COUNT the first page pays for and the last one wastes. Either way the
+    # number is wrong the moment it is written and nobody recomputes it. A
+    # console that shows "1–50 of 3,241" is showing an operator a figure that
+    # looks authoritative and is not; one that shows "more" and means it is
+    # showing them something true.
+    #
+    # `next_cursor` is non-empty on **every** page, including the last. A page
+    # that carries none is not a page a client can hold: a client asked to
+    # continue from an empty position would resume from the beginning of
+    # retained history on every page, re-reading the same rows forever behind
+    # a position that never moves. The last page's cursor resumes the walk and
+    # returns an empty page, which is the honest answer.
+    # -------------------------------------------------------------------------
+
+    PageEnvelope:
+      type: object
+      required:
+        - items
+        - next_cursor
+        - has_more
+      properties:
+        items:
+          type: array
+          description: The rows on this page. May be empty, and an empty
+            first page is a legitimate answer — an account with no users is
+            not an error.
+        next_cursor:
+          $ref: "#/components/schemas/Cursor"
+        has_more:
+          type: boolean
+          description: >-
+            Whether rows exist past this page. This — not the page's length —
+            is the only honest end-of-collection signal, because a short page
+            is also what a concurrent write produces. A page shorter than the
+            requested limit with `has_more: true` is a normal page, and a
+            client that treats a short page as the end is the bug this field
+            exists to prevent.
+      additionalProperties: false
+
+    UserPage:
+      allOf:
+        - $ref: "#/components/schemas/PageEnvelope"
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: "#/components/schemas/User"
+      unevaluatedProperties: false
+
+    APIKeyPage:
+      allOf:
+        - $ref: "#/components/schemas/PageEnvelope"
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: "#/components/schemas/APIKey"
+      unevaluatedProperties: false
+
+    PlanPage:
+      allOf:
+        - $ref: "#/components/schemas/PageEnvelope"
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: "#/components/schemas/Plan"
+      unevaluatedProperties: false
+
+    SubscriptionPage:
+      allOf:
+        - $ref: "#/components/schemas/PageEnvelope"
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: "#/components/schemas/Subscription"
+      unevaluatedProperties: false
+
+    EntitlementPage:
+      allOf:
+        - $ref: "#/components/schemas/PageEnvelope"
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: "#/components/schemas/Entitlement"
+      unevaluatedProperties: false
+
+    FundingBucketPage:
+      allOf:
+        - $ref: "#/components/schemas/PageEnvelope"
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: "#/components/schemas/FundingBucket"
+      unevaluatedProperties: false
+
+    LedgerEntryPage:
+      allOf:
+        - $ref: "#/components/schemas/PageEnvelope"
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: "#/components/schemas/LedgerEntry"
+      unevaluatedProperties: false
+
+    FindingPage:
+      allOf:
+        - $ref: "#/components/schemas/PageEnvelope"
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: "#/components/schemas/Finding"
+      unevaluatedProperties: false
+
+    ReconciliationRunPage:
+      allOf:
+        - $ref: "#/components/schemas/PageEnvelope"
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: "#/components/schemas/ReconciliationRun"
+      unevaluatedProperties: false

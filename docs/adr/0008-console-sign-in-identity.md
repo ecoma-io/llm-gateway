@@ -64,6 +64,27 @@ refuses to resurrect the identity — `Activate` on a removed user is
 anybody's principal. Resolution is total by construction: one live row, or
 none.
 
+> **Amended by [ADR 0012](0012-management-console.md) §2.** The open question
+> this section left is decided: a credential **may not** be exercised while the
+> identity is `invited`. Resolution says the invitation's own redemption — the
+> row is found, so the _lookup_ is right — but the credential is checked
+> against a row whose `Activate` has not run, and the activation is what
+> establishes that the human who now holds the address is the human the
+> invitation named. Both facts are load-bearing together: the lookup is scoped
+> to live rows so the tombstone trap of §Context-2 cannot fire, and the
+> credential is refused on an `invited` row so the answer cannot be the
+> invitation's redemption. An `invited` row therefore resolves to exactly one
+> user and authenticates nobody, which is the same shape as the uniform
+> pre-credential answer of §2: one refusal, not a diagnosis.
+>
+> The consequence is that the sign-in surface carries the account id, the
+> email and the credential in one submission, and the invitation is activated
+> out of band — the same link the invitation itself carries, which carries
+> everything the transition needs. The console may show the `invited` state
+> plainly to an authenticated user of the account (a live row is a fact about
+> the account's membership, not a secret), and that display is not a path to a
+> session.
+
 ### 2. What the console asks for: the account id, with the email, before any credential
 
 The sign-in form collects **the account's id** and **the email**, and only then

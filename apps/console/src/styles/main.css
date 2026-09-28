@@ -13,3 +13,66 @@
 #app {
   height: 100dvh;
 }
+
+/* ---- Focus not obscured by the sticky header (ADR 0012 §7, SC 2.4.11) ---
+ *
+ * A keyboard user tabs to a control near the top of a long list; the browser
+ * scrolls it into view; the browser's notion of "in view" is the scroll
+ * container's top edge, which is exactly where the `z-30` sticky `AppHeader`
+ * sits on top of it. The focus ring is occluded and the control's label is
+ * hidden. This is WCAG 2.2 SC 2.4.11 — Focus Not Obscured (Minimum) — and it is
+ * the one criterion in this console's a11y gate with NO automated rule to catch
+ * it: Loom's own `a11y-contract.js` says so in as many words ("2.4.11 has
+ * none"), which is why the fix below is a stylesheet rule rather than
+ * something a green run would have found on its own.
+ *
+ * **The offset is a constant, and that is a deliberate shortfall against the
+ * ADR's "measured", which this comment states rather than hides.** CSS cannot
+ * measure a SIBLING. The header is a sibling of the scroll column inside
+ * `AppShell` — the header is `position: sticky` INSIDE the column's parent, and
+ * the column is the scroller — so there is no CSS value that reads the header's
+ * height into the column's `scroll-padding-top`. The honest ways to measure it
+ * are a `ResizeObserver` writing `--header-height` from JavaScript, or Loom
+ * publishing the height as a custom property itself. The first needs a runtime
+ * dependency and a lifecycle this console does not own (`AppShell`'s internals
+ * are Loom's); the second is a change in Loom, not here. So this is the honest
+ * constant, and the number is written in `rem` because that is the unit Loom
+ * publishes `min-h-14` in — 3.5rem is 56px at the default root size — so the two
+ * can be compared by a reader instead of by a diff.
+ *
+ * It is correct at every width this console is used at and it is a snapshot
+ * where the ADR asked for a reading. Loom's header is `min-h-14 … sm:h-14 …
+ * 3xl:h-16`: 56px from `sm` up (the whole range a console is used on, and the
+ * whole range this constant is written for), 64px only from `3xl` (1920px),
+ * and TALLER than 56px only below `sm`, where the header's search field wraps
+ * to a second row. The two steps are therefore handled as the media queries
+ * below rather than left to rot silently — a 64px header behind a 56px offset
+ * would leave 8px of a focus ring visible, which is the failure in miniature.
+ * What this cannot survive is a Loom release that changes the header's own
+ * padding or its `min-h-14` in a way the media queries do not name, and the
+ * only thing that will catch that is a human reading a header that grew.
+ *
+ * The selector is STRUCTURAL rather than a class list, which is the same
+ * rot-prevention applied one level up: `.overflow-y-auto` matches TWO elements
+ * in this shell (the sidebar's `<nav>` as well as the content column) and
+ * applying the offset to the sidebar would push the navigation down 56px for
+ * no reason. This selector matches exactly one — the column that is the last
+ * child of the header's parent — and it is keyed on Loom's OWN
+ * `data-loom-app-header` attribute, which is the seam Loom publishes rather
+ * than a class it is free to rewrite. Measured against the rendered shell in
+ * a test rather than assumed; the test is what makes that a claim.
+ *
+ * `scroll-padding-top` rather than `scroll-margin-top` on the controls: the
+ * offset belongs to the CONTAINER, so it applies to every scrolled-into-view
+ * target in that container — a fragment link, a `focus()` call, and the
+ * browser's own tab-scrolling alike — rather than only to the ones a screen
+ * remembered to mark up. */
+#app div:has(> header [data-loom-app-header]) > div:last-of-type {
+  scroll-padding-top: 3.5rem;
+}
+
+@media (min-width: 1920px) {
+  #app div:has(> header [data-loom-app-header]) > div:last-of-type {
+    scroll-padding-top: 4rem;
+  }
+}
