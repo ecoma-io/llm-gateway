@@ -171,6 +171,30 @@ What that surface decides, and what it does not:
   three-role RBAC system invented inside an implementation change is a role
   model nobody reviewed, and the migration to change it later runs over live
   authorization decisions.
+  These are **classes of a holder, not kinds of a credential**, and the
+  distinction is structural rather than a naming preference. `identity.Kind`
+  already exists and is the orthogonal axis: it says _which credential
+  authenticated_ — `PrincipalUser` for a console identity, `PrincipalAPIKey` for
+  a runtime credential. A session is a browser credential, so its `Kind` is
+  always `PrincipalUser`; the class says _what that holder may do across
+  accounts_ (`user` acts for exactly one, `operator` administers several).
+  Conflating them would either invent a third credential kind the runtime has
+  no way to present, or demote `user`/`operator` to a redeclaration of what
+  `Kind` already says. So the two live on different types:
+  `identity.SessionClass` is the holder's authorisation class, validated to
+  its own vocabulary, and the session's own aggregate — not `Principal` —
+  carries it. `operator` is admitted in the column's vocabulary and in the
+  contract enum now, so adding the staff surface later is a new predicate and
+  not a migration over live authorization decisions, which is the whole reason
+  this record refuses a three-role model. The `operator_id` it names is text,
+  not a `users` row, and the reason is the same one
+  `domain/accounting/ids.go:55-58` gives: the operator surface is not built and
+  the grammar of a staff identity is not something the ledger may guess at.
+  **`user` is the only class the first console mints.** A row cannot be
+  created as `operator` through any surface this change ships, and the
+  predicate for an operator session is not yet written — so a class that has no
+  predicate is unreachable rather than merely unused, and the one test worth
+  having here is that no signed path produces one.
 - **The browser is not a security boundary, and the mechanisms are named.** No
   credential in `localStorage`, `sessionStorage` or `IndexedDB` — with one
   named exception already in the tree, `loom:theme` in
