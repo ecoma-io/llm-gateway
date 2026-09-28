@@ -2,9 +2,27 @@ package analytics
 
 import (
 	"errors"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
+
+// analyticsContractPath is the fragment this package answers, relative to this
+// package's directory — `go test` runs each package with that directory as its
+// working directory. The five levels back are: analytics, domain, internal,
+// console-api, apps.
+//
+// The agreement cannot be typed across the seam: the document is what a
+// generated client and any other consumer reads, while this package enforces
+// the bound in Go and has no way to be compiled against the yaml. The number
+// therefore exists twice, and nothing in either language notices when the two
+// copies drift — which is why every behaviour test in this file stays green
+// through the drift, because they all measure the same Go constant. The pin
+// below is the one test that measures the CODE against the DOCUMENT, and the
+// constant's own comment is the promise it keeps.
+const analyticsContractPath = "../../../../../api/openapi/shared/analytics.yaml"
 
 // at is a UTC instant written the way a test reads it, because every assertion
 // in this file is about where a bucket edge FALLS and a literal built from
@@ -201,13 +219,17 @@ func TestNewQueryServesTheEdgesOfEveryBound(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			query, err := NewQuery(tt.from, tt.to, tt.grain, tt.zone)
-			if err != nil {
+			// The acceptance IS the assertion. NewQuery counts the buckets with
+			// CountBuckets and refuses over MaxSeriesPoints before it returns,
+			// so a nil error says a range whose walk is at most the ceiling was
+			// served — and the walk it counted is the walk BucketBounds performs,
+			// which the tiling test below holds step for step against the count.
+			// Re-deriving the length here from the constructed query would
+			// re-assert the same constant twice and prove nothing the acceptance
+			// does not already prove.
+			if _, err := NewQuery(tt.from, tt.to, tt.grain, tt.zone); err != nil {
 				t.Fatalf("NewQuery(%s, %s, %q, %q) error = %v, want nil — the contract promises this range",
 					tt.from, tt.to, tt.grain, tt.zone, err)
-			}
-			if points := len(query.BucketBounds()); points > MaxSeriesPoints {
-				t.Errorf("a query the bounds accepted produced %d points, over the %d the contract allows", points, MaxSeriesPoints)
 			}
 		})
 	}
@@ -673,4 +695,153 @@ func renderBuckets(bounds []Bucket) string {
 		return "  (none)\n"
 	}
 	return out
+}
+
+// TestTheContractSeriesCeilingIsWhatTheDomainEnforces is the pin the constant's
+// own comment promises and this file did not have: MaxSeriesPoints is one
+// number written twice, enforced here and declared in
+// `components.schemas.AnalyticsUsageResponse.properties.series.maxItems`, and
+// until this test nothing would have failed if either copy moved alone.
+//
+// The two copies are not the same document. The yaml is what a generated client
+// is built from and what every consumer reads; the constant is what
+// NewQuery counts against. A yaml that under-declared the ceiling describes a
+// response the plane will produce and the client's own type would call
+// impossible — and the drift is invisible in this package, because every other
+// test here measures the constant against itself. A constant raised without the
+// yaml fails in the other direction: the plane serves a series the contract
+// promises cannot exist, and the client has no type to refuse it.
+//
+// The literal is spelled beside the constant for the reason
+// `TestTheContractBoundsAndFloorsAreWhatThisPackageEnforces` spells it in the
+// projection package: a reviewed contract change is a deliberate edit to both
+// halves, and this row is the line a reviewer reads when deciding whether the
+// ceiling may move. It is 2161 and not 2160 for the reason the constant gives —
+// an unaligned ninety-day range has 2161 hour-buckets because the first of them
+// is partial, and a 2160 bound would refuse every caller who asks for the
+// maximum range at the finest grain.
+func TestTheContractSeriesCeilingIsWhatTheDomainEnforces(t *testing.T) {
+	const key = "components.schemas.AnalyticsUsageResponse.properties.series.maxItems"
+	declared, ok := scanContract(t, analyticsContractPath).numbers[key]
+	if !ok {
+		t.Fatalf("%s declares no %s; this pin proves nothing until the scan finds it", analyticsContractPath, key)
+	}
+	if declared != MaxSeriesPoints {
+		t.Errorf("%s says %s is %d and this package enforces MaxSeriesPoints = %d; the domain and the contract have drifted, and every other test in this file stays green through the drift because they all measure the same Go constant",
+			analyticsContractPath, key, declared, MaxSeriesPoints)
+	}
+	if MaxSeriesPoints != 2161 {
+		t.Errorf("MaxSeriesPoints = %d, want 2161; the document spells the literal, and the number follows from the walk — ninety days is 2160 hours, and an unaligned start adds the partial bucket that contains it", MaxSeriesPoints)
+	}
+}
+
+// TestTheWalkAndTheCountAgreeAtTheCeilingItself is the second half of what the
+// pin above is a pin FOR. A pin that only compares two constants proves the two
+// copies agree; it cannot prove the constant is reachable, and a ceiling
+// nothing produces is a ceiling no caller is refused against.
+//
+// So the number is measured rather than assumed: the widest range the surface
+// admits, at the finest grain, started OFF the hour, and both the count that
+// gates the request and the walk that builds the answer are asked how many
+// buckets it has. They must both say MaxSeriesPoints — one more than ninety
+// days of hours, because the first bucket is the one CONTAINING 09:30 and
+// holds only half an hour. A surface whose ceiling were 2160 would refuse this
+// exact range, which is the caller shortening nothing and still being told no.
+func TestTheWalkAndTheCountAgreeAtTheCeilingItself(t *testing.T) {
+	from := at(2026, time.June, 1, 9, 30)
+	to := from.Add(MaxRange)
+	location := time.UTC
+
+	if counted := CountBuckets(from, to, GranularityHour, location); counted != MaxSeriesPoints {
+		t.Fatalf("CountBuckets() over the widest range the surface admits at the hour grain = %d, want %d — the bound the contract declares is written against this number, and a ceiling no range reaches is a ceiling nothing enforces",
+			counted, MaxSeriesPoints)
+	}
+	query := mustQuery(t, from, to, GranularityHour, "UTC")
+	if walked := len(query.BucketBounds()); walked != MaxSeriesPoints {
+		t.Errorf("BucketBounds() over the same range = %d buckets, want %d — the walk is what the caller receives and the count is what refused, and one point apart is a response past the declared ceiling",
+			walked, MaxSeriesPoints)
+	}
+
+	// And one hour shorter is not the ceiling, which is what makes the case
+	// above a boundary rather than a formula: a count hard-wired to the
+	// maximum range would return 2161 for this too.
+	if counted := CountBuckets(from, to.Add(-time.Hour), GranularityHour, location); counted >= MaxSeriesPoints {
+		t.Errorf("CountBuckets() over a range an hour shorter = %d, want fewer than %d — the ceiling counts BUCKETS and not hours, so a shorter range is a shorter series",
+			counted, MaxSeriesPoints)
+	}
+}
+
+// contractDocument is the fragment's integer scalars, keyed by dotted path —
+// each one a separate key, so a `maxItems` under one schema and a `maxItems`
+// under another can never be confused for one another.
+type contractDocument struct {
+	numbers map[string]int
+}
+
+// scanContract reads the fragment's indentation-nested keys.
+//
+// It is a scanner rather than a parser because Go's standard library has no
+// YAML parser and the shape being read is narrow: one integer under one path.
+// Keys are pushed and popped by indentation, so the path the `maxItems` is
+// recorded against is the one it was written at. Folded description prose falls
+// out on its own, since a line is only read as a key when it reads exactly as
+// `key: value` with no whitespace inside the key, and a line of prose that
+// happens to contain a colon is skipped by the same rule. A document that
+// stopped matching the scan yields nothing, and the caller above treats an
+// absent key as a failure rather than a skip, so a scanner that goes blind is
+// loud instead of vacuous.
+func scanContract(t *testing.T, path string) contractDocument {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+
+	document := contractDocument{numbers: map[string]int{}}
+	type frame struct {
+		indent int
+		path   string
+	}
+	stack := []frame{}
+
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimRight(raw, " \t")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+
+		key, value, found := strings.Cut(trimmed, ":")
+		if !found || key == "" || strings.ContainsAny(key, " \t") {
+			continue
+		}
+		value = strings.TrimSpace(value)
+
+		for len(stack) > 0 && stack[len(stack)-1].indent >= indent {
+			stack = stack[:len(stack)-1]
+		}
+		parent := ""
+		if len(stack) > 0 {
+			parent = stack[len(stack)-1].path
+		}
+		joined := key
+		if parent != "" {
+			joined = parent + "." + key
+		}
+
+		if value == "" {
+			// A mapping whose children follow at a deeper indent.
+			stack = append(stack, frame{indent: indent, path: joined})
+			continue
+		}
+		if number, err := strconv.Atoi(value); err == nil {
+			document.numbers[joined] = number
+		}
+	}
+
+	if len(document.numbers) == 0 {
+		t.Fatalf("%s yielded no integer keys; every pin against it would prove nothing", path)
+	}
+	return document
 }

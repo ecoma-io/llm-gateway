@@ -574,6 +574,68 @@ func TestTheMoneyIsTheSettlementHeaderAndNotAReDerivedAmount(t *testing.T) {
 	}
 }
 
+// TestAMinorUnitArrivesWholeIs the fixture every other money case in this file
+// cannot be. 700 and 400 and 300 are all multiples of a hundred, so each of
+// them survives being divided by a hundred, truncated, or cast through a float
+// and rounded back — the three operations a SUM over money is most likely to
+// pick up by accident, and none of which any assertion here would have noticed.
+// The figure is an int64 of minor units, so a read that divided by the scale
+// and re-multiplied would answer 100 for a request that settled for 101, and a
+// report that is short by one minor unit on every odd request is not a report
+// anyone can reconcile against an invoice.
+//
+// 101 is the smallest amount that makes the claim: it is not divisible by any
+// round number, it survives as 101, and the fixtures beside it are all round,
+// so a suite whose every other sum is a multiple of a hundred is a suite that
+// has never asked whether the read preserves the units it was given. The sum is
+// asserted against 101 AND 111 rather than against 101 alone, because the second
+// figure is what rules out the read having produced a number that is merely
+// close — a per-request ceiling, or a division applied on the way in and again
+// on the way out, each lands elsewhere.
+//
+// Two requests rather than one, deliberately: one request settled for 101 would
+// be satisfied by a read that returned the request's amount without summing it
+// at all. It is the SECOND that a header-sum has to keep, and it is also what
+// catches a read that summed per-REQUEST amounts where the two requests had
+// charged differently — the state the port's own header warns about when it
+// says the per-request amount is rounded and the sum of rounded figures is not
+// the rounded total. Here the two agree, and that agreement is the point: the
+// figure is exact either way, and this fixture is what would notice a read that
+// stopped being exact.
+func TestAMinorUnitArrivesWhole(t *testing.T) {
+	a := integrationAnalytics(t)
+	account, bucket := a.newAccountWithBucket(t, "minor unit arrives whole")
+
+	// The two charges differ by ten minor units, so the second is the
+	// distinguishing one: a read that lost the odd remainder on the first
+	// request and summed faithfully after it would return 110 rather than
+	// either of the two figures asserted below.
+	a.settleRequest(t, account, bucket, 101, "reported")
+	a.settleRequest(t, account, bucket, 10, "gateway_observed")
+
+	now := time.Now().UTC()
+	usage, _, err := a.repo.Usage(t.Context(), persistence.UsageQuery{
+		AccountID: account, From: now.Add(-time.Hour), To: now, Buckets: a0(now),
+	})
+	if err != nil {
+		t.Fatalf("Usage() error = %v", err)
+	}
+	if usage.SettledMinorUnits != 111 {
+		t.Errorf("SettledMinorUnits = %d, want 111 — two settlement headers of 101 and 10 minor units, summed exactly, and a figure that has passed through a scale or a float on the way in would land at 100, 110 or something no pair of headers could produce",
+			usage.SettledMinorUnits)
+	}
+	if usage.SettledMinorUnits%100 == 0 {
+		t.Errorf("SettledMinorUnits = %d, which is a whole number of major units; a fixture whose every amount is a multiple of a hundred cannot tell a read that divides by the scale and re-multiplies from one that does not", usage.SettledMinorUnits)
+	}
+	// The counts are the control: a read that mangled the money alone would
+	// leave the request counts untouched, so they say the range and the
+	// attribution are the two requests the fixture booked and the figure
+	// above is about the amount rather than about what was found.
+	if usage.Capture.Total() != 2 {
+		t.Errorf("the capture split counts %d settlements, want 2 — the two this fixture booked, and a capture count of 1 would mean the sum above was a one-request figure wearing a two-request fixture", usage.Capture.Total())
+	}
+}
+
 // ---------------------------------------------------------------------------
 // the capture split
 // ---------------------------------------------------------------------------
@@ -1410,6 +1472,11 @@ func (a *analyticsRepos) newAccountWithBucket(t *testing.T, name string) (string
 // analyticsTestFund is the capacity every fixture bucket is topped up with —
 // well above the 700 the charges are made of, so a test that books several
 // charges on one bucket is not refused for capacity it did not mean to test.
+//
+// The CHARGE amounts are not this round, or every money assertion in this file
+// would be satisfied by a read that divided by a hundred and multiplied back;
+// the topup is a fixture of capacity rather than of a settled figure, and no
+// assertion below reads a sum of it for money spent.
 const analyticsTestFund = 100_000
 
 // capturePtr is the address of one capture method, for the applied facts whose

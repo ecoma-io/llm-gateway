@@ -289,6 +289,8 @@ func TestTheAnalyticsGrammarNamesNoTransport(t *testing.T) {
 		"strconv":      true,
 		"unicode":      true,
 		"unicode/utf8": true,
+		"text/scanner": true,
+		"os":           true,
 	}
 
 	graph := importGraph(t)
