@@ -498,6 +498,7 @@ assert_equals "the namespace carries the ownership comment, byte for byte" \
 	"Control Plane ownership namespace (ADR 0006 §7); owned by apps/console-api."
 # The list is an EXACT equality and stays one, and that is the whole point of
 # the assertion rather than an incidental strictness: relaxed to a containment
+<<<<<<< HEAD
 # or LIKE check it would silently unconstrain the twenty-three tables already
 # in it, and a table that appears without anybody reading the diff is precisely
 # the failure a control-plane schema change can least afford. ADR 0012's
@@ -509,6 +510,20 @@ assert_equals "the namespace holds exactly the identity, commerce, projection, a
 assert_equals "the control tables are the identity, commerce, projection, accounting, ingestion, reconciliation, session and analytics foundations' set" \
 	"$(psql_scalar "$control_db" "SELECT string_agg(tablename, ',' ORDER BY tablename COLLATE \"C\") FROM pg_tables WHERE schemaname = 'control'")" \
 	"account_payg,accounts,analytics_fact_dimensions,api_keys,applied_facts,entitlements,funding_buckets,ingestion_cursor,ledger_entries,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,quarantined_facts,reconciliation_findings,reconciliation_runs,sessions,settlements,subscriptions,users"
+=======
+# or LIKE check it would silently unconstrain the twenty-five tables already in
+# it, and a table that appears without anybody reading the diff is precisely
+# the failure a control-plane schema change can least afford. ADR 0012's
+# Consequences names this by name. `sessions` extends the list in the same
+# change that creates the table, and the count moves with it — as the three
+# payment tables do, added by 000013 with the payment integration that writes
+# them.
+assert_equals "the namespace holds exactly the identity, commerce, projection, accounting, ingestion, reconciliation, session and payment schemas' twenty-five tables" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "25"
+assert_equals "the control tables are the identity, commerce, projection, accounting, ingestion, reconciliation, session and payment foundations' set" \
+	"$(psql_scalar "$control_db" "SELECT string_agg(tablename, ',' ORDER BY tablename COLLATE \"C\") FROM pg_tables WHERE schemaname = 'control'")" \
+	"account_payg,accounts,api_keys,applied_facts,entitlements,funding_buckets,ingestion_cursor,ledger_entries,payment_events,payment_intents,payment_quarantine,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,quarantined_facts,reconciliation_findings,reconciliation_runs,sessions,settlements,subscriptions,users"
+>>>>>>> f2fe24e (chore(console-api): hold the payment integration working tree)
 assert_equals "the projection counter is a seeded singleton with a timeline epoch" \
 	"$(psql_scalar "$control_db" "SELECT count(*) FROM control.projection_revision WHERE id = 1 AND last_revision = (SELECT count(*) FROM control.accounts) AND epoch IS NOT NULL")" \
 	"1"
@@ -2419,6 +2434,8 @@ assert_equals "the accounting tables are gone after a full roll-back" \
 	"$(psql_scalar "$control_db" "SELECT to_regclass('control.funding_buckets') IS NULL AND to_regclass('control.ledger_entries') IS NULL AND to_regclass('control.settlements') IS NULL")" "t"
 assert_equals "the projection tables are gone after a full roll-back" \
 	"$(psql_scalar "$control_db" "SELECT to_regclass('control.projection_revision') IS NULL AND to_regclass('control.projection_changes') IS NULL AND to_regclass('control.projection_api_keys') IS NULL AND to_regclass('control.projection_accounts') IS NULL")" "t"
+assert_equals "the payment tables are gone after a full roll-back" \
+	"$(psql_scalar "$control_db" "SELECT to_regclass('control.payment_intents') IS NULL AND to_regclass('control.payment_events') IS NULL AND to_regclass('control.payment_quarantine') IS NULL")" "t"
 assert_equals "the ownership namespace and its comment are gone after a full roll-back" \
 	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_namespace WHERE nspname = '$control_db'")" "0"
 assert_equals "the Control Plane's public schema is back to its migration history alone" \

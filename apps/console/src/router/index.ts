@@ -32,6 +32,7 @@ import DashboardPage from "@/pages/DashboardPage.vue";
 import IdentityPage from "@/pages/IdentityPage.vue";
 import CatalogPage from "@/pages/CatalogPage.vue";
 import CommercePage from "@/pages/CommercePage.vue";
+import PaymentsPage from "@/pages/PaymentsPage.vue";
 import AccountingPage from "@/pages/AccountingPage.vue";
 import ReconciliationPage from "@/pages/ReconciliationPage.vue";
 import NotFoundPage from "@/pages/NotFoundPage.vue";
@@ -77,6 +78,16 @@ export const ROUTES = [
     path: "/commerce",
     name: "commerce",
     component: CommercePage,
+  },
+  // Payments sits beside its two neighbours rather than under either of them.
+  // Buying a top-up is not a purchase in the commerce sense — there is no plan
+  // and no cycle, so nothing on `/commerce` names it — and it is not the
+  // ledger: the credit a payment produces is written when the provider says so,
+  // and this screen only ever reads that.
+  {
+    path: "/payments",
+    name: "payments",
+    component: PaymentsPage,
   },
   {
     path: "/accounting",

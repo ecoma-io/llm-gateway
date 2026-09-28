@@ -48,6 +48,14 @@ const (
 	// about a database, a provider, a path, or a stack frame it cannot fix.
 	internalErrorMessage = "internal error"
 
+	// upstreamUnavailableMessage is what a caller is told when a dependency of
+	// this plane did not answer. It is a different sentence from
+	// internalErrorMessage because the two ask for different things — this one
+	// is worth retrying — and it stays a sentence about the DEPENDENCY rather
+	// than about the request, which is the distinction the contract draws:
+	// nothing about the caller's request was wrong.
+	upstreamUnavailableMessage = "the payment provider is unavailable"
+
 	// notReadyMessage is the same discipline for the readiness probe's one
 	// refusal: the client learns that this service cannot receive traffic yet,
 	// and nothing about which dependency is missing or why it is not answering.
@@ -81,7 +89,31 @@ const (
 // The surface itself is declared in routes.go and mounted here; this function
 // owns everything around it — the middleware, the two fallbacks below, and the
 // order they are composed in.
-func New(app *application.App, readiness persistence.Pinger, sessions SessionUseCases, reads ConsoleReadUseCases, usage UsageUseCases) stdhttp.Handler {
+// The surface itself is declared in routes.go and mounted here; this function
+// owns everything around it — the middleware, the two fallbacks below, and the
+// order they are composed in.
+//
+// surface is the payment integration: the four payment use cases and the
+// provider's delivery verifier, travelling as one optional argument. It is
+// optional in the SIGNATURE and required in every process that serves a console
+// — cmd/console-api passes it — and the two are not in tension: the four
+// payment rows are part of the declared surface, so a server built without them
+// has a complete route table and handlers that refuse, rather than a table with
+// a hole in it. See unwiredPaymentSurface for why that is the shape, and why a
+// request to an unwired payment operation is a logged 500 rather than a panic.
+//
+// A caller that supplies a surface must supply BOTH halves: a process that can
+// open payments but cannot verify a delivery would create checkouts it can never
+// settle, and that is refused here rather than discovered by a customer. More
+// than one surface is a wiring mistake with no meaning, so it is refused too.
+//
+// The surface is the one argument that is not a required positional parameter,
+// and the reason is a fact about who calls this function: routes_test.go and
+// contract_test.go build a table with nothing but fakes, and the four-argument
+// form is what they call. Making the surface a fifth required parameter would
+// edit every one of those tests to say "and no payments", which is a line about
+// the test rather than about the server.
+func New(app *application.App, readiness persistence.Pinger, sessions SessionUseCases, reads ConsoleReadUseCases, usage UsageUseCases, surface ...PaymentSurface) stdhttp.Handler {
 	if readiness == nil {
 		panic("http: New requires a readiness Pinger; /readyz has nothing to gate on without one")
 	}
@@ -94,9 +126,29 @@ func New(app *application.App, readiness persistence.Pinger, sessions SessionUse
 	if usage == nil {
 		panic("http: New requires the usage use cases; the /usage surface has no use case to serve without one")
 	}
+	if len(surface) > 1 {
+		panic("http: New takes one payment surface at most")
+	}
+	payments := unwiredPaymentSurface()
+	if len(surface) == 1 {
+		if surface[0].Payments == nil || surface[0].Verifier == nil {
+			panic("http: New requires both halves of the payment surface; a server that can open payments but not verify a delivery would open checkouts it can never settle")
+		}
+		if surface[0].Provider == "" {
+			// An empty name is not a missing feature like the two nil halves
+			// above — it is a wire defect, and it fails CLOSED but silently:
+			// the delivery path's own segment is never empty, so no path would
+			// match and every delivery would be answered 404 with the process
+			// reporting itself healthy. A wired surface with no name is a
+			// composition root that forgot one argument, and the only place
+			// that can be caught cheaply is here.
+			panic("http: New requires the wired payment surface to name its provider; the delivery path is addressed by that name and an unnamed surface serves no path at all")
+		}
+		payments = surface[0]
+	}
 	mux := stdhttp.NewServeMux()
 
-	table := routes(app, readiness, sessions, reads, usage)
+	table := routesWithPayments(app, readiness, sessions, reads, usage, payments)
 	for _, rt := range table {
 		register(mux, rt)
 	}
@@ -243,6 +295,15 @@ func writeError(w stdhttp.ResponseWriter, r *stdhttp.Request, err error) {
 // errorResponse maps one error to its deterministic status, wire code and
 // public message. It is the whole status mapping; nothing else in the
 // package decides a status from an error.
+//
+// The application's code vocabulary is CLOSED and every member of it has an arm
+// below. That is a rule with a test behind it — TestEveryApplicationCodeHasAStatus
+// enumerates the codes the application package declares and fails on one this
+// table does not answer — because the alternative is what this function used to
+// be: a three-arm switch over five codes, where a code with no arm answered 500
+// `internal` and the omission was invisible. A status is the one thing a client
+// acts on, so a missing arm is not a missing detail; it is a caller doing the
+// wrong thing on purpose.
 func errorResponse(err error) (status int, code string, message string) {
 	var transportError interface {
 		error
@@ -256,6 +317,21 @@ func errorResponse(err error) (status int, code string, message string) {
 	if !ok {
 		return stdhttp.StatusInternalServerError, string(application.CodeInternal), internalErrorMessage
 	}
+	return applicationResponse(applicationError)
+}
+
+// applicationResponse is the code-to-status table: one arm per code, and the arm
+// is chosen from what the code MEANS rather than from how it is spelled.
+//
+// It is a function of its own so the test can call it for every code the
+// application declares without constructing an error value, and so the reader
+// can see the whole mapping in one screen.
+//
+// The `default` arm is not a fallback for a code this build knows: it is the
+// arrival of a code it does not, and it LOGS the code it could not place. That
+// line is the difference between a missing arm and a broken server — without it
+// the two are one symptom, and the one that gets fixed is the wrong one.
+func applicationResponse(applicationError *application.Error) (status int, code string, message string) {
 	switch applicationError.Code {
 	case application.CodeNotFound:
 		return stdhttp.StatusNotFound, string(application.CodeNotFound), applicationError.Message
@@ -298,8 +374,53 @@ func errorResponse(err error) (status int, code string, message string) {
 		// resolve answered 500 `internal`, which a client reads as a server
 		// fault and retries, when the honest answer is that the caller must
 		// present a credential that resolves.
+		//
+		// Which is the general shape of this arm, and the defect this table was
+		// written for. The code means the caller did not identify itself as a
+		// service this plane accepts, the contract declares 401 for it on every
+		// operation that can produce it, and it used to fall through to the
+		// default: a caller who had not authenticated was told the server had a
+		// fault. 500 is the status a generated client retries, and a retry with
+		// the same credential fails the same way — so the answer was not merely
+		// wrong, it was the one wrong answer that produces traffic.
 		return stdhttp.StatusUnauthorized, string(application.CodeUnauthenticated), applicationError.Message
+	case application.CodeConflict:
+		// 409, and the message is forwarded for the reason InvalidRequest's is:
+		// the application has already reduced this to a statement about the
+		// request's relationship to the server's state — an account that may not
+		// fund itself — and that statement is what the contract promises the
+		// caller. It names no account, because the answer does not need one: the
+		// caller's own request said which resource it was about.
+		return stdhttp.StatusConflict, string(application.CodeConflict), applicationError.Message
+	case application.CodeUpstreamUnavailable:
+		// 503, and this arm is the closure between the contract and the
+		// implementation rather than a nicety: api/openapi/shared/errors.yaml
+		// names `upstream_unavailable` as a code "produced by the Console API's
+		// payment operations", and api/openapi/console.yaml declares the 503 on
+		// POST /payment-intents with a paragraph explaining what it means —
+		// "the condition is the provider's and is expected to clear, so the
+		// caller retries later rather than differently". Without this arm the
+		// code existed in the document and nowhere else: a provider outage
+		// arrived as CodeInternal and answered 500, which is the one status a
+		// generated client must NOT retry, on the one failure that is safe to.
+		//
+		// The message is fixed rather than forwarded, for internalErrorMessage's
+		// reason: the cause here is a third party's, and a provider's own error
+		// prose is written for someone holding a credential.
+		return stdhttp.StatusServiceUnavailable, string(application.CodeUpstreamUnavailable), upstreamUnavailableMessage
+	case application.CodeInternal:
+		// The cause is deliberately not forwarded and never serialized: a client
+		// can act on the status and the request identifier, and an operational
+		// cause is the operator's fact — writeError logs the correlation line.
+		return stdhttp.StatusInternalServerError, string(application.CodeInternal), internalErrorMessage
 	default:
+		// Unreachable through the application's own vocabulary, and reachable
+		// the moment somebody adds a member to it. A code this build cannot place
+		// is a 500 — it is not a refusal a caller could act on, and it is not a
+		// success — and the log line is what makes it a wiring defect an operator
+		// reads rather than a server error a client reports.
+		log.Printf("%s unrecognised application code %q: answering %d %s",
+			serviceName, applicationError.Code, stdhttp.StatusInternalServerError, application.CodeInternal)
 		return stdhttp.StatusInternalServerError, string(application.CodeInternal), internalErrorMessage
 	}
 }

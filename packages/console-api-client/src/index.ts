@@ -4,20 +4,38 @@
 // layout, which is free to change with a pinned version bump. Anything not
 // listed here is not API.
 //
-// `getVersion` is generated and deliberately NOT re-exported. That is not an
-// oversight to correct: the operations published here are behaviour this
+// Two generated operations are deliberately NOT re-exported, and neither is
+// an oversight to correct: the operations published here are behaviour this
 // package then owes its consumer, and an export nobody imports is a promise
-// kept for a caller who does not exist. `/version` remains reachable through
-// the generated SDK, so nothing is lost — it becomes public API the day the
-// console probes it, which is a one-line change.
+// kept for a caller who does not exist.
+//
+// `getVersion` is withheld on those ordinary terms. `/version` remains
+// reachable through the generated SDK, so nothing is lost — it becomes public
+// API the day the console probes it, which is a one-line change.
+//
+// `receiveProviderWebhook` is withheld on stronger ones, and it is the only
+// operation in `console.yaml` that is withheld because a console must not
+// call it rather than because nothing needs it. It is the payment provider's
+// endpoint: the provider's servers call it, it is authenticated by a
+// signature over the raw request body and not by a session cookie, and a
+// console page's only correct use of it is none. Its body type,
+// `WebhookAcknowledgement`, is withheld with it, because a console that could
+// name the shape of an answer from that endpoint is a console being told it
+// has business there.
 //
 // Every other generated operation IS re-exported, because the console calls
-// all sixteen: the two probes, the three session operations, the
-// server-composed overview, the one key-minting write, and the nine paged
-// reads. `console.yaml` declares seventeen operationIds, and this file
-// re-exports every one of them but the `getVersion` withheld above. The nine
-// paged reads are the nine `list*` operations, one per `*Page` schema in
-// `shared/console.yaml`; `getAccountOverview` is not among them, because
+// all nineteen: the two probes, the three session operations, the
+// server-composed overview, the two writes that produce something new — a
+// minted credential and an opened payment — the ten paged reads, and the
+// top-up price list. `console.yaml` declares twenty-one operationIds, and this
+// file re-exports every one of them but the two withheld above. The eleven
+// `list*` operations are the ten paged reads — one per `*Page` schema in
+// `shared/console.yaml` — plus `listTopUpOffers`, which is deliberately not
+// paged and is published all the same: it is what a top-up chooser renders, so
+// it is a read the console cannot render a screen without. A cursor names a
+// position in a history and a fixed price list has no position to name, which
+// is why its schema has no `next_cursor` to offer rather than a page of one.
+// `getAccountOverview` is not among the paged reads either, because
 // `AccountOverview` is a server-composed projection with no `items`,
 // `next_cursor` or `has_more` and no reference to `PageEnvelope` at all.
 // ADR 0012 §8 scopes the console to exactly the surface `console.yaml`
@@ -34,6 +52,7 @@
 // be a second vocabulary the contract cannot govern.
 export { client } from "./generated/client.gen";
 export {
+  createPaymentIntent,
   getAccountOverview,
   getHealth,
   getReadiness,
@@ -43,9 +62,11 @@ export {
   listFindings,
   listFundingBuckets,
   listLedgerEntries,
+  listPaymentIntents,
   listPlans,
   listReconciliationRuns,
   listSubscriptions,
+  listTopUpOffers,
   listUsers,
   mintApiKey,
   signIn,
@@ -58,6 +79,15 @@ export type {
   ApiKeyPage,
   Balances,
   ClientOptions,
+  CreatePaymentIntentData,
+  CreatePaymentIntentRequest,
+  CreatePaymentIntentResponse,
+  // The currency code both a price and a payment carry, published as the
+  // contract's own named schema rather than as a bare `string`: the console
+  // renders one in a chooser and in a receipt, and a hand-written mirror of
+  // "three letters, uppercase" is a second place that rule would have to be
+  // remembered.
+  CurrencyCode,
   Cursor,
   Entitlement,
   EntitlementPage,
@@ -91,12 +121,16 @@ export type {
   ListFundingBucketsResponse,
   ListLedgerEntriesData,
   ListLedgerEntriesResponse,
+  ListPaymentIntentsData,
+  ListPaymentIntentsResponse,
   ListPlansData,
   ListPlansResponse,
   ListReconciliationRunsData,
   ListReconciliationRunsResponse,
   ListSubscriptionsData,
   ListSubscriptionsResponse,
+  ListTopUpOffersData,
+  ListTopUpOffersResponse,
   ListUsersData,
   ListUsersResponse,
   MintApiKeyData,
@@ -109,6 +143,9 @@ export type {
   // and a hand-written mirror of an envelope the generator owns is a second
   // place a contract change would have to be remembered.
   PageEnvelope,
+  PaymentIntent,
+  PaymentIntentPage,
+  PaymentIntentState,
   Plan,
   PlanPage,
   PriceSnapshot,
@@ -122,6 +159,8 @@ export type {
   SignOutResponse,
   Subscription,
   SubscriptionPage,
+  TopUpOffer,
+  TopUpOfferList,
   User,
   UserPage,
 } from "./generated";

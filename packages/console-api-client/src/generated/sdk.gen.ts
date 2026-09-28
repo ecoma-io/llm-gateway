@@ -3,6 +3,9 @@
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from "./client";
 import { client } from "./client.gen";
 import type {
+  CreatePaymentIntentData,
+  CreatePaymentIntentErrors,
+  CreatePaymentIntentResponses,
   GetAccountOverviewData,
   GetAccountOverviewErrors,
   GetAccountOverviewResponses,
@@ -15,9 +18,6 @@ import type {
   GetSessionData,
   GetSessionErrors,
   GetSessionResponses,
-  GetUsageData,
-  GetUsageErrors,
-  GetUsageResponses,
   GetVersionData,
   GetVersionErrors,
   GetVersionResponses,
@@ -36,6 +36,9 @@ import type {
   ListLedgerEntriesData,
   ListLedgerEntriesErrors,
   ListLedgerEntriesResponses,
+  ListPaymentIntentsData,
+  ListPaymentIntentsErrors,
+  ListPaymentIntentsResponses,
   ListPlansData,
   ListPlansErrors,
   ListPlansResponses,
@@ -45,12 +48,18 @@ import type {
   ListSubscriptionsData,
   ListSubscriptionsErrors,
   ListSubscriptionsResponses,
+  ListTopUpOffersData,
+  ListTopUpOffersErrors,
+  ListTopUpOffersResponses,
   ListUsersData,
   ListUsersErrors,
   ListUsersResponses,
   MintApiKeyData,
   MintApiKeyErrors,
   MintApiKeyResponses,
+  ReceiveProviderWebhookData,
+  ReceiveProviderWebhookErrors,
+  ReceiveProviderWebhookResponses,
   SignInData,
   SignInErrors,
   SignInResponses,
@@ -81,6 +90,7 @@ export type Options<
  * Liveness of the Control Plane API process
  *
  * Returns 200 while the process is able to serve. Anything more than "is the process alive" belongs to /readyz, not here.
+ * It declares no security requirement: a probe is called by an orchestrator that holds no session and could not present one, and a liveness check that demanded a credential would fail for a reason that has nothing to do with whether the process is alive.
  */
 export const getHealth = <ThrowOnError extends boolean = false>(
   options?: Options<GetHealthData, ThrowOnError>,
@@ -94,6 +104,7 @@ export const getHealth = <ThrowOnError extends boolean = false>(
  * Readiness of the Control Plane API service
  *
  * Returns 200 when the service may receive traffic, and 503 while one of the Control Plane's own dependencies is not answering — its database, and only its database. The Data Plane is never among them: this service is ready when it can serve the console, whether or not the runtime is reachable.
+ * It declares no security requirement, exactly as /healthz does: a probe that needed a session would report this deployment unready whenever the orchestrator had none, which is a lie about this process's dependencies.
  */
 export const getReadiness = <ThrowOnError extends boolean = false>(
   options?: Options<GetReadinessData, ThrowOnError>,
@@ -107,6 +118,7 @@ export const getReadiness = <ThrowOnError extends boolean = false>(
  * Build version of the Control Plane API service
  *
  * Returns the version stamped into the console-api binary at build time. It is the repository release version when the release lane supplies one, and "dev" for an unstamped local build.
+ * It declares no security requirement for the same reason the two probes above do, and it is grouped with them deliberately: the three were exempted from the `no-store` rule together, and they are exempted from the session together.
  */
 export const getVersion = <ThrowOnError extends boolean = false>(
   options?: Options<GetVersionData, ThrowOnError>,
@@ -123,6 +135,7 @@ export const getVersion = <ThrowOnError extends boolean = false>(
  * Resolution is `(account_id, email)` over live rows, and never email alone: the address can be live in two accounts, so an email-only lookup is a guess between two live identities (ADR 0008 §1). An `invited` row resolves to exactly one user and **authenticates nobody** — the activation is what establishes that the human who now holds the address is the human the invitation named, and an invited row has not had one (ADR 0012 §2, amending ADR 0008).
  * Every failure — no such account, no such user, a removed user, a wrong credential, an `invited` row — returns the **same** 401 with the **same** body. They are not distinguished, by status, by code, by message, or by wall time: a difference is a disclosure to anyone willing to submit guesses, and the one answer keeps the account's own existence off the wire. The account's lifecycle verdict is made after the credential matches, and says `suspended` or `closed` distinctly — authentication before authorisation, the same step order the API-key path uses.
  * The request body is never logged, at any level, on any path. A sign-in that failed still costs the credential comparison, and the comparison is constant-time, so the wall time of a rejection does not answer whether the account exists.
+ * It declares no security requirement, and it could not declare one: it is the operation that CREATES the session every other operation presents, so a requirement here would be a credential that cannot exist yet. The 401 below is not that requirement failing — it is the credential in the body not matching, which is why it shares one answer with a removed user and an invited row.
  */
 export const signIn = <ThrowOnError extends boolean = false>(
   options: Options<SignInData, ThrowOnError>,
@@ -140,6 +153,7 @@ export const signIn = <ThrowOnError extends boolean = false>(
  * End this session
  *
  * Ends the session the cookie names and clears the cookie. It is **idempotent**: signing out twice is not an error, and signing out with no session is not an error either. A sign-out that failed would leave a session alive on a machine the user believes they signed out of, so the second call answers 204 whether or not there was anything to end — and a caller who cares can read the cookie's absence as the answer.
+ * It declares NO security requirement, and the absence is the design rather than an omission. Every other product operation fails closed on a missing cookie; this one must not, because the caller that has just lost its session is exactly the caller that needs a sign-out to finish — a requirement here would refuse the one call whose whole purpose is to make the absence durable, and a client generated from this document would be told it may not call sign-out until it can prove what it no longer has. The credential it does accept when present is the same `sessionCookie` scheme the rest of the surface names; the row simply treats its absence as "there is nothing to revoke" rather than as a refusal.
  */
 export const signOut = <ThrowOnError extends boolean = false>(
   options?: Options<SignOutData, ThrowOnError>,
@@ -154,11 +168,19 @@ export const signOut = <ThrowOnError extends boolean = false>(
  *
  * What the console calls on every load, before it renders anything, to know whether to show a signed-in shell or a sign-in form. It reads the cookie, resolves the session row, and answers with the principal — no account data, no balances, nothing an unauthenticated caller could enumerate by asking.
  * A 200 here is the only proof of authentication the client ever has, and the client treats it as one: the browser is not a security boundary, and every product operation re-checks the session server-side regardless of what this said.
+ * It requires the session cookie, declared here rather than left to the prose above: without that cookie the answer is the 401 below, so a caller generated from this document can be told the credential is a precondition instead of discovering it from a status.
  */
 export const getSession = <ThrowOnError extends boolean = false>(
   options?: Options<GetSessionData, ThrowOnError>,
 ): RequestResult<GetSessionResponses, GetSessionErrors, ThrowOnError> =>
   (options?.client ?? client).get<GetSessionResponses, GetSessionErrors, ThrowOnError>({
+    security: [
+      {
+        in: "cookie",
+        name: "__Host-console_session",
+        type: "apiKey",
+      },
+    ],
     url: "/auth/session",
     ...options,
   });
@@ -176,7 +198,17 @@ export const getAccountOverview = <ThrowOnError extends boolean = false>(
     GetAccountOverviewResponses,
     GetAccountOverviewErrors,
     ThrowOnError
-  >({ url: "/account/overview", ...options });
+  >({
+    security: [
+      {
+        in: "cookie",
+        name: "__Host-console_session",
+        type: "apiKey",
+      },
+    ],
+    url: "/account/overview",
+    ...options,
+  });
 
 /**
  * The account's console users
@@ -188,6 +220,13 @@ export const listUsers = <ThrowOnError extends boolean = false>(
   options?: Options<ListUsersData, ThrowOnError>,
 ): RequestResult<ListUsersResponses, ListUsersErrors, ThrowOnError> =>
   (options?.client ?? client).get<ListUsersResponses, ListUsersErrors, ThrowOnError>({
+    security: [
+      {
+        in: "cookie",
+        name: "__Host-console_session",
+        type: "apiKey",
+      },
+    ],
     url: "/users",
     ...options,
   });
@@ -201,6 +240,13 @@ export const listApiKeys = <ThrowOnError extends boolean = false>(
   options?: Options<ListApiKeysData, ThrowOnError>,
 ): RequestResult<ListApiKeysResponses, ListApiKeysErrors, ThrowOnError> =>
   (options?.client ?? client).get<ListApiKeysResponses, ListApiKeysErrors, ThrowOnError>({
+    security: [
+      {
+        in: "cookie",
+        name: "__Host-console_session",
+        type: "apiKey",
+      },
+    ],
     url: "/api-keys",
     ...options,
   });
@@ -216,6 +262,13 @@ export const mintApiKey = <ThrowOnError extends boolean = false>(
   options: Options<MintApiKeyData, ThrowOnError>,
 ): RequestResult<MintApiKeyResponses, MintApiKeyErrors, ThrowOnError> =>
   (options.client ?? client).post<MintApiKeyResponses, MintApiKeyErrors, ThrowOnError>({
+    security: [
+      {
+        in: "cookie",
+        name: "__Host-console_session",
+        type: "apiKey",
+      },
+    ],
     url: "/api-keys",
     ...options,
     headers: {
@@ -234,6 +287,13 @@ export const listPlans = <ThrowOnError extends boolean = false>(
   options?: Options<ListPlansData, ThrowOnError>,
 ): RequestResult<ListPlansResponses, ListPlansErrors, ThrowOnError> =>
   (options?.client ?? client).get<ListPlansResponses, ListPlansErrors, ThrowOnError>({
+    security: [
+      {
+        in: "cookie",
+        name: "__Host-console_session",
+        type: "apiKey",
+      },
+    ],
     url: "/plans",
     ...options,
   });
@@ -250,7 +310,17 @@ export const listSubscriptions = <ThrowOnError extends boolean = false>(
     ListSubscriptionsResponses,
     ListSubscriptionsErrors,
     ThrowOnError
-  >({ url: "/subscriptions", ...options });
+  >({
+    security: [
+      {
+        in: "cookie",
+        name: "__Host-console_session",
+        type: "apiKey",
+      },
+    ],
+    url: "/subscriptions",
+    ...options,
+  });
 
 /**
  * The entitlements the account's subscriptions materialised
@@ -261,6 +331,13 @@ export const listEntitlements = <ThrowOnError extends boolean = false>(
   options?: Options<ListEntitlementsData, ThrowOnError>,
 ): RequestResult<ListEntitlementsResponses, ListEntitlementsErrors, ThrowOnError> =>
   (options?.client ?? client).get<ListEntitlementsResponses, ListEntitlementsErrors, ThrowOnError>({
+    security: [
+      {
+        in: "cookie",
+        name: "__Host-console_session",
+        type: "apiKey",
+      },
+    ],
     url: "/entitlements",
     ...options,
   });
@@ -278,7 +355,17 @@ export const listFundingBuckets = <ThrowOnError extends boolean = false>(
     ListFundingBucketsResponses,
     ListFundingBucketsErrors,
     ThrowOnError
-  >({ url: "/funding-buckets", ...options });
+  >({
+    security: [
+      {
+        in: "cookie",
+        name: "__Host-console_session",
+        type: "apiKey",
+      },
+    ],
+    url: "/funding-buckets",
+    ...options,
+  });
 
 /**
  * One bucket's ledger, oldest first
@@ -290,8 +377,98 @@ export const listLedgerEntries = <ThrowOnError extends boolean = false>(
   options: Options<ListLedgerEntriesData, ThrowOnError>,
 ): RequestResult<ListLedgerEntriesResponses, ListLedgerEntriesErrors, ThrowOnError> =>
   (options.client ?? client).get<ListLedgerEntriesResponses, ListLedgerEntriesErrors, ThrowOnError>(
-    { url: "/funding-buckets/{funding_bucket_id}/ledger", ...options },
+    {
+      security: [
+        {
+          in: "cookie",
+          name: "__Host-console_session",
+          type: "apiKey",
+        },
+      ],
+      url: "/funding-buckets/{funding_bucket_id}/ledger",
+      ...options,
+    },
   );
+
+/**
+ * The top-up offers this deployment sells
+ *
+ * What a customer may choose to top up with: each offer's identifier, the amount it charges, the currency that amount is in, and a label to render. It is the price list, and a console that rendered a top-up chooser without it would be asking a customer to name an offer they could not see — a blind POST, which is not a screen.
+ * This is the ONLY operation on this surface that publishes a price, and publishing it read-only is what keeps the design whole rather than breaking it. The request side still names an OFFER and never an amount: `CreatePaymentIntentRequest` carries no `amount_minor_units` and no `currency`, and nothing here changes that. Showing a price and being able to set one are different powers, and they are held by different operations — a client that reads these figures is reading what the server charges, not choosing it.
+ * The offers are this DEPLOYMENT's own configuration rather than anybody's rows: a price this plane decides, not a fact about an account. That is why the operation is not account-scoped, carries no account parameter, and returns the same list to every session that may fund itself.
+ * The response is deliberately not a `PageEnvelope`, and the reason is the one this repository already gives for rejecting page numbers: a cursor names a POSITION, and a fixed price list has no position to name. There is no `total` either — a count maintained for a list that arrives whole would be a number that goes stale for nobody's benefit.
+ */
+export const listTopUpOffers = <ThrowOnError extends boolean = false>(
+  options?: Options<ListTopUpOffersData, ThrowOnError>,
+): RequestResult<ListTopUpOffersResponses, ListTopUpOffersErrors, ThrowOnError> =>
+  (options?.client ?? client).get<ListTopUpOffersResponses, ListTopUpOffersErrors, ThrowOnError>({
+    security: [
+      {
+        in: "cookie",
+        name: "__Host-console_session",
+        type: "apiKey",
+      },
+    ],
+    url: "/top-up-offers",
+    ...options,
+  });
+
+/**
+ * The account's payments, newest first
+ *
+ * The account's payments, keyset-paged, newest first. The cursor is a payment's own id and it is unique, so a page can neither skip a payment nor read one twice, and the id is minted in time order, so a page is very nearly a slice of the account's payment history in the order it happened.
+ * The list is the account's payments and **only** the account's. The account comes from the session, and the query carries the predicate with it — as a `WHERE` clause and not as a filter applied to rows already fetched — so another account's payment is a row the query never returned.
+ * Nothing on this read decides anything about a payment: an intent's status was written by a signed delivery from the provider's servers, and a page that rendered a payment as settled is rendering the provider's word as this plane recorded it. That is why the console reloads a payment after sending a customer to checkout instead of assuming the answer from the redirect.
+ */
+export const listPaymentIntents = <ThrowOnError extends boolean = false>(
+  options?: Options<ListPaymentIntentsData, ThrowOnError>,
+): RequestResult<ListPaymentIntentsResponses, ListPaymentIntentsErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    ListPaymentIntentsResponses,
+    ListPaymentIntentsErrors,
+    ThrowOnError
+  >({
+    security: [
+      {
+        in: "cookie",
+        name: "__Host-console_session",
+        type: "apiKey",
+      },
+    ],
+    url: "/payment-intents",
+    ...options,
+  });
+
+/**
+ * Open a payment against a top-up offer
+ *
+ * Opens a payment for the top-up the customer chose, and answers with it. The request names an OFFER and the server prices it: `amount_minor_units` and `currency` are not fields of the request and cannot be, because a client-supplied amount is not a smaller version of a policy, it is the absence of one. A price is a decision this platform makes about what a top-up costs, in the currency it settles in; a client that could send one could charge itself one minor unit or a billion, and the server would have no rule to refuse either. The offer resolves, here and server-side, into an amount the request never carried.
+ * The response is the payment, and it is durable **before** the provider is called: the intent is written first because the provider's own idempotency key is derived from the payment's identity, and a key derived from something that does not exist until after the call is a key that cannot make a retry the same request. That ordering is also what makes the 503 below safe to retry.
+ * A retried request carrying the same `idempotency_key` converges: it is answered with the payment the account already has, the same `id` and the same checkout, rather than opening a second one. The 201 is the answer on both the first call and the converged repeat, because the client asked for a payment and now holds it; which of the two happened is not a difference a page may act on, so the contract does not make one available.
+ * Nothing here decides that a payment succeeded. The provider does, from its own servers, at an endpoint no browser can call — see `POST /payment-webhooks/{provider}` — and a console learns the outcome by re-reading the payment.
+ */
+export const createPaymentIntent = <ThrowOnError extends boolean = false>(
+  options: Options<CreatePaymentIntentData, ThrowOnError>,
+): RequestResult<CreatePaymentIntentResponses, CreatePaymentIntentErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    CreatePaymentIntentResponses,
+    CreatePaymentIntentErrors,
+    ThrowOnError
+  >({
+    security: [
+      {
+        in: "cookie",
+        name: "__Host-console_session",
+        type: "apiKey",
+      },
+    ],
+    url: "/payment-intents",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * The divergences the worker has recorded
@@ -303,6 +480,13 @@ export const listFindings = <ThrowOnError extends boolean = false>(
   options?: Options<ListFindingsData, ThrowOnError>,
 ): RequestResult<ListFindingsResponses, ListFindingsErrors, ThrowOnError> =>
   (options?.client ?? client).get<ListFindingsResponses, ListFindingsErrors, ThrowOnError>({
+    security: [
+      {
+        in: "cookie",
+        name: "__Host-console_session",
+        type: "apiKey",
+      },
+    ],
     url: "/reconciliation/findings",
     ...options,
   });
@@ -319,27 +503,42 @@ export const listReconciliationRuns = <ThrowOnError extends boolean = false>(
     ListReconciliationRunsResponses,
     ListReconciliationRunsErrors,
     ThrowOnError
-  >({ url: "/reconciliation/runs", ...options });
+  >({
+    security: [
+      {
+        in: "cookie",
+        name: "__Host-console_session",
+        type: "apiKey",
+      },
+    ],
+    url: "/reconciliation/runs",
+    ...options,
+  });
 
 /**
- * The caller's account usage over a range
+ * One delivery from the payment provider — never a console call
  *
- * Returns one account's usage figures over a half-open range `[from, to)`, cut into buckets of the requested granularity.
- * SCOPE IS DERIVED, NEVER REQUESTED. There is no account parameter on this operation and no other way for a caller to name the account these figures are about. The scope comes from the credential on the request, resolved on the server, and it is applied inside the statement that produces the numbers rather than after it. A caller therefore has nothing to tamper with: there is no filter on the request to tamper with, and a caller that presents a scope it was not granted is refused rather than silently answered for its own.
- * WHAT THIS SERVES, AND WHAT IT DELIBERATELY DOES NOT. Every figure is derived from the Control Plane's own state — the settlement headers of record, the usage-fact ledger, and the accounting projection's cached balances — and every one of them is reconstructable from that state. None is an authority, and the ledger remains the money record: a usage figure and the ledger disagreeing is a defect in the figure.
- * THE POPULATION IS NAMED, NOT ASSUMED. This plane cannot derive the requests the runtime ADMITTED: a request that produced no usage fact leaves no row here at all, so any "requests admitted" figure it published would measure the set of requests it knows about and call it the set of requests. The counts here are therefore named for what they count — `requests_with_usage_facts` — and the absence of the operational metrics below is the same finding seen from the other side.
- * Requests, latency, attempts, per-model and per-provider spend, routing outcomes and egress are NOT served: they are the Data Plane's operational facts and no read path imports them here at all. Token counts are NOT served either, and for a different reason — the counters DO travel this plane's fact feed, and they are byte lengths under a tokenizer's name, so a figure published from them as a token count would be a category error invisible in the output, an integer being an integer regardless of what the field is called (docs/architecture/analytics.md §10.2).
- * Their absence is a decision rather than a gap, and a figure this surface cannot source honestly is one it will not serve — not at zero, which would be a false statement about a customer, and not as an empty series, which would render as a quiet month.
- * NOTHING HERE IS CLOSED. No period is closed anywhere in this system: no accounting period, no close, no lock. A late usage fact lands in the bucket it lands in and changes a figure that was already reported, so a range ending near `freshness.data_through` is provisional, and `final_bucket_partial` says so structurally. Read the freshness object before treating any of this as a bill.
- * SERVED AT `/usage`, like every product operation here: this document's server base is `/`, so the path a caller calls is the path declared above. The runtime's namespace prefix is `/v1/` and nothing on this surface is served under it (ADR 0006 §5).
- * BOUNDS ARE REFUSALS. A range longer than 90 days, a `from` at or after `to`, a granularity outside the enumeration, or an unknown query parameter is HTTP 400 with `invalid_request`. Nothing is clamped: a silently shortened range is indistinguishable from the range that was asked for, and a caller could not learn of the mismatch anywhere.
- * The answer is subject to a per-request deadline. A caller that exceeds it receives HTTP 503 with `service_unavailable`, which is a retry-later answer rather than a differently-shaped one.
+ * This operation is called by the payment provider's servers. It is not called by the console, it is not called by any browser, and it must never be invoked from browser code: it is authenticated by a cryptographic signature computed over the exact bytes of the request body with a signing secret only the provider and this deployment hold, and NOT by a session cookie. The request carries no session, no origin and no double-submit token. A client generated from this document must not expose it as a callable function, and a console page's only correct response to this operation existing is to never call it.
+ * The signature covers the RAW BYTES, and the raw bytes are what are verified. The body is never parsed and re-serialised before verification, because a decoded object has lost its whitespace, its key order, its duplicate keys and its number spellings, and a signature computed over that authenticates something the provider never sent. The header below carries the signature; the path segment is an ADDRESS, not a request parameter, and this process answers for exactly one of them — see the parameter and the 404 below.
+ * The statuses are a deliberate and unusual shape, and the rule that produces them is one sentence: **2xx means "this event needs no further delivery from you"**. Applied, already recorded as a duplicate, and quarantined are all 2xx with one identical body, because the only decision the provider makes from this response is whether to send the event again. A quarantined delivery is one this build authenticated and cannot interpret — an event kind it has no rule for, a schema version ahead of it — and it is recorded, where it can be, as an operator's work item; refusing it would put a permanent refusal into the provider's retry budget, and a retry storm is what comes out of that.
+ * 400 has exactly one meaning, and the sentence above is what keeps it narrow: this delivery may not be acted on, and never will be. Two things make a delivery permanently unusable, and both are facts about the delivery rather than about its contents. The signature header is absent, appears more than once, or does not equal what this deployment computes over these exact bytes — the delivery did not authenticate. Or the signature is correct and the delivery is STALE: it arrived outside the freshness tolerance this deployment allows between the moment the provider signed it and the moment it was received, which is a replay rather than a delivery, and this plane refuses it for the same reason it refuses a forged one — a signature proves who sent a message, and the tolerance is what makes it proof about a MOMENT. A redelivery of a stale event carries the same signed timestamp, so a retry could only repeat the refusal, which is why neither case belongs in the provider's retry budget.
+ * It is NOT the answer to a delivery this build authenticated and cannot read — that is a 200, and the two must not share a status. A refusal for authenticity and a refusal for readability are opposite events, an attack or a misconfiguration against a provider bug, and a status that meant both would be a status an operator cannot monitor: the responses they call for have nothing in common, and a 400 cannot say which one happened. Keeping them apart is also what keeps the rule above total rather than "2xx means we used it, except sometimes", and a retry would buy nothing anyway — the provider's next attempt carries the SAME bytes, so a tenth reading could not find what the first did not.
+ * 5xx is declared for exactly one situation — nothing was durably recorded — because that is the only case in which a redelivery can change the outcome.
+ * Nothing here names an account and nothing here is authorized against one. A delivery names a reference; the reference resolves to a payment THIS PLANE CREATED, and that payment carries the account and the funding bucket fixed when it was opened. The account is a consequence of a stored row rather than of anything the payload said, because a signature proves who sent a message and not what the message may do.
+ * A 404 here is about the ADDRESS rather than the message, and it is reached before the signature is: this deployment serves one provider, the path segment must name it, and a delivery addressed to any other is refused without a header being read or a byte of the body being taken. That is the whole of why it exists — the alternative is what this row would do without it: verify every delivery to every path against the one configured secret, so that a mistyped endpoint URL answers the provider "did not authenticate" for a URL that was never served, and an operator hunts a signing-secret problem that is not there.
  */
-export const getUsage = <ThrowOnError extends boolean = false>(
-  options: Options<GetUsageData, ThrowOnError>,
-): RequestResult<GetUsageResponses, GetUsageErrors, ThrowOnError> =>
-  (options.client ?? client).get<GetUsageResponses, GetUsageErrors, ThrowOnError>({
-    security: [{ scheme: "bearer", type: "http" }],
-    url: "/usage",
+export const receiveProviderWebhook = <ThrowOnError extends boolean = false>(
+  options: Options<ReceiveProviderWebhookData, ThrowOnError>,
+): RequestResult<ReceiveProviderWebhookResponses, ReceiveProviderWebhookErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    ReceiveProviderWebhookResponses,
+    ReceiveProviderWebhookErrors,
+    ThrowOnError
+  >({
+    url: "/payment-webhooks/{provider}",
     ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });

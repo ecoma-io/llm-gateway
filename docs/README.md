@@ -12,18 +12,21 @@ architecture decisions land the same way: an ADR is written and accepted
 first, and the implementation follows the decision — an architecture decision
 that is not recorded as an ADR has not been made.
 
-| ADR                                                           | Decision                                                                                                          |
-| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| [0001](adr/0001-bounded-contexts-and-aggregates.md)           | Bounded contexts and aggregate boundaries                                                                         |
-| [0002](adr/0002-routing-and-fallback-ownership.md)            | Routing model — who owns fallback, translation, and egress                                                        |
-| [0003](adr/0003-concurrent-subscriptions-and-entitlements.md) | Commerce — concurrent subscriptions, scoped entitlements, and PAYG                                                |
-| [0004](adr/0004-reserve-and-settle-accounting.md)             | Accounting — reserve, execute, settle                                                                             |
-| [0005](adr/0005-relational-and-event-storage-split.md)        | Storage — PostgreSQL relational state and Timescale-oriented event history                                        |
-| [0006](adr/0006-control-plane-and-data-plane.md)              | Control Plane and Data Plane — the four applications, their boundaries and their data                             |
-| [0007](adr/0007-control-to-data-projection.md)                | The Control → Data credential projection — durable log, reconciliation loop, and mirror                           |
-| [0008](adr/0008-console-sign-in-identity.md)                  | Console sign-in — account-scoped resolution and the live-filtered email lookup rule                               |
-| [0009](adr/0009-provider-adapters-and-egress.md)              | Provider adapters and egress — the executor boundary, the settled claim, and the renewed lease                    |
-| [0010](adr/0010-usage-fact-ingestion-and-settlement.md)       | Usage fact ingestion and settlement — the pull consumer, the kind-classed ledger, and the page that commits whole |
+| ADR                                                           | Decision                                                                                                                   |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| [0001](adr/0001-bounded-contexts-and-aggregates.md)           | Bounded contexts and aggregate boundaries                                                                                  |
+| [0002](adr/0002-routing-and-fallback-ownership.md)            | Routing model — who owns fallback, translation, and egress                                                                 |
+| [0003](adr/0003-concurrent-subscriptions-and-entitlements.md) | Commerce — concurrent subscriptions, scoped entitlements, and PAYG                                                         |
+| [0004](adr/0004-reserve-and-settle-accounting.md)             | Accounting — reserve, execute, settle                                                                                      |
+| [0005](adr/0005-relational-and-event-storage-split.md)        | Storage — PostgreSQL relational state and Timescale-oriented event history                                                 |
+| [0006](adr/0006-control-plane-and-data-plane.md)              | Control Plane and Data Plane — the four applications, their boundaries and their data                                      |
+| [0007](adr/0007-control-to-data-projection.md)                | The Control → Data credential projection — durable log, reconciliation loop, and mirror                                    |
+| [0008](adr/0008-console-sign-in-identity.md)                  | Console sign-in — account-scoped resolution and the live-filtered email lookup rule                                        |
+| [0009](adr/0009-provider-adapters-and-egress.md)              | Provider adapters and egress — the executor boundary, the settled claim, and the renewed lease                             |
+| [0010](adr/0010-usage-fact-ingestion-and-settlement.md)       | Usage fact ingestion and settlement — the pull consumer, the kind-classed ledger, and the page that commits whole          |
+| [0011](adr/0011-reaper-and-reconciliation.md)                 | The reaper and the reconciliation pass — a second door into an ending, and a second look at what the Control Plane derived |
+| [0012](adr/0012-management-console.md)                        | The management console — its surface, its read model, and what it does not have                                            |
+| [0013](adr/0013-payment-integration.md)                       | Payment integration — what has financial authority, and what merely has a browser                                          |
 
 ## Architecture pages
 
@@ -42,7 +45,8 @@ and the serving domains are still design.
 - [Cross-plane protocols](architecture/cross-plane-protocols.md) — what crosses
   the plane boundary in each direction, and how a fact reaches its consumer
 - [Ports and adapters](architecture/ports.md) — the layering every Go
-  application keeps, and the fact-feed chain end to end
+  application keeps, and the two chains that run through it end to end: the
+  fact feed and the payment webhook
 - [Routing](architecture/routing.md) — the routing pipeline, its policy inputs
   and egress ownership
 - [Request lifecycle](architecture/request-lifecycle.md) — what happens to one

@@ -22,6 +22,7 @@
 // the runtime (ADR 0006 §4).
 import {
   client,
+  createPaymentIntent,
   getAccountOverview,
   getHealth,
   getReadiness,
@@ -31,15 +32,18 @@ import {
   listFindings,
   listFundingBuckets,
   listLedgerEntries,
+  listPaymentIntents,
   listPlans,
   listReconciliationRuns,
   listSubscriptions,
+  listTopUpOffers,
   listUsers,
   mintApiKey,
   signIn,
   signOut,
   type AccountOverview,
   type ApiKeyPage,
+  type CreatePaymentIntentRequest,
   type EntitlementPage,
   type Error as ApiError,
   type ErrorEnvelope,
@@ -54,17 +58,22 @@ import {
   type ListFindingsData,
   type ListFundingBucketsData,
   type ListLedgerEntriesData,
+  type ListPaymentIntentsData,
   type ListPlansData,
   type ListReconciliationRunsData,
   type ListSubscriptionsData,
+  type ListTopUpOffersData,
   type ListUsersData,
   type MintApiKeyResponse,
+  type PaymentIntent,
+  type PaymentIntentPage,
   type PlanPage,
   type Principal,
   type ReconciliationRunPage,
   type SignInRequest,
   type SignInResponse,
   type SubscriptionPage,
+  type TopUpOfferList,
   type UserPage,
 } from "@ecoma-io/llm-gateway-console-api-client";
 
@@ -192,7 +201,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * shorthand here. `503` is `service_unavailable` and not
  * `upstream_unavailable`: those are two different codes on two different
  * statuses, and inferring one from the other is precisely how an outage ends up
- * rendered with the wrong recovery affordance.
+ * rendered with the wrong recovery affordance. `403` is absent for the same
+ * reason `429` is: the one operation that declares it —
+ * `createPaymentIntent`, whose cross-origin and double-submit guard is the
+ * reason that POST has a 403 and the two payment GETs do not — declares its
+ * code as `invalid_request`, which the parsed envelope carries. A `403` that
+ * arrived with no envelope at all is not a status this table will guess a code
+ * for, because the guess would be a second opinion about a security refusal.
+ *
+ * `409` IS here, and it is the only status whose code could not have been
+ * derived from anything already in this file. It is the payment write's own
+ * refusal: the body is well-formed and the SERVER's state says no, which is
+ * `conflict` and not `invalid_request`. A status → code table without this row
+ * would render the account-state refusal as `internal` — a bug with a request
+ * id nobody can look up — and the failure matrix's `conflict` row would be
+ * unreachable from a response whose body did not parse.
  */
 function codeForStatus(status: number): ApiError["code"] {
   switch (status) {
@@ -204,6 +227,8 @@ function codeForStatus(status: number): ApiError["code"] {
       return "not_found";
     case 405:
       return "method_not_allowed";
+    case 409:
+      return "conflict";
     case 503:
       return "service_unavailable";
     default:
@@ -449,6 +474,50 @@ export async function fetchEntitlements(
   options: ListOptions<ListEntitlementsData> = {},
 ): Promise<ApiResult<EntitlementPage>> {
   return call<EntitlementPage>(() => listEntitlements(options));
+}
+
+// ─── payments ───────────────────────────────────────────────────────────────
+
+/**
+ * The offers this deployment publishes. Not a paged read and deliberately so:
+ * a cursor names a position in a history and a price list has no position to
+ * name, which is why `TopUpOfferList` has no `next_cursor` and why this wrapper
+ * takes the `*Data` type of an operation with no query at all.
+ *
+ * It is a read of the DEPLOYMENT and not of the account: the list is the same
+ * for every customer, which is why nothing here is filtered by the session.
+ */
+export async function fetchTopUpOffers(
+  options: ListOptions<ListTopUpOffersData> = {},
+): Promise<ApiResult<TopUpOfferList>> {
+  return call<TopUpOfferList>(() => listTopUpOffers(options));
+}
+
+/** One account's payments, newest first. Paged, and the cursor is the server's. */
+export async function fetchPaymentIntents(
+  options: ListOptions<ListPaymentIntentsData> = {},
+): Promise<ApiResult<PaymentIntentPage>> {
+  return call<PaymentIntentPage>(() => listPaymentIntents(options));
+}
+
+/**
+ * Open a payment for one offer, under the caller's key for that top-up.
+ *
+ * `request` is the contract's own `CreatePaymentIntentRequest` rather than two
+ * loose arguments, so the key cannot be forgotten at a call site: it is a
+ * required member of the type, and a request without one is refused by the
+ * server rather than served as a second payment.
+ *
+ * The double-submit token is echoed because this is the console's ONE
+ * money-moving POST. The contract declares a `403` on this operation and on no
+ * other — an unsafe method carries an `Origin` and the CSRF guard, a GET does
+ * not — so a browser-side security refusal is a real outcome here and is
+ * rendered through the matrix's `invalid_request` row.
+ */
+export async function createPaymentForOffer(
+  request: CreatePaymentIntentRequest,
+): Promise<ApiResult<PaymentIntent>> {
+  return call<PaymentIntent>(() => createPaymentIntent({ body: request, headers: csrfHeader() }));
 }
 
 // ─── accounting ─────────────────────────────────────────────────────────────

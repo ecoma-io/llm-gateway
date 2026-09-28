@@ -404,15 +404,16 @@ is taken.
   **Disabling** blocks new spills at admission
   (the waterfall treats PAYG as absent); holds already secured against the
   bucket settle normally against it.
-- **Funding** appends `topup` legs to the account's PAYG funding bucket
-  (operator-recorded today; payment-provider webhooks later —
-  [request lifecycle](request-lifecycle.md)). Every topup carries a command
+- **Funding** appends `topup` legs to the account's PAYG funding bucket —
+  written by an operator, or by a verified payment-provider webhook
+  ([request lifecycle](request-lifecycle.md); ADR
+  [0013](../adr/0013-payment-integration.md)). Every topup carries a command
   key unique per `(bucket, command_key)` — a partial unique index in the
   schema — so a redelivered webhook cannot fund twice: the same key converges
   on the original leg, and the same key with a different amount is a named
   contract defect rather than a second payment. The key is the caller's
-  idempotency identity, so each source (operator today, provider later)
-  namespaces its own keys into that one scope.
+  idempotency identity, so each source (an operator, a provider) namespaces
+  its own keys into that one scope.
 - **Access**: an alias is servable iff a matching active entitlement exists
   **or** PAYG is enabled (ADR 0003). Client prices are **alias-exact** — the
   effective price revision prices every active alias exactly once, so a
@@ -444,9 +445,10 @@ PAYG's funding is the same authority by another door: the account's bucket is
 opened with a zero balance and the write-once reference is filed in one unit
 of work (a choreography over IDs, not a shared transaction — the bucket is an
 Accounting aggregate), and funding appends keyed `topup` legs to it. An
-operator's topup today is the payment webhook's entry tomorrow, with the same
-key-same-payload convergence ([request lifecycle](request-lifecycle.md);
-[accounting](accounting.md)).
+operator's topup and a payment webhook's are the same entry by another door,
+with the same key-same-payload convergence ([request
+lifecycle](request-lifecycle.md); [accounting](accounting.md); ADR
+[0013](../adr/0013-payment-integration.md)).
 
 ## Insufficient entitlement — decision table
 

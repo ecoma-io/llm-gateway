@@ -466,7 +466,7 @@ in queries/jobs that:
 There is no second metering pipeline: the usage event written at step 12 is
 the single substrate for usage analytics.
 
-## Future payment-provider integration — its own disjoint path
+## Payment-provider integration — its own disjoint path
 
 Payments (topping up PAYG balance, charging subscriptions at renewal) enter
 exclusively as:
@@ -482,8 +482,37 @@ payment provider webhook → (verified) → append `topup` / subscription lifecy
 - The ledger entry kinds (`topup`, `grant`) and the subscription states
   (`suspended` for payment failure, etc.) already exist in this model — the
   integration adds a **writer**, not new domain concepts.
-- Until that integration exists, top-ups are recorded by the operator through
-  whatever internal surface comes first; the accounting shape is identical.
 
-This separation is what lets the gateway ship and operate before any payment
-provider is chosen, without re-modelling when one is.
+This separation is what let the gateway ship and operate before any payment
+provider was chosen, and it is why choosing one did not re-model anything.
+
+### What landed, and the one word in the diagram that carries the weight
+
+B15 builds the PAYG top-up half of that path. The word **(verified)** above is
+where its whole security argument lives, and it is worth saying here what it
+resolved to:
+
+- **The verified webhook is the only financial authority.** The customer's
+  browser returns to a page that re-reads the payment's status from this
+  plane's own rows; it credits nothing, and no code path exists by which it
+  could. A provider event is resolved against a payment row this plane wrote,
+  and the account and the funding bucket come from that row rather than from
+  the payload — so a signed message cannot name whose money moves.
+- **The signature is computed over the exact bytes that are interpreted.** A
+  parsed-then-re-serialised body loses its whitespace, key order and number
+  spellings, and an HMAC over it authenticates a message the provider never
+  sent. The provider port cannot be handed a parsed request at all.
+- **The delivery record and the funding leg are one transaction.** A redelivery
+  is a duplicate because a unique key says so, not because a timestamp was
+  fresh — a timestamp bounds staleness and cannot bound replay.
+- **Refunds are recognised and recorded, not booked.** A refund is a debit that
+  leaves `settled`, and the accounting algebra has no movement for a customer
+  who has already spent the money. ADR
+  [0013](../adr/0013-payment-integration.md) §9 records why every alternative
+  was worse.
+
+Still out of scope, and named so their absence is a decision rather than a gap:
+card data of any kind (the checkout is provider-hosted, and no field for it
+exists), issuing refunds, provider payouts and fees, reconciliation against the
+provider, and multi-currency — the settlement currency is a platform-wide
+singleton, and the currency on a payment must equal the provider's.

@@ -53,11 +53,11 @@ func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 		"GET /auth/session",
 		"DELETE /auth/session",
 		"POST /api-keys",
-		// The ten reads. Seven are account-scoped and take their account from
-		// the session, never from the path; three — the plan catalogue, the
-		// findings and the reconciliation runs — are whole-plane and are
-		// account-scoped by nothing, which is the contract's own statement
-		// about them rather than an omission here.
+		// The reads. Seven are account-scoped and take their account from the
+		// session, never from the path; four — the plan catalogue, the top-up
+		// price list, the findings and the reconciliation runs — are whole-plane
+		// and are account-scoped by nothing, which is the contract's own
+		// statement about them rather than an omission here.
 		"GET /account/overview",
 		"GET /users",
 		"GET /api-keys",
@@ -73,6 +73,14 @@ func TestTheSurfaceIsTheDeclaredSet(t *testing.T) {
 		// rest: a route that appears without a line in this list is a surface
 		// nobody reviewed.
 		"GET /usage",
+		// The payment surface: the price list and the account's payments are
+		// reads, and the two writes are the top-up itself and the provider's
+		// delivery endpoint — the last of which is the one row on this surface
+		// no browser may call.
+		"GET /top-up-offers",
+		"GET /payment-intents",
+		"POST /payment-intents",
+		"POST /payment-webhooks/{provider}",
 	}
 
 	sort.Strings(want)
@@ -96,23 +104,40 @@ func TestTheControlPlaneServesNoInferenceRoute(t *testing.T) {
 // TestEveryUnsafeRouteIsGuarded is the mechanical form of ADR 0012 §2's
 // "four layers, because SameSite is a browser control and not a boundary".
 //
-// The guard is derived from the method in routes(), so this is a regression pin
-// rather than a check of a hand-set field: it turns red the moment someone
-// changes the derivation, and it is the assertion that states what the
-// derivation must be. An unsafe method whose row is not guarded is a
-// money-moving write reachable by a cross-origin page, which is the failure
-// mode the whole session surface exists to prevent.
+// The guard class is derived from the method in routes() for every row that does
+// not declare one, so this is a regression pin rather than a check of a hand-set
+// field: it turns red the moment someone changes the derivation, and it is the
+// assertion that states what the derivation must be. An unsafe method whose row
+// is not guarded is a money-moving write reachable by a cross-origin page, which
+// is the failure mode the whole session surface exists to prevent.
+//
+// There are exactly two right answers for an unsafe row and they are not
+// interchangeable: guardBrowserUnsafe is the browser's three guards, and
+// guardServerToServer is a write that authenticates ITSELF — the provider's
+// webhook, which has no origin, no cookie and no session to present, and which
+// browser guards would refuse every time. The one value an unsafe row may not
+// carry is guardNone, and that is what the first branch below asserts. A class
+// rather than a boolean is what makes that a distinction a reader can see in the
+// table and a test can require, instead of a `false` that says both "no guards"
+// and "not the browser's guards".
 //
 // The reverse direction matters as much. A safe method marked guarded would be a
 // read that requires an origin and a double-submit token, which is not stricter
 // — it is unreachable, because a browser does not send Origin on a same-origin
-// GET. So the rule has a wrong answer in each direction and this asserts both.
+// GET. So the rule has a wrong answer in each direction and this asserts both,
+// with the safe direction requiring guardNone exactly.
 func TestEveryUnsafeRouteIsGuarded(t *testing.T) {
 	for _, rt := range routeTableForTest() {
-		unsafe := isUnsafeMethod(rt.method)
-		if rt.guard != unsafe {
-			t.Errorf("%s %s: guarded = %v, want %v; an unsafe method must clear the origin, content-type and double-submit guards",
-				rt.method, rt.path, rt.guard, unsafe)
+		if isUnsafeMethod(rt.method) {
+			if rt.guard != guardBrowserUnsafe && rt.guard != guardServerToServer {
+				t.Errorf("%s %s: guard = %s, want %s or %s; an unsafe method must clear the origin, content-type and double-submit guards, or declare that it authenticates itself",
+					rt.method, rt.path, rt.guard, guardBrowserUnsafe, guardServerToServer)
+			}
+			continue
+		}
+		if rt.guard != guardNone {
+			t.Errorf("%s %s: guard = %s, want %s; a safe method is guarded by the session cookie inside its handler and by nothing at the mount, because a browser sends no Origin on a same-origin GET",
+				rt.method, rt.path, rt.guard, guardNone)
 		}
 	}
 }
@@ -122,19 +147,34 @@ func TestEveryUnsafeRouteIsGuarded(t *testing.T) {
 //
 // Without it, an empty product surface would satisfy TestEveryUnsafeRouteIsGuarded
 // vacuously — no unsafe row, no violated rule, a green test over a guard that
-// guards nothing. The two product writes this change ships are named here, so
+// guards nothing. The writes this surface ships are counted here, by class, so
 // removing one without deciding anything turns this red and names what is
 // missing.
+//
+// The counts are per class rather than one total, and the split is the assertion:
+// four browser writes are the session's three (POST /auth/sign-in,
+// DELETE /auth/session, POST /api-keys) plus POST /payment-intents, and the ONE
+// server-to-server write is the provider's delivery endpoint
+// (POST /payment-webhooks/{provider}). A fifth browser write arriving without a
+// decision, or the webhook quietly losing its class and inheriting the browser
+// guards, both turn this red — and the second is the one that would otherwise be
+// invisible, because a provider refused by an origin check answers 403 and no
+// test that only counted total guarded routes would notice.
 func TestTheGuardCoversEveryUnsafeMethodTheSurfaceDeclares(t *testing.T) {
-	guarded := 0
+	browser, serverToServer := 0, 0
 	for _, rt := range routeTableForTest() {
-		if rt.guard {
-			guarded++
+		switch rt.guard {
+		case guardBrowserUnsafe:
+			browser++
+		case guardServerToServer:
+			serverToServer++
 		}
 	}
-	// Three: POST /auth/sign-in, DELETE /auth/session, POST /api-keys.
-	if guarded != 3 {
-		t.Errorf("the surface declares %d guarded routes, want 3; the session surface's three writes are the ones the guards exist for", guarded)
+	if browser != 4 {
+		t.Errorf("the surface declares %d browser-guarded routes, want 4; the session surface's three writes and the top-up are the ones the browser guards exist for", browser)
+	}
+	if serverToServer != 1 {
+		t.Errorf("the surface declares %d server-to-server routes, want 1; POST /payment-webhooks/{provider} is the one write here that authenticates itself with a signature over the raw body", serverToServer)
 	}
 }
 

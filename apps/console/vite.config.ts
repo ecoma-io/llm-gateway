@@ -32,9 +32,12 @@ export default defineConfig({
     // The list is the console-api's route table, not a guess: the three probes,
     // `/auth` (sign-in, the session read, sign-out), `/account`, `/users`,
     // `/api-keys`, `/plans`, `/subscriptions`, `/entitlements`,
-    // `/funding-buckets` (whose prefix also covers that bucket's ledger) and
-    // `/reconciliation`. A path added to api/openapi/console.yaml without a
-    // rule here is a dev-server 404 that looks exactly like a backend failure.
+    // `/funding-buckets` (whose prefix also covers that bucket's ledger),
+    // `/top-up-offers` and `/payment-intents` (the price list and the payments,
+    // which are two routes rather than one prefix because neither is nested
+    // under the other) and `/reconciliation`. A path added to
+    // api/openapi/console.yaml without a rule here is a dev-server 404 that
+    // looks exactly like a backend failure.
     proxy: {
       "/healthz": "http://localhost:8080",
       "/readyz": "http://localhost:8080",
@@ -47,6 +50,8 @@ export default defineConfig({
       "/subscriptions": "http://localhost:8080",
       "/entitlements": "http://localhost:8080",
       "/funding-buckets": "http://localhost:8080",
+      "/top-up-offers": "http://localhost:8080",
+      "/payment-intents": "http://localhost:8080",
       "/reconciliation": "http://localhost:8080",
     },
   },

@@ -586,6 +586,11 @@ func TestLoadUsesExplicitDefaultsAndEnvironmentOverrides(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Load() error = %v", err)
 			}
+			// DeepEqual, not ==, and the change is what the payment group
+			// brought: Config now carries the top-up catalogue, and a struct
+			// holding a slice is not comparable — Go refuses `got != tt.want`
+			// at compile time rather than answering wrongly, which is why this
+			// is a one-line change and not a rewritten assertion.
 			if !reflect.DeepEqual(got, tt.want) {
 				// Redacted, not %#v-raw: a dumped Config carries Postgres.DSN,
 				// and a test failure is CI output the whole world can read.

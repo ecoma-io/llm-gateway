@@ -12,7 +12,14 @@
 // the one question a screen's spec cannot: what did this request carry?
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createApiKey, signInWith, signOutOfSession } from "./api";
+import {
+  createApiKey,
+  createPaymentForOffer,
+  fetchPaymentIntents,
+  fetchTopUpOffers,
+  signInWith,
+  signOutOfSession,
+} from "./api";
 
 /** The names the server mints the token under; the same ones the code reads. */
 const CSRF_COOKIE = "__Host-console_csrf";
@@ -32,6 +39,15 @@ interface Seen {
   readonly method: string;
   readonly url: string;
   readonly headers: Record<string, string>;
+  /**
+   * The serialised request body, when the call carried one.
+   *
+   * Added for the payment write, which is the console's one money-moving POST:
+   * what it carries is as much of a claim as where it goes, and the assertion
+   * that it names an OFFER and never an amount is one only a body can support.
+   * The existing tests ignore it, which is why it is optional.
+   */
+  readonly body?: string | undefined;
 }
 
 /**
@@ -58,6 +74,21 @@ function sentRequest(
   return { method, headers };
 }
 
+/**
+ * The serialised body `fetch` was handed, from either call shape.
+ *
+ * A `Request` is cloned before it is read: reading the original would consume
+ * the body the code under test is still going to send, and a clone is the only
+ * way to see what was written without changing it.
+ */
+async function sentBody(input: unknown, init?: RequestInit): Promise<string | undefined> {
+  if (typeof Request !== "undefined" && input instanceof Request) {
+    return await input.clone().text();
+  }
+  const body = init?.body;
+  return typeof body === "string" ? body : undefined;
+}
+
 let seen: Seen[] = [];
 
 function stubFetch(body: unknown, status = 200) {
@@ -67,6 +98,7 @@ function stubFetch(body: unknown, status = 200) {
       method,
       url: typeof input === "string" ? input : (input as Request).url,
       headers,
+      body: await sentBody(input, init),
     });
     return new Response(body === undefined ? null : JSON.stringify(body), {
       status,
@@ -214,5 +246,185 @@ describe("the double-submit token", () => {
     // worse than the thing the server already set.
     expect(setItem).not.toHaveBeenCalled();
     setItem.mockRestore();
+  });
+});
+
+/**
+ * The payment write, driven through the real seam.
+ *
+ * Three claims live here and none of them is visible from a screen's spec,
+ * because every screen's spec mocks this module — which is the right way to test
+ * a screen and exactly the wrong way to find out what the console puts on the
+ * wire.
+ *
+ * **1. The 409 has a code, and it is `conflict`.** The status → code table has
+ * no row for every status the contract names, on purpose: a code invented there
+ * is a code `CONSOLE_BEHAVIOUR` has no row for and a reader would be shown a
+ * behaviour nobody wrote. `409` is the one row the payment surface added, and
+ * without it a refusal whose body did not parse would render as `internal` — a
+ * bug with a request id nobody can look up — while the matrix's real `conflict`
+ * row sat unreachable.
+ *
+ * **2. A 403 is classified by what the envelope says, not by the status.** This
+ * is the coordinator's point made permanent: `createPaymentIntent` is the ONE
+ * operation on this surface that declares a 403 — it carries the cross-origin
+ * and double-submit guard, which a GET does not — and the contract declares that
+ * refusal's code as `invalid_request`. So there is no `case 403` in the table:
+ * the parsed envelope already carries the code, and a second opinion derived
+ * from the status number is exactly the drift the seam exists to prevent. A 403
+ * with NO envelope at all falls to `internal`, which is the honest answer for a
+ * status this console has not been given a code for.
+ *
+ * **3. The list calls carry no CSRF header.** Also the same point from the other
+ * side. `listTopUpOffers` and `listPaymentIntents` declare no 403 — a GET has no
+ * `Origin` and no unsafe method to guard — so the seam sends no token on them,
+ * and a test that asserted one would be asserting a contract the document does
+ * not contain.
+ */
+describe("the payment write", () => {
+  beforeEach(() => {
+    seen = [];
+    setJar("");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete (document as unknown as Record<string, unknown>).cookie;
+    Object.defineProperty(Document.prototype, "cookie", realCookie!);
+  });
+
+  it("classifies a 409 whose body did not parse as `conflict`", async () => {
+    // A body that is JSON and is not the contract's envelope. This is the case
+    // the table exists for: the status is the only thing left to classify by,
+    // and `internal` here would show a payment refusal as a console bug.
+    stubFetch({ detail: "the account is suspended" }, 409);
+
+    const result = await createPaymentForOffer({
+      offer: "o0000000-0000-4000-8000-0000000000o1",
+      idempotency_key: "key-1",
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("a 409 must not be a success");
+    expect(result.failure.kind).toBe("api");
+    if (result.failure.kind !== "api") throw new Error("expected an api failure");
+    expect(result.failure.envelope.error.code).toBe("conflict");
+    // And the correlation is honest rather than invented: the response carried
+    // no `X-Request-Id`, and a fabricated identifier is worse than a stated
+    // absence because it looks like something an operator could look up.
+    expect(result.failure.envelope.request_id).toBe("unreported");
+    expect(result.failure.unauthenticated).toBe(false);
+  });
+
+  it("passes a contracted envelope through untouched, code included", async () => {
+    stubFetch(
+      {
+        error: { code: "conflict", message: "the account is suspended" },
+        request_id: "req-409-1",
+      },
+      409,
+    );
+
+    const result = await createPaymentForOffer({
+      offer: "o0000000-0000-4000-8000-0000000000o1",
+      idempotency_key: "key-1",
+    });
+
+    if (result.ok) throw new Error("a 409 must not be a success");
+    if (result.failure.kind !== "api") throw new Error("expected an api failure");
+    expect(result.failure.envelope.error.code).toBe("conflict");
+    expect(result.failure.envelope.request_id).toBe("req-409-1");
+  });
+
+  it("reads a 403's code off the envelope rather than inventing one from the status", async () => {
+    // The shape the contract declares for this operation's 403: "the status is
+    // 403 with the `invalid_request` code — the request is well-formed HTTP and
+    // is refused for being untrusted, not malformed".
+    stubFetch(
+      {
+        error: { code: "invalid_request", message: "the request did not come from this origin" },
+        request_id: "req-403-1",
+      },
+      403,
+    );
+
+    const result = await createPaymentForOffer({
+      offer: "o0000000-0000-4000-8000-0000000000o1",
+      idempotency_key: "key-1",
+    });
+
+    if (result.ok) throw new Error("a 403 must not be a success");
+    if (result.failure.kind !== "api") throw new Error("expected an api failure");
+    expect(result.failure.envelope.error.code).toBe("invalid_request");
+  });
+
+  it("names no code for a 403 that carried no envelope", async () => {
+    // Deliberately NOT a second guess at the security refusal. `403` has no row
+    // in the table because the one operation that declares it declares its code
+    // in the envelope; a body this console cannot read is a failure it can only
+    // call ours.
+    stubFetch({}, 403);
+
+    const result = await createPaymentForOffer({
+      offer: "o0000000-0000-4000-8000-0000000000o1",
+      idempotency_key: "key-1",
+    });
+
+    if (result.ok) throw new Error("a 403 must not be a success");
+    if (result.failure.kind !== "api") throw new Error("expected an api failure");
+    expect(result.failure.envelope.error.code).toBe("internal");
+  });
+
+  it("echoes the double-submit token, names the offer, and sends no amount", async () => {
+    issueToken();
+    stubFetch(
+      {
+        id: "y0000000-0000-4000-8000-0000000000y1",
+        status: "created",
+        amount_minor_units: 2_500,
+        currency: "EUR",
+        checkout_url: null,
+        created_at: "2026-09-20T09:00:00Z",
+        expires_at: "2026-09-20T09:30:00Z",
+      },
+      201,
+    );
+
+    await createPaymentForOffer({
+      offer: "o0000000-0000-4000-8000-0000000000o1",
+      idempotency_key: "key-1",
+    });
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.method).toBe("POST");
+    expect(seen[0]!.url).toContain("/payment-intents");
+    expect(seen[0]!.headers[CSRF_HEADER.toLowerCase()]).toBe(TOKEN);
+
+    // What it carries, which is the request side of "a client may not choose a
+    // price". The contract has no `amount_minor_units` and no `currency` on
+    // this request, and a client that sent one would be inventing a field the
+    // server refuses — so the assertion is over the WHOLE parsed body rather
+    // than over the two keys this change expects to see.
+    const body = JSON.parse(seen[0]!.body ?? "{}") as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(["idempotency_key", "offer"]);
+    expect(body.offer).toBe("o0000000-0000-4000-8000-0000000000o1");
+    expect(body.idempotency_key).toBe("key-1");
+    expect(body).not.toHaveProperty("amount_minor_units");
+    expect(body).not.toHaveProperty("currency");
+  });
+
+  it("sends the token on the write and on neither list read", async () => {
+    // The asymmetry the contract states and the coordinator's note rests on.
+    issueToken();
+    stubFetch({ items: [] });
+
+    await fetchTopUpOffers();
+    await fetchPaymentIntents();
+
+    expect(seen).toHaveLength(2);
+    for (const request of seen) {
+      expect(request.method).toBe("GET");
+      expect(request.headers).not.toHaveProperty("x-console-csrf");
+    }
   });
 });
