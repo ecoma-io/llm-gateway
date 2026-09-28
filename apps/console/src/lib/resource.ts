@@ -52,10 +52,15 @@ export function useResource<T>(
    * nothing because it looks correct.
    *
    * `run` takes a generation number and a call writes only if its own is still
-   * the current one; `latest` advances on every call, so the first arrival is
-   * stale the moment a second is started. A screen that wants the last click to
-   * win rather than the first to settle passes `latest: true` to `run` and
-   * defeats this; nothing does, and the option's comment says what it is for.
+   * the current one, so the counter has to ADVANCE too — a double click is a
+   * second generation, not a second call sharing the first's number.
+   *
+   * `latest` is the one caller that does not take a number, and it is always
+   * treated as current. So a plain call issued after a `latest` one is the
+   * SUPERSEDED call and does not land, which is the inversion: a screen that
+   * wants the last click to win rather than the first to settle passes
+   * `latest: true` and gets it. Nothing in the console does, and
+   * `resource.spec.ts` fails if a caller appears.
    */
   let generation = 0;
 
@@ -64,6 +69,11 @@ export function useResource<T>(
     loading.value = true;
     try {
       const result = await load();
+      // A stale call returns before ANY state is touched, `loaded` included. It
+      // is the newer call that decides whether anything has loaded, and a
+      // superseded one claiming otherwise would tell a screen that has nothing
+      // to render that it is ready — which is the blank-table-under-a-spinner
+      // state the header says this module exists to make impossible.
       if (mine !== generation) return;
       if (result.ok) {
         data.value = result.data;
@@ -82,30 +92,35 @@ export function useResource<T>(
       // `loading`, and letting a superseded call set it false is how a screen
       // ends up claiming it is idle while a read is outstanding.
       if (mine === generation) loading.value = false;
+      // In the `finally` and not after it, so it is reached on the SUCCESS path
+      // too: the `return` above leaves the block, and a `loaded` flag that is
+      // skipped whenever a read succeeds is not a flag at all.
+      if (mine === generation) loaded.value = true;
     }
-    loaded.value = true;
   }
 
   return {
     data,
     failure,
     loading: readonly(loading),
-    ready: computed(() => loaded.value && failure.value === undefined),
     /**
-     * A screen reaches for this when it has data and wants the empty state —
-     * and a list that arrived with zero rows is a legitimate answer (an account
-     * with no users is not an error), while "nothing has loaded yet" is a
-     * different thing to say and the dashboard's placeholder is the other
-     * screen that needs it. The two are the same fact about the data and are
-     * kept as one computed so no screen has to reconstruct the difference.
+     * Whether a read has been answered at all, whatever the answer was.
+     *
+     * `loaded` and `data` are different facts and a screen needs both: a
+     * retryable failure keeps the data and still has not given the reader a
+     * current answer, so a list that renders the kept rows next to a banner is
+     * branching on `data` and a screen that says "nothing to show" is
+     * branching on this.
      */
-    empty: computed(() => data.value === undefined && failure.value === undefined),
+    loaded: readonly(loaded),
     /**
-     * Whether the failure standing is one the console can answer itself by
-     * dropping the cursor. A flag the screen reads rather than a code it
-     * matches on, so the vocabulary of codes stays in the matrix.
+     * Whether a read is settled and has something to show: data, or a failure
+     * the console renders. A screen that branches on this is branching between
+     * "here is the list" and "here is why there is not one", and cannot land in
+     * the third state the file header names — a blank table under a spinner,
+     * or a "nothing to show" sentence over a read that failed.
      */
-    cursorLost: computed(() => failure.value !== undefined && isCursorLost(failure.value)),
+    settled: computed(() => loaded.value && failure.value !== undefined),
     run,
   };
 }
