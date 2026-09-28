@@ -54,7 +54,7 @@ func validPaymentsEnv() map[string]string {
 // paymentsEnv merges the data plane values every successful Load needs with a
 // payments environment.
 func paymentsEnv(payments map[string]string) map[string]string {
-	return merge(requiredDataPlaneEnv(), payments)
+	return merge(requiredEnv(), payments)
 }
 
 func TestLoadReadsThePaymentsGroup(t *testing.T) {
@@ -63,7 +63,7 @@ func TestLoadReadsThePaymentsGroup(t *testing.T) {
 		// console that refused to start because a feature it was not asked to
 		// run had no credentials would be a plane taken down by a setting an
 		// operator never meant to make.
-		cfg, err := Load(lookup(requiredDataPlaneEnv()))
+		cfg, err := Load(lookup(requiredEnv()))
 		if err != nil {
 			t.Fatalf("Load() error = %v", err)
 		}
@@ -760,7 +760,7 @@ func TestADeploymentThatDeclaresOffersWithoutTheRestOfTheGroupIsRefused(t *testi
 	// variable is in the group's presence probe exactly so this is caught rather
 	// than started as a console with no payments and a price list nobody reads.
 	declared := merge(map[string]string{topUpOfferIDsVariable: "starter"}, offerEnvFor("starter", "1000", "USD", "2", "Starter"))
-	_, err := Load(lookup(merge(requiredDataPlaneEnv(), declared)))
+	_, err := Load(lookup(merge(requiredEnv(), declared)))
 	if err == nil {
 		t.Fatal("Load() error = nil, want the group refused as half-configured")
 	}

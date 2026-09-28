@@ -258,7 +258,7 @@ func newFakeWebhookVerifier() *fakeWebhookVerifier {
 // four-argument constructor, which builds unwiredPaymentSurface itself.
 func newPaymentServer(payments *fakePaymentUseCases, verifier *fakeWebhookVerifier) stdhttp.Handler {
 	return New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(),
-		newFakeConsoleReadUseCases(), PaymentSurface{
+		newFakeConsoleReadUseCases(), stubUsage(), PaymentSurface{
 			Payments: payments,
 			Verifier: verifier,
 			Provider: "stripe",
@@ -1308,7 +1308,7 @@ func TestErrorMessagesFollowTheStatusTheyMapTo(t *testing.T) {
 func TestAnUnwiredPaymentSurfaceFailsClosed(t *testing.T) {
 	// The four-argument constructor is the unwired surface, which is the form
 	// the route-table and contract tests call.
-	handler := New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases())
+	handler := New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), stubUsage())
 
 	cases := []struct {
 		name    string
@@ -1374,7 +1374,7 @@ func TestNewRefusesAPaymentSurfaceThatIsNotExactlyOneCompletePair(t *testing.T) 
 					t.Errorf("New built a handler from %s; the missing half is a wiring defect and a customer would find it first", tc.name)
 				}
 			}()
-			New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), tc.surfaces...)
+			New(application.New("test"), &answeringPinger{}, newFakeSessionUseCases(), newFakeConsoleReadUseCases(), stubUsage(), tc.surfaces...)
 		})
 	}
 

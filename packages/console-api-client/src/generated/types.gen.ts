@@ -5,6 +5,158 @@ export type ClientOptions = {
 };
 
 /**
+ * Whether this plane holds a derivation for the account it answered for.
+ * `available` means the figures below ARE the answer to the range asked of, and it is what a run that legitimately found nothing reports: an account this plane has ingested, in a range that was quiet, comes back available with every bucket zero. `not_available` means this plane holds no derived rows for that ACCOUNT at all — none in the queried range and none in any other: the usage it names has not been ingested, or it predates this surface. It is an ANSWER, not a failure — a caller renders it as an empty series and asks for a later range.
+ * The axis is the account's coverage and not the range's, because every range can be answered: a bucket this plane found nothing for is a bucket with a zero in it, so a range that was simply quiet is the same shape as a range this plane has no rows for, and only the coverage of the account tells the two apart.
+ * It is never a stand-in for a failed derivation. A failure is a non-2xx status carrying the ErrorEnvelope, and no value of this enum is ever returned with one. The distinction is the whole reason this field exists rather than the absence of the figures: "nothing happened" and "we do not know" are different sentences, and a caller that cannot tell them apart will draw a chart of the second and call it the first.
+ */
+export type AnalyticsAvailability = "available" | "not_available";
+
+export type AnalyticsFreshness = {
+  /**
+   * The instant this plane last completed a pass over the usage-fact feed.
+   * Read this field for what it names and nothing more. It is a LIVENESS signal, not a completeness one: it says when the Control Plane last moved through the feed, and it does NOT say that every fact the runtime has emitted is reflected in the figures below. The two are different questions and only the first can be answered from this plane's own state, because the feed's high-water mark is the Data Plane's to publish and this surface does not read it. A figure for a range whose instant is at or after `data_through` may still be missing work; a figure for a range entirely before it is as complete as this plane can make it.
+   * The consequence a caller must design around, and the reason this field is here rather than left implicit: NOTHING IN THIS SYSTEM CLOSES A PERIOD. There is no accounting period, no close, no lock, and no reconciliation window that is a financial period — those are the worker's own sweep windows. So a late fact lands in the bucket it lands in and quietly changes a figure that was already reported, and re-running the same range later may return a different number. A report over a range that ends well before `data_through` is stable in the sense that a later pass will not move it; a report whose end is near or after `data_through` is provisional, and a caller that treats a provisional number as a closed one will restate a customer's bill.
+   */
+  data_through: string;
+  /**
+   * What `data_through` is a statement about, so a caller can tell this from a watermark without the contract having to change when one arrives.
+   * `fact_feed_pass` is a record-time of this plane's own ingestion loop. It is never an event-time of the runtime that produced the usage, and a bucket is never assigned to it. The single-member enumeration is deliberate: it is what makes the absence of a true watermark visible in the contract rather than implied by a field that looks like one.
+   */
+  basis: "fact_feed_pass";
+};
+
+export type AnalyticsRange = {
+  /**
+   * The inclusive lower bound of the range, as an absolute instant.
+   */
+  start_at: string;
+  /**
+   * The EXCLUSIVE upper bound of the range, as an absolute instant.
+   * Half-open by construction — inclusive below, exclusive above — so two consecutive ranges tile the timeline with no overlap and no gap. An inclusive upper bound would make the instant a range ends at belong to two ranges at once, and a recomputed lower bound would skip the band between them.
+   */
+  end_at: string;
+  /**
+   * The IANA zone the bucket boundaries in this answer were CUT in. It is not how the instants are written — every instant in this document is an absolute one in UTC — it is the calendar the cuts were made against.
+   * The STORAGE of every figure in this contract is UTC and always will be: a wall-clock reading in some operator's zone must never move a commercial boundary, so a day boundary is a UTC instant before it is a local one. This field exists because that is not the same as being what the reader wants to see, and a chart labelled in the wrong zone is wrong in a way no number can defend. The response echoes the zone its buckets were cut on, so a caller renders the instants it was given rather than re-deriving them.
+   * A zone changes where the bucket EDGES fall and nothing else. The monetary figures are sums of UTC instants either way, so the same range costs the same amount at `Asia/Ho_Chi_Minh` as it does at UTC — only the labels move.
+   * Under a daylight-saving transition a `day` bucket is 23 or 25 hours long, and a `calendar_month` is the zone's calendar month. This is why every bucket carries BOTH `bucket_start` and `bucket_end` rather than a start and a nominal width: a reader can tell how long the bucket actually was, and an export can be re-aggregated without re-deriving what a bucket meant.
+   */
+  timezone: string;
+};
+
+export type AnalyticsSeriesPoint = {
+  /**
+   * The inclusive start of this bucket, as an absolute instant in RFC 3339 with a `Z` offset. The range's zone decides where the EDGE falls and never how it is written: an instant is an instant, and a client renders it in whatever zone it displays.
+   */
+  bucket_start: string;
+  /**
+   * The exclusive end of this bucket, an absolute instant written the same way `bucket_start` is. Half-open with it, so two consecutive buckets tile the timeline with neither overlap nor gap.
+   */
+  bucket_end: string;
+  /**
+   * Requests this plane holds a usage FACT for, whose fact names at least one of the account's funding buckets, and whose fact this plane applied inside this bucket.
+   * The name is the definition, and it is deliberately not "requests". The runtime's ADMITTED-request population is not derivable here: a request that produced no fact leaves no row in this plane's fact tables at all, so counting the requests a query can see and calling them the requests admitted measures the set of requests this plane knows about. This figure is that set, honestly named — requests whose usage reached the account's capacity and was recorded.
+   * It is the denominator of `requests_settled`, and that is a real rate with a real meaning: the share of this account's fact-producing requests that reached a charge. It is NOT the denominator of a rejection or an error rate, because this plane holds no population a rejected request could belong to.
+   * It is scoped to the account, so it counts only requests this account's own funding buckets paid for. A fact whose allocation tail named no bucket of this account — a zero-priced settle, whose tail is empty by construction — belongs to no account and is counted in none.
+   */
+  requests_with_usage_facts: number;
+  /**
+   * Requests that reached a settlement of record AND were attributed to this account, in this bucket.
+   * "In this bucket" is placed by the APPLY clock — the instant this plane recorded the usage fact, which is the same clock `requests_with_usage_facts` is placed by and the same one this fragment's rule 4 requires every bucketed figure to name. The pair is therefore one population sliced by one clock, and their ratio is the share of this account's fact-producing requests that reached a charge. The settlement's own creation instant is NOT the clock here: a fact applied in this bucket whose settlement was created moments later, in the next one, counts here and its money is bucketed there.
+   * A zero-priced settle settles for nothing and is a settlement of record, but it names no funding bucket — the account is derived from the allocation tail, and an empty tail derives no account. Such a request is therefore counted in a platform-wide view and in no account's report, which is the tenancy rule stated in §5 applied literally: a fact that draws on no bucket of an account belongs to no account. A caller needing free-model traffic counted needs a platform-scoped view, which this endpoint deliberately is not.
+   */
+  requests_settled: number;
+};
+
+/**
+ * One account's usage over one range, at one grain.
+ * EVERY MONETARY FIGURE HERE IS AN INTEGER NUMBER OF MINOR UNITS. No field in this response carries a currency, and that is the contract rather than a field deferred: the money domain holds no currency value either, because the settlement currency is configuration that lives above the domain and no per-row currency column exists anywhere to contradict it. A consumer takes the deployment's own currency from its configuration; one that guesses has invented a currency the model never had.
+ */
+export type AnalyticsUsageResponse = {
+  availability: AnalyticsAvailability;
+  /**
+   * The metric family this answer reports, so a client can bind a renderer to a family rather than to a field that happens to be present today. It is an enumeration with one member because the one-member case is still a family, and a second one arriving is a contract review rather than a silent widening.
+   */
+  metric: "usage";
+  range: AnalyticsRange;
+  /**
+   * The width of one point in `series`. A closed enumeration, and the request's `granularity` must be one of these values.
+   * A report mixing grains is a defect rather than a wide sheet: without the grain recorded, a figure cannot be re-aggregated without re-deriving what a bucket meant. `calendar_month` is a CALENDAR month in the range's zone — February, not thirty days — and `day` is a local day, so under a daylight-saving transition one is 23 or 25 hours long, which is what `bucket_end` is for.
+   */
+  granularity: "hour" | "day" | "calendar_month";
+  /**
+   * Whether the range's `end_at` falls INSIDE the last bucket, so that bucket has not finished filling and its figures will grow.
+   * True for any range whose end is not exactly a bucket boundary in the range's zone, which is almost every range — a caller asking for "up to now" gets a bucket that is minutes old. False means the last bucket is complete at the instant the range ended, and with `freshness.data_through` well past that instant, is stable against later passes.
+   * This is a fact about the RANGE, not about the data, which is why it is separate from `availability`: an empty partial bucket is still a partial bucket, and a caller drawing it as a complete zero is drawing a number this plane never claimed.
+   */
+  final_bucket_partial: boolean;
+  /**
+   * One point per bucket in the range, in ascending order, with no bucket omitted. A bucket with no activity is present with zero figures rather than absent, so a caller renders a gap-free series without having to fill holes and invent a rule for which holes to fill.
+   * At the maximum range of 90 days the finest grain yields at most 2161 buckets, and that is the bound: 90 days is 2160 hours, and the first bucket of a range is the bucket CONTAINING its start rather than one clipped to it, so a caller asking for 09:30 on 1 June to 09:30 on 30 August has 2161 of them — the first holding the last half hour of the 09:00 bucket, and the last being the 09:00 bucket the range ends inside. A range starting at 09:00 has 2160, because then the first bucket IS the range's own first hour; the extra one comes from the range being unaligned, not from the maximum window being one hour longer than it looks. A bound of 2160 would refuse the unaligned range, and would refuse every unaligned range in the last hour of the maximum window — a caller shortening their range by an hour to get past a bound they were never told about. The bound is stated here rather than requested as a parameter because it is a property of the answer, not a preference of the caller.
+   */
+  series: Array<AnalyticsSeriesPoint>;
+  /**
+   * The range total of `series[].requests_with_usage_facts`, repeated on the envelope so a caller that wants one number does not have to sum a series it may not have been sent in full. Read it as the field above says: the requests whose usage this plane recorded, not every request the runtime admitted.
+   */
+  requests_with_usage_facts: number;
+  /**
+   * The range total of `series[].requests_settled`. Read the series field for what it counts and which clock placed it — and note that it is the APPLY clock on both sides of the pair: a request is counted in this series because this plane recorded its usage fact then, whether or not its settlement was created in the same bucket. `settled_amount_minor_units` is the money that settled, placed by the settlement's own clock, so the two are counted over one range and not over one instant — and the money's window is the range's own while this total is the series', which is a bucket wider at each end. Both facts are stated where the money is defined; the pair is not a ratio of two figures cut the same way.
+   */
+  requests_settled: number;
+  /**
+   * What the range COST, summed over the settlements of record it contains.
+   * "The range" here is exactly `range.start_at` inclusive to `range.end_at` exclusive, the window the range object states. The SERIES is a bucket wider at each end, deliberately: its first bucket is the calendar bucket CONTAINING the range's start and its last is the one the range's end falls inside, so the counts summed from it and the money summed over the range cover two windows that agree everywhere except those two partial buckets. Both are the range's answer and neither is wrong; a caller combining them — the average settlement, the cost per settled request — is combining two windows, and a caller who wants one window throughout should read the series and take its own sums from it.
+   * BUCKETED BY `settlements.created_at` — the database clock, at the instant the settlement was booked. Never by the fact's `occurred_at`: that is the runtime's clock, clocks disagree between processes, and ordering one plane's records by another plane's timestamps is how a modest skew becomes a fact filed outside the window it belongs to. This is the one attribution axis a money figure may use, and it is this plane's own.
+   * Summed from settlement headers, never from per-request re-derivations. A re-derived per-request amount is a ROUNDED figure — the derivation applies one ceiling over a request's summed raw cost — and the sum of rounded figures is not the rounded total. Adding one such figure per request overstates the total, and overstates it in proportion to volume: a thousand one-minor-unit requests settle for one minor unit between them, and a naive sum of their per-request ceilings would bill a thousand. The settlement header is the authority here precisely because it is written once and summed, with no rounding anywhere in the aggregate.
+   */
+  settled_amount_minor_units: number;
+  /**
+   * Held capacity RETURNED unused across the range, from the ledger's release legs. BUCKETED BY `ledger_entries.created_at`, the same database clock as the settled figure above.
+   * It is never netted against `settled_amount_minor_units`, and the reason is present tense rather than future: a release moves the HELD axis and a consume moves the SETTLED axis. They are different balances of different legs, so there is no arithmetic today that nets them into one figure — a net number would not be a refund, it would be a subtraction of two unrelated quantities.
+   * (A refund is also a concept this model does not have. One arriving would be a new leg kind, and this field would keep its meaning untouched.)
+   */
+  released_amount_minor_units: number;
+  /**
+   * Capacity the account was credited across the range — entitlement grants and operator top-ups alike. BUCKETED BY `ledger_entries.created_at`.
+   * The population is exactly the ledger's two crediting leg kinds, `grant` and `topup`, summed over their `amount`. The ledger has four other kinds and none of them is a credit: `hold`, `release` and `consume` move capacity the account already has, and `adjustment` is an operator CORRECTION whose stated deltas are free values, one of which may be negative — its `amount` column is the magnitude of whichever delta moved, so adding it to this figure would book the size of a downward correction as capacity credited, and it arrives as a compensating pair besides. A correction fixes records; it never adds capacity, and this figure counts only what does.
+   * Keyed on the ledger's own leg kinds rather than on a payment concept, because the ledger already HAS both kinds and a payment integration adds a WRITER to them rather than new concepts. A figure computed from these kinds is correct today and needs no shape change when an automated top-up starts arriving through one.
+   * This is capacity credited, which is not revenue and not income. Nothing in this plane has ever received a payment.
+   */
+  funds_added_minor_units: number;
+  /**
+   * Capacity reserved and not yet consumed, as at the moment this read ran.
+   */
+  held_minor_units: number;
+  /**
+   * Capacity settled and unspent, as at the moment this read ran: the settled balance less the held balance.
+   * `held_minor_units` and `available_minor_units` are POINT-IN-TIME balances and are NOT bucketed, and the instant they are true of is the READ's and not the range's: the accounting projection caches the account's present balance and keeps no history, so a range that ended in June is answered with the balance the account holds today, and there is no as-of read that could answer anything else. They are reported once, beside the series rather than on every point, because a caller that received them per point had no way to know they were true of none of them. `available` is `settled - held` and both terms are non-negative by construction.
+   * They are the CACHED balances the accounting projection already maintains, read and never re-derived — and they are exact in a way a per-request spend is not. A cached balance is a running exact integer accumulation of signed leg deltas, never a sum of rounded per-request figures, which is why these two may be summed and the money above may not be summed from its parts.
+   */
+  available_minor_units: number;
+  /**
+   * How the SETTLEMENTS in this range captured their usage, split by the three methods the fact grammar admits.
+   * The counts are over SETTLEMENTS THAT CAPTURED — `kind = settled` — and a release or an expiry captures nothing, so it is not a settlement that failed to capture but a settlement that is not of this kind. A fact claiming no usage while being disclaimed also carries a capture method and books no charge, which is why the population is the settlements and not the facts. A rate over this object divides by the sum of its three members, never by the number of facts in the range.
+   * `reservation_floor` is the interesting one and the reason this split exists at all: it is the count of settlements whose figure was the reservation's own — a clamp that bound, or the basis fall-through when neither the provider's report nor the gateway's own count arrived. It is a measure of pricing confidence, and a rising floor is a signal about the upstream's usage reporting rather than about this account. A figure derived from it is biased upward against a report that would have arrived, and no average cost computed here mixes the two without saying so.
+   */
+  capture: {
+    /**
+     * Settlements priced as the provider's own report of its usage.
+     */
+    reported: number;
+    /**
+     * Settlements priced as the gateway's own count of what it received. Delivery is always the gateway's count by construction, and it never decides the label — a figure the gateways observed that arrived beside a provider's report is priced as the report.
+     */
+    gateway_observed: number;
+    /**
+     * Settlements whose figure was the reservation's own: a clamp that bound, or the basis fall-through when neither the provider's report nor the gateway's count arrived. This is a measure of PRICING CONFIDENCE — it is biased upward against a report that would have arrived, so a rising floor is a statement about the upstream's usage reporting and not about this account.
+     */
+    reservation_floor: number;
+  };
+  freshness: AnalyticsFreshness;
+};
+
+/**
  * A key's ownership record as every read but the mint returns it. The credential is absent, not null: this plane stores no plaintext and no digest, and the Data Plane's credential record is written only by the Data Plane (ADR 0006 §8).
  */
 export type ApiKey = {
@@ -562,7 +714,7 @@ export type WebhookAcknowledgement = {
 
 export type Error = {
   /**
-   * A stable machine-readable category for the failure, shared by both surfaces that return this envelope. `cursor_expired` is produced by the Data Plane management API today, as are the three projection codes (`unsupported_version`, `revision_gap`, `snapshot_required`); `conflict` and `upstream_unavailable` are produced by the Console API's payment operations, and `upstream_unavailable` by the Data Plane management API as well; `service_unavailable` is produced by the Console API's readiness probe. They are named here rather than in the document alone so a caller of either surface has one vocabulary for both.
+   * A stable machine-readable category for the failure, shared by both surfaces that return this envelope. `cursor_expired` is produced by the Data Plane management API today, as are the three projection codes (`unsupported_version`, `revision_gap`, `snapshot_required`); `conflict` and `upstream_unavailable` are produced by the Console API's payment operations, and `upstream_unavailable` by the Data Plane management API as well; `service_unavailable` is produced by the Console API's readiness probe and by the usage report whose read outran its own per-request deadline — two conditions that share the code because both are retry-later answers, and each operation's own 503 description says which one it is. They are named here rather than in the document alone so a caller of either surface has one vocabulary for both.
    * `conflict` is the console surface's one conflict code, and it is a code of its own rather than a reuse of the projection pair above: those two describe a delivered batch that cannot join a consumer's position, which is a statement about a projection stream, while this one is the server's own state refusing a request that is itself perfectly well-formed. They call for different client behaviour — one is a retry against a moved position, the other is not a retry at all — and a client that answered one with the other's recovery would be doing the wrong thing confidently.
    */
   code:
@@ -610,6 +762,7 @@ export type Version = {
 
 /**
  * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+ * An empty page's `next_cursor` names the position the page was REQUESTED FROM, so paging past the end holds the walk where it is rather than restarting it: a client that pages once more gets the same empty page and `has_more: false`, and an empty position — the one before the first row — is only ever named by the FIRST page of a walk that is empty from the start.
  */
 export type PageAfter = Cursor;
 
@@ -944,6 +1097,7 @@ export type ListUsersData = {
     state?: "invited" | "active" | "removed";
     /**
      * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     * An empty page's `next_cursor` names the position the page was REQUESTED FROM, so paging past the end holds the walk where it is rather than restarting it: a client that pages once more gets the same empty page and `has_more: false`, and an empty position — the one before the first row — is only ever named by the FIRST page of a walk that is empty from the start.
      */
     after?: Cursor;
     /**
@@ -1001,6 +1155,7 @@ export type ListApiKeysData = {
   query?: {
     /**
      * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     * An empty page's `next_cursor` names the position the page was REQUESTED FROM, so paging past the end holds the walk where it is rather than restarting it: a client that pages once more gets the same empty page and `has_more: false`, and an empty position — the one before the first row — is only ever named by the FIRST page of a walk that is empty from the start.
      */
     after?: Cursor;
     /**
@@ -1113,6 +1268,7 @@ export type ListPlansData = {
   query?: {
     /**
      * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     * An empty page's `next_cursor` names the position the page was REQUESTED FROM, so paging past the end holds the walk where it is rather than restarting it: a client that pages once more gets the same empty page and `has_more: false`, and an empty position — the one before the first row — is only ever named by the FIRST page of a walk that is empty from the start.
      */
     after?: Cursor;
     /**
@@ -1170,6 +1326,7 @@ export type ListSubscriptionsData = {
   query?: {
     /**
      * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     * An empty page's `next_cursor` names the position the page was REQUESTED FROM, so paging past the end holds the walk where it is rather than restarting it: a client that pages once more gets the same empty page and `has_more: false`, and an empty position — the one before the first row — is only ever named by the FIRST page of a walk that is empty from the start.
      */
     after?: Cursor;
     /**
@@ -1228,6 +1385,7 @@ export type ListEntitlementsData = {
   query?: {
     /**
      * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     * An empty page's `next_cursor` names the position the page was REQUESTED FROM, so paging past the end holds the walk where it is rather than restarting it: a client that pages once more gets the same empty page and `has_more: false`, and an empty position — the one before the first row — is only ever named by the FIRST page of a walk that is empty from the start.
      */
     after?: Cursor;
     /**
@@ -1285,6 +1443,7 @@ export type ListFundingBucketsData = {
   query?: {
     /**
      * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     * An empty page's `next_cursor` names the position the page was REQUESTED FROM, so paging past the end holds the walk where it is rather than restarting it: a client that pages once more gets the same empty page and `has_more: false`, and an empty position — the one before the first row — is only ever named by the FIRST page of a walk that is empty from the start.
      */
     after?: Cursor;
     /**
@@ -1352,6 +1511,7 @@ export type ListLedgerEntriesData = {
     kind?: "grant" | "topup" | "hold" | "release" | "consume" | "adjustment";
     /**
      * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     * An empty page's `next_cursor` names the position the page was REQUESTED FROM, so paging past the end holds the walk where it is rather than restarting it: a client that pages once more gets the same empty page and `has_more: false`, and an empty position — the one before the first row — is only ever named by the FIRST page of a walk that is empty from the start.
      */
     after?: Cursor;
     /**
@@ -1453,6 +1613,7 @@ export type ListPaymentIntentsData = {
   query?: {
     /**
      * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     * An empty page's `next_cursor` names the position the page was REQUESTED FROM, so paging past the end holds the walk where it is rather than restarting it: a client that pages once more gets the same empty page and `has_more: false`, and an empty position — the one before the first row — is only ever named by the FIRST page of a walk that is empty from the start.
      */
     after?: Cursor;
     /**
@@ -1591,6 +1752,7 @@ export type ListFindingsData = {
     severity?: "info" | "warning" | "critical";
     /**
      * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     * An empty page's `next_cursor` names the position the page was REQUESTED FROM, so paging past the end holds the walk where it is rather than restarting it: a client that pages once more gets the same empty page and `has_more: false`, and an empty position — the one before the first row — is only ever named by the FIRST page of a walk that is empty from the start.
      */
     after?: Cursor;
     /**
@@ -1648,6 +1810,7 @@ export type ListReconciliationRunsData = {
   query?: {
     /**
      * An opaque cursor naming the position after which rows are wanted. Omit it to begin at the first row. The value is never interpreted by the caller and never by the console: pass back the `next_cursor` of the previous page, or nothing. A cursor carrying a filter the request no longer makes is refused with `400 invalid_request` rather than served against the new filter, because a page reached through a mismatched cursor is a page whose rows belong to a question the caller is no longer asking.
+     * An empty page's `next_cursor` names the position the page was REQUESTED FROM, so paging past the end holds the walk where it is rather than restarting it: a client that pages once more gets the same empty page and `has_more: false`, and an empty position — the one before the first row — is only ever named by the FIRST page of a walk that is empty from the start.
      */
     after?: Cursor;
     /**
@@ -1725,7 +1888,7 @@ export type ReceiveProviderWebhookData = {
 
 export type ReceiveProviderWebhookErrors = {
   /**
-   * This delivery may not be acted on, and never will be. The code is `invalid_request`, and there are exactly two ways to earn it: the delivery did not authenticate — the signature header is absent, appears more than once, or does not equal what this deployment computes over these exact bytes — or it authenticated but is STALE, arriving outside the freshness tolerance this deployment allows between the moment the provider signed it and the moment it was received, which is a replay rather than a delivery. Neither becomes usable on a second attempt: a wrong signature will be wrong again, and a redelivery re-sends the same signed timestamp.
+   * This delivery may not be acted on, and never will be. The code is `invalid_request`, and there are exactly five ways to earn it. In the order the branches run: the body declared a Content-Encoding this endpoint will not decode — a compressed body is not the body that was signed; it declared a Content-Type that cannot carry the JSON this endpoint verifies; it is larger than the read bound; the delivery did not authenticate — the signature header is absent, appears more than once, or does not equal what this deployment computes over these exact bytes; or it authenticated but is STALE, arriving outside the freshness tolerance this deployment allows between the moment the provider signed it and the moment it was received, which is a replay rather than a delivery. None becomes usable on a second attempt: a malformed body carries its own defect, a wrong signature will be wrong again, and a redelivery re-sends the same signed timestamp.
    * The one thing this response deliberately does NOT cover is a body this build cannot read. An authenticated delivery whose event is unreadable is answered 200, because a status that meant both would be a status an operator could not monitor, and a signature failure and a provider bug are not one event. The refusal is a 4xx rather than a 5xx on purpose: a 400 keeps a permanently unusable delivery out of the provider's retry budget, which is the one thing a provider's retry could not fix.
    */
   400: ErrorEnvelope;
@@ -1757,3 +1920,72 @@ export type ReceiveProviderWebhookResponses = {
 
 export type ReceiveProviderWebhookResponse =
   ReceiveProviderWebhookResponses[keyof ReceiveProviderWebhookResponses];
+
+export type GetUsageData = {
+  body?: never;
+  headers?: {
+    /**
+     * An optional caller-generated request identifier. The gateway accepts it only when it is 1–64 ASCII letters, digits, periods, underscores, or hyphens; otherwise it generates a new identifier. The chosen identifier is returned in the X-Request-Id response header and, for errors, in the ErrorEnvelope request_id field.
+     */
+    "X-Request-Id"?: RequestId;
+  };
+  path?: never;
+  query: {
+    /**
+     * The inclusive lower bound of the range, as an absolute instant in RFC 3339. Required rather than defaulted: a range that defaults to "the last thirty days" answers a question nobody asked, and a caller cannot tell a default from a choice.
+     */
+    from: string;
+    /**
+     * The EXCLUSIVE upper bound of the range, as an absolute instant in RFC 3339. Half-open with `from`, so two consecutive ranges tile the timeline with neither overlap nor gap.
+     */
+    to: string;
+    /**
+     * The width of one point in the series. A closed enumeration, and the request may name nothing outside it. There is deliberately no `group_by`: the dimensions a caller may slice by are the ones this surface writes a query for, and a caller that named a column would be naming the schema.
+     */
+    granularity: "hour" | "day" | "calendar_month";
+    /**
+     * The IANA zone to cut the buckets in. Optional, and defaults to UTC, which is also where every figure is stored. A local zone changes where the bucket EDGES fall and nothing else: the monetary figures are UTC instants summed either way. A zone that cannot be resolved is HTTP 400, never a silent fallback to UTC — a chart in the wrong zone is wrong in a way no figure defends.
+     */
+    timezone?: string;
+  };
+  url: "/usage";
+};
+
+export type GetUsageErrors = {
+  /**
+   * A bound does not satisfy the contract: a range longer than 90 days, a `from` at or after `to`, a granularity outside the enumeration, an instant that is not RFC 3339, a `timezone` that does not resolve to an IANA zone, a parameter present but empty, or a parameter this operation does not define. `timezone` is optional and its default is `UTC`, but a caller that SENDS it must send a zone: an empty value is a parameter the caller set and this surface will not guess the meaning of, which is a different request from the one that omits the parameter altogether.
+   */
+  400: ErrorEnvelope;
+  /**
+   * The request carried no credential this deployment resolves. This is the one operation on this surface that does not identify its caller by a session — `consoleCredential` is a bearer credential a script or an operator's tooling presents, and there is nothing to sign in to — so the answer says the credential did not resolve and says nothing about which of absent, unknown or retired it was. One answer for every cause, deliberately: a difference is a disclosure to anyone willing to present tokens. The account these figures are about is derived from the credential and is never named by the request, so a caller that cannot tell it was refused would be the caller that draws a chart of someone else's spend.
+   */
+  401: ErrorEnvelope;
+  /**
+   * No operation is declared at the requested path. The gateway answers every unmatched path this way rather than letting its router emit an HTML or plain-text page, so a caller parses one shape for every failure the surface can produce.
+   */
+  404: ErrorEnvelope;
+  /**
+   * The resource exists but does not accept the request method.
+   */
+  405: ErrorEnvelope;
+  /**
+   * The surface failed in a way it cannot classify. Internal causes are logged against the request identifier and never serialized: a caller can act on the status and the request ID, and cannot act on a stack frame, a query or a provider error.
+   */
+  500: ErrorEnvelope;
+  /**
+   * The read did not finish inside this operation's own per-request deadline, so the answer would have been a truncated series — a chart showing real activity having stopped at whatever instant the deadline landed on. It is a retry-later answer and not a differently-shaped one: the same request, asked again, is answered normally, and the range is unchanged. The code is `service_unavailable`.
+   * This is deliberately not the readiness probe's 503. That one means the service may not receive traffic because a dependency is not answering; this one means the service is up, this one read overran its budget, and the caller should retry — backing the whole surface off on a single slow report would be reading this answer as that one.
+   */
+  503: ErrorEnvelope;
+};
+
+export type GetUsageError = GetUsageErrors[keyof GetUsageErrors];
+
+export type GetUsageResponses = {
+  /**
+   * The account's usage over the range. An account this plane holds no derived rows for is a 200 with `availability: not_available` and an empty series — an answer, not a failure, and distinct from a range that is simply quiet.
+   */
+  200: AnalyticsUsageResponse;
+};
+
+export type GetUsageResponse = GetUsageResponses[keyof GetUsageResponses];

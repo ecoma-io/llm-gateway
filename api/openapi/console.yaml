@@ -16,9 +16,7 @@
 # The gateway's product domains (accounts, keys, subscriptions, usage) are
 # not designed yet. When one arrives, its contract changes here first and the
 # implementation follows it, never the reverse — see AGENTS.md, "The API
-# contract is the OpenAPI document". The usage read model's own fragment is
-# `./shared/analytics.yaml`: it answers from the Control Plane's own derived
-# state, and the fragment is where what it is allowed to say is declared.
+# contract is the OpenAPI document".
 openapi: 3.1.0
 info:
   title: Ecoma LLM Gateway — Console API
@@ -32,16 +30,12 @@ info:
     Plane's own dependencies are not answering returns HTTP 503 and the
     `service_unavailable` code.
 
-    The surface has two halves that meet at the credential on the request. The
+    The surface has two halves that meet at the session cookie. The
     **session surface** — sign-in, the current principal, sign-out — is the
     only part reachable without one, and the only part that writes nothing but
     the session itself. The **product surface** is everything else, and every
-    operation on it authorizes against the account the request's credential
-    names. That credential is the session cookie for all of them but one: the
-    usage operation accepts `consoleCredential` instead, a bearer credential for
-    the caller that has no browser at all — a script, a scheduled report, an
-    operator's tooling — because a session is a thing a browser holds and this
-    surface is not only read by browsers.
+    operation on it requires a session and authorizes against the account that
+    session names.
 
     The session credential is declared as `sessionCookie` in
     `components.securitySchemes` and named by every operation that requires
@@ -61,7 +55,7 @@ info:
     not publish it as a callable function.
 
     The account is never a path segment and never a query parameter the
-    caller sets. It comes from the credential, always; a resource the caller's
+    caller sets. It comes from the session, always; a resource the session's
     account does not own is a 404 the query did not return, not a 403 a filter
     turned into one. Unsafe methods additionally require a same-origin
     `Origin` and a JSON content type, which no cross-site HTML form can
@@ -72,11 +66,6 @@ info:
     `./shared/console.yaml`, alongside the session types — one fragment rather
     than a second document, because the repository holds exactly three OpenAPI
     documents, one per application (AGENTS.md rule 2).
-
-    Usage is on it. Its scope is derived from the credential on the request
-    and never named by the caller, so the rule above about the account never
-    being a parameter is a property of the statement rather than a convention
-    this surface asks its handlers to remember.
 servers:
   - url: /
 tags:
@@ -91,9 +80,7 @@ tags:
       The session surface. Sign-in, the current principal and sign-out — the
       three operations reachable without a session, and the only three that
       do. Sign-in is the sole unauthenticated write on this surface: it
-      creates the session cookie every other BROWSER operation requires — the
-      usage operation is the one that takes a bearer credential instead
-      (`consoleCredential`), for the caller that holds no cookie at all.
+      creates the session cookie every other operation requires.
   - name: account
     description: >-
       The session's own account: its dashboard, its plan catalogue, and the
@@ -122,6 +109,25 @@ tags:
       Read-only: acknowledging a finding records an operator's decision, and
       that write is a separate change with its own contract. A finding is
       evidence, not a repair path, and nothing on this surface refunds anyone.
+  - name: payments
+    description: >-
+      Funding the account: the payments a customer opened, and the top-up
+      offers they open them against. The offers are published here read-only,
+      because a chooser cannot be rendered from a price the client does not
+      know, and reading a price is not setting one: a payment is opened by
+      naming a server-owned OFFER and never by sending an amount — the server
+      prices the offer, and a client that could set a price could charge itself
+      whatever it liked. Its outcome is equally not a client's to decide: a
+      payment moves only when the provider's servers say so, so every status
+      here is something a page READS after the fact and can never make true.
+  - name: webhooks
+    description: >-
+      The payment provider's delivery endpoint, and the only tag in this
+      document with no console operation under it. It is authenticated by a
+      signature over the raw body rather than by a session, it is never called
+      by a browser, and it is declared here because the route belongs to this
+      application — not because a console may reach it. A client generated
+      from this document must not publish it.
   - name: usage
     description: >-
       The account's usage read model — derived figures over a bounded range, at
@@ -143,26 +149,6 @@ tags:
       invisible in the output, an integer being an integer regardless of what
       the field is called (docs/architecture/analytics.md §10.2). A figure this
       surface cannot source honestly is one it does not serve.
-
-  - name: payments
-    description: >-
-      Funding the account: the payments a customer opened, and the top-up
-      offers they open them against. The offers are published here read-only,
-      because a chooser cannot be rendered from a price the client does not
-      know, and reading a price is not setting one: a payment is opened by
-      naming a server-owned OFFER and never by sending an amount — the server
-      prices the offer, and a client that could set a price could charge itself
-      whatever it liked. Its outcome is equally not a client's to decide: a
-      payment moves only when the provider's servers say so, so every status
-      here is something a page READS after the fact and can never make true.
-  - name: webhooks
-    description: >-
-      The payment provider's delivery endpoint, and the only tag in this
-      document with no console operation under it. It is authenticated by a
-      signature over the raw body rather than by a session, it is never called
-      by a browser, and it is declared here because the route belongs to this
-      application — not because a console may reach it. A client generated
-      from this document must not publish it.
 paths:
   /healthz:
     get:
@@ -1532,159 +1518,6 @@ paths:
         "500":
           $ref: "./shared/errors.yaml#/components/responses/InternalError"
 
-  /usage:
-    get:
-      operationId: getUsage
-      tags:
-        - usage
-      summary: The caller's account usage over a range
-      description: >-
-        Returns one account's usage figures over a half-open range
-        `[from, to)`, cut into buckets of the requested granularity.
-
-        SCOPE IS DERIVED, NEVER REQUESTED. There is no account parameter on
-        this operation and no other way for a caller to name the account
-        these figures are about. The scope comes from the credential on the
-        request, resolved on the server, and it is applied inside the
-        statement that produces the numbers rather than after it. A caller
-        therefore has nothing to tamper with: there is no filter on the
-        request to tamper with, and a caller that presents a scope it was
-        not granted is refused rather than silently answered for its own.
-
-        WHAT THIS SERVES, AND WHAT IT DELIBERATELY DOES NOT. Every figure is
-        derived from the Control Plane's own state — the settlement headers
-        of record, the usage-fact ledger, and the accounting projection's
-        cached balances — and every one of them is reconstructable from that
-        state. None is an authority, and the ledger remains the money record:
-        a usage figure and the ledger disagreeing is a defect in the figure.
-
-        THE POPULATION IS NAMED, NOT ASSUMED. This plane cannot derive the
-        requests the runtime ADMITTED: a request that produced no usage fact
-        leaves no row here at all, so any "requests admitted" figure it
-        published would measure the set of requests it knows about and call
-        it the set of requests. The counts here are therefore named for what
-        they count — `requests_with_usage_facts` — and the absence of the
-        operational metrics below is the same finding seen from the other
-        side.
-
-        Requests, latency, attempts, per-model and per-provider spend, routing
-        outcomes and egress are NOT served: they are the Data Plane's
-        operational facts and no read path imports them here at all. Token
-        counts are NOT served either, and for a different reason — the counters
-        DO travel this plane's fact feed, and they are byte lengths under a
-        tokenizer's name, so a figure published from them as a token count
-        would be a category error invisible in the output, an integer being an
-        integer regardless of what the field is called
-        (docs/architecture/analytics.md §10.2).
-
-        Their absence is a decision rather than a gap, and a figure this
-        surface cannot source honestly is one it will not serve — not at zero,
-        which would be a false statement about a customer, and not as an empty
-        series, which would render as a quiet month.
-
-        NOTHING HERE IS CLOSED. No period is closed anywhere in this system:
-        no accounting period, no close, no lock. A late usage fact lands in
-        the bucket it lands in and changes a figure that was already
-        reported, so a range ending near `freshness.data_through` is
-        provisional, and `final_bucket_partial` says so structurally. Read
-        the freshness object before treating any of this as a bill.
-
-        SERVED AT `/usage`, like every product operation here: this document's
-        server base is `/`, so the path a caller calls is the path declared
-        above. The runtime's namespace prefix is `/v1/` and nothing on this
-        surface is served under it (ADR 0006 §5).
-
-        BOUNDS ARE REFUSALS. A range longer than 90 days, a `from` at or
-        after `to`, a granularity outside the enumeration, or an unknown
-        query parameter is HTTP 400 with `invalid_request`. Nothing is
-        clamped: a silently shortened range is indistinguishable from the
-        range that was asked for, and a caller could not learn of the
-        mismatch anywhere.
-
-        The answer is subject to a per-request deadline. A caller that
-        exceeds it receives HTTP 503 with `service_unavailable`, which is a
-        retry-later answer rather than a differently-shaped one.
-      security:
-        - consoleCredential: []
-      parameters:
-        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
-        - name: from
-          in: query
-          required: true
-          description: >-
-            The inclusive lower bound of the range, as an absolute instant in
-            RFC 3339. Required rather than defaulted: a range that defaults
-            to "the last thirty days" answers a question nobody asked, and a
-            caller cannot tell a default from a choice.
-          schema:
-            type: string
-            format: date-time
-        - name: to
-          in: query
-          required: true
-          description: >-
-            The EXCLUSIVE upper bound of the range, as an absolute instant in
-            RFC 3339. Half-open with `from`, so two consecutive ranges tile
-            the timeline with neither overlap nor gap.
-          schema:
-            type: string
-            format: date-time
-        - name: granularity
-          in: query
-          required: true
-          description: >-
-            The width of one point in the series. A closed enumeration, and
-            the request may name nothing outside it. There is deliberately
-            no `group_by`: the dimensions a caller may slice by are the ones
-            this surface writes a query for, and a caller that named a
-            column would be naming the schema.
-          schema:
-            type: string
-            enum:
-              - hour
-              - day
-              - calendar_month
-        - name: timezone
-          in: query
-          required: false
-          description: >-
-            The IANA zone to cut the buckets in. Optional, and defaults to
-            UTC, which is also where every figure is stored. A local zone
-            changes where the bucket EDGES fall and nothing else: the
-            monetary figures are UTC instants summed either way. A zone that
-            cannot be resolved is HTTP 400, never a silent fallback to UTC —
-            a chart in the wrong zone is wrong in a way no figure defends.
-          schema:
-            type: string
-            maxLength: 64
-            default: UTC
-      responses:
-        "200":
-          description: >-
-            The account's usage over the range. An account this plane holds no
-            derived rows for is a 200 with `availability: not_available` and an
-            empty series — an answer, not a failure, and distinct from a range
-            that is simply quiet.
-          headers:
-            X-Request-Id:
-              $ref: "./shared/probes.yaml#/components/headers/RequestId"
-            Cache-Control:
-              $ref: "./shared/console.yaml#/components/headers/NoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "./shared/analytics.yaml#/components/schemas/AnalyticsUsageResponse"
-        "400":
-          description: >-
-            A bound does not satisfy the contract: a range longer than 90 days,
-            a `from` at or after `to`, a granularity outside the enumeration, an
-            instant that is not RFC 3339, a `timezone` that does not resolve to
-            an IANA zone, a parameter present but empty, or a parameter this
-            operation does not define. `timezone` is optional and its default is
-            `UTC`, but a caller that SENDS it must send a zone: an empty value
-            is a parameter the caller set and this surface will not guess the
-            meaning of, which is a different request from the one that omits the
-            parameter altogether.
   # ---------------------------------------------------------------------------
   # The payment provider's delivery endpoint.
   #
@@ -1910,20 +1743,6 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
-        "401":
-          description: >-
-            The request carried no credential this deployment resolves. This is
-            the one operation on this surface that does not identify its caller
-            by a session — `consoleCredential` is a bearer credential a script
-            or an operator's tooling presents, and there is nothing to sign in
-            to — so the answer says the credential did not resolve and says
-            nothing about which of absent, unknown or retired it was. One answer
-            for every cause, deliberately: a difference is a disclosure to
-            anyone willing to present tokens. The account these figures are
-            about is derived from the credential and is never named by the
-            request, so a caller that cannot tell it was refused would be the
-            caller that draws a chart of someone else's spend.
                 $ref: "./shared/console.yaml#/components/schemas/WebhookAcknowledgement"
         "400":
           description: >-
@@ -1961,27 +1780,6 @@ paths:
               schema:
                 $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
         "404":
-          $ref: "./shared/errors.yaml#/components/responses/NotFound"
-        "405":
-          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
-        "500":
-          $ref: "./shared/errors.yaml#/components/responses/InternalError"
-        "503":
-          description: >-
-            The read did not finish inside this operation's own per-request
-            deadline, so the answer would have been a truncated series — a
-            chart showing real activity having stopped at whatever instant the
-            deadline landed on. It is a retry-later answer and not a
-            differently-shaped one: the same request, asked again, is answered
-            normally, and the range is unchanged. The code is
-            `service_unavailable`.
-
-            This is deliberately not the readiness probe's 503. That one means
-            the service may not receive traffic because a dependency is not
-            answering; this one means the service is up, this one read
-            overran its budget, and the caller should retry — backing the whole
-            surface off on a single slow report would be reading this answer as
-            that one.
           description: >-
             The delivery is addressed to a provider this deployment does not
             serve. This is not the shared `NotFound` the rest of the document
@@ -2013,32 +1811,6 @@ paths:
             application/json:
               schema:
                 $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
-components:
-  securitySchemes:
-    consoleCredential:
-      type: http
-      scheme: bearer
-      description: >-
-        A credential presented by a caller of the Control Plane's public
-        surface. It is the one scheme here that is not a browser session: the
-        operations beside this one identify their caller by the session
-        cookie, and this is for a caller that has none — a script, a scheduled
-        report, an operator's tooling.
-
-        The deployment supplies the credential and the resolution is the
-        server's: the account this surface answers about is derived from the
-        credential and is never named by the request. A credential that does
-        not resolve is HTTP 401 with `unauthenticated`; it is not silently
-        answered for a default
-        account, because a caller that cannot tell it was refused is a
-        caller that will draw a chart of someone else's spend.
-
-        The transport is expected to be replaced by one that proves the
-        identity cryptographically (mTLS or a signed credential) without
-        changing this contract, and a browser session is not this scheme: a
-        session is a different credential with a different lifetime and a
-        different revocation story, and modelling it here before it exists
-        would be a promise this document cannot keep.
         "405":
           $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
         "500":
@@ -2060,18 +1832,235 @@ components:
               schema:
                 $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
 
-# ---------------------------------------------------------------------------
-# The one security scheme this document declares, named by every operation
-# that requires a session and by no operation that does not. It sits here
-# rather than in a fragment for the reason the fragments exist in the first
-# place: `shared/` holds shapes more than one document reaches for, and this
-# scheme is this document's alone — the Data Plane's façade declares a service
-# identity of its own, and the two must not be able to be mistaken for one
-# another. The prose is the contract (AGENTS.md, "The API contract is the
-# OpenAPI document"): the machine-readable half below is what a client
-# generator reads, and the sentences are what tell a human why the shape is
-# what it is.
-# ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # The one security scheme this document declares, named by every operation
+  # that requires a session and by no operation that does not. It sits here
+  # rather than in a fragment for the reason the fragments exist in the first
+  # place: `shared/` holds shapes more than one document reaches for, and this
+  # scheme is this document's alone — the Data Plane's façade declares a service
+  # identity of its own, and the two must not be able to be mistaken for one
+  # another. The prose is the contract (AGENTS.md, "The API contract is the
+  # OpenAPI document"): the machine-readable half below is what a client
+  # generator reads, and the sentences are what tell a human why the shape is
+  # what it is.
+  # ---------------------------------------------------------------------------
+
+  /usage:
+    get:
+      operationId: getUsage
+      tags:
+        - usage
+      summary: The caller's account usage over a range
+      description: >-
+        Returns one account's usage figures over a half-open range
+        `[from, to)`, cut into buckets of the requested granularity.
+
+        SCOPE IS DERIVED, NEVER REQUESTED. There is no account parameter on
+        this operation and no other way for a caller to name the account
+        these figures are about. The scope comes from the credential on the
+        request, resolved on the server, and it is applied inside the
+        statement that produces the numbers rather than after it. A caller
+        therefore has nothing to tamper with: there is no filter on the
+        request to tamper with, and a caller that presents a scope it was
+        not granted is refused rather than silently answered for its own.
+
+        WHAT THIS SERVES, AND WHAT IT DELIBERATELY DOES NOT. Every figure is
+        derived from the Control Plane's own state — the settlement headers
+        of record, the usage-fact ledger, and the accounting projection's
+        cached balances — and every one of them is reconstructable from that
+        state. None is an authority, and the ledger remains the money record:
+        a usage figure and the ledger disagreeing is a defect in the figure.
+
+        THE POPULATION IS NAMED, NOT ASSUMED. This plane cannot derive the
+        requests the runtime ADMITTED: a request that produced no usage fact
+        leaves no row here at all, so any "requests admitted" figure it
+        published would measure the set of requests it knows about and call
+        it the set of requests. The counts here are therefore named for what
+        they count — `requests_with_usage_facts` — and the absence of the
+        operational metrics below is the same finding seen from the other
+        side.
+
+        Requests, latency, attempts, per-model and per-provider spend, routing
+        outcomes and egress are NOT served: they are the Data Plane's
+        operational facts and no read path imports them here at all. Token
+        counts are NOT served either, and for a different reason — the counters
+        DO travel this plane's fact feed, and they are byte lengths under a
+        tokenizer's name, so a figure published from them as a token count
+        would be a category error invisible in the output, an integer being an
+        integer regardless of what the field is called
+        (docs/architecture/analytics.md §10.2).
+
+        Their absence is a decision rather than a gap, and a figure this
+        surface cannot source honestly is one it will not serve — not at zero,
+        which would be a false statement about a customer, and not as an empty
+        series, which would render as a quiet month.
+
+        NOTHING HERE IS CLOSED. No period is closed anywhere in this system:
+        no accounting period, no close, no lock. A late usage fact lands in
+        the bucket it lands in and changes a figure that was already
+        reported, so a range ending near `freshness.data_through` is
+        provisional, and `final_bucket_partial` says so structurally. Read
+        the freshness object before treating any of this as a bill.
+
+        SERVED AT `/usage`, like every product operation here: this document's
+        server base is `/`, so the path a caller calls is the path declared
+        above. The runtime's namespace prefix is `/v1/` and nothing on this
+        surface is served under it (ADR 0006 §5).
+
+        BOUNDS ARE REFUSALS. A range longer than 90 days, a `from` at or
+        after `to`, a granularity outside the enumeration, or an unknown
+        query parameter is HTTP 400 with `invalid_request`. Nothing is
+        clamped: a silently shortened range is indistinguishable from the
+        range that was asked for, and a caller could not learn of the
+        mismatch anywhere.
+
+        The answer is subject to a per-request deadline. A caller that
+        exceeds it receives HTTP 503 with `service_unavailable`, which is a
+        retry-later answer rather than a differently-shaped one.
+      security:
+        - consoleCredential: []
+      parameters:
+        - $ref: "./shared/probes.yaml#/components/parameters/RequestId"
+        - name: from
+          in: query
+          required: true
+          description: >-
+            The inclusive lower bound of the range, as an absolute instant in
+            RFC 3339. Required rather than defaulted: a range that defaults
+            to "the last thirty days" answers a question nobody asked, and a
+            caller cannot tell a default from a choice.
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: true
+          description: >-
+            The EXCLUSIVE upper bound of the range, as an absolute instant in
+            RFC 3339. Half-open with `from`, so two consecutive ranges tile
+            the timeline with neither overlap nor gap.
+          schema:
+            type: string
+            format: date-time
+        - name: granularity
+          in: query
+          required: true
+          description: >-
+            The width of one point in the series. A closed enumeration, and
+            the request may name nothing outside it. There is deliberately
+            no `group_by`: the dimensions a caller may slice by are the ones
+            this surface writes a query for, and a caller that named a
+            column would be naming the schema.
+          schema:
+            type: string
+            enum:
+              - hour
+              - day
+              - calendar_month
+        - name: timezone
+          in: query
+          required: false
+          description: >-
+            The IANA zone to cut the buckets in. Optional, and defaults to
+            UTC, which is also where every figure is stored. A local zone
+            changes where the bucket EDGES fall and nothing else: the
+            monetary figures are UTC instants summed either way. A zone that
+            cannot be resolved is HTTP 400, never a silent fallback to UTC —
+            a chart in the wrong zone is wrong in a way no figure defends.
+          schema:
+            type: string
+            maxLength: 64
+            default: UTC
+      responses:
+        "200":
+          description: >-
+            The account's usage over the range. An account this plane holds no
+            derived rows for is a 200 with `availability: not_available` and an
+            empty series — an answer, not a failure, and distinct from a range
+            that is simply quiet.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/probes.yaml#/components/headers/RequestId"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/analytics.yaml#/components/schemas/AnalyticsUsageResponse"
+        "400":
+          description: >-
+            A bound does not satisfy the contract: a range longer than 90 days,
+            a `from` at or after `to`, a granularity outside the enumeration, an
+            instant that is not RFC 3339, a `timezone` that does not resolve to
+            an IANA zone, a parameter present but empty, or a parameter this
+            operation does not define. `timezone` is optional and its default is
+            `UTC`, but a caller that SENDS it must send a zone: an empty value
+            is a parameter the caller set and this surface will not guess the
+            meaning of, which is a different request from the one that omits the
+            parameter altogether.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "401":
+          description: >-
+            The request carried no credential this deployment resolves. This is
+            the one operation on this surface that does not identify its caller
+            by a session — `consoleCredential` is a bearer credential a script
+            or an operator's tooling presents, and there is nothing to sign in
+            to — so the answer says the credential did not resolve and says
+            nothing about which of absent, unknown or retired it was. One answer
+            for every cause, deliberately: a difference is a disclosure to
+            anyone willing to present tokens. The account these figures are
+            about is derived from the credential and is never named by the
+            request, so a caller that cannot tell it was refused would be the
+            caller that draws a chart of someone else's spend.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+        "404":
+          $ref: "./shared/errors.yaml#/components/responses/NotFound"
+        "405":
+          $ref: "./shared/errors.yaml#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "./shared/errors.yaml#/components/responses/InternalError"
+        "503":
+          description: >-
+            The read did not finish inside this operation's own per-request
+            deadline, so the answer would have been a truncated series — a
+            chart showing real activity having stopped at whatever instant the
+            deadline landed on. It is a retry-later answer and not a
+            differently-shaped one: the same request, asked again, is answered
+            normally, and the range is unchanged. The code is
+            `service_unavailable`.
+
+            This is deliberately not the readiness probe's 503. That one means
+            the service may not receive traffic because a dependency is not
+            answering; this one means the service is up, this one read
+            overran its budget, and the caller should retry — backing the whole
+            surface off on a single slow report would be reading this answer as
+            that one.
+          headers:
+            X-Request-Id:
+              $ref: "./shared/console.yaml#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "./shared/console.yaml#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "./shared/errors.yaml#/components/schemas/ErrorEnvelope"
+
 components:
   securitySchemes:
     sessionCookie:
@@ -2114,3 +2103,27 @@ components:
         authenticated by a signature over the request body that only the
         provider's servers and this deployment can compute, so no cookie is
         asked for and none would help.
+    consoleCredential:
+      type: http
+      scheme: bearer
+      description: >-
+        A credential presented by a caller of the Control Plane's public
+        surface. It is the one scheme here that is not a browser session: the
+        operations beside this one identify their caller by the session
+        cookie, and this is for a caller that has none — a script, a scheduled
+        report, an operator's tooling.
+
+        The deployment supplies the credential and the resolution is the
+        server's: the account this surface answers about is derived from the
+        credential and is never named by the request. A credential that does
+        not resolve is HTTP 401 with `unauthenticated`; it is not silently
+        answered for a default
+        account, because a caller that cannot tell it was refused is a
+        caller that will draw a chart of someone else's spend.
+
+        The transport is expected to be replaced by one that proves the
+        identity cryptographically (mTLS or a signed credential) without
+        changing this contract, and a browser session is not this scheme: a
+        session is a different credential with a different lifetime and a
+        different revocation story, and modelling it here before it exists
+        would be a promise this document cannot keep.

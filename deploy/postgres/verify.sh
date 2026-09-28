@@ -498,32 +498,18 @@ assert_equals "the namespace carries the ownership comment, byte for byte" \
 	"Control Plane ownership namespace (ADR 0006 §7); owned by apps/console-api."
 # The list is an EXACT equality and stays one, and that is the whole point of
 # the assertion rather than an incidental strictness: relaxed to a containment
-<<<<<<< HEAD
-# or LIKE check it would silently unconstrain the twenty-three tables already
+# or LIKE check it would silently unconstrain the twenty-six tables already
 # in it, and a table that appears without anybody reading the diff is precisely
 # the failure a control-plane schema change can least afford. ADR 0012's
 # Consequences names this by name. `sessions` and `analytics_fact_dimensions`
-# each extend the list in the change that creates the table, and the count
-# moves with them.
-assert_equals "the namespace holds exactly the identity, commerce, projection, accounting, ingestion, reconciliation, session and analytics schemas' twenty-three tables" \
-	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "23"
-assert_equals "the control tables are the identity, commerce, projection, accounting, ingestion, reconciliation, session and analytics foundations' set" \
+# each extend the list in the change that creates the table, and the payment
+# tables do too — added by 000013 with the payment integration that writes
+# them — so the count moves with them.
+assert_equals "the namespace holds exactly the identity, commerce, projection, accounting, ingestion, reconciliation, session, analytics and payment schemas' twenty-six tables" \
+	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "26"
+assert_equals "the control tables are the identity, commerce, projection, accounting, ingestion, reconciliation, session, analytics and payment foundations' set" \
 	"$(psql_scalar "$control_db" "SELECT string_agg(tablename, ',' ORDER BY tablename COLLATE \"C\") FROM pg_tables WHERE schemaname = 'control'")" \
-	"account_payg,accounts,analytics_fact_dimensions,api_keys,applied_facts,entitlements,funding_buckets,ingestion_cursor,ledger_entries,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,quarantined_facts,reconciliation_findings,reconciliation_runs,sessions,settlements,subscriptions,users"
-=======
-# or LIKE check it would silently unconstrain the twenty-five tables already in
-# it, and a table that appears without anybody reading the diff is precisely
-# the failure a control-plane schema change can least afford. ADR 0012's
-# Consequences names this by name. `sessions` extends the list in the same
-# change that creates the table, and the count moves with it — as the three
-# payment tables do, added by 000013 with the payment integration that writes
-# them.
-assert_equals "the namespace holds exactly the identity, commerce, projection, accounting, ingestion, reconciliation, session and payment schemas' twenty-five tables" \
-	"$(psql_scalar "$control_db" "SELECT count(*) FROM pg_tables WHERE schemaname = 'control'")" "25"
-assert_equals "the control tables are the identity, commerce, projection, accounting, ingestion, reconciliation, session and payment foundations' set" \
-	"$(psql_scalar "$control_db" "SELECT string_agg(tablename, ',' ORDER BY tablename COLLATE \"C\") FROM pg_tables WHERE schemaname = 'control'")" \
-	"account_payg,accounts,api_keys,applied_facts,entitlements,funding_buckets,ingestion_cursor,ledger_entries,payment_events,payment_intents,payment_quarantine,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,quarantined_facts,reconciliation_findings,reconciliation_runs,sessions,settlements,subscriptions,users"
->>>>>>> f2fe24e (chore(console-api): hold the payment integration working tree)
+	"account_payg,accounts,analytics_fact_dimensions,api_keys,applied_facts,entitlements,funding_buckets,ingestion_cursor,ledger_entries,payment_events,payment_intents,payment_quarantine,plan_grant_definitions,plan_versions,plans,projection_accounts,projection_api_keys,projection_changes,projection_revision,quarantined_facts,reconciliation_findings,reconciliation_runs,sessions,settlements,subscriptions,users" 
 assert_equals "the projection counter is a seeded singleton with a timeline epoch" \
 	"$(psql_scalar "$control_db" "SELECT count(*) FROM control.projection_revision WHERE id = 1 AND last_revision = (SELECT count(*) FROM control.accounts) AND epoch IS NOT NULL")" \
 	"1"
