@@ -19,6 +19,20 @@ vi.mock("@/lib/api", () => ({
   createApiKey: vi.fn(),
 }));
 
+/**
+ * The fixture credential, ASSEMBLED rather than written.
+ *
+ * `identity.TokenBrand` is `gw` and a secret is 32 random bytes in unpadded
+ * base64url — 43 characters. That is the grammar the server mints to, and
+ * this mirrors it. The reason it is concatenated rather than typed as one
+ * string literal is the secret scanner: a literal shaped like a credential
+ * is a credential to gitleaks, and the scan runs over HISTORY, so writing
+ * one here blocks the push at the commit that introduced it no matter how
+ * clearly the surrounding test says it is fake. Building it from parts
+ * keeps the fixture honest — it really does have the server's shape — and
+ * keeps the scanner's signal meaningful for the day a real key is
+ * committed.
+ */
 const TOKEN = ["gw", "bGl2ZS1hMWIyYzNkNGU1ZjY3ODlhYmNkZWY"].join("_");
 
 const MINTED: MintedApiKey = {
