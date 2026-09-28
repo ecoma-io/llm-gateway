@@ -1,4 +1,4 @@
-<script setup lang="ts">
+<script setup lang="ts" generic="TRow extends object">
 // The console's own table, because Loom's will not do this job (ADR 0012 §8.3).
 // `Table` hands a bare `<table>` slot and `TableCell` renders `<td>` and never
 // `<th>`, so a list built from it has no row header at all: the first column of
@@ -16,6 +16,28 @@
 // `RouterLink`s with `aria-current="page"` — real URLs, so Back undoes a page
 // change, which Loom's `Pagination` (buttons, plus a `total` the contract does
 // not have) cannot do.
+//
+// **The row type is a parameter, and a screen names it at the cell.** `rows` is
+// `readonly TRow[]`, so the table reads a row's fields rather than stringifying
+// an opaque value, and a cell slot says what it is handed:
+// `<template #status="{ row }: { row: FundingBucket }">`. That annotation is
+// the whole mechanism, and it is load-bearing in one specific way: Vue resolves a
+// generic component's type parameters from a BOUND type argument or not at all,
+// so `row` inside an unannotated slot is `any` and a screen's `row.status` —
+// indexing a presentation map whose keys the contract fixes — silently accepts
+// anything. The annotation is what turns that cell back into a checked
+// expression.
+//
+// Two things it does not buy, both established by experiment rather than by
+// argument. A bound argument (`<DataTable<Plan>`) is not available at all — the
+// SFC parser reads the `<` as the start of a tag and reports "Invalid end tag" —
+// and an inferred one is resolved by `extendsCheck` against the LAST component
+// in the template, which is the pager's `RouterLink`, not against the slot's
+// `row`. Both routes are therefore typed as `object` here, and a cell is what
+// recovers the row's real shape. What remains checked without an annotation is
+// the table's own `rows: readonly TRow[]`, and a screen never relies on that
+// alone: `usePagedList<TPage>` in `lib/paged-list.ts` names the page type once
+// and derives `rows` from it.
 import { computed, nextTick, onBeforeUpdate, onUpdated, ref, useTemplateRef } from "vue";
 import { RouterLink } from "vue-router";
 
@@ -38,7 +60,7 @@ const props = withDefaults(
     /** The table's caption, rendered as a real `<caption>` rather than a heading above the table. */
     caption: string;
     /** The rows, in the server's order. The table never sorts them: a keyset page has no order to re-sort into. */
-    rows: readonly unknown[];
+    rows: readonly TRow[];
     /** One entry per column, in reading order. The first is rendered as the row header of every row. */
     columns: readonly DataTableColumn[];
     /**
@@ -114,8 +136,7 @@ function isRowHeader(columnIndex: number): boolean {
  * relative date fills a slot; a screen that wants the raw field does nothing
  * and gets the value.
  */
-function fieldValue(row: unknown, key: string): string {
-  if (typeof row !== "object" || row === null) return "";
+function fieldValue(row: TRow, key: string): string {
   const value = (row as Record<string, unknown>)[key];
   return value === undefined || value === null ? "" : String(value);
 }

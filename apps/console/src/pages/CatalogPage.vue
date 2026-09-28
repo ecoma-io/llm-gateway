@@ -1,9 +1,62 @@
+// Catalog: the plans this gateway sells. // // The name is the catalog screen. ADR 0012 §5 defers
+the model catalog — a // model's catalogue, its prices and its availability are Data Plane state
+with // no operation on `console.yaml` — so what remains is the plan list, and this // screen says
+so rather than reading as the model catalog with its contents // removed. A nav label of "Catalog"
+beside a table of plans invites exactly the // question this plane cannot answer, so the page header
+answers it in one line. // // The list is whole-plane: a plan is not an account's, and the operation
+takes // no account and no filter. Nothing here is filtered, which is why the pager // carries no
+query parameters at all and why there is no filter control.
 <script setup lang="ts">
-import { Stack } from "@ecoma-io/loom";
+import { PageHeader, Stack } from "@ecoma-io/loom";
+
+import DataTable from "@/components/DataTable.vue";
+import { fetchPlans } from "@/lib/api";
+import { usePagedList } from "@/lib/paged-list";
+import type { DataTableColumn } from "@/components/data-table";
+import FailureView from "@/modules/failure/FailureView.vue";
+import InstantCell from "@/modules/status/InstantCell.vue";
+import type { ListPlansData, Plan, PlanPage } from "@ecoma-io/llm-gateway-console-api-client";
+
+const plans = usePagedList<PlanPage, ListPlansData["query"]>({
+  read: (query) => fetchPlans({ query }),
+  shape: { filters: [] },
+  vocabulary: {},
+});
+
+const columns: readonly DataTableColumn[] = [
+  { key: "name", label: "Plan" },
+  { key: "id", label: "Id", class: "font-mono text-xs" },
+  { key: "created_at", label: "Created" },
+];
 </script>
 
 <template>
-  <Stack gap="md">
-    <h1 class="text-2xl font-semibold text-foreground">CatalogPage</h1>
+  <Stack gap="lg">
+    <PageHeader
+      title="Catalog"
+      description="The plans this gateway sells. The model catalog — what a model is called, what it costs, whether it is available — is Data Plane state and has no operation here yet."
+    />
+
+    <FailureView
+      v-if="plans.failure.value"
+      :failure="plans.failure.value"
+      :on-retry="() => plans.run()"
+      :retrying="plans.loading.value"
+    />
+
+    <DataTable
+      v-else
+      caption="Plans"
+      layer="page"
+      :columns="columns"
+      :rows="plans.rows.value"
+      :state="plans.loading.value ? 'loading' : 'empty'"
+      :pages="plans.pages.value"
+      empty-message="This gateway has published no plan."
+    >
+      <template #created_at="{ row }: { row: Plan }">
+        <InstantCell :value="row.created_at" />
+      </template>
+    </DataTable>
   </Stack>
 </template>

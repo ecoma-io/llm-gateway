@@ -21,30 +21,10 @@
 // page through `onCursorLost`. The failure matrix's own sentence for those two
 // names exactly that fix, and honouring it is why those rows say `retry` and
 // not `none`.
-import { computed, ref, shallowRef, type Ref, type ShallowRef } from "vue";
+import { computed, readonly, ref, shallowRef } from "vue";
 
 import type { ApiResult, Failure } from "@/lib/api";
 import { behaviourFor } from "@/lib/failure-matrix";
-
-/** What a screen shows right now. */
-export interface ResourceState<T> {
-  /** The last data that arrived, or `undefined` before the first success. */
-  readonly data: ShallowRef<T | undefined>;
-  /** The failure, or `undefined` while the last call succeeded. */
-  readonly failure: Ref<Failure | undefined>;
-  /** True while a call is in flight. */
-  readonly loading: Ref<boolean>;
-  /** True once a call has answered and no failure is standing. */
-  readonly ready: Ref<boolean>;
-  /** True when there is no data and no failure and nothing is in flight. */
-  readonly empty: Ref<boolean>;
-  /**
-   * Whether the failure standing is one the console can answer itself by
-   * dropping the cursor. Kept as a flag the screen reads rather than a code it
-   * matches on, so the vocabulary of codes stays in the matrix.
-   */
-  readonly cursorLost: Ref<boolean>;
-}
 
 /**
  * One resource, its four states, and the three operations that move between
@@ -59,16 +39,35 @@ export function useResource<T>(
   const failure = ref<Failure | undefined>(undefined);
   const loading = ref(false);
   const loaded = ref(false);
-  const droppedByFailure = ref(false);
 
-  async function run(): Promise<void> {
+  /**
+   * The generation the in-flight call belongs to, which is how a slow answer is
+   * stopped from overwriting a fast one.
+   *
+   * The bug this closes is real and reachable in a console, not a theoretical
+   * race: the Refresh button is live while a load is in flight, and a double
+   * click on Next starts two reads. Whichever ANSWERS LAST then wins, so
+   * double-clicking Next renders page three on top of page two — the user sees
+   * the second page with the first page's rows, which is worse than seeing
+   * nothing because it looks correct.
+   *
+   * `run` takes a generation number and a call writes only if its own is still
+   * the current one; `latest` advances on every call, so the first arrival is
+   * stale the moment a second is started. A screen that wants the last click to
+   * win rather than the first to settle passes `latest: true` to `run` and
+   * defeats this; nothing does, and the option's comment says what it is for.
+   */
+  let generation = 0;
+
+  async function run(options_: { readonly latest?: boolean } = {}): Promise<void> {
+    const mine = options_.latest === true ? Number.MAX_SAFE_INTEGER : ++generation;
     loading.value = true;
     try {
       const result = await load();
+      if (mine !== generation) return;
       if (result.ok) {
         data.value = result.data;
         failure.value = undefined;
-        droppedByFailure.value = false;
         return;
       }
       failure.value = result.failure;
@@ -76,28 +75,39 @@ export function useResource<T>(
       // but report it — so the data is dropped rather than left on screen
       // looking current. A `retry` one keeps it, which is the whole point of
       // offering a retry at all.
-      const retains = keepsLastData(result.failure);
-      droppedByFailure.value = !retains;
-      if (!retains) data.value = undefined;
+      if (!keepsLastData(result.failure)) data.value = undefined;
       if (isCursorLost(result.failure)) options.onCursorLost?.();
     } finally {
-      loading.value = false;
-      loaded.value = true;
+      // A stale call clears nothing: the newer one still in flight owns
+      // `loading`, and letting a superseded call set it false is how a screen
+      // ends up claiming it is idle while a read is outstanding.
+      if (mine === generation) loading.value = false;
     }
+    loaded.value = true;
   }
 
-  const state: ResourceState<T> = {
+  return {
     data,
     failure,
-    loading,
+    loading: readonly(loading),
     ready: computed(() => loaded.value && failure.value === undefined),
-    empty: computed(() => loaded.value && failure.value === undefined && data.value === undefined),
-    cursorLost: computed(() => cursorLost.value),
+    /**
+     * A screen reaches for this when it has data and wants the empty state —
+     * and a list that arrived with zero rows is a legitimate answer (an account
+     * with no users is not an error), while "nothing has loaded yet" is a
+     * different thing to say and the dashboard's placeholder is the other
+     * screen that needs it. The two are the same fact about the data and are
+     * kept as one computed so no screen has to reconstruct the difference.
+     */
+    empty: computed(() => data.value === undefined && failure.value === undefined),
+    /**
+     * Whether the failure standing is one the console can answer itself by
+     * dropping the cursor. A flag the screen reads rather than a code it
+     * matches on, so the vocabulary of codes stays in the matrix.
+     */
+    cursorLost: computed(() => failure.value !== undefined && isCursorLost(failure.value)),
+    run,
   };
-
-  const cursorLost = computed(() => failure.value !== undefined && isCursorLost(failure.value));
-
-  return { ...state, run, cursorLost };
 }
 
 /**

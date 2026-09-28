@@ -105,13 +105,27 @@ async function submit() {
         result.failure.kind === "api"
           ? behaviourFor(result.failure.envelope.error.code)
           : undefined;
+      // Both arms are the SAME sentence, deliberately. Every refused sign-in
+      // reads identically — "no such account", "no such user", "a wrong
+      // credential" and "an invited row" are one 401 by design, and a screen
+      // that told them apart would be a membership oracle for the account id.
+      // So the title and the message are chosen together, and the code is read
+      // for its RECOVERY only: a code whose recovery is "sign-in" is one this
+      // screen is the answer to, and anything else is still a refused sign-in
+      // rather than a different failure needing different words.
+      //
+      // The earlier version of this put the matrix's title into the message slot
+      // whenever the row said to show a request id — which rendered "Something
+      // went wrong on our sideSomething went wrong on our side" inside one
+      // alert, because the title was already the heading above it. A request id
+      // is not rendered here at all, and deliberately: a wrong credential is not
+      // something an operator quotes a request id about, and an id on the
+      // sign-in form is an identifier for an attempt that never authenticated
+      // anybody.
+      const isSignInRecovery = behaviour?.recovery === "sign-in";
       failure.value = {
-        // Every refusal reads the same, and the transport arm says so too: a
-        // body that never reached the contract's vocabulary is not a credential
-        // that was refused, and saying it was would be a guess.
-        title:
-          behaviour?.recovery === "sign-in" ? refusedTitle : (behaviour?.title ?? refusedTitle),
-        message: behaviour?.showRequestId === true ? behaviour.title : refusedMessage,
+        title: isSignInRecovery ? refusedTitle : (behaviour?.title ?? refusedTitle),
+        message: refusedMessage,
       };
       return;
     }
@@ -155,6 +169,16 @@ async function submit() {
 
     <Card v-else title="Sign in" description="Sign in to the console for your account.">
       <form novalidate class="flex flex-col gap-4" @submit.prevent="submit">
+        <!--
+          No per-field error is rendered, and that is the design rather than an
+          omission. The contract answers every wrong input with one 401 that
+          does not say which of the three was wrong, so a field-level message
+          would be the console guessing which one it was — and a guess here is
+          the membership oracle the contract's single failure exists to prevent.
+          What the form does instead is leave `novalidate` on, so a browser's
+          own required-field bubble never claims to know either, and describe
+          the failure once, where the answer to it is the same for all three.
+        -->
         <Field
           label="Account id"
           hint="The id of the account you are signing in to. It is not the account's name."
@@ -185,7 +209,7 @@ async function submit() {
           />
         </Field>
 
-        <Alert v-if="failure" variant="warning" :title="failure.title" role="alert">
+        <Alert v-if="failure" variant="warning" :title="failure.title">
           {{ failure.message }}
         </Alert>
 

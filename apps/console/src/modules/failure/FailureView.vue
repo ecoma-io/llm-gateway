@@ -38,10 +38,20 @@
 // about a body that is not a contract body is try again, and that is all it
 // says.
 //
-// The message is spoken by a live region: `role="alert"` on the `Alert` is the
-// interruption, and it carries the *title* and the body — never a secret. No
+// The message is spoken by a live region: `live="assertive"` on the `Alert` is
+// the interruption, and it carries the *title* and the body — never a secret. No
 // credential, token or key material is ever passed to this component, and
 // none of the words it renders is one.
+//
+// The interruption is set through Loom's `live` prop rather than a `role` on
+// the `Alert`, and that is a correction rather than a preference. `Alert`
+// declares `live` and not `role`, so a `role="alert"` passed here was a
+// fall-through attribute that happened to land on the element — it worked only
+// because the tone was `destructive` or `warning`, which are Loom's two
+// assertive tones, so a row that added a third neutral failure would have
+// quietly stopped being announced. `live="assertive"` says it and Loom chooses
+// the element that carries it, so the promise survives a row this console did
+// not write.
 import { Alert, Button, Stack } from "@ecoma-io/loom";
 import { computed } from "vue";
 import { RouterLink } from "vue-router";
@@ -131,7 +141,7 @@ function retry() {
 </script>
 
 <template>
-  <Alert :variant="variant" :title="title" role="alert">
+  <Alert :variant="variant" :title="title" live="assertive">
     <Stack gap="sm" class="mt-1">
       <p>{{ message }}</p>
 
