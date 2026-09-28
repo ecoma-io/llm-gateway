@@ -781,7 +781,7 @@ components:
       type: string
       enum:
         - created
-        - checkout_open
+        - awaiting_transfer
         - requires_action
         - succeeded
         - failed
@@ -799,46 +799,54 @@ components:
         provider, and it is a durable state rather than a moment: the
         provider's own idempotency key is derived from the payment's identity,
         so the payment has to exist before the call that can fail.
-        `checkout_open` is a customer at the provider's hosted page who has
-        not finished, and `requires_action` is the provider asking them for
-        one more step — a separate state rather than a flag, because the
-        customer's next act is different and a console that rendered the two
-        alike would be telling them to do something the provider did not ask
-        for. `succeeded` is the one irreversible move: it is the only state
-        from which a funding leg is written, and every balance on a bucket
-        follows from it. `expired` and `cancelled` are LOCAL decisions — this
-        platform stopped waiting, or the customer walked away — and neither is
-        a fact about the money, which is why a delivery arriving later still
-        funds the customer: the provider is the only party that gets to say
-        whether they paid. `partially_refunded` and `refunded` describe money
-        the provider gave back, which changes what the customer keeps and not
-        what was funded. `quarantined` is the one member a payment never moves
-        into: it is what a delivery that authenticated and could not be
-        interpreted is recorded as, so an operator reads one state vocabulary
-        rather than two, and the payment's own status stays whatever the money
-        says it is.
+        `awaiting_transfer` is a customer who has been given a destination to
+        pay into and has not been seen paying — the state this deployment's
+        provider spends a payment's whole life in, because its instrument is a
+        bank transfer rather than a page a customer completes. `requires_action`
+        is the provider asking the customer for one more step — a separate
+        state rather than a flag, because the customer's next act is different
+        and a console that rendered the two alike would be telling them to do
+        something the provider did not ask for; the provider this deployment
+        speaks never reports it, and it is kept because it is a fact about
+        money rather than about one provider's vocabulary. `succeeded` is the
+        one irreversible move: it is the only state from which a funding leg is
+        written, and every balance on a bucket follows from it. `expired` and
+        `cancelled` are LOCAL decisions — this platform stopped waiting, or the
+        customer walked away — and neither is a fact about the money, which is
+        why a delivery arriving later still funds the customer: the provider is
+        the only party that gets to say whether they paid.
+        `partially_refunded` and `refunded` describe money the provider gave
+        back, which changes what the customer keeps and not what was funded;
+        they are reachable only from a provider that reports a refund, and this
+        deployment's does not, which is a fact about the provider rather than a
+        rule this surface enforces. `quarantined` is the one member a payment
+        never moves into: it is what a delivery that authenticated and could
+        not be interpreted is recorded as, so an operator reads one state
+        vocabulary rather than two, and the payment's own status stays whatever
+        the money says it is.
 
     PaymentIntent:
       type: object
       description: >-
-        One payment: what this platform asked the provider to charge, and what
+        One payment: what this platform asked the provider to collect, and what
         became of it. The amount was priced **here**, from the offer the
         customer named, and it is the figure the ledger is credited with when
         a signed delivery reports the capture — the two are compared, and a
         delivery that disagrees funds nothing.
 
-        `checkout_url` is the provider's own page, returned verbatim and never
-        parsed: it is a promise the provider makes and this plane keeps on the
-        provider's behalf. The status is the provider's word and cannot be set
-        by a client — a browser that decided a payment had succeeded would be
-        deciding the instant a customer's balance moved.
+        `transfer_instructions` is what a customer is handed to pay with:
+        where to send the money, and a QR the provider drew. Returned verbatim
+        and never parsed: it is a promise the provider makes and this plane
+        keeps on the provider's behalf. The status is the provider's word and
+        cannot be set by a client — a browser that decided a payment had
+        succeeded would be deciding the instant a customer's balance moved.
       required:
         - id
         - status
         - amount_minor_units
         - currency
         - minor_unit_exponent
-        - checkout_url
+        - transfer_instructions
         - created_at
         - expires_at
       properties:
@@ -893,18 +901,28 @@ components:
             that offer was removed. The amount is integer minor units and
             nothing here places the decimal point for the client; this is the
             figure it needs to place it itself.
-        checkout_url:
-          type: [string, "null"]
+        transfer_instructions:
+          oneOf:
+            - $ref: "#/components/schemas/PaymentTransferInstructions"
+            - type: "null"
           description: >-
-            The provider's hosted checkout, where the customer completes the
-            payment. Returned verbatim and never parsed, rewritten or
-            re-derived by anything on this side — the URL is the provider's to
-            shape, and a client that read a session id out of it would break
-            the day that shape changed. Null exactly while the payment is
-            `created`: a payment exists before its checkout does, deliberately,
-            so that the provider's idempotency key can be derived from a
-            durable identity. A customer returning to a payment they started
-            is sent back to this same URL.
+            How to pay this payment, or null when this plane holds none. Null
+            exactly while the payment is `created`: a payment exists before the
+            provider has been asked for a destination, deliberately, so that
+            the provider's idempotency key can be derived from a durable
+            identity. It is also null for a payment whose destination was never
+            obtained, which is the state the `503` below describes and the
+            state a retry under the same idempotency key resolves.
+
+            It is a copy of what was recorded and not a judgement about the
+            payment: a payment whose destination has been recorded keeps it, in
+            every later state, because the account it names is the account the
+            money is resolved by and a payment whose destination disappeared
+            from its own record would be a payment whose deliveries could not
+            be explained to the customer who sent them. Whether a destination
+            should be SHOWN is a question about the status beside this field,
+            and it is a client's to answer rather than this field's to
+            pre-answer.
         created_at:
           type: string
           format: date-time
@@ -912,10 +930,90 @@ components:
           type: string
           format: date-time
           description: >-
-            When an uncompleted checkout stops being waited on. It is a
+            When an uncompleted transfer stops being waited on. It is a
             deadline on this platform's PATIENCE and not a fact about the
             money: a delivery arriving after it is still honoured, because the
             provider alone gets to say whether the customer paid.
+
+    # The destination a customer pays into, and the provider's own drawing of
+    # it. Three strings and an optional URL, and every one of them is written
+    # by the provider and reproduced here unchanged.
+    PaymentTransferInstructions:
+      type: object
+      description: >-
+        Where to send the money, as the provider stated it. Every member is
+        the provider's own value, returned verbatim: `transfer_code` is the
+        reference the payment resolves by when a delivery reports money
+        arriving at it, `bank_name` and `account_holder` are what a customer
+        checks before sending and what a banking app fills in when the QR is
+        scanned, and `qr_url` is an image the provider drew.
+
+        Nothing here has been parsed, normalised or re-derived. A client
+        renders these and does not interpret them: a console that read a bank
+        or an amount out of `qr_url`, or that composed its own QR from the
+        other three, would be reimplementing an encoding the provider owns and
+        would break the day that encoding changed.
+      required:
+        - transfer_code
+        - bank_name
+        - account_holder
+        - qr_url
+      properties:
+        transfer_code:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >-
+            The account number the customer transfers to — the provider's
+            virtual account for this payment, minted by the provider when
+            these instructions were obtained. It is the value the provider
+            echoes back when money arrives at it, which is what makes it the
+            key a delivery is resolved by, and it is unique to this payment
+            across the deployment.
+
+            It is a DESTINATION and not a reference the customer types: the
+            customer sends money TO it, which is why it can be the key at all.
+            A customer's own free text — the transfer memo — never is, because
+            a memo is theirs to edit and their bank's to rewrite, and a
+            payment whose correlation rested on one would be a payment that
+            stopped resolving the first time somebody's app shortened it.
+
+            Bounded at 255 characters, which is the column's own bound: a
+            value longer than this is one this plane could not have stored.
+        bank_name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >-
+            The bank the virtual account is held at, as the provider named it.
+            It is shown so a customer can check the destination before sending
+            and so a customer typing the account number by hand knows where it
+            goes. It is not parsed, not matched against anything, and not a
+            code: the provider's spelling is the whole of its meaning.
+        account_holder:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >-
+            The name the account is held in, as the provider stated it. It is
+            the third thing a customer checks before sending money and the
+            thing their banking app verifies against — the one field that
+            tells them the destination is this business and not somebody
+            else's. Returned verbatim, like everything else here.
+        qr_url:
+          type: [string, "null"]
+          description: >-
+            The provider's own QR image for this transfer, as a URL. Returned
+            verbatim and never parsed, rewritten or re-derived by anything on
+            this side — the URL is the provider's to shape, and a client that
+            read an account number or an amount out of its query string would
+            break the day that shape changed.
+
+            Null when the provider drew none, which is a fact about the
+            provider's answer and not a failure: the three members above are
+            always present and are always enough to pay, and a console that
+            treated a missing image as a missing payment would be refusing a
+            transfer a customer could make.
       additionalProperties: false
 
     CreatePaymentIntentRequest:
@@ -980,7 +1078,8 @@ components:
             a second one. That payment may be in any state by then, including
             one that has already succeeded, and the honest thing for a client
             to do with a converged answer is render what it was told: a retry
-            after a customer paid must not send them to a checkout again.
+            after a customer paid must not present them with a destination to
+            send money to again.
       additionalProperties: false
 
     TopUpOffer:
@@ -1033,7 +1132,8 @@ components:
             What choosing this offer charges, in integer minor units of
             `currency`. Strictly positive, because a free offer is not a
             top-up and a zero here would be a payment that funds nothing while
-            still occupying the customer's checkout. Bounded by
+            still taking a destination from the provider that another payment
+            could have used. Bounded by
             `Number.MAX_SAFE_INTEGER` — 2^53 − 1 — for the same reason
             `PaymentIntent.amount_minor_units` is: the console is JavaScript,
             where an integer above it has no exact representation, so a price
@@ -1145,15 +1245,28 @@ components:
         branch on it, which is a decision the provider has no business making
         and one this plane could not make true.
       required:
-        - received
+        - success
       properties:
-        received:
+        success:
           type: boolean
           description: >-
             Always true. It acknowledges the delivery and says nothing about
             it — not the disposition, not the payment, not the amount. A
             provider that read more into an acknowledgement than "stop sending
             this one" would be reading a claim this body does not make.
+
+            The member is spelled `success` rather than `received` because the
+            provider this deployment speaks names it, and the name is
+            load-bearing in a way a field name usually is not: that provider
+            decides from this body whether a delivery was accepted at all, so
+            a body it does not recognise as an acknowledgement would be a
+            delivery it retries. This is the one member of this contract whose
+            spelling is somebody else's, and the operation's description says
+            what that costs — the response is written as exact bytes rather
+            than produced by a serialiser, because a serialiser is free to
+            reformat, and "the same members in a different order" is
+            indistinguishable from "not an acknowledgement" to the program
+            reading it.
       additionalProperties: false
 
     PriceSnapshot:

@@ -155,6 +155,7 @@ export type {
   PaymentIntent,
   PaymentIntentPage,
   PaymentIntentState,
+  PaymentTransferInstructions,
   Plan,
   PlanPage,
   PriceSnapshot,
