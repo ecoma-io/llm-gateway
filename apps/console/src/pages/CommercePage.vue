@@ -1,16 +1,21 @@
-// Commerce: what this account has bought and what it has been granted. // // Three lists, and the
-distinction between them is the whole reason this screen // exists rather than one table called
-"billing". A **subscription** is a // recurring arrangement on a plan version. An **entitlement** is
-one cycle of // one grant inside that arrangement — it is granted, it has a period, and it //
-expires when the period ends, which is not the same moment the subscription // ends. A **bucket** is
-money, and a bucket funded by an entitlement is not // the same bucket as a pay-as-you-go one.
-Nothing on this page adds two of // those together. // // **The grant figure is a rendered value.**
-`granted_minor_units` is what the // server granted; the page does not multiply it by a cycle count,
-a plan price // or anything else it holds. A grant's amount is the whole of a plan's money // for
-one cycle, and the reason that is worth saying out loud is that a // console which multiplies a
-grant by the number of cycles would produce a // figure the contract never promised and no server
-could contradict.
 <script setup lang="ts">
+// Commerce: what this account has bought and what it has been granted.
+//
+// Three lists, and the distinction between them is the whole reason this
+// screen exists rather than one table called "billing". A **subscription** is
+// a recurring arrangement on a plan version. An **entitlement** is one cycle
+// of one grant inside that arrangement — it is granted, it has a period, and
+// it expires when the period ends, which is not the same moment the
+// subscription ends. A **bucket** is money, and a bucket funded by an
+// entitlement is not the same bucket as a pay-as-you-go one. Nothing on this
+// page adds two of those together.
+//
+// **The grant figure is a rendered value.** `granted_minor_units` is what the
+// server granted; the page does not multiply it by a cycle count, a plan price
+// or anything else it holds. A grant's amount is the whole of a plan's money
+// for one cycle, and the reason that is worth saying out loud is that a
+// console which multiplies a grant by the number of cycles would produce a
+// figure the contract never promised and no server could contradict.
 import { Card, PageHeader, Stack } from "@ecoma-io/loom";
 import { computed } from "vue";
 
@@ -37,13 +42,27 @@ import type {
 
 const subscriptions = usePagedList<SubscriptionPage, ListSubscriptionsData["query"]>({
   read: (query) => fetchSubscriptions({ query }),
-  shape: { filters: [] },
+  // First list on the route, so it keeps the contract's own name for the
+  // cursor; the second has to disagree or the two share a key. See the long
+  // note on the entitlements list below for what sharing one actually costs.
+  shape: { filters: [], cursor: "after" },
   vocabulary: {},
 });
 
 const entitlements = usePagedList<EntitlementPage, ListEntitlementsData["query"]>({
   read: (query) => fetchEntitlements({ query }),
-  shape: { filters: [] },
+  // NAMED, and the second list on a route has to be. Both lists here default
+  // their cursor key to `after`, and a route has exactly one query string: leave
+  // them alone and paging one writes a cursor into the key the other is
+  // reading. The other list re-reads with a cursor minted for a different
+  // collection, the server refuses it (`application/consolecursor.go` checks
+  // that the cursor names the collection it was issued for), and the refusal
+  // comes back as `invalid_request` — which `resource.ts` classes as a LOST
+  // cursor, so `paged-list.ts` answers with `restartWithoutCursor(carryOver())`,
+  // a REPLACE that drops `after` entirely. One Next button would then reset both
+  // tables to page one, and the reader would experience a pager that undoes
+  // itself. `AccountingPage` gets this right with `ledger_after`.
+  shape: { filters: [], cursor: "entitlements_after" },
   vocabulary: {},
 });
 
@@ -102,6 +121,40 @@ const pendingCancellation = computed(() =>
       row.cancel_at > new Date().toISOString(),
   ),
 );
+
+/**
+ * The subscriptions table's state word, and the three states rather than the two
+ * `loading ? "loading" : "empty"` derives.
+ *
+ * The read is fired from `onMounted`, which runs after the first render, so on
+ * the first paint `loading` is false while nothing has been asked and nothing
+ * has come back: `data` is `undefined` and `rows` is empty. "Empty" would then
+ * be a claim — "This account has no subscription." — made about an account the
+ * console has not heard from. A reader on a slow connection is told they bought
+ * nothing; a reader whose subscription was genuinely cancelled sees the same
+ * sentence and cannot tell a fact from a silence. `data === undefined` is the
+ * probe that separates them, and it is the one `resource.ts` is built around.
+ */
+function subscriptionsTableState(): "ready" | "loading" | "empty" {
+  if (subscriptions.loading.value) return "loading";
+  if (subscriptions.data.value === undefined) return "loading";
+  return subscriptions.rows.value.length === 0 ? "empty" : "ready";
+}
+
+/**
+ * The entitlements table's state word: the same three, for the same reason.
+ *
+ * Worth saying twice because this screen has two tables and a reader moving
+ * between them is exactly who would be misled: the subscriptions table would
+ * already have its rows while the entitlements read is still outstanding, so
+ * the two-state derivation would report the account as having funded nothing
+ * while showing a purchase one panel away.
+ */
+function entitlementsTableState(): "ready" | "loading" | "empty" {
+  if (entitlements.loading.value) return "loading";
+  if (entitlements.data.value === undefined) return "loading";
+  return entitlements.rows.value.length === 0 ? "empty" : "ready";
+}
 </script>
 
 <template>
@@ -129,7 +182,7 @@ const pendingCancellation = computed(() =>
         layer="page"
         :columns="subscriptionColumns"
         :rows="subscriptions.rows.value"
-        :state="subscriptions.loading.value ? 'loading' : 'empty'"
+        :state="subscriptionsTableState()"
         :pages="subscriptions.pages.value"
         empty-message="This account has no subscription."
         note="A subscription is a recurring arrangement on a plan version. A pay-as-you-go balance is a different kind of thing, and it is on the accounting screen."
@@ -167,7 +220,7 @@ const pendingCancellation = computed(() =>
         layer="page"
         :columns="entitlementColumns"
         :rows="entitlements.rows.value"
-        :state="entitlements.loading.value ? 'loading' : 'empty'"
+        :state="entitlementsTableState()"
         :pages="entitlements.pages.value"
         empty-message="No grant has been made to this account."
         note="A grant is one cycle of one plan, and it expires with its period."

@@ -1,20 +1,28 @@
-// Accounting: the buckets, and one bucket's ledger. // // **The rule this screen exists to hold is
-that it computes nothing.** A bucket // carries three figures — `settled`, `held`, `available` — and
-the three // identities the domain keeps between them are the SERVER's to keep. This page // renders
-each from its own field and reads no other one to produce it. The // temptation is exactly the
-arithmetic a reader would do in their head, and // doing it here would make a client-side `settled -
-held` a second ledger with // no audit behind it; when it disagreed with the server there would be
-no way to // say which was right. `formatBalances` is a view over the response for the same //
-reason, and the assertion that matters is the one a sum would fail. // // **A bucket is shown per
-bucket, and the ledger is per bucket too.** A PAYG // bucket and an entitlement bucket are never one
-balance — a cycle that rolls // must not take the pay-as-you-go balance with it — so this screen
-opens no // cross-bucket view and offers no total. The reader picks a bucket from the list // and
-reads that bucket's history, which is what a ledger is a record of. // // **The ledger's legs are
-signed, and the sign is read.** A `consume` leg's // `settled_delta` is negative in the server's own
-storage, and this page renders // the sign it was given. It does not negate anything for
-readability, because a // client that flipped a sign is a client whose ledger disagrees with the
-domain // over what a `consume` means.
 <script setup lang="ts">
+// Accounting: the buckets, and one bucket's ledger.
+//
+// **The rule this screen exists to hold is that it computes nothing.** A
+// bucket carries three figures — `settled`, `held`, `available` — and the
+// three identities the domain keeps between them are the SERVER's to keep.
+// This page renders each from its own field and reads no other one to produce
+// it. The temptation is exactly the arithmetic a reader would do in their
+// head, and doing it here would make a client-side `settled - held` a second
+// ledger with no audit behind it; when it disagreed with the server there
+// would be no way to say which was right. `formatBalances` is a view over the
+// response for the same reason, and the assertion that matters is the one a
+// sum would fail.
+//
+// **A bucket is shown per bucket, and the ledger is per bucket too.** A PAYG
+// bucket and an entitlement bucket are never one balance — a cycle that rolls
+// must not take the pay-as-you-go balance with it — so this screen opens no
+// cross-bucket view and offers no total. The reader picks a bucket from the
+// list and reads that bucket's history, which is what a ledger is a record of.
+//
+// **The ledger's legs are signed, and the sign is read.** A `consume` leg's
+// `settled_delta` is negative in the server's own storage, and this page
+// renders the sign it was given. It does not negate anything for readability,
+// because a client that flipped a sign is a client whose ledger disagrees with
+// the domain over what a `consume` means.
 import { Card, PageHeader, SegmentedControl, Stack } from "@ecoma-io/loom";
 import { computed } from "vue";
 
@@ -160,6 +168,50 @@ const bucketColumns: readonly DataTableColumn[] = [
   { key: "status", label: "Status" },
   { key: "version", label: "Version", align: "right" },
 ];
+
+/**
+ * The buckets table's state word, and it is three states rather than the two
+ * `loading ? "loading" : "empty"` derives.
+ *
+ * The read is fired from `onMounted`, after the first render, so on the first
+ * paint nothing has been asked and nothing has answered: `loading` is false,
+ * `data` is `undefined`, `rows` is empty. "Empty" is therefore not "this account
+ * holds no money", it is "this console has not been told", and the table would
+ * render the first as the second. On a screen whose whole reason to exist is
+ * that its figures are the server's and not the browser's — see the rule in this
+ * file's header — a screen that invents a claim about the account's money is
+ * failing at the one job it was written to do. `data === undefined` is the
+ * probe that tells the two apart, and it is the one `resource.ts` is built
+ * around.
+ */
+function bucketsTableState(): "ready" | "loading" | "empty" {
+  if (buckets.loading.value) return "loading";
+  if (buckets.data.value === undefined) return "loading";
+  return buckets.rows.value.length === 0 ? "empty" : "ready";
+}
+
+/**
+ * The ledger table's state word, and the same three states.
+ *
+ * This one is the more surprising of the two, because the ledger is the table
+ * whose gate the file above spends a long comment on: it only reads once a
+ * bucket has been named, and it renders nothing at all until then. The gate is
+ * what makes the two-state derivation look safe here — a table that is not
+ * mounted is not claiming anything — and it is not enough. The moment the
+ * reader names a bucket, the table mounts and paints, and the read it triggers
+ * has not returned: `loading` is false on that first paint, `rows` is empty,
+ * and the ledger says the bucket has no entries. The claim is about a bucket
+ * that genuinely exists and that the reader has just explicitly asked about,
+ * so it is more misleading than a wrong count would be. This page got the
+ * cursor key right (`ledger_after`, and the reason for it is written at the
+ * list) and still had this wrong; the two defects are unrelated and both were
+ * here.
+ */
+function ledgerTableState(): "ready" | "loading" | "empty" {
+  if (ledger.loading.value) return "loading";
+  if (ledger.data.value === undefined) return "loading";
+  return ledger.rows.value.length === 0 ? "empty" : "ready";
+}
 </script>
 
 <template>
@@ -185,7 +237,7 @@ const bucketColumns: readonly DataTableColumn[] = [
         layer="page"
         :columns="bucketColumns"
         :rows="buckets.rows.value"
-        :state="buckets.loading.value ? 'loading' : 'empty'"
+        :state="bucketsTableState()"
         :pages="buckets.pages.value"
         empty-message="This account holds no funding bucket."
         note="A bucket is money set aside for spend. It comes from a plan's cycle or from a top-up — never from the other."
@@ -261,7 +313,7 @@ const bucketColumns: readonly DataTableColumn[] = [
           layer="page"
           :columns="ledgerColumns"
           :rows="ledger.rows.value"
-          :state="ledger.loading.value ? 'loading' : 'empty'"
+          :state="ledgerTableState()"
           :pages="ledger.pages.value"
           empty-message="This bucket has no leg matching that kind."
         >

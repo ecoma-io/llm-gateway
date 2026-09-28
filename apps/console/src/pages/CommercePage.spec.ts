@@ -228,6 +228,69 @@ describe("CommercePage", () => {
     ).toContain("Granted");
   });
 
+  it("keeps the two lists on one route from sharing a cursor", async () => {
+    // The case the accounting screen fixed for its bucket list and its ledger,
+    // and this screen did not have for either of its lists. Asserted on the
+    // REQUESTS rather than on the hrefs: two lists sharing a cursor key
+    // produces links that look perfectly reasonable and only misbehave once the
+    // second list reads the first list's position.
+    const { router } = await mountAt("/commerce?entitlements_after=c-entitlements-2");
+
+    // The entitlements list sends its own cursor — that is the one asked for.
+    expect(seam.fetchEntitlements.mock.lastCall?.[0]).toEqual({
+      query: { after: "c-entitlements-2" },
+    });
+
+    // The subscriptions list sends NONE, and that is the load-bearing half.
+    // Both lists watch the same route query, so before the fix this one found
+    // `after` — the default key the entitlements list had also been using —
+    // and sent the entitlements cursor against `GET /subscriptions`. The
+    // server refuses a cursor that "names a different collection" with `400
+    // invalid_request`, `resource.ts` classifies that as a lost cursor, and
+    // `paged-list.ts` fires `restartWithoutCursor(carryOver())` — a REPLACE
+    // that drops `after` entirely and takes the ENTITLEMENTS list's position
+    // with it, because both lists believed they owned the key. On the
+    // commerce screen that is a reader losing their place in a list of grants
+    // because of a pager on the table above it.
+    expect(seam.fetchSubscriptions.mock.lastCall?.[0]).toEqual({ query: {} });
+
+    // The URL survives, which is what proves the restart did NOT fire. A cursor
+    // the console cannot place is answered by dropping it, and a drop replaces
+    // the URL — so the assertion is on the address bar the reader would still
+    // be looking at, not only on the request that was made.
+    expect(router.currentRoute.value.query.entitlements_after).toBe("c-entitlements-2");
+
+    // And the other direction: the subscriptions cursor, sent to the operation
+    // that minted it, and not to the grants.
+    seam.fetchEntitlements.mockClear();
+    await mountAt("/commerce?after=c-subscriptions-2&entitlements_after=c-entitlements-2");
+    expect(seam.fetchSubscriptions.mock.lastCall?.[0]).toEqual({
+      query: { after: "c-subscriptions-2" },
+    });
+    expect(seam.fetchEntitlements.mock.lastCall?.[0]).toEqual({
+      query: { after: "c-entitlements-2" },
+    });
+  });
+
+  it("claims the account bought nothing only after the server has said so", async () => {
+    // The four-state resource, and the fifth state a two-state derivation
+    // invents. `usePagedList` issues its read from `onMounted` and `onMounted`
+    // runs after the first render, so `loading.value` is false at exactly the
+    // moment the console knows least — and what the reader was shown in that
+    // window was "This account has no subscription." A claim about what an
+    // account has BOUGHT, made by a read that had not answered, on the one
+    // screen where the claims are about money.
+    seam.fetchSubscriptions.mockReturnValue(new Promise(() => {}));
+    seam.fetchEntitlements.mockReturnValue(new Promise(() => {}));
+
+    const { wrapper } = await mountAt("/commerce");
+    for (const body of wrapper.findAll("tbody")) {
+      expect(body.text()).toMatch(/Loading/);
+    }
+    expect(wrapper.text()).not.toContain("This account has no subscription.");
+    expect(wrapper.text()).not.toContain("No grant has been made to this account.");
+  });
+
   describe("an absent grant is not a grant of zero", () => {
     it("renders the two as different facts on the same screen", async () => {
       const { wrapper } = await mountAt("/commerce");

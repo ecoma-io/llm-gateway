@@ -443,6 +443,33 @@ describe("AccountingPage", () => {
       ).toEqual(["false", "true"]);
     });
 
+    it("claims the account holds no money only after the server has said so", async () => {
+      // The four-state resource, and the fifth state a two-state derivation
+      // invents. `usePagedList` issues its read from `onMounted`, which runs after
+      // the first render, so `loading.value` is false exactly when the console
+      // knows least.
+      //
+      // The ledger is the one worth naming, because it is the screen's most
+      // correct read — the `enabled` gate, the `ledger_after` key, the sign taken
+      // from the server — and it still had the wrong empty sentence. Getting the
+      // cursor key right and the state word wrong on the same table are
+      // unrelated failures, and one of them being fixed says nothing about the
+      // other.
+      seam.fetchFundingBuckets.mockReturnValue(new Promise(() => {}));
+      seam.fetchLedgerEntries.mockReturnValue(new Promise(() => {}));
+
+      const { wrapper } = await mountAt(`/accounting?bucket=${PAYG}`);
+      const bodies = wrapper.findAll("tbody").map((body) => body.text());
+      expect(bodies).toHaveLength(2);
+      for (const body of bodies) {
+        expect(body).toMatch(/Loading/);
+      }
+      // A claim about the account's MONEY, which on this screen is the one
+      // category of sentence that has to come from the server.
+      expect(wrapper.text()).not.toContain("This account holds no funding bucket.");
+      expect(wrapper.text()).not.toContain("This bucket has no leg matching that kind.");
+    });
+
     it("keeps the two lists on one route from sharing a cursor", async () => {
       const { wrapper } = await mountAt(`/accounting?bucket=${PAYG}&after=c-buckets-2`);
 

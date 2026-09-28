@@ -319,9 +319,11 @@ describe("ReconciliationPage", () => {
       expect(seam.fetchFindings.mock.lastCall?.[0]).toEqual({
         query: { status: "open", severity: "critical" },
       });
-      const findingsNext = pagerHrefs(wrapper).filter((href) => href.includes("after=c-findings"));
+      const findingsNext = pagerHrefs(wrapper).filter((href) =>
+        href.includes("findings_after=c-findings"),
+      );
       expect(findingsNext).toEqual([
-        "/reconciliation?status=open&severity=critical&after=c-findings-2",
+        "/reconciliation?status=open&severity=critical&findings_after=c-findings-2",
       ]);
       for (const href of pagerHrefs(wrapper)) {
         expect(href, href).not.toMatch(/account_id|account/i);
@@ -331,8 +333,71 @@ describe("ReconciliationPage", () => {
     it("keeps a valid filter pair on a page change with no undeclared noise", async () => {
       const { wrapper } = await mountAt("/reconciliation?status=resolved&severity=critical");
       expect(pagerHrefs(wrapper)).toEqual([
-        "/reconciliation?status=resolved&severity=critical&after=c-findings-2",
+        "/reconciliation?status=resolved&severity=critical&findings_after=c-findings-2",
       ]);
+    });
+  });
+
+  describe("the two lists on one route do not share a cursor", () => {
+    it("sends each list only the cursor its own key holds", async () => {
+      // The case the accounting screen fixed for its bucket list and its
+      // ledger, and this screen did not have for either of its lists. Asserted
+      // on the REQUESTS rather than on the hrefs, because a shared cursor key
+      // produces links that look correct and only misbehave once the second
+      // list reads the first list's position.
+      const { router } = await mountAt(
+        "/reconciliation?after=c-runs-2&findings_after=c-findings-2",
+      );
+
+      // Each list reads its own key, so each sends the cursor that key holds.
+      expect(seam.fetchReconciliationRuns.mock.lastCall?.[0]).toEqual({
+        query: { after: "c-runs-2" },
+      });
+      expect(seam.fetchFindings.mock.lastCall?.[0]).toEqual({
+        query: { after: "c-findings-2" },
+      });
+
+      // And that is the ONLY way this passes. With both lists on the default
+      // `after` key, the findings list would have read `after` — the runs
+      // list's cursor — and sent it against `GET /findings`; the server refuses
+      // a cursor that "names a different collection" with `400
+      // invalid_request`, `resource.ts` classifies that as a lost cursor, and
+      // the console replies with `restartWithoutCursor` — a REPLACE that drops
+      // `after` and so resets the runs list the reader was not even reading.
+      // The address bar is asserted because that restart is the damage: it
+      // replaces the URL rather than pushing, so Back cannot undo it either.
+      expect(router.currentRoute.value.query.after).toBe("c-runs-2");
+      expect(router.currentRoute.value.query.findings_after).toBe("c-findings-2");
+
+      // The runs list alone, with a findings cursor in the URL. It must send
+      // nothing, and — the half a shared key fails on — the findings cursor
+      // must survive on screen rather than being cleared by a restart.
+      seam.fetchReconciliationRuns.mockClear();
+      const { router: isolated } = await mountAt("/reconciliation?findings_after=c-findings-2");
+      expect(seam.fetchReconciliationRuns.mock.lastCall?.[0]).toEqual({ query: {} });
+      expect(isolated.currentRoute.value.query.findings_after).toBe("c-findings-2");
+    });
+
+    it("keeps both declared filters on a page change while naming its own cursor key", async () => {
+      // The two halves of the findings list's shape, asserted together because
+      // they are the same declaration: `shape.filters` says which keys a page
+      // change carries, and `shape.cursor` says which key the cursor itself
+      // rides in. Getting the first right and the second wrong still loses the
+      // reader's place — on a different table, for a pager they never touched.
+      const { wrapper } = await mountAt("/reconciliation?status=open&findings_after=c-findings-2");
+
+      // The reader's own cursor is in the request...
+      expect(seam.fetchFindings.mock.lastCall?.[0]).toEqual({
+        query: { status: "open", after: "c-findings-2" },
+      });
+      // ...and "First" drops it while keeping the filter, because the first
+      // page is a position the console can name and "no cursor" is the honest
+      // way to write it.
+      const hrefs = pagerHrefs(wrapper);
+      expect(hrefs).toContain("/reconciliation?status=open");
+      for (const href of hrefs) {
+        expect(href, href).toContain("status=open");
+      }
     });
   });
 
@@ -409,6 +474,39 @@ describe("ReconciliationPage", () => {
   });
 
   describe("empty is an answer, not a failure", () => {
+    it("claims nothing about the system until the system has answered", async () => {
+      // The four-state resource, and the fifth state a two-state derivation
+      // invents. `usePagedList` reads from `onMounted`, which runs AFTER the
+      // first render, so `loading.value` is false exactly when the console has
+      // least to say.
+      //
+      // Worth the assertion here more than on any other screen, because both of
+      // this screen's empty sentences are SYSTEM-LEVEL claims — "No pass has
+      // run yet.", "No finding matches those filters." A gateway whose reaper
+      // has never run and a console that has not finished asking are different
+      // facts, and only the second one is true during that window.
+      seam.fetchReconciliationRuns.mockReturnValue(new Promise(() => {}));
+      seam.fetchFindings.mockReturnValue(new Promise(() => {}));
+
+      const { wrapper } = await mountAt("/reconciliation");
+      for (const body of wrapper.findAll("tbody")) {
+        expect(body.text()).toMatch(/Loading/);
+      }
+      expect(wrapper.text()).not.toContain("No pass has run yet.");
+      expect(wrapper.text()).not.toContain("No finding matches those filters.");
+
+      // The findings table's `note` — "That is the answer a healthy system
+      // gives." — is a SHARPER claim than either sentence, and this change does
+      // not reach it. `DataTable` guards `emptyMessage` on `state` but renders
+      // `note` unconditionally, so the verdict survives next to "Loading…".
+      // That is a real defect and it lives in `components/DataTable.vue`, which
+      // this change does not own; the assertion below records the boundary
+      // rather than pretending the screen is clean. An owner's fix is to gate
+      // the note on the same `state` the message is gated on, at which point
+      // this becomes a plain `not.toMatch`.
+      expect(wrapper.text()).toMatch(/answer a healthy system gives/i);
+    });
+
     it("renders a healthy system's silence as a sentence about the filters", async () => {
       seam.fetchFindings.mockResolvedValue(
         ok({ items: [], next_cursor: undefined, has_more: false }),

@@ -158,6 +158,25 @@ describe("CatalogPage", () => {
     );
   });
 
+  it("claims the catalog is empty only after the server has said so", async () => {
+    // The four-state resource, and the fifth state a two-state derivation
+    // invents. `usePagedList` issues its read from `onMounted`, which runs AFTER
+    // the first render, so `loading.value` is false while the console is
+    // painting a table it knows nothing about — and on THIS screen the
+    // sentence that two-state derivation produced is a real answer to a real
+    // question ("This gateway has published no plan."), which is exactly what
+    // makes it the wrong one to give speculatively.
+    //
+    // The read below never answers, so no amount of flushing can talk the test
+    // out of the window; the assertion is about the DOM the console has
+    // actually produced.
+    seam.fetchPlans.mockReturnValue(new Promise(() => {}));
+
+    const { wrapper } = await mountAt("/catalog");
+    expect(wrapper.get("tbody").text()).toMatch(/Loading/);
+    expect(wrapper.text()).not.toContain("This gateway has published no plan.");
+  });
+
   it("renders an empty plan list as an answer, never as a failure", async () => {
     seam.fetchPlans.mockResolvedValue(ok(NO_PLANS));
     const { wrapper } = await mountAt("/catalog");

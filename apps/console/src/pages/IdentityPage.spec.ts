@@ -336,12 +336,28 @@ describe("IdentityPage", () => {
 
     // The keys list declares no filters, so its link is a bare cursor — the
     // pair is what makes "declared here, absent there" visible in one screen.
+    //
+    // And the two links are written to DIFFERENT keys. This was the bug, and
+    // the first version of this test asserted it rather than catching it: it
+    // expected both hrefs to carry `after`, with the two collections' cursors
+    // side by side under one parameter name. That expectation was not merely
+    // different from the fix — it was wrong. Two lists on one route sharing a
+    // cursor key means the keys pager's Next writes a position the users list
+    // then reads and sends against `GET /users`; the server answers `400
+    // invalid_request` ("the after cursor names a different collection"),
+    // `resource.ts` reads that as a lost cursor, and the console answers with
+    // `restartWithoutCursor` — a REPLACE that drops `after` and resets the
+    // keys list the reader was paging. The test passed by describing the
+    // collision as if it were the design.
     seam.fetchApiKeys.mockResolvedValue({
       ok: true,
       data: { ...KEYS, next_cursor: "c-keys-3", has_more: true },
     });
     const { wrapper: both } = await mountAt("/identity");
-    expect(pagerHrefs(both)).toEqual(["/identity?after=c-users-3", "/identity?after=c-keys-3"]);
+    expect(pagerHrefs(both)).toEqual([
+      "/identity?after=c-users-3",
+      "/identity?keys_after=c-keys-3",
+    ]);
 
     // And the same pager, with the value the vocabulary rejected. The link
     // does NOT carry it, which was a real defect: `routeTo` asked
@@ -358,6 +374,87 @@ describe("IdentityPage", () => {
     // already rejected on the way IN. What is new is that the control and the
     // link now agree with the request instead of contradicting it.
     expect(seam.fetchUsers.mock.lastCall?.[0]).toEqual({ query: {} });
+  });
+
+  it("keeps the two lists on one route from sharing a cursor", async () => {
+    // The case the accounting screen had already fixed for its bucket list and
+    // its ledger, and this screen did not have for either of its lists. The
+    // assertion is on the REQUESTS, because the href alone cannot show the
+    // damage: a shared key produces links that look perfectly reasonable and
+    // only misbehave once the second list reads the first list's position.
+    const { wrapper, router } = await mountAt("/identity?keys_after=c-keys-2");
+
+    // The keys list sends its own cursor. This is the one that was asked for.
+    expect(seam.fetchApiKeys.mock.lastCall?.[0]).toEqual({ query: { after: "c-keys-2" } });
+
+    // The users list sends NONE, and this is the load-bearing half. It watches
+    // the same route query as the keys list, so before the fix it found
+    // `after` — the keys list's default key — and sent the keys cursor against
+    // `GET /users`. `DecodeCursor` refuses that with `400 invalid_request`,
+    // `resource.ts:154-158` classifies it as a lost cursor, and
+    // `paged-list.ts:136` fires `restartWithoutCursor(carryOver())` — a
+    // REPLACE that drops `after` entirely and takes the KEYS list's position
+    // down with it, because both lists believed they owned the key.
+    expect(seam.fetchUsers.mock.lastCall?.[0]).toEqual({ query: {} });
+
+    // The URL survives, which is what proves the restart did NOT happen. A
+    // cursor the console cannot place is answered by dropping it, and a drop
+    // would have replaced this URL with one carrying neither key — so the
+    // reader's place on a list they were not reading would have been gone.
+    expect(router.currentRoute.value.query.keys_after).toBe("c-keys-2");
+
+    // And with the USERS list's own cursor in the URL, that is the one it
+    // sends, and the keys list still sees nothing.
+    seam.fetchUsers.mockClear();
+    seam.fetchApiKeys.mockClear();
+    await mountAt("/identity?after=c-users-2&keys_after=c-keys-2");
+    expect(seam.fetchUsers.mock.lastCall?.[0]).toEqual({ query: { after: "c-users-2" } });
+    expect(seam.fetchApiKeys.mock.lastCall?.[0]).toEqual({ query: { after: "c-keys-2" } });
+
+    // Neither list's cursor is allowed to reach the other's operation, in
+    // either direction — asserted over EVERY call rather than the last one, so
+    // a screen that fixed only the second read cannot pass.
+    void wrapper;
+  });
+
+  it("says the account has no key only after the server has said so", async () => {
+    // The four-state resource, and the fifth state a two-state derivation
+    // invents. `loading.value` is false on the very first render, because
+    // `usePagedList` issues its read from `onMounted` and `onMounted` runs
+    // AFTER that render — so `loading ? "loading" : "empty"` reads "empty"
+    // during the whole window between the console painting the page and the
+    // server's first byte arriving, and the table renders "This account has no
+    // API key." about an account the console has not heard from.
+    //
+    // The read below NEVER ANSWERS, which is the honest shape of a slow or
+    // wedged network and the state no flushPromises count can talk its way out
+    // of. The assertion is made with zero ticks elapsed, so it is about the DOM
+    // the console has actually produced rather than about a settled one.
+    seam.fetchUsers.mockReturnValue(new Promise(() => {}));
+    seam.fetchApiKeys.mockReturnValue(new Promise(() => {}));
+
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const router = createConsoleRouter(createMemoryHistory());
+    await router.push("/identity");
+    await router.isReady();
+    const wrapper = mount(IdentityPage, {
+      attachTo: document.body,
+      global: { plugins: [router, pinia] },
+    });
+    mounted.push(wrapper);
+    await flushPromises();
+
+    // Both tables are waiting, and neither is claiming a fact.
+    const bodies = wrapper.findAll("tbody").map((body) => body.text());
+    expect(bodies).toHaveLength(2);
+    for (const body of bodies) {
+      expect(body).toMatch(/Loading/);
+    }
+    // The specific sentences that were being asserted about an account the
+    // console had not asked.
+    expect(wrapper.text()).not.toContain("This account has no API key.");
+    expect(wrapper.text()).not.toContain("No user in this account matches that lifecycle.");
   });
 
   describe("the one-time secret", () => {

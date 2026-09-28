@@ -1,20 +1,30 @@
-// Reconciliation: whether the numbers agree. // // Two lists, whole-plane. A **run** is one pass —
-a window it scanned, how many // buckets it read, and how many findings it opened, re-confirmed or
-left alone. // A **finding** is one divergence a pass wrote, with the figures it compared in //
-`observed`. // // **A run is not an account's and a finding is not a bucket's.** Both operations //
-take no account and no account-scoped filter, and this screen renders them as // system-wide on
-purpose: a reader who filtered findings by an account would be // reading a subset and reading it as
-a report about their own money, which is // the question the plane split exists to keep separate. An
-open finding about // another account's bucket is visible here because the system has a divergence
-// to report, not because the account behind it is the reader's. // // **The evidence is the
-server's bytes.** `observed` is whatever this plane's // own check wrote, and its shape is not the
-contract's to fix — so it is shown // as the JSON it is, formatted, and never parsed into a table of
-columns this // screen invented. A console that turned the evidence into its own summary is //
-making claims about the figures a second time, and a claim it cannot make. // // **Severity is
-written once and never moved** (the contract says so on the // field), so the two filters are
-independent: an operator narrowing to // `critical` is not thereby saying it is open, and a finding
-that is resolved // and critical is one they can still find.
 <script setup lang="ts">
+// Reconciliation: whether the numbers agree.
+//
+// Two lists, whole-plane. A **run** is one pass — a window it scanned, how
+// many buckets it read, and how many findings it opened, re-confirmed or left
+// alone. A **finding** is one divergence a pass wrote, with the figures it
+// compared in `observed`.
+//
+// **A run is not an account's and a finding is not a bucket's.** Both
+// operations take no account and no account-scoped filter, and this screen
+// renders them as system-wide on purpose: a reader who filtered findings by an
+// account would be reading a subset and reading it as a report about their own
+// money, which is the question the plane split exists to keep separate. An
+// open finding about another account's bucket is visible here because the
+// system has a divergence to report, not because the account behind it is the
+// reader's.
+//
+// **The evidence is the server's bytes.** `observed` is whatever this plane's
+// own check wrote, and its shape is not the contract's to fix — so it is shown
+// as the JSON it is, formatted, and never parsed into a table of columns this
+// screen invented. A console that turned the evidence into its own summary is
+// making claims about the figures a second time, and a claim it cannot make.
+//
+// **Severity is written once and never moved** (the contract says so on the
+// field), so the two filters are independent: an operator narrowing to
+// `critical` is not thereby saying it is open, and a finding that is resolved
+// and critical is one they can still find.
 import { Card, PageHeader, SegmentedControl, Stack } from "@ecoma-io/loom";
 import { computed } from "vue";
 
@@ -41,7 +51,9 @@ import type {
 
 const runs = usePagedList<ReconciliationRunPage, ListReconciliationRunsData["query"]>({
   read: (query) => fetchReconciliationRuns({ query }),
-  shape: { filters: [] },
+  // First list on the route, so it keeps the contract's own name for the
+  // cursor; the second has to disagree. See the findings list for why.
+  shape: { filters: [], cursor: "after" },
   vocabulary: {},
 });
 
@@ -53,7 +65,18 @@ const findings = usePagedList<FindingPage, ListFindingsData["query"]>({
   // Two filters, both declared, both in the pager's links — so a page change
   // keeps them, and a filter change drops the cursor because the cursor
   // carries a fingerprint of the filters that minted it.
-  shape: { filters: ["status", "severity"] },
+  //
+  // And a NAMED cursor key, because this is the second list on a route and
+  // `cursor` defaults to `after` for every list that does not name its own. The
+  // two lists would then be reading and writing one key, and the failure is not
+  // cosmetic: page the findings and the runs list re-reads with a findings
+  // cursor against `GET /reconciliation/runs`, the server refuses it because
+  // the cursor names a different collection, and the refusal — arriving as
+  // `invalid_request` — is treated as a lost cursor, so `paged-list.ts` fires
+  // `restartWithoutCursor(carryOver())` and drops `after` from the route
+  // altogether. Both tables return to page one and the findings position the
+  // reader had just chosen is gone with it.
+  shape: { filters: ["status", "severity"], cursor: "findings_after" },
   vocabulary: { status: FINDING_STATUSES, severity: FINDING_SEVERITIES },
 });
 
@@ -125,6 +148,43 @@ function windowText(run: ReconciliationRun): string {
 function subjectText(finding: Finding): string {
   return `${finding.subject_kind} ${finding.subject_id}`;
 }
+
+/**
+ * The runs table's state word: three states, not the two
+ * `loading ? "loading" : "empty"` gives.
+ *
+ * `usePagedList` fires its read from `onMounted`, after the first render, so on
+ * that first paint `loading` is false, `data` is `undefined` and `rows` is
+ * empty. Reading those as "empty" makes the table claim the gateway has run no
+ * reconciliation — a fact about the system's health, asserted by a page that
+ * has not yet asked. `data === undefined` is the probe that distinguishes
+ * "nothing has come back" from "nothing was there", which is the distinction
+ * `resource.ts` exists to keep.
+ */
+function runsTableState(): "ready" | "loading" | "empty" {
+  if (runs.loading.value) return "loading";
+  if (runs.data.value === undefined) return "loading";
+  return runs.rows.value.length === 0 ? "empty" : "ready";
+}
+
+/**
+ * The findings table's state word, and the same three states.
+ *
+ * The boundary this function is careful about is `DataTable.vue`'s `note`
+ * prop, which is rendered UNCONDITIONALLY rather than under the `state` gate
+ * that guards `emptyMessage`. So returning "loading" here suppresses the empty
+ * sentence but not the note, and a `note` that reads "Findings are scoped to
+ * the whole system" will be on screen before the system has answered. That is
+ * a boundary in a component outside this file; the state word is still the
+ * honest one, and the note's ungated rendering is reported rather than worked
+ * around here, because changing it would mean editing a component this screen
+ * does not own.
+ */
+function findingsTableState(): "ready" | "loading" | "empty" {
+  if (findings.loading.value) return "loading";
+  if (findings.data.value === undefined) return "loading";
+  return findings.rows.value.length === 0 ? "empty" : "ready";
+}
 </script>
 
 <template>
@@ -150,7 +210,7 @@ function subjectText(finding: Finding): string {
         layer="page"
         :columns="runColumns"
         :rows="runs.rows.value"
-        :state="runs.loading.value ? 'loading' : 'empty'"
+        :state="runsTableState()"
         :pages="runs.pages.value"
         empty-message="No pass has run yet."
       >
@@ -200,7 +260,7 @@ function subjectText(finding: Finding): string {
         layer="page"
         :columns="findingColumns"
         :rows="findings.rows.value"
-        :state="findings.loading.value ? 'loading' : 'empty'"
+        :state="findingsTableState()"
         :pages="findings.pages.value"
         empty-message="No finding matches those filters."
         note="That is the answer a healthy system gives."
