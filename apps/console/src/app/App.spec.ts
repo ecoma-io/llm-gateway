@@ -11,7 +11,7 @@
 // destination.
 import { createPinia, setActivePinia } from "pinia";
 import { flushPromises, mount } from "@vue/test-utils";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
 
 const api = vi.hoisted(() => ({
@@ -20,6 +20,15 @@ const api = vi.hoisted(() => ({
   getSessionResult: vi.fn(),
   fetchAccountOverview: vi.fn(),
   signOutOfSession: vi.fn(),
+  // The identity screen's two lists, and nothing else. They are here because
+  // the marking test below needs a route that IS a nav entry, and every product
+  // route is a real screen that reads the seam on mount — mounting one without
+  // answering it throws rather than rendering, which would fail this file for a
+  // reason that has nothing to do with the shell. Each is answered with an
+  // empty page, so the screen renders quietly and the shell's chrome is the
+  // only thing the assertions are about.
+  fetchUsers: vi.fn(),
+  fetchApiKeys: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => api);
@@ -46,6 +55,9 @@ const PRINCIPAL: Principal = {
  */
 let pinia: ReturnType<typeof createPinia>;
 
+/** Every `App` this file mounted, torn down after each test. See `mountApp`. */
+const wrappers: ReturnType<typeof mount>[] = [];
+
 function mountApp() {
   setActivePinia(pinia);
   const session = useSessionStore();
@@ -54,11 +66,44 @@ function mountApp() {
     accountId: PRINCIPAL.account_id,
     email: "ops@example.test",
   });
-  return mount(App, {
+  const wrapper = mount(App, {
     global: {
       plugins: [pinia, router],
     },
   });
+  // Every mount in this file is registered, because the file shares one
+  // module-level router: a test that leaves its `App` mounted keeps a component
+  // tree attached to the shared route table, and the next test's mount then
+  // either renders into a document that is being torn down or finds a `null`
+  // root. That is a leak between tests, not a defect in the shell, and it
+  // shows up as failures in tests that never touched the router.
+  wrappers.push(wrapper);
+  return wrapper;
+}
+
+/**
+ * The shell, mounted on a NAMED route.
+ *
+ * The file shares one module-level router across its tests, so `mountApp`
+ * alone mounts whatever route the last navigation left behind. A test whose
+ * subject is which screen the shell thinks the reader is on cannot leave that
+ * to the previous test's `beforeEach` — the marking is computed from
+ * `route.path`, so the route has to be stated where the assertion is.
+ *
+ * The navigation goes through the real guard, which is the point: a route the
+ * guard refuses would land on sign-in, and the test would then be asserting
+ * about the sign-in screen while believing it had mounted `/identity`.
+ */
+async function mountAt(path: string) {
+  await router.push(path);
+  await router.isReady();
+  const wrapper = mountApp();
+  // The screen behind the route reads the seam on mount and the shell's
+  // `active` flags are a computed over `route.path`, so the assertion needs the
+  // route committed AND the screen settled. Reading either one early is a test
+  // that asserts about the previous route.
+  await flushPromises();
+  return wrapper;
 }
 
 /**
@@ -76,6 +121,22 @@ function signOutButton(wrapper: ReturnType<typeof mountApp>) {
 }
 
 describe("application shell", () => {
+  beforeAll(() => {
+    // Loom's `SegmentedControl` sizes its selection indicator on mount and
+    // jsdom ships no `ResizeObserver`. The identity screen renders one, so a
+    // test that mounts a real nav route — which is what the current-route
+    // marking is about — cannot mount at all without this. Stubbed rather than
+    // polyfilled for the same reason `IdentityPage.spec.ts` stubs it: the
+    // indicator's geometry is not what this file is about, and this file is
+    // about the shell.
+    class NoopResizeObserver {
+      observe(): void {}
+      unobserve(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal("ResizeObserver", NoopResizeObserver);
+  });
+
   beforeEach(async () => {
     // Theme's state is deliberately shared by Loom for an application's
     // lifetime. The public consumer API has no reset hook, so clear its
@@ -102,6 +163,12 @@ describe("application shell", () => {
         },
       },
     });
+    const emptyPage = (items: readonly unknown[]) => ({
+      ok: true,
+      data: { items, next_cursor: "c-2", has_more: false },
+    });
+    api.fetchUsers.mockResolvedValue(emptyPage([]));
+    api.fetchApiKeys.mockResolvedValue(emptyPage([]));
 
     pinia = createPinia();
     setActivePinia(pinia);
@@ -113,8 +180,18 @@ describe("application shell", () => {
   });
 
   afterEach(() => {
+    // Teardown first: an `App` still mounted when the next test's router
+    // navigation commits is a component tree rendering into a document the
+    // runner is already tearing down.
+    for (const wrapper of wrappers.splice(0)) wrapper.unmount();
     window.localStorage.clear();
     document.documentElement.removeAttribute("data-theme");
+  });
+
+  afterAll(() => {
+    // A global stub outlives the file unless it is taken back, and this file's
+    // last act is to leave the environment as it found it.
+    vi.unstubAllGlobals();
   });
 
   it("renders the accessible shell around the gateway-status route", async () => {
@@ -131,13 +208,53 @@ describe("application shell", () => {
   });
 
   it("marks the current screen in the sidebar navigation", async () => {
-    const wrapper = mountApp();
-    await flushPromises();
+    // The marking is `aria-current="page"`, which Loom's `SidebarNav` puts on
+    // the link whose `active` the host declared. Asserting on it rather than on
+    // the presence of a link is what makes this a test: the previous version
+    // asserted only that one link pointed at `/`, and setting
+    // `AppLayout.vue`'s `active: route.path === "/"` to `active: false` left it
+    // green — a test that could not tell a marked link from an unmarked one.
+    const wrapper = await mountAt("/");
+    const current = wrapper.findAll('nav[aria-label="Console navigation"] a[aria-current="page"]');
+    // Exactly one, and it is the Dashboard — a link the reader is on marked
+    // while every other destination is not.
+    expect(current).toHaveLength(1);
+    expect(current[0]?.text()).toContain("Dashboard");
+    expect(current[0]?.attributes("href")).toBe("/");
+
+    // Exactly ONE because the marking is a position, not a section: if the
+    // comparison were ever a prefix or a `startsWith`, two links would light up
+    // at once and a reader would be told they are on two screens.
+    const others = wrapper
+      .findAll('nav[aria-label="Console navigation"] a')
+      .filter((link) => link.attributes("href") !== "/");
+    for (const link of others) {
+      expect(link.attributes("aria-current"), link.text()).toBeUndefined();
+    }
+  });
+
+  it("moves the marking with the route, and leaves none on a screen it does not offer", async () => {
+    // The same rule seen from the other two directions, because a marking that
+    // is computed once and never recomputed passes the test above on the
+    // landing route and is wrong everywhere else.
+    const onIdentity = await mountAt("/identity");
+    const identityCurrent = onIdentity
+      .findAll('nav[aria-label="Console navigation"] a[aria-current="page"]')
+      .map((link) => link.attributes("href"));
+    expect(identityCurrent).toEqual(["/identity"]);
 
     // `/gateway-status` is not a nav entry — it is the contract's test entry
     // point — so no nav link is current, which is the honest answer for a
-    // destination the sidebar does not offer.
-    expect(wrapper.findAll('nav[aria-label="Console navigation"] a[href="/"]')).toHaveLength(1);
+    // destination the sidebar does not offer. Asserting the negative is the
+    // other half: a sidebar that fell back to marking the first link, or to
+    // marking the nearest by prefix, would leave one lit here.
+    const onStatus = await mountAt("/gateway-status");
+    expect(
+      onStatus.findAll('nav[aria-label="Console navigation"] a[aria-current="page"]'),
+    ).toHaveLength(0);
+    // And the dashboard link is still on the page, unmarked — the negative
+    // above is "nothing is current", not "the sidebar went missing".
+    expect(onStatus.find('nav[aria-label="Console navigation"] a[href="/"]').exists()).toBe(true);
   });
 
   it("names every product screen in the sidebar", async () => {
@@ -166,8 +283,13 @@ describe("application shell", () => {
     // The address is the signed-in person's own and is a label, never a lookup
     // key and never in a URL.
     expect(wrapper.text()).toContain("Signed in as ops@example.test");
-    expect(wrapper.find("button").exists()).toBe(true);
-    expect(wrapper.text()).toContain("Sign out");
+    // A way out is a CONTROL, not a sentence. The assertion used to be
+    // `expect(wrapper.find("button").exists()).toBe(true)`, which the header's
+    // three theme buttons satisfy on their own — it held for a shell with no
+    // sign-out control at all. Found by what the button SAYS, the same
+    // selection the click test below uses, so this test and that one can never
+    // disagree about which control is the one under test.
+    expect(signOutButton(wrapper).attributes("type")).toBe("button");
   });
 
   it("signs the visitor out on a click, which the one above never proved", async () => {

@@ -17,8 +17,16 @@
 // exhaustiveness requirement is a property of the contract's union and not of
 // today's reachability — and because a behaviour that is a rendering of the
 // server's own message is better than an unhandled crash if one ever arrives.
-// `assertEveryCodeIsDeclaredOrUnreachable` in the spec proves the claim from
-// the UI side, so the plane boundary is pinned by a test rather than a comment.
+//
+// `reachable` is a hand-set boolean, and a hand-set boolean is exactly the kind
+// of claim that needs a test, because nothing else looks at it: the page specs
+// read it to decide which codes to drive through a screen, so a row flipped to
+// `reachable: false` drops a code every screen stops testing and leaves every
+// suite green. `assertEveryCodeIsDeclaredOrUnreachable` in
+// `FailureView.spec.ts` is what holds the line — it compares the declared rows
+// against the contract's union and the `reachable: false` set against the
+// projection vocabulary, both from the CONTRACT side rather than from this
+// table, so the plane boundary is pinned by a test rather than a comment.
 import type { Error as ApiError } from "@ecoma-io/llm-gateway-console-api-client";
 
 export type ApiErrorCode = ApiError["code"];

@@ -346,14 +346,25 @@ describe("DataTable", () => {
       await press("ArrowDown");
       expect(document.activeElement?.getAttribute(CELL_ATTRIBUTE)).toBe("r1c1");
 
+      // End at the LAST column is a no-op, not a wrap. The reader is already
+      // on `r1c1` — the last column of a three-column row — so this is the one
+      // End press that can fail by going somewhere else, and the earlier
+      // position it would have to have started from is stated above so a reader
+      // can see the state the assertion is about rather than infer it.
       await press("End");
       expect(document.activeElement?.getAttribute(CELL_ATTRIBUTE)).toBe("r1c1");
 
+      // Home from that last column reaches the first, so the End that follows
+      // is pressed from a DIFFERENT cell than the one above and asserts a
+      // transition rather than a fixed point.
       await press("Home");
       expect(document.activeElement?.getAttribute(CELL_ATTRIBUTE)).toBe("r1c0");
 
-      // End alone is the last column of this row; Ctrl+End is the last cell of
-      // the table, which is the distinction a spreadsheet user expects.
+      // End alone is the last column of THIS row; Ctrl+End is the last cell of
+      // the table, which is the distinction a spreadsheet user expects. From
+      // `r1c0` the plain End is a real move to `r1c1`, and Ctrl+End then leaves
+      // the row entirely for `r2c1` — so the two are told apart by WHERE they
+      // land, not by one being a repeat of the other.
       await press("End");
       expect(document.activeElement?.getAttribute(CELL_ATTRIBUTE)).toBe("r1c1");
 

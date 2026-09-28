@@ -17,11 +17,35 @@
 import { defineComponent, h, nextTick } from "vue";
 import { createRouter, createWebHistory, type Router } from "vue-router";
 import { mount } from "@vue/test-utils";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 
 import { usePagedList } from "@/lib/paged-list";
 import type { ApiResult } from "@/lib/api";
 import { CONSOLE_BEHAVIOUR, type ApiErrorCode } from "@/lib/failure-matrix";
+
+/**
+ * The contract's `Error.code` enum, pinned to the contract rather than derived
+ * from the matrix — see the long form in `FailureView.spec.ts`, which this is
+ * the same list as. The one-line reason it cannot be `Object.keys` of the table
+ * under test: that derivation is a tautology and proves nothing about coverage
+ * in either direction. The type ties it to the generated union so the gate
+ * holds at the compiler, which is the gate a screen needs it at (ADR 0012 §6).
+ */
+const CONTRACT_CODES = [
+  "not_found",
+  "method_not_allowed",
+  "invalid_request",
+  "unauthenticated",
+  "cursor_expired",
+  "unsupported_version",
+  "revision_gap",
+  "snapshot_required",
+  "upstream_unavailable",
+  "service_unavailable",
+  "internal",
+] as const satisfies readonly ApiErrorCode[];
+
+expectTypeOf<(typeof CONTRACT_CODES)[number]>().toEqualTypeOf<ApiErrorCode>();
 
 /** A page the contract's envelope would produce: two fields and a rows array. */
 function pageOf<T>(items: readonly T[], hasMore = false) {
@@ -41,6 +65,8 @@ type Harness = {
   router: Router;
   calls: { query: Record<string, unknown> }[];
   read: (query: Record<string, unknown>) => Promise<ApiResult<TestPage>>;
+  /** The list the screen was handed, so a test can reach the refs it renders from. */
+  list: ReturnType<typeof usePagedList<TestPage, Record<string, unknown>>>;
   mounted: () => void;
   advance: () => Promise<void>;
 };
@@ -48,11 +74,17 @@ type Harness = {
 /**
  * A real router on a real `/accounting`, one `usePagedList`, and a list of
  * every query that list was asked for. `respond` decides the answer so a test
- * can make the server refuse a cursor the way the contract says it will.
+ * can make the server refuse a cursor the way the contract says it will, or
+ * hold a read open so a test can observe the module mid-flight.
+ *
+ * `respond` may return a PROMISE as well as a result: `read` is async and
+ * returns whatever `respond` gives it without awaiting, so both spellings reach
+ * the same place, and a test that needs to hold a read open has no other way
+ * to say so.
  */
 async function harness(
   query: Record<string, string>,
-  respond?: (query: Record<string, unknown>) => ApiResult<TestPage>,
+  respond?: (query: Record<string, unknown>) => ApiResult<TestPage> | Promise<ApiResult<TestPage>>,
   ceiling = 50,
 ): Promise<Harness> {
   const router = createRouter({
@@ -78,12 +110,25 @@ async function harness(
     // forever. One constant object does neither: the watcher's source stops
     // changing, the run returns, and the test's assertion sees the count.
     if (calls.length > ceiling) return { ok: true, data: HELD };
-    return respond ? respond(q) : { ok: true, data: pageOf([{ id: "row-1" }], true) };
+    // Awaited, because `respond` may be async — the read's whole value is the
+    // promise it returns, and `useResource` is already awaiting this one, so
+    // awaiting here is the same await rather than a second tick.
+    return respond ? await respond(q) : { ok: true, data: pageOf([{ id: "row-1" }], true) };
   };
+
+  // The list the probe's `setup` captured, so a test can reach the refs the
+  // screen was handed. Declared before the mount and narrowed on the way out,
+  // because the assignment happens inside `setup` and the compiler cannot see
+  // that it always runs.
+  let list!: Harness["list"];
 
   const Probe = defineComponent({
     setup() {
-      const list = usePagedList<ReturnType<typeof pageOf>, Record<string, unknown>>({
+      // Typed as `TestPage` rather than as `ReturnType<typeof pageOf>`: the row
+      // element type is then `{ id: string }` rather than `unknown`, which is
+      // what makes the returned list assignable to `Harness["list"]`. The two
+      // name the same shape — the annotation only names the element.
+      list = usePagedList<TestPage, Record<string, unknown>>({
         read,
         shape: { filters: ["kind"], cursor: "after" },
         vocabulary: { kind: ["consume", "grant"] },
@@ -97,6 +142,7 @@ async function harness(
     router,
     calls,
     read,
+    list,
     mounted: () => wrapper.unmount(),
     advance: async () => {
       // Let every already-queued navigation COMMIT before reading the address
@@ -318,13 +364,17 @@ describe("a cursor the server will not place", () => {
 describe("what the console reads from the matrix", () => {
   it("reads the recovery column rather than restating it", () => {
     // Every code the contract declares has a row, keyed exhaustively over the
-    // generated union. A code added to `console.yaml` without one stops this
-    // module compiling, which is the gate holding at the point a screen needs
-    // it (ADR 0012 §6).
-    const codes = Object.keys(CONSOLE_BEHAVIOUR);
-    expect(codes.length).toBeGreaterThan(0);
-    for (const code of codes) {
-      expect(CONSOLE_BEHAVIOUR[code as ApiErrorCode], code).toBeDefined();
+    // generated union. The set comparison is what makes the claim checkable:
+    // deriving the code list off the table and then checking each derived code
+    // has a row is a tautology that holds for a table of eleven rows and for an
+    // empty one alike. The list is pinned to the contract instead, in the type
+    // system — `satisfies` proves the list names only contract codes, and
+    // `toEqualTypeOf` proves it names all of them — so a code the contract
+    // gained and a code the table invented are each a different compile error.
+    const declared = Object.keys(CONSOLE_BEHAVIOUR).sort();
+    expect(declared).toEqual([...CONTRACT_CODES].sort());
+    for (const code of declared) {
+      expect(CONSOLE_BEHAVIOUR[code as ApiErrorCode].recovery, code).toBeTruthy();
     }
   });
 });
@@ -337,13 +387,40 @@ describe("the module does not reach past its declaration", () => {
   });
   afterEach(() => warn.mockRestore());
 
-  it("hands the screen a readonly loading flag", async () => {
+  it("hands the screen a readonly loading flag, and the write does not take", async () => {
     // Vue reports a write to a readonly ref as a warning rather than an
-    // exception, so the assertion that matters is that the write did not take.
-    const h1 = await harness({});
-    await h1.advance();
+    // exception, so asserting only that unmounting is quiet proves nothing: it
+    // is a property of the teardown, not of the flag, and a module that handed
+    // out a plain writable `loading` would satisfy it exactly as well. So the
+    // write is ATTEMPTED, and both halves of the claim are checked — the flag
+    // is still true afterwards, and Vue complained about it.
+    //
+    // The read is HELD rather than let to settle, because `loading` is true only
+    // between a read starting and its answer landing. A write attempted
+    // against an idle `loading` is a write against `false`, and a module whose
+    // `loading` was stuck on would pass it.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const h1 = await harness({}, async (): Promise<ApiResult<TestPage>> => {
+      await held;
+      return { ok: true, data: pageOf([{ id: "row-1" }], true) };
+    });
+
+    // Still in flight, so the flag under test is the one that says "busy".
+    expect(h1.list.loading.value).toBe(true);
     warn.mockClear();
+    (h1.list.loading as unknown as { value: boolean }).value = false;
+    expect(h1.list.loading.value).toBe(true);
+    expect(warn).toHaveBeenCalled();
+
+    // And the read that set it is what clears it — a flag a screen could pin at
+    // `true` is a spinner that never stops, so the write really is inert rather
+    // than merely overwritten a moment later.
+    release();
+    await h1.advance();
+    expect(h1.list.loading.value).toBe(false);
     h1.mounted();
-    expect(warn).not.toHaveBeenCalled();
   });
 });

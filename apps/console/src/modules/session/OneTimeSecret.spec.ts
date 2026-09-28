@@ -55,6 +55,49 @@ async function mountRevealed() {
   return wrapper;
 }
 
+/**
+ * The component's OWN state, read from the live instance.
+ *
+ * `<script setup>` keeps a non-exposed binding out of the parent's
+ * `setupState`, so the only honest way in is `$.devtoolsRawSetupState` — which
+ * is the object a devtools inspector walks, and is therefore exactly the
+ * surface the leak this file guards against would show up on. A surviving
+ * `shallowRef` there is a credential in a component instance a devtools
+ * inspector can read even after the panel is gone from the DOM.
+ *
+ * The RAW graph holds the refs THEMSELVES rather than their values, so the
+ * reading is via `__v_isRef`/`value` rather than a direct property access: a
+ * helper that read `state.secret` would see the ref object and could not tell
+ * an erased credential from a live one.
+ *
+ * Reading the DOM instead of this is not a weaker version of the same claim,
+ * it is a different one. `IdentityPage.spec.ts` records the exact reason in
+ * its own comment: a DOM-only version of the dismiss assertion passed against
+ * a `clear()` that never erased anything, because `clear()` runs TWICE for one
+ * click — the component's own button and then the Card's dismiss path — so the
+ * second pass tidied up after a broken first one and the screen looked right.
+ */
+function heldState(wrapper: ReturnType<typeof mount>): {
+  secret: string | undefined;
+  revealed: boolean;
+} {
+  const state = (
+    wrapper.vm as unknown as {
+      $: { devtoolsRawSetupState: Record<string, unknown> };
+    }
+  ).$.devtoolsRawSetupState;
+  const unwrap = (key: string): unknown => {
+    const held = state[key];
+    return (held as { __v_isRef?: boolean; value?: unknown } | undefined)?.__v_isRef === true
+      ? (held as { value: unknown }).value
+      : held;
+  };
+  return {
+    secret: unwrap("secret") as string | undefined,
+    revealed: unwrap("revealed") as boolean,
+  };
+}
+
 describe("the one-time secret", () => {
   beforeEach(() => {
     vi.mocked(createApiKey).mockResolvedValue({ ok: true, data: MINTED });
@@ -140,9 +183,14 @@ describe("the one-time secret", () => {
     wrapper.unmount();
   });
 
-  it("clears the token on dismiss and again on unmount", async () => {
+  it("clears the token on dismiss, which is the way an operator leaves it", async () => {
     const wrapper = await mountRevealed();
     expect(wrapper.text()).toContain("Copy this key now");
+    // The credential is in the component's own graph before the click, so the
+    // assertions below are known to be reading something that was there — a
+    // helper that found `undefined` throughout would make every later
+    // `toBeUndefined` pass without anything having been erased.
+    expect(heldState(wrapper).secret).toBe(TOKEN);
 
     // Dismiss, the way the operator does.
     const dismiss = wrapper
@@ -153,11 +201,49 @@ describe("the one-time secret", () => {
     await nextTick();
     expect(wrapper.text()).not.toContain("Copy this key now");
 
-    // The flag is what a template reads, and it is a boolean, never the
-    // token: a component holding `revealed` true and `secret` set is the
-    // state that would survive a Back button with a live credential in it.
-    const second = await mountRevealed();
-    second.unmount();
+    // The state, not the screen. The panel is a `v-if` on `revealed`, so it is
+    // gone the moment the flag is false whatever `secret` still holds — a
+    // `clear()` that dropped the flag and kept the token would leave a clean
+    // screen with a live credential bound to a `model-value` a re-render would
+    // paint again. `IdentityPage.spec.ts` records that this exact mistake
+    // shipped once and was invisible to a DOM-only assertion.
+    const held = heldState(wrapper);
+    expect(held.secret).toBeUndefined();
+    expect(held.revealed).toBe(false);
+    // And the element the credential was painted into is genuinely detached,
+    // not merely unmounted from the template — `name` is unique, so this
+    // cannot be satisfied by some other field on the page.
+    expect(document.querySelector('input[name="api-key-secret"]')).toBeNull();
+    expect(document.body.innerHTML).not.toContain(TOKEN);
+
+    wrapper.unmount();
+  });
+
+  it("clears the token again on unmount, the path a Back button takes", async () => {
+    // The other half, and the reason `clear()` is wired to two hooks rather
+    // than one. A visitor who navigates away never clicks the dismiss button,
+    // so a component that clears only on dismiss leaves a live credential in a
+    // component instance that is still reachable from a devtools inspector
+    // after the DOM is gone — which is the state the ADR's first rule names,
+    // and the one a DOM-only assertion cannot see at all: once a component is
+    // unmounted its rendered tree is removed by Vue regardless of what its
+    // refs still hold, so `document.body.innerHTML` is empty either way and the
+    // mutation this guards against is a silent, permanent no-op.
+    const wrapper = await mountRevealed();
+    expect(heldState(wrapper).secret).toBe(TOKEN);
+
+    // No dismiss: the component is torn down the way a route change tears it
+    // down, mid-reveal, with the panel still on screen.
+    expect(wrapper.text()).toContain("Copy this key now");
+    wrapper.unmount();
+
+    // The credential is read back off the instance the component leaves behind.
+    // `unmount()` does not destroy the vm, so the setup state is still readable
+    // here — which is precisely the reachability that makes an uncleared ref a
+    // leak rather than a dead reference.
+    const held = heldState(wrapper);
+    expect(held.secret).toBeUndefined();
+    expect(held.revealed).toBe(false);
     expect(document.body.innerHTML).not.toContain(TOKEN);
   });
 

@@ -4,7 +4,7 @@
 // on the figures — so the assertion that matters is the one that a sum would
 // fail. A test asserting the numbers are present passes just as happily when a
 // `+` appears between them.
-import { flushPromises, mount } from "@vue/test-utils";
+import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createMemoryHistory, createRouter } from "vue-router";
@@ -13,6 +13,8 @@ const api = vi.hoisted(() => ({ fetchAccountOverview: vi.fn() }));
 vi.mock("@/lib/api", () => api);
 
 import DashboardPage from "@/pages/DashboardPage.vue";
+import StatusBadge from "@/modules/status/StatusBadge.vue";
+import { ACCOUNT_STATE_PRESENTATION } from "@/modules/status/presentation";
 import type { AccountOverview } from "@ecoma-io/llm-gateway-console-api-client";
 
 /** A bucket whose three balances disagree with any sum, on purpose. */
@@ -81,6 +83,66 @@ async function mountPage() {
   return wrapper;
 }
 
+/**
+ * The figure a Loom `Card` shows, read from the card's BODY.
+ *
+ * `Card` has no heading element and no `aria-label` — its title is a `<p>` in
+ * the header slot — and it cannot be found by COMPONENT either: Loom's
+ * primitives compile to fragments, so `Card` is in the source but never a
+ * component instance in the tree, and `findAll(Card)` fails with
+ * `Invalid selector [object Object]`. What is left is the card's own element,
+ * recognised by the first paragraph under its header being the title.
+ *
+ * The card's BODY, not the whole card, is the return value, and that is the
+ * part that matters: the header also carries the `description` slot, and a
+ * `count(...)` description repeats the figure. Reading the whole card and
+ * testing `toContain("3")` would then be satisfied by the DESCRIPTION even if
+ * the body rendered the wrong number — which is the substring defect this
+ * helper exists to end. The body is the last `div` of the card, and the figure
+ * is the only `<p>` in it, so its text is the figure and nothing else.
+ *
+ * The property this has and a string alternative does not: a card whose title
+ * was mistyped, or whose figure was read out of the wrong field, is a MISS
+ * rather than a pass. `"Live users" + "12"` concatenated into one `toContain`
+ * also matches a card titled "Live users1" showing 2.
+ */
+function cardFigure(wrapper: VueWrapper, title: string): string {
+  const found = wrapper
+    .findAll("div")
+    .filter(
+      (candidate) => candidate.element.querySelector(":scope > div > p")?.textContent === title,
+    )
+    .at(0);
+  if (!found) throw new Error(`no Card titled "${title}" was rendered`);
+  // The body's `div` is the last direct child of the card root; its only
+  // paragraph is the figure.
+  const bodyDivs = found.element.querySelectorAll(":scope > div");
+  const body = bodyDivs[bodyDivs.length - 1];
+  const figure = body?.querySelector("p")?.textContent ?? "";
+  return figure.trim();
+}
+
+/**
+ * The whole card's text, for the claims that are about more than the figure —
+ * the account card's name and its state badge, which are not a figure and are
+ * not in a body paragraph.
+ */
+function card(wrapper: VueWrapper, title: string) {
+  const found = wrapper
+    .findAll("div")
+    .filter(
+      (candidate) => candidate.element.querySelector(":scope > div > p")?.textContent === title,
+    )
+    .at(0);
+  if (!found) throw new Error(`no Card titled "${title}" was rendered`);
+  return found;
+}
+
+/** The text of one `aria-label`ed region, so a figure is asserted where it belongs. */
+function region(wrapper: VueWrapper, label: string): string {
+  return wrapper.find(`section[aria-label="${label}"]`).text();
+}
+
 describe("DashboardPage", () => {
   beforeEach(() => {
     api.fetchAccountOverview.mockReset();
@@ -91,9 +153,50 @@ describe("DashboardPage", () => {
 
     const wrapper = await mountPage();
 
-    expect(wrapper.text()).toContain("Northwind");
-    expect(wrapper.text()).toContain("12");
-    expect(wrapper.text()).toContain("Active");
+    // The account's own name, on the account card. The state badge is selected
+    // by COMPONENT: "Active" also appears in the "Active API keys" card title
+    // two elements away, so a substring read over the whole page would be
+    // satisfied by a card title rather than by a state.
+    const accountCard = card(wrapper, "Account");
+    expect(accountCard.text()).toContain("Northwind");
+    const stateBadge = accountCard.getComponent(StatusBadge);
+    expect(stateBadge.text()).toBe(ACCOUNT_STATE_PRESENTATION.active.label);
+    // The state is the PRESENTATION's word for it, and for `active` that word
+    // is the contract token — so the negative is stated for the states where
+    // the two differ rather than as a claim that would be vacuous here.
+    expect(stateBadge.text()).not.toBe("suspended");
+
+    // The three counts, each read as the WHOLE of the card body and compared
+    // for EQUALITY rather than for containment. `toContain` here is still the
+    // old defect one level down: a body of "312" contains "3", so a card
+    // rendering a concatenation rather than a figure would satisfy it, and a
+    // `count(...)` description repeating the figure would satisfy it too.
+    expect(cardFigure(wrapper, "Live users")).toBe("12");
+    expect(cardFigure(wrapper, "Active API keys")).toBe("3");
+    expect(cardFigure(wrapper, "Open reconciliation findings")).toBe("2");
+  });
+
+  it("renders each count from its own field, so a card cannot show another's figure", async () => {
+    // The negative a substring assertion cannot express. The dashboard shows
+    // three counts off three fields; a screen that read `user_count` into all
+    // three would satisfy `toContain("12")` three times over. The counts here
+    // are far apart, so a field read into the wrong card is a DIFFERENT number
+    // rather than the same one — which is what makes the negative meaningful.
+    api.fetchAccountOverview.mockResolvedValue({
+      ok: true,
+      data: { ...OVERVIEW, user_count: 7, active_api_key_count: 4, open_finding_count: 9 },
+    });
+
+    const wrapper = await mountPage();
+
+    expect(cardFigure(wrapper, "Live users")).toBe("7");
+    expect(cardFigure(wrapper, "Active API keys")).toBe("4");
+    expect(cardFigure(wrapper, "Open reconciliation findings")).toBe("9");
+    // And the figures the fixture used to carry are gone from the page, so a
+    // card that rendered both its own figure and its neighbour's is not
+    // satisfying the assertions above.
+    const figures = region(wrapper, "Account figures");
+    expect(figures).not.toContain("12");
   });
 
   it("renders each balance from its own field and never sums them", async () => {
