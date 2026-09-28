@@ -39,9 +39,8 @@
 import { Alert, Button, Card, CopyButton, Stack, TextField } from "@ecoma-io/loom";
 import { onBeforeUnmount, ref, shallowRef } from "vue";
 
-import { mintApiKey } from "@/lib/api";
+import { createApiKey } from "@/lib/api";
 import { behaviourFor } from "@/lib/failure-matrix";
-import type { ApiErrorCode } from "@/lib/failure-matrix";
 
 /**
  * The credential, held in a component-scoped `shallowRef` and nowhere else.
@@ -78,14 +77,17 @@ async function mint() {
   minting.value = true;
   failure.value = undefined;
   try {
-    const { data, error } = await mintApiKey({ body: { display_name: displayName.value } });
-    if (error !== undefined || data === undefined) {
+    const result = await createApiKey(displayName.value);
+    if (!result.ok) {
       // The mint is the one write that can be refused for a reason the
       // operator can act on, so the failure matrix decides what is said — a
       // page that decided for itself is the thing the matrix exists to stop.
-      const code = (error as { error?: { error?: { code?: ApiErrorCode } } } | undefined)?.error
-        ?.error?.code;
-      const behaviour = code === undefined ? undefined : behaviourFor(code);
+      // The seam has already parsed the envelope, so the code is read from it
+      // directly rather than re-derived from a status number here.
+      const behaviour =
+        result.failure.kind === "api"
+          ? behaviourFor(result.failure.envelope.error.code)
+          : undefined;
       failure.value = {
         title: behaviour?.title ?? "The key could not be created",
         // The recovery column decides whether a retry is even offered, and
@@ -98,7 +100,7 @@ async function mint() {
       };
       return;
     }
-    secret.value = data.token;
+    secret.value = result.data.token;
     revealed.value = true;
   } finally {
     minting.value = false;

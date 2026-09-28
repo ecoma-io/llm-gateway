@@ -14,7 +14,7 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 
-import { getSession, signOut } from "@/lib/api";
+import { getSessionResult, signOutOfSession } from "@/lib/api";
 import type { PrincipalClass } from "@ecoma-io/llm-gateway-console-api-client";
 
 /**
@@ -82,15 +82,18 @@ export const useSessionStore = defineStore("session", () => {
   async function resolve(): Promise<boolean> {
     resolving.value = true;
     try {
-      const { data, error } = await getSession();
-      if (error !== undefined || data === undefined) {
+      const result = await getSessionResult();
+      if (!result.ok) {
         forget();
         return false;
       }
+      // The contract answers `GET /auth/session` with the `Principal` itself
+      // rather than a document wrapping one, so the principal IS the body.
+      const who = result.data;
       remember({
-        class: data.principal.class,
-        accountId: data.principal.account_id,
-        ...(data.principal.email === undefined ? {} : { email: data.principal.email }),
+        class: who.class,
+        accountId: who.account_id,
+        ...(who.email === undefined ? {} : { email: who.email }),
       });
       return true;
     } finally {
@@ -106,7 +109,7 @@ export const useSessionStore = defineStore("session", () => {
    */
   async function end() {
     try {
-      await signOut();
+      await signOutOfSession();
     } finally {
       forget();
     }
