@@ -107,5 +107,22 @@ export default [
     },
   },
 
+  {
+    // Spec files may declare more than one component, and the reason is the
+    // same one that makes them worth having: a composable's behaviour is often
+    // a property of the COMBINATION of what it does with a host, so a test
+    // mounts two minimal hosts to observe two of them on one route. Splitting
+    // those across files would mean exporting a test component from a
+    // non-test file to share, which is the trade this rule exists to prevent.
+    //
+    // Scoped to the spec glob rather than switched off repository-wide: the
+    // rule is still right everywhere it is a rule, and a component that grew a
+    // second one in `src/` would still be caught.
+    files: ["**/*.spec.ts", "**/*.spec.js"],
+    rules: {
+      "vue/one-component-per-file": "off",
+    },
+  },
+
   prettier,
 ];
