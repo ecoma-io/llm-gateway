@@ -826,10 +826,44 @@ func TestIntegrationPaymentConvergencePathsSurviveTheirOwnTransaction(t *testing
 	intent := p.openIntent(t, f, payKey(t, "convergence"), time.Now().UTC())
 	event := p.event(t, f, intent, payRef(t, "evt"), payRef(t, "pi"))
 
+	// The retry carries a FRESH id, which is what makes this test about the
+	// idempotency key at all. A second Create of the same intent STRUCT would
+	// collide on the primary key first and answer a bare 23505 on
+	// `payment_intents_pkey` — a violation this adapter deliberately does not
+	// translate, because two payments sharing an id is a bug to surface and not
+	// a convergence, and the read the convergence then does is keyed on
+	// (account, key) and could never find such a row anyway. The retry the
+	// USE CASE makes mints a new id per attempt, so the constraint it meets is
+	// `payment_intents_idempotency_key`, and this fixture reproduces that shape.
+	retryAt := micros(time.Now().UTC()).Add(time.Minute)
+	retryID, err := payments.NewIntent(retryAt)
+	if err != nil {
+		t.Fatalf("NewIntent: %v", err)
+	}
+	retry, err := payments.New(payments.NewPayment{
+		AccountID:         intent.AccountID,
+		FundingBucketID:   intent.FundingBucketID,
+		AmountMinorUnits:  intent.AmountMinorUnits,
+		Currency:          intent.Currency,
+		MinorUnitExponent: intent.MinorUnitExponent,
+		Provider:          f.provider,
+		IdempotencyKey:    intent.IdempotencyKey,
+		CheckoutTTL:       time.Hour,
+		Now:               retryAt,
+		MintedID:          retryID,
+		MintedAt:          retryAt,
+	})
+	if err != nil {
+		t.Fatalf("New payment: %v", err)
+	}
+	if retry.ID == intent.ID {
+		t.Fatalf("the retry reuses the first payment's id %s; this fixture must not collide on the primary key", retry.ID)
+	}
+
 	t.Run("a repeated idempotency key converges on the payment already written", func(t *testing.T) {
 		var converged payments.Intent
 		err := p.store.WithinTx(t.Context(), func(ctx context.Context) error {
-			if err := p.intents.Create(ctx, intent); !errors.Is(err, payments.ErrDuplicatePayment) {
+			if err := p.intents.Create(ctx, retry); !errors.Is(err, payments.ErrDuplicatePayment) {
 				return fmt.Errorf("the repeated create answered %v, want payments.ErrDuplicatePayment", err)
 			}
 			// The read the convergence is FOR. Without the savepoint this is
