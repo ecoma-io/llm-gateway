@@ -284,6 +284,20 @@ predicates in architecture tests, so `internal/domain` is governed the moment a
 package appears there, and a package with no responsibility is not created to
 satisfy a diagram.
 
+**A cross-domain read is a use case, not a layer.** `console-api` is the only
+application that composes several bounded contexts into one answer, and the way
+it does so is fixed by this section rather than left to the first screen that
+needs a join. A composition is a method in `application/` beside the use case it
+serves: it orchestrates the contexts' own read ports, returns a projection the
+contract declares as its own `console.yaml` operation, and writes nothing of its
+own. It is never page-component arithmetic in the frontend, and it never becomes
+a package — an `internal/bff` or `internal/presentation` would be a layer with
+no inbound port and no domain of its own, and `packages_test.go` refuses exactly
+that shape. The consequence for the wire is the same rule ADR 0006 §3 already
+implied and that the console surface makes visible: a screen's data is a
+contract operation the backend computes, so a contract change and an
+implementation change are the same review.
+
 ### 7. Database ownership
 
 One TimescaleDB deployment, **two databases, explicitly owned**:
@@ -387,6 +401,21 @@ console → console-api → ports/outbound/dataplane → HTTP adapter → datapl
   Plane's rules about what it serves live in the runtime's module, and the
   runtime's database is the only place they are kept. A management operation is
   a request the Data Plane can refuse, not a query the façade performs.
+- **`console-api` is measured against the façade, not read as one.** The
+  management word in this section names `dataplane-api` and only
+  `dataplane-api`: it is the application that owns no domain, and every claim
+  above about thinness is a claim about it. `console-api` is the other kind of
+  application entirely — it is the Control Plane's domain owner (section 3)
+  _and_ the surface that composes those domains into screens (§6's use-case
+  rule), and both roles are held in one module, not in a façade in front of a
+  module. Reading "management façade" onto `console-api` is the error this
+  bullet exists to prevent: the word was spent on the application that had no
+  domain underneath it, and `console-api` has five. The two tests that make the
+  distinction mechanical are `apps/console-api/internal/arch/packages_test.go`
+  (which asserts `console-api` has exactly one cross-plane seam and a real
+  domain tree, so it cannot be a transport) and
+  `apps/dataplane-api/internal/arch`, whose `modules_test.go` declares no
+  domain and so asserts the opposite — it cannot become one.
 - **No shared foundation library is introduced, and no Data Plane logic is
   duplicated into the façade.** A shared core module would be a fourth artifact
   with a fourth version and would fuse the two transports' release cadence
