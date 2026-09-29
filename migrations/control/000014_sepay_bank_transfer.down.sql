@@ -76,6 +76,13 @@ CREATE OR REPLACE FUNCTION control.payment_intents_status_transition() RETURNS t
                 DETAIL = 'the refused move names no legal edge of this payment''s state machine. TWO of the legal ones are worth knowing because they look wrong and are not: expired -> succeeded and cancelled -> succeeded are legal because expiry and cancellation are LOCAL decisions about this platform''s patience, while the provider alone states the money sentence — a customer who paid thirty seconds after a local timer fired must still be funded. And refunded -> refunded is idempotent on itself because a full refund arriving after a partial one is the SAME refund completed, not a second one. What is NOT legal in the other direction: there is no edge out of failed, that state is terminal, and there is no path back from refunded to succeeded or from succeeded to succeeded — a payment reported captured again after its final word is a provider contradicting itself, and the caller records it as a quarantine rather than guessing',
                 ERRCODE = 'integrity_constraint_violation';
         END IF;
+        -- A payment cannot be succeeded without naming the capture that
+        -- succeeded it: the reference is what the funding leg's command key is
+        -- derived from, so a succeeded payment without one is a payment whose
+        -- credit cannot be re-derived and whose redelivery would fund it
+        -- again. The CHECK on the table states the same thing for the path a
+        -- trigger on UPDATE OF status cannot see — a direct INSERT — and the
+        -- two are one rule told from the two directions a row can arrive from.
         IF NEW.status = 'succeeded' AND NEW.provider_payment_ref IS NULL THEN
             RAISE EXCEPTION USING
                 MESSAGE = 'control.payment_intents cannot reach succeeded without the capture that succeeded it',
