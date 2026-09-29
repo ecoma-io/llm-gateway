@@ -906,13 +906,22 @@ components:
             - $ref: "#/components/schemas/PaymentTransferInstructions"
             - type: "null"
           description: >-
-            How to pay this payment, or null when this plane holds none. Null
-            exactly while the payment is `created`: a payment exists before the
-            provider has been asked for a destination, deliberately, so that
-            the provider's idempotency key can be derived from a durable
-            identity. It is also null for a payment whose destination was never
-            obtained, which is the state the `503` below describes and the
-            state a retry under the same idempotency key resolves.
+            How to pay this payment, or null when this plane holds none. What
+            this field answers is whether a destination EXISTS, and null says
+            it does not — which is two states and deliberately not a
+            biconditional about `created`. A payment this platform has just
+            opened is null because it exists before the provider has been asked
+            for anything, deliberately, so that the provider's own idempotency
+            key can be derived from a durable identity: that is the state the
+            `503` below describes, and the one a retry under the same
+            idempotency key resolves. A payment the provider refused a
+            destination for is ALSO null, and is `cancelled` rather than
+            `created`: the destination it was refused is one the provider holds
+            under this payment's own transfer identity and cannot be shown to
+            anyone, which is the `409` below. A client that read null as "still
+            opening" would offer to resume a payment this platform has
+            abandoned and can never pay. Whether the attempt is still open is a
+            question for the status beside this field.
 
             It is a copy of what was recorded and not a judgement about the
             payment: a payment whose destination has been recorded keeps it, in
