@@ -41,6 +41,7 @@
 // the outcome the server's own key semantics are built to absorb. A `201`
 // carrying instructions retires it, so the same customer funding the same offer
 // again later gets a new payment rather than a rendering of the old one.
+import type { Failure } from "@/lib/api";
 import type { PaymentIntent } from "@ecoma-io/llm-gateway-console-api-client";
 
 /**
@@ -88,21 +89,68 @@ export function beginTopUp(
 /**
  * The attempt still live after one answer, or `undefined` when the act is over.
  *
- * `transfer_instructions !== null` is the whole test, and it is deliberately
- * the contract's field rather than a status the console interprets. The
- * contract says the field is null "exactly while the payment is `created`" —
- * the state a provider call that never answered leaves behind — so a payment
- * carrying instructions is one where the provider WAS reached and a destination
- * was obtained, and a payment without them is an attempt that has produced
- * nothing to send money to yet. Whether that destination is one the customer
- * can still pay into or one whose payment is already settled does not matter
- * here: either way the attempt has finished. Retiring the key on an answer that
- * carries instructions is what makes a second top-up a second payment; keeping
- * it on a null is what makes a retry converge.
+ * Two tests, and the second one is the reason this function is no longer the
+ * single sentence it was.
+ *
+ * **A payment carrying instructions is over.** `transfer_instructions !== null`
+ * means the provider WAS reached and a destination was obtained, and whether
+ * that destination is one the customer can still pay into or one whose payment
+ * is already settled does not matter here: either way the attempt has finished.
+ * Retiring the key on it is what makes a second top-up a second payment.
+ *
+ * **So is a payment whose attempt this platform has abandoned.** The contract
+ * used to say the field was null "exactly while the payment is `created`", and
+ * this function used to be that test alone: null meant the provider had not
+ * answered yet, and keeping the key is what makes a retry converge. That is no
+ * longer the whole truth — a payment the provider refused a destination for is
+ * `cancelled` with no destination, because the destination it was refused is
+ * one the provider holds under this payment's own transfer identity and cannot
+ * be shown to anyone. It is not `created`, a retry under this key resolves to
+ * it and is told the attempt is over, and the contract's answer is a NEW
+ * payment under a NEW key. Keeping the key here would leave the customer
+ * clicking an offer that can never open anything: the reuse rule below hands
+ * back the same key for the same offer, so the next click repeats the refusal,
+ * and a deployment with one offer has no other button to press. `created` is
+ * therefore the state to keep the key in — it is the one state that means
+ * "opened, no destination, a second attempt is the same attempt" — and every
+ * other answer ends the act.
  */
 export function retireTopUp(
   pending: TopUpAttempt | undefined,
   payment: PaymentIntent,
 ): TopUpAttempt | undefined {
-  return payment.transfer_instructions === null ? pending : undefined;
+  if (payment.transfer_instructions !== null) return undefined;
+  return payment.status === "created" ? pending : undefined;
+}
+
+/**
+ * The attempt still live after a REFUSAL, or `undefined` when the refusal has
+ * ended the act.
+ *
+ * Exactly one refusal ends it, and it is the one the contract says does:
+ * `conflict`. Both of its causes are durable states rather than moments — an
+ * account that may not fund itself, and a payment whose transfer identity the
+ * provider already holds under a destination nobody was ever shown — and
+ * neither is something another attempt under the same key can clear. The
+ * contract's own answer to the second is a new top-up, and a console that kept
+ * the key would make that impossible to follow: `beginTopUp` hands the same key
+ * back for the same offer, so the customer's next click would repeat the
+ * refusal, and a deployment selling one offer has no other button to press.
+ *
+ * Every other refusal keeps the key, and that is the whole reason this is a
+ * separate function rather than a broader rule. A `503` is the provider not
+ * having answered, and the payment it left behind is one a retry under this key
+ * converges on; a transport failure is not even a contract answer. Neither is
+ * evidence that the act is over, and treating either as such would be the
+ * second-payment bug the key exists to prevent.
+ *
+ * Kept beside `retireTopUp` rather than in the page, because it is the same
+ * question asked of the other kind of answer: is this act still open?
+ */
+export function retireTopUpAfterFailure(
+  pending: TopUpAttempt | undefined,
+  failure: Failure | undefined,
+): TopUpAttempt | undefined {
+  if (failure === undefined || failure.kind !== "api") return pending;
+  return failure.envelope.error.code === "conflict" ? undefined : pending;
 }

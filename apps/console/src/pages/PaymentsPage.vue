@@ -51,7 +51,12 @@ import { useResource } from "@/lib/resource";
 import type { DataTableColumn } from "@/components/data-table";
 import type { Failure } from "@/lib/api";
 import FailureView from "@/modules/failure/FailureView.vue";
-import { beginTopUp, retireTopUp, type TopUpAttempt } from "@/modules/payments/idempotency";
+import {
+  beginTopUp,
+  retireTopUp,
+  retireTopUpAfterFailure,
+  type TopUpAttempt,
+} from "@/modules/payments/idempotency";
 import {
   showTransferInstructions,
   type TransferInstructions,
@@ -175,6 +180,11 @@ async function startTopUp(offer: TopUpOffer): Promise<void> {
 
     if (!result.ok) {
       commitFailure.value = result.failure;
+      // A refusal that ends the act retires the key, so the customer's next
+      // click opens a NEW payment instead of repeating a request the server has
+      // already said it will not serve. Every other refusal keeps it: see
+      // `retireTopUpAfterFailure`.
+      pendingTopUp.value = retireTopUpAfterFailure(pendingTopUp.value, result.failure);
       return;
     }
 
@@ -369,9 +379,11 @@ function paymentsTableState(): "ready" | "loading" | "empty" {
 
       <template v-else>
         <p class="text-sm text-muted-foreground">
-          Choosing an offer opens a payment and shows you an account to transfer into. The money
-          moves as a bank transfer, and this console never sees your bank details — no field on this
-          page asks for any.
+          Choosing an offer opens a payment, and the provider answers with an account to transfer
+          into — that account appears below as soon as it has been recorded. If the provider cannot
+          be reached, the payment stays open and there is nothing to pay into yet. The money moves
+          as a bank transfer, and this console never sees your bank details — no field on this page
+          asks for any.
         </p>
 
         <ul aria-label="Top-up offers" class="flex flex-wrap gap-2">
@@ -464,16 +476,18 @@ function paymentsTableState(): "ready" | "loading" | "empty" {
           <!-- The account a customer can pay into, selectable so it can be
                copied rather than retyped. It is shown exactly while the payment
                is one the provider has not settled, and the three branches are
-               three different facts: a destination to pay, a payment whose
-               destination was never obtained, and a payment that is over and
-               whose account must not be paid again. -->
+               three different facts: a destination to pay, a payment that is
+               still being opened, and a payment that is over and whose account
+               must not be paid again. The middle branch tests `created` rather
+               than a null destination, because a null is two facts and only one
+               of them is "not yet": a payment the provider refused a
+               destination for is over with no destination at all, and telling
+               its customer to wait would be telling them to wait for something
+               that is never coming. -->
           <span v-if="destinationAccount(row) !== undefined" class="select-all font-mono text-xs">
             {{ destinationAccount(row) }}
           </span>
-          <span
-            v-else-if="row.transfer_instructions === null"
-            class="text-xs text-muted-foreground"
-          >
+          <span v-else-if="row.status === 'created'" class="text-xs text-muted-foreground">
             Not ready yet
           </span>
           <span v-else class="text-xs text-muted-foreground">—</span>
@@ -485,8 +499,10 @@ function paymentsTableState(): "ready" | "loading" | "empty" {
         the provider's own account number, handed to the browser as it arrived: this console does
         not derive it, does not build a payment code of its own, and nothing here decides that a
         payment succeeded. The account is shown only while the provider still has something to
-        confirm; on a settled payment it reads as a dash, because transferring to it again would
-        send money to an account whose payment is already over.
+        confirm; a payment that is over reads as a dash, because transferring to it again would send
+        money to an account whose payment is already settled, and a payment that is still being
+        opened reads as "not ready yet" because the provider has not answered with an account at
+        all.
       </p>
     </section>
 

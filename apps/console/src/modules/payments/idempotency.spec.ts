@@ -9,16 +9,20 @@
 // below is about which of two keys it is.
 //
 // The rule under test is deliberately NOT "same offer" alone. It is whether the
-// PREVIOUS attempt is finished, and "finished" is read off the answer: the
-// contract's `transfer_instructions` is non-null exactly when the provider was
-// reached and a destination obtained, and until then the act is still open. The
-// 503 case is why that matters — the contract says the payment is durable in
-// `created` with a null `transfer_instructions` and that a retry under the same
-// key converges on it, so a client that retired the key on a FAILURE would open
-// a second payment on the retry that the server was built to absorb.
+// PREVIOUS attempt is finished. A destination means it is; so does a cancelled
+// payment with none, because the provider refused the destination under that
+// payment's immutable transfer identity. `created` with no destination is the
+// one answer that keeps it open — the provider was never reached, and the retry
+// has to keep its key so it converges rather than opening a second payment.
 import { describe, expect, it, vi } from "vitest";
 
-import { beginTopUp, retireTopUp, type TopUpAttempt } from "@/modules/payments/idempotency";
+import type { ApiFailure, Failure } from "@/lib/api";
+import {
+  beginTopUp,
+  retireTopUp,
+  retireTopUpAfterFailure,
+  type TopUpAttempt,
+} from "@/modules/payments/idempotency";
 import type { TransferInstructions } from "@/modules/payments/instructions";
 import type { PaymentIntent } from "@ecoma-io/llm-gateway-console-api-client";
 
@@ -30,11 +34,17 @@ const INSTRUCTIONS: TransferInstructions = {
   qr_url: "https://pay.example.test/qr/y1",
 };
 
-/** A payment as the API returns one, with the one field this module reads. */
-function payment(transfer_instructions: TransferInstructions | null): PaymentIntent {
+/** A payment as the API returns one, with the two fields this module reads. */
+function payment({
+  status = "awaiting_transfer",
+  transfer_instructions = INSTRUCTIONS,
+}: {
+  readonly status?: PaymentIntent["status"];
+  readonly transfer_instructions?: TransferInstructions | null;
+} = {}): PaymentIntent {
   return {
     id: "y0000000-0000-4000-8000-0000000000y1",
-    status: transfer_instructions === null ? "created" : "awaiting_transfer",
+    status,
     amount_minor_units: 2_500,
     currency: "EUR",
     minor_unit_exponent: 2,
@@ -43,6 +53,17 @@ function payment(transfer_instructions: TransferInstructions | null): PaymentInt
     expires_at: "2026-09-20T09:30:00Z",
   };
 }
+
+/** A server refusal with the one code that can end an attempt. */
+function apiFailure(code: "conflict" | "upstream_unavailable"): ApiFailure {
+  return {
+    kind: "api",
+    unauthenticated: false,
+    envelope: { error: { code, message: "the server's own words" }, request_id: "req-payments-1" },
+  };
+}
+
+const TRANSPORT_FAILURE: Failure = { kind: "transport", error: new Error("network unavailable") };
 
 /** A generator a test can read, so a REUSE is asserted by identity and not by luck. */
 function counter() {
@@ -102,22 +123,50 @@ describe("retireTopUp", () => {
     // to. The same offer clicked again afterwards is a NEW top-up — this is the
     // half that stops "fund me once" from meaning "fund me forever".
     const attempt: TopUpAttempt = { offer: "offer-a", key: "key-1" };
-    expect(retireTopUp(attempt, payment(INSTRUCTIONS))).toBeUndefined();
+    expect(retireTopUp(attempt, payment())).toBeUndefined();
   });
 
-  it("keeps the key when the answer has no destination, so the retry converges", () => {
+  it("keeps the key for created with no destination, so the retry converges", () => {
     // The 503 shape the contract describes: the payment exists in `created`
     // with null `transfer_instructions` because the provider never answered.
     // Retiring here would make the customer's retry a second payment instead of
     // the same one — which is precisely the convergence the key exists to
     // provide.
     const attempt: TopUpAttempt = { offer: "offer-a", key: "key-1" };
-    expect(retireTopUp(attempt, payment(null))).toBe(attempt);
+    expect(retireTopUp(attempt, payment({ status: "created", transfer_instructions: null }))).toBe(
+      attempt,
+    );
+  });
+
+  it("retires the key for a cancelled payment without a destination", () => {
+    // A duplicate SePay order code is permanently bound at the provider, but
+    // gave this platform no VA to show. Keeping its key would replay that
+    // conflict forever, so the next click must mint a new payment.
+    const attempt: TopUpAttempt = { offer: "offer-a", key: "key-1" };
+    expect(
+      retireTopUp(attempt, payment({ status: "cancelled", transfer_instructions: null })),
+    ).toBeUndefined();
   });
 
   it("has nothing to retire when no attempt was open", () => {
-    expect(retireTopUp(undefined, payment(INSTRUCTIONS))).toBeUndefined();
-    expect(retireTopUp(undefined, payment(null))).toBeUndefined();
+    expect(retireTopUp(undefined, payment())).toBeUndefined();
+    expect(
+      retireTopUp(undefined, payment({ status: "created", transfer_instructions: null })),
+    ).toBeUndefined();
+  });
+});
+
+describe("retireTopUpAfterFailure", () => {
+  it("retires the key after conflict so the next click opens a new payment", () => {
+    const attempt: TopUpAttempt = { offer: "offer-a", key: "key-1" };
+    expect(retireTopUpAfterFailure(attempt, apiFailure("conflict"))).toBeUndefined();
+  });
+
+  it("keeps the key for retryable and transport failures", () => {
+    const attempt: TopUpAttempt = { offer: "offer-a", key: "key-1" };
+    expect(retireTopUpAfterFailure(attempt, apiFailure("upstream_unavailable"))).toBe(attempt);
+    expect(retireTopUpAfterFailure(attempt, TRANSPORT_FAILURE)).toBe(attempt);
+    expect(retireTopUpAfterFailure(attempt, undefined)).toBe(attempt);
   });
 });
 
@@ -132,14 +181,17 @@ describe("one top-up, from first click to a second deliberate one", () => {
     const first = beginTopUp(undefined, "offer-a", mint);
     // The first request failed — a dropped response, or a 503 from a provider
     // that never answered. NO answer, so nothing retires and the key is live.
-    const afterFailure = retireTopUp(first, payment(null));
+    const afterFailure = retireTopUp(
+      first,
+      payment({ status: "created", transfer_instructions: null }),
+    );
     // The customer presses the button again for the same offer.
     const retry = beginTopUp(afterFailure, "offer-a", mint);
     expect(retry.key).toBe(first.key);
     expect(mint).toHaveBeenCalledTimes(1);
 
     // That retry succeeded and handed back a destination to pay into.
-    const afterSuccess = retireTopUp(retry, payment(INSTRUCTIONS));
+    const afterSuccess = retireTopUp(retry, payment());
     expect(afterSuccess).toBeUndefined();
 
     // The customer comes back later and funds the same offer again on purpose.
@@ -164,7 +216,7 @@ describe("what this module is not", () => {
 
     const attempt = beginTopUp(undefined, "offer-a", mint);
     const retry = beginTopUp(attempt, "offer-a", mint);
-    retireTopUp(retry, payment(INSTRUCTIONS));
+    retireTopUp(retry, payment());
 
     expect(local).not.toHaveBeenCalled();
     local.mockRestore();
