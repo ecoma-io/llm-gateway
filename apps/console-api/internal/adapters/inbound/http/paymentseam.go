@@ -42,7 +42,7 @@ import (
 // with no verifier has an endpoint that cannot authenticate a delivery — and
 // those are two different missing features with two different failure modes. A
 // webhook handler that reached a nil verifier would answer 500 to every
-// delivery, forever, and a checkout handler that reached a nil use-case would
+// delivery, forever, and a top-up handler that reached a nil use-case would
 // create no payment while its own row still existed. Keeping the two apart lets
 // each be refused on its own terms.
 //
@@ -68,7 +68,7 @@ import (
 // the surface: a payment is money, and "which account funds itself" is not a
 // question the browser gets to answer.
 type PaymentUseCases interface {
-	// BeginCheckout opens a payment for the account against one of this
+	// BeginTransfer opens a payment for the account against one of this
 	// deployment's top-up offers, and answers with it — durable, and priced by
 	// the server. The offer is an opaque identifier the application resolves
 	// into an amount and a currency; the request never carries either.
@@ -79,7 +79,7 @@ type PaymentUseCases interface {
 	// names rather than opening a second one. A converged call returns the SAME
 	// payment, possibly in a later state than this call's request would have
 	// opened, and the handler renders it identically either way.
-	BeginCheckout(ctx context.Context, accountID, offerID, idempotencyKey string) (PaymentIntentResult, error)
+	BeginTransfer(ctx context.Context, accountID, offerID, idempotencyKey string) (PaymentIntentResult, error)
 
 	// ApplyProviderEvent records one verified delivery and reports what became
 	// of it. It is the ONLY operation on this surface that can move money, and
@@ -156,13 +156,13 @@ type WebhookVerifier interface {
 // and forwards values and never interprets them. Note what is NOT here — there
 // is no disposition, no status and no account. A verified event is a CLAIM about
 // a payment, and which payment it is about is a question only the application
-// can answer, because only the application can resolve the checkout reference
-// this build stored.
+// can answer, because only the application can resolve the destination
+// reference this build recorded.
 //
 // The field-for-field mirror is deliberately mechanical, so a reference the port
-// grows — a refund resolves against a reference a checkout does not name — is
-// one more plain field here and nothing else: no handler in this package reads
-// any of these fields, and a transport that had begun to would have to be
+// grows — a refund resolves against a payment reference a capture does not name
+// — is one more plain field here and nothing else: no handler in this package
+// reads any of these fields, and a transport that had begun to would have to be
 // taught what the new one means.
 //
 // AmountMinorUnits is a pointer and nil is a refusal rather than a zero: an
@@ -181,9 +181,15 @@ type VerifiedEvent struct {
 	// of the bytes at all, which is the case it reports as
 	// payments.ErrMalformedEvent instead of returning.
 	EventID string
-	// CheckoutRef is the provider's identifier for the CHECKOUT this platform
-	// opened, or empty when the delivery names none.
-	CheckoutRef string
+	// TransferRef is the provider's identifier for the DESTINATION it issued
+	// for this platform's payment — the virtual account the money arrived at —
+	// or empty when the delivery names none.
+	//
+	// It is the reference a capture is resolved by, because it is the one this
+	// plane recorded before the customer was ever shown it. A refund names the
+	// payment instead, which is why the two are separate fields rather than one
+	// reference with a footnote.
+	TransferRef string
 	// PaymentRef is the provider's identifier for the PAYMENT rather than the
 	// delivery, or empty when the provider named none. It is the value a
 	// refund resolves through, and the one a capture stores.
@@ -226,7 +232,8 @@ type WebhookDelivery struct {
 // it resolved to one.
 //
 // The handler renders NONE of this on the wire, and that is deliberate rather
-// than an oversight — see the acknowledgement DTO at the bottom of this file.
+// than an oversight — see the acknowledgement constant at the bottom of this
+// file.
 // The outcome exists so a test can assert what a delivery did and so a future
 // log line can name it; a response that carried it would invite the provider's
 // implementation to branch on a decision it has no business making.
@@ -237,20 +244,22 @@ type WebhookOutcome struct {
 }
 
 // PaymentIntentRecord is the seam's payment row: what this platform asked the
-// provider to charge, and what became of it.
+// provider to collect, and what became of it.
 //
 // Status is the plain string the contract's own enum spells — `created`,
-// `checkout_open`, `requires_action`, `succeeded`, `failed`, `cancelled`,
+// `awaiting_transfer`, `requires_action`, `succeeded`, `failed`, `cancelled`,
 // `expired`, `partially_refunded`, `refunded`, `quarantined` — and this package
 // never compares it to anything. A handler that rendered a payment as settled
 // made that up; the only thing that can move a payment's status is a signed
 // delivery the application applied.
 //
-// CheckoutURL is empty exactly while the payment is `created`, and the wire
-// renders that absence as an explicit null rather than an empty string — the
-// contract types the field `[string, "null"]` and the schema says null is the
-// value of a payment whose checkout does not exist yet. There is no derived
-// status here: nothing in this package infers "created" from an empty URL.
+// TransferInstructions is nil exactly while no destination has been recorded,
+// and the wire renders that absence as an explicit null rather than as an empty
+// object — the contract types the field `[string, "null"]` and the schema says
+// null is the value of a payment whose destination does not exist yet. There is
+// no derived status here: nothing in this package infers "created" from an
+// absent destination, and a payment whose destination has been recorded keeps
+// carrying it in every later state.
 //
 // MinorUnitExponent is copied from the payment rather than looked up in the
 // live catalogue, and the difference is visible to a customer: the amount is
@@ -259,17 +268,38 @@ type WebhookOutcome struct {
 // because it outlives the offer that priced it — an offer withdrawn from the
 // price list would otherwise change how a historical payment reads.
 type PaymentIntentRecord struct {
-	ID                string
-	Status            string
-	AmountMinorUnits  int64
-	Currency          string
-	MinorUnitExponent int
-	CheckoutURL       string
-	CreatedAt         string
-	ExpiresAt         string
+	ID                   string
+	Status               string
+	AmountMinorUnits     int64
+	Currency             string
+	MinorUnitExponent    int
+	TransferInstructions *PaymentTransferInstructions
+	CreatedAt            string
+	ExpiresAt            string
 }
 
-// PaymentIntentResult is BeginCheckout's answer: the payment, and whether this
+// PaymentTransferInstructions is where the customer sends the money, in the
+// provider's own words: the destination the provider issued for this payment,
+// the bank and holder it sits with, and the provider's drawing of the same.
+//
+// The four fields are the domain's own four, and none of them is parsed here.
+// The seam carries them so the transport can render a destination a customer can
+// check before sending anything; nothing in this package reads a bank out of the
+// image, or re-derives the code from the other three, and a transport that began
+// to would be interpreting an encoding the provider owns.
+//
+// QRURL is empty when the provider drew no image, which is an ordinary value
+// rather than a failure — the contract types it nullable, and a destination with
+// a code, a bank name and a holder is one a customer can pay into without ever
+// scanning anything.
+type PaymentTransferInstructions struct {
+	TransferCode  string
+	BankName      string
+	AccountHolder string
+	QRURL         string
+}
+
+// PaymentIntentResult is BeginTransfer's answer: the payment, and whether this
 // call was the one that opened it.
 //
 // Converged carries no wire meaning and the handler does not render it. The
@@ -423,7 +453,7 @@ func errPaymentSurfaceUnwired(operation string) error {
 
 type unwiredPayments struct{}
 
-func (unwiredPayments) BeginCheckout(context.Context, string, string, string) (PaymentIntentResult, error) {
+func (unwiredPayments) BeginTransfer(context.Context, string, string, string) (PaymentIntentResult, error) {
 	return PaymentIntentResult{}, errPaymentSurfaceUnwired("POST /payment-intents")
 }
 
@@ -453,24 +483,40 @@ func (unwiredVerifier) Verify(map[string][]string, []byte) (VerifiedEvent, error
 // paymentIntentRecord mirrors the contract's PaymentIntent, whose seven fields
 // are all required.
 //
-// CheckoutURL is a *string because the schema types it `[string, "null"]` and
-// null is the value of a payment whose checkout does not exist yet. The null is
-// rendered from the seam's empty string by nullableString, and no handler
-// derives the payment's status from it — the two facts travel separately because
-// the schema declares both, and a client that inferred one from the other would
-// be inferring a state the provider's own delivery is the only authority on.
+// TransferInstructions is a pointer because the schema types it
+// `[string, "null"]` and null is the value of a payment whose destination does
+// not exist yet. The null is rendered from the seam's nil by
+// renderTransferInstructions, and no handler derives the payment's status from
+// it — the two facts travel separately because the schema declares both, and a
+// client that inferred one from the other would be inferring a state the
+// provider's own delivery is the only authority on.
 type paymentIntentRecord struct {
-	ID                string  `json:"id"`
-	Status            string  `json:"status"`
-	AmountMinorUnits  int64   `json:"amount_minor_units"`
-	Currency          string  `json:"currency"`
-	MinorUnitExponent int     `json:"minor_unit_exponent"`
-	CheckoutURL       *string `json:"checkout_url"`
-	CreatedAt         string  `json:"created_at"`
-	ExpiresAt         string  `json:"expires_at"`
+	ID                   string                       `json:"id"`
+	Status               string                       `json:"status"`
+	AmountMinorUnits     int64                        `json:"amount_minor_units"`
+	Currency             string                       `json:"currency"`
+	MinorUnitExponent    int                          `json:"minor_unit_exponent"`
+	TransferInstructions *paymentTransferInstructions `json:"transfer_instructions"`
+	CreatedAt            string                       `json:"created_at"`
+	ExpiresAt            string                       `json:"expires_at"`
 }
 
-// beginCheckoutRequest mirrors the contract's CreatePaymentIntentRequest.
+// paymentTransferInstructions mirrors the contract's PaymentTransferInstructions,
+// whose four fields are all required and one of which is nullable.
+//
+// QRURL is a *string because the schema types it `[string, "null"]`: a provider
+// that drew no image answered a real destination, and the null is that answer
+// rather than a failure. The other three are plain strings and are always
+// written, because a destination the store recorded always has them — the
+// domain refuses to record one that does not.
+type paymentTransferInstructions struct {
+	TransferCode  string  `json:"transfer_code"`
+	BankName      string  `json:"bank_name"`
+	AccountHolder string  `json:"account_holder"`
+	QRURL         *string `json:"qr_url"`
+}
+
+// beginTransferRequest mirrors the contract's CreatePaymentIntentRequest.
 //
 // Both fields are required by the schema and NEITHER is validated here beyond
 // being decodable. An offer is an opaque identifier whose vocabulary belongs to
@@ -482,7 +528,7 @@ type paymentIntentRecord struct {
 // There is deliberately no amount and no currency field, and their absence is
 // the design rather than an omission: a client-supplied amount is not a smaller
 // version of a policy, it is the absence of one.
-type beginCheckoutRequest struct {
+type beginTransferRequest struct {
 	Offer          string `json:"offer"`
 	IdempotencyKey string `json:"idempotency_key"`
 }
@@ -514,37 +560,74 @@ type topUpOfferList struct {
 	Items []topUpOfferRecord `json:"items"`
 }
 
-// webhookAcknowledgement mirrors the contract's WebhookAcknowledgement: one
-// boolean, and the same body for every outcome an authenticated delivery can
-// have.
+// webhookAcknowledgementBody is the exact body every 2xx from the delivery
+// endpoint carries, and it is a raw BYTE STRING rather than a marshalled value
+// for a reason that would otherwise look like a style preference.
 //
-// The sameness is the contract's rule and the reason this DTO has exactly one
-// field. 2xx means "this event needs no further delivery from you" and nothing
-// more, so a disposition rendered here would invite the provider's
-// implementation to branch on a decision it has no business making — and the
-// provider is the one party this plane cannot correct afterwards. A quarantined
-// delivery is an operator's work item, recorded where it can be; telling the
-// provider about it would put a permanent refusal into its retry budget.
-type webhookAcknowledgement struct {
-	Received bool `json:"received"`
-}
+// The body is a third party's contract to the byte. The provider accepts a
+// delivery only when the response is 200 or 201 within thirty seconds AND the
+// body is exactly the JSON document it documents — one member, spelled
+// `success`, with the space after the colon that the provider's own example
+// shows. Go's encoding/json emits `{"success":true}`: no space, but the same
+// document as far as every JSON parser is concerned and a DIFFERENT byte string
+// as far as a provider comparing what it received against what it published is
+// concerned. This platform's JSON discipline — always marshal a value, never
+// hand-write a body — is exactly what would produce the other string, which is
+// why this one exception has to be deliberate, spelled out here, and tested at
+// the byte.
+//
+// The sameness across outcomes is the contract's other rule: 2xx means "this
+// event needs no further delivery from you" and nothing more, so applied,
+// duplicate and quarantined all get these same bytes. A disposition rendered
+// here would invite the provider's implementation to branch on a decision it has
+// no business making — and the provider is the one party this plane cannot
+// correct afterwards. A quarantined delivery is an operator's work item,
+// recorded where it can be; telling the provider about it would put a permanent
+// refusal into its retry budget.
+const webhookAcknowledgementBody = `{"success": true}`
 
 // renderPaymentIntent converts one seam record into the contract's shape.
 //
 // The two instants go through mustWireTime, so a malformed timestamp is a panic
 // at the boundary rather than a field the contract types as a date-time
-// rendering as something else. The checkout URL goes through nullableString, for
-// the reason on that function.
+// rendering as something else. The destination goes through
+// renderTransferInstructions, for the reason on that function.
 func renderPaymentIntent(intent PaymentIntentRecord) paymentIntentRecord {
 	return paymentIntentRecord{
-		ID:                intent.ID,
-		Status:            intent.Status,
-		AmountMinorUnits:  intent.AmountMinorUnits,
-		Currency:          intent.Currency,
-		MinorUnitExponent: intent.MinorUnitExponent,
-		CheckoutURL:       nullableString(intent.CheckoutURL),
-		CreatedAt:         mustWireTime(intent.CreatedAt),
-		ExpiresAt:         mustWireTime(intent.ExpiresAt),
+		ID:                   intent.ID,
+		Status:               intent.Status,
+		AmountMinorUnits:     intent.AmountMinorUnits,
+		Currency:             intent.Currency,
+		MinorUnitExponent:    intent.MinorUnitExponent,
+		TransferInstructions: renderTransferInstructions(intent.TransferInstructions),
+		CreatedAt:            mustWireTime(intent.CreatedAt),
+		ExpiresAt:            mustWireTime(intent.ExpiresAt),
+	}
+}
+
+// renderTransferInstructions renders a recorded destination, or null when this
+// payment has none.
+//
+// The nil is the whole reason this is a function rather than a field copy: the
+// contract types `transfer_instructions` as an object OR null, and null is a
+// value the contract has — the state of a payment this platform has recorded
+// but not yet obtained a destination for. An empty object would be a different
+// value, and a client that received one would have to guess whether four empty
+// strings meant "no destination" or "a destination whose fields were lost".
+//
+// The QR URL is the one member that may be absent WITHIN a destination, and the
+// two nulls mean different things: no destination at all, versus a destination
+// the provider issued without drawing an image. Both are payable and only the
+// second has a code, a bank name and a holder beside it.
+func renderTransferInstructions(instructions *PaymentTransferInstructions) *paymentTransferInstructions {
+	if instructions == nil {
+		return nil
+	}
+	return &paymentTransferInstructions{
+		TransferCode:  instructions.TransferCode,
+		BankName:      instructions.BankName,
+		AccountHolder: instructions.AccountHolder,
+		QRURL:         nullableString(instructions.QRURL),
 	}
 }
 
@@ -583,8 +666,8 @@ func renderTopUpOfferList(result TopUpOfferListResult) topUpOfferList {
 // nullableString renders an absent value as an explicit null. It is the sibling
 // of wireInstants for the one field on this surface whose absence is not an
 // instant, and it exists for the same reason: the empty string and null are
-// different values on the wire, and the contract chooses null for a checkout
-// that does not exist yet.
+// different values on the wire, and the contract chooses null for a destination
+// the provider drew no image of.
 func nullableString(value string) *string {
 	if value == "" {
 		return nil

@@ -29,24 +29,47 @@ import (
 // because it looks like a statement about this code. The explanations here are
 // worth keeping; they are written in this build's own words instead, and this
 // test is what keeps them that way.
-// The dotted spellings carry their trailing period on purpose. A bare
-// `payment_intent` would match this repository's OWN `payment_intents_*` table
-// and constraint names, which are ours and belong in the domain's comments
-// without ceremony — a rule that made naming our own schema illegal would be
-// fixed by deleting the name, and the next person would name it in a comment
-// instead. What cannot appear here is the provider's FIELD PATH, and the dot is
-// what distinguishes one from the other.
+//
+// The list is ONE provider's, and replacing the adapter means replacing the
+// list: the superseded provider's names were deleted rather than kept
+// alongside. A word list that accumulated every protocol this build had ever
+// spoken would fail on a comment recording that the swap happened — the one
+// place an old provider's name genuinely belongs — and a rule that forbids its
+// own rationale is a rule the next person deletes. What this list asserts is
+// that the core does not depend on the protocol in front of it, and there is
+// one such protocol at a time.
+//
+// Every entry is spelled the way the provider spells it, punctuation and case
+// included, and that is what keeps the rule from firing on this repository's
+// own vocabulary. Two entries are worth explaining for that reason:
+//
+//   - `bank-accounts` keeps its hyphen, because the provider's path segment has
+//     one and this build has no reason to write those two words joined.
+//   - `order_code` keeps its underscore. The bare word "order" is ordinary
+//     English and appears throughout this build's prose about the ORDER of its
+//     writes — which is the doctrine most of the payment comments exist to
+//     state — so the rule names the provider's spelling rather than a word the
+//     core needs to keep saying.
+//
+// `SePay` and the two header names overlap, a header name containing the
+// provider name, so one offending line is reported twice, once per entry. That
+// is not a false positive: both entries do occur there, and a contributor is
+// told the one line to edit either way.
 var providerVocabulary = []string{
-	"payment_intent.succeeded",
-	"payment_intent.amount_capturable",
-	"charge.succeeded",
-	"charge.refunded",
-	"checkout.session.completed",
-	"checkout.session.expired",
-	"amount_refunded",
-	"amount_total",
-	"payment_status",
-	"Stripe",
+	"X-SePay-Signature",
+	"X-SePay-Timestamp",
+	"SePay",
+	"subAccount",
+	"transferType",
+	"transferAmount",
+	"va_number",
+	"va_holder_name",
+	"va_prefix",
+	"qr_code_url",
+	"with_qrcode",
+	"qrcode_template",
+	"bank-accounts",
+	"order_code",
 }
 
 // corePackages are the two directories the provider protocol must stay out of.

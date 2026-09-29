@@ -11,32 +11,53 @@ import (
 
 const (
 	// DefaultWebhookTolerance is how stale a signed provider delivery may be
-	// when no deployment sets one. Five minutes is the provider's own
-	// recommendation for its signing scheme (Stripe's documentation uses 300
-	// seconds as its example tolerance), and matching the provider's number
-	// rather than inventing a rounder one is the point: the window is a joint
-	// decision between two clocks, and the party that stamps the timestamp is
-	// the one whose documentation says how far apart they may drift.
+	// when no deployment sets one. It is the provider's own documented window
+	// for one of its signatures — five minutes, written as 300 seconds because
+	// the provider stamps the timestamp in whole seconds — and matching the
+	// provider's number rather than inventing a rounder one is the point: the
+	// window is a joint decision between two clocks, and the party that stamps
+	// the timestamp is the one whose documentation says how far apart they may
+	// drift.
+	//
+	// It is also the widest window this build will accept, which is why
+	// DefaultWebhookTolerance and MaxWebhookTolerance are the same number. A
+	// deployment may narrow it; it may not widen it past the point where this
+	// process would honour a delivery the provider already treats as
+	// undelivered.
 	DefaultWebhookTolerance = 5 * time.Minute
 
-	// MaxWebhookTolerance is the widest staleness this configuration accepts.
-	// Fifteen minutes is three times the provider's own recommendation and is
-	// deliberately not generous: the tolerance is the window in which a
-	// captured delivery can be replayed, and nothing this platform does needs
-	// a delivery older than the provider's own retry schedule — a stale
-	// delivery is recorded and answered, and the window is what bounds how
-	// much of the provider's history an attacker who captured one delivery can
-	// still make this plane act on.
-	MaxWebhookTolerance = 15 * time.Minute
+	// MaxWebhookTolerance is the widest staleness this configuration accepts,
+	// and it is the PROVIDER's window rather than a bound this build chose: the
+	// provider treats a signature older than 300 seconds as no longer valid, so
+	// a tolerance wider than this would leave this process acting on deliveries
+	// the provider has already stopped counting — a captured delivery stays
+	// replayable here long after the provider itself would have refused it, and
+	// the window is exactly what bounds how much of the provider's history an
+	// attacker holding one delivery can still make this plane act on.
+	//
+	// It is stated in SECONDS rather than in minutes because the provider
+	// states it in seconds, and a number converted on the way in is a number
+	// two readers can disagree about.
+	MaxWebhookTolerance = 300 * time.Second
 
 	// DefaultPaymentsRequestTimeout bounds one outbound call to the provider
-	// when no deployment sets one. Ten seconds is generous against a
-	// hosted-checkout API — which answers in tens of milliseconds — and short
-	// enough that a customer waiting on the redirect is not held behind a
-	// provider that has stopped answering. The call sits on a browser-facing
-	// request path, so this bound is what the customer's patience is spent
-	// against, and there is no ambient deadline above it.
+	// when no deployment sets one. Ten seconds is generous against an API that
+	// answers in tens of milliseconds and short enough that a customer waiting
+	// for a destination to pay into is not held behind a provider that has
+	// stopped answering. The call sits on a browser-facing request path, so
+	// this bound is what the customer's patience is spent against, and there
+	// is no ambient deadline above it.
 	DefaultPaymentsRequestTimeout = 10 * time.Second
+
+	// DefaultQRCodeTemplate names the provider's own drawing this build asks
+	// for when a deployment names none. It is a value of the PROVIDER's
+	// vocabulary rather than a rendering decision made here: the provider
+	// offers several images of the same transfer, this build asks for one of
+	// them, and "compact" is the one whose aspect suits a console's payment
+	// panel. A deployment whose provider spells its templates differently
+	// overrides it; the default exists so that a deployment which never
+	// thought about the question still has a pay-able destination.
+	DefaultQRCodeTemplate = "compact"
 
 	// maxPaymentsProviderLength bounds the provider name. It is the same
 	// alphabet and the same ceiling the domain's own provider namespace folds
@@ -109,20 +130,25 @@ const (
 	// every figure that can reach a bucket.
 	MaxTopUpOfferAmountMinorUnits = int64(1)<<53 - 1
 
-	// ProviderMaxUnitAmountMinorUnits is the largest amount the payment
-	// provider's API carries in its integer amount field: 99,999,999.99 in a
-	// two-decimal currency. It is the PROVIDER's bound, and this configuration
-	// restates it rather than importing the adapter's copy — configuration
-	// cannot import an adapter, and a bound that only existed one layer down
-	// would be a bound nothing at load time could enforce.
+	// MaxTopUpAmountMinorUnits is the largest top-up this platform will sell in
+	// one payment: 1,000,000,000 minor units, which is ten million units in a
+	// two-decimal currency and the whole amount itself in a currency with no
+	// minor unit.
 	//
-	// It is the smaller of the two ceilings a price has to clear, and enforcing
-	// only the larger one is the failure this constant exists to prevent: an
-	// offer priced between the two would pass every check here and then be
-	// refused by the provider on every single attempt, forever, with the
-	// payment left in `created` and a customer told nothing until they
-	// complained.
-	ProviderMaxUnitAmountMinorUnits = int64(99_999_999)
+	// It is a POLICY ceiling and not a protocol one, and the distinction is the
+	// honest part of this comment: this build knows of NO bound the payment
+	// provider's API places on an amount. The bound exists because an operator
+	// typing a price into a deployment template can add a digit by accident, and
+	// the difference between a five-hundred-thousand top-up and a
+	// five-billion one is one keystroke — while the money difference is four
+	// orders of magnitude and the customer is the one who finds out. Refusing it
+	// at configuration load makes that a startup line rather than a sale.
+	//
+	// A deployment that sells larger top-ups raises this number deliberately,
+	// and that deliberate edit is the whole point of the bound: the value is a
+	// statement about what this deployment is willing to charge, and changing it
+	// should be a decision somebody made rather than a digit that arrived.
+	MaxTopUpAmountMinorUnits = int64(1_000_000_000)
 )
 
 // placeholderWebhookSecrets are the values a deployment must not ship as its
@@ -147,8 +173,8 @@ var placeholderWebhookSecrets = []string{"changeme", "secret", "test", "placehol
 // points the console at a different processor changes every field here and
 // none of the ones there.
 //
-// Both secrets are plain strings, and that is a decision made for a mechanical
-// reason rather than a stylistic one. internal/arch/secrets_test.go refuses any
+// Both credentials are plain strings, and that is a decision made for a
+// mechanical reason rather than a stylistic one. internal/arch/secrets_test.go refuses any
 // struct field that nests the keymaterial package's Secret, because fmt reaches
 // into unexported fields and prints their bytes under a formatting verb; the
 // redaction contract lives in LogValue below, exactly as it does for
@@ -167,9 +193,17 @@ type Payments struct {
 	// Provider names which payment provider adapter this deployment uses.
 	Provider string
 
-	// SecretKey is the provider's API secret used to call it. NEVER logged,
-	// never returned, never put in the frontend bundle.
-	SecretKey string
+	// APIToken is the credential this process presents to the provider's API.
+	//
+	// It is a CREDENTIAL rather than a scoped key: the provider issues it with
+	// full access to the merchant account and with NO permission scopes, so it
+	// cannot be narrowed to the one operation this build performs and it cannot
+	// be made safe by a scope it does not have. Everything the merchant's
+	// account can do, a holder of this value can do. It is NEVER logged, never
+	// returned and never put in the frontend bundle, and the redaction in
+	// LogValue, String and GoString below is what enforces that rather than a
+	// call-site habit.
+	APIToken string
 
 	// WebhookSigningSecret verifies inbound provider webhooks. NEVER logged.
 	WebhookSigningSecret string
@@ -181,9 +215,46 @@ type Payments struct {
 	// APIBaseURL is the provider's API base URL.
 	APIBaseURL string
 
-	// CheckoutReturnURL is where the provider sends the customer back. It is
-	// built from configuration, NEVER from a request parameter.
-	CheckoutReturnURL string
+	// BankAccountXID is the provider's own identifier for the bank account
+	// this deployment's virtual accounts are issued under. It is part of the
+	// order this process sends when it asks for a destination, and the
+	// provider refuses an identifier it does not hold.
+	//
+	// It travels inside a URL PATH SEGMENT, so the loader refuses any value
+	// outside the alphabet a path segment may carry — see validPaymentsXID.
+	// A value that needed escaping would be one this process could not address,
+	// and the failure would be a 404 from the provider on a customer's first
+	// top-up rather than a startup line.
+	BankAccountXID string
+
+	// VAHolderName is the name the virtual account is held in, as this
+	// deployment registered it with the provider. It is what a customer's
+	// banking app checks against when the destination is entered or scanned,
+	// so it is the merchant's real trading name rather than a label.
+	VAHolderName string
+
+	// TID is the provider's transaction-template identifier, if this
+	// deployment's orders need one. OPTIONAL, and whether it is needed at all
+	// is the provider's business rather than this build's: which bank a
+	// deployment's account sits at decides which of the provider's optional
+	// order settings apply, and the provider adds and retires them as its own
+	// integration changes. It is therefore sent only when a deployment sets
+	// it, and this file does not guess a default for a value whose necessity
+	// it cannot decide.
+	TID string
+
+	// VAPrefix is a prefix the provider prepends to the virtual account
+	// numbers it issues for this deployment's orders, when the deployment's
+	// bank requires one. OPTIONAL for TID's reason: it is the provider's
+	// setting, sent when a deployment sets it and absent otherwise.
+	VAPrefix string
+
+	// QRCodeTemplate names which of the provider's own drawings of the
+	// transfer the customer is shown. It has a default because a destination
+	// without an image is still payable, but a template this deployment did
+	// set is passed through verbatim: the value belongs to the provider's
+	// vocabulary and this build does not translate it.
+	QRCodeTemplate string
 
 	// WebhookTolerance bounds how stale a signed delivery may be.
 	WebhookTolerance time.Duration
@@ -248,26 +319,32 @@ type TopUpOffer struct {
 }
 
 // LogValue renders the group safe for logs: the provider, its account
-// identifier, the two URLs and the two bounds are visible; both secrets are
-// not. Payments satisfies slog.LogValuer for the same reason DataPlane does —
-// redaction by construction, not by call-site discipline — and the field names
-// below are the configuration variable's own, so a log line and a deployment
-// template read as the same thing.
+// identifier, the API base URL, the merchant's order configuration and the two
+// bounds are visible; both credentials are not. Payments satisfies
+// slog.LogValuer for the same reason DataPlane does — redaction by
+// construction, not by call-site discipline — and the field names below are the
+// configuration variable's own, so a log line and a deployment template read as
+// the same thing.
 //
-// The account key is deliberately visible. It is an identifier rather than a
-// credential: it names a merchant account, it appears in the webhook dedup key
-// this process derives, and an operator reading a log line needs it to tell an
-// event from the wrong account apart from an event from the wrong provider. The
-// two fields that could be used to ACT — the API secret and the signing secret
-// — are the two that are struck out.
+// The account key and the order settings are deliberately visible. They are
+// identifiers rather than credentials: the account key names a merchant account
+// and appears in the webhook dedup key this process derives, and the bank
+// account id, the holder name and the three optional order settings are what an
+// operator checks when a destination comes back wrong. The two fields that
+// could be used to ACT — the API token and the signing secret — are the two
+// that are struck out.
 func (p Payments) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("provider", p.Provider),
-		slog.String("secret_key", "[redacted]"),
+		slog.String("api_token", "[redacted]"),
 		slog.String("webhook_signing_secret", "[redacted]"),
 		slog.String("provider_account_key", p.ProviderAccountKey),
 		slog.String("api_base_url", p.APIBaseURL),
-		slog.String("checkout_return_url", p.CheckoutReturnURL),
+		slog.String("bank_account_xid", p.BankAccountXID),
+		slog.String("order_va_holder_name", p.VAHolderName),
+		slog.String("order_tid", p.TID),
+		slog.String("order_va_prefix", p.VAPrefix),
+		slog.String("qrcode_template", p.QRCodeTemplate),
 		slog.Duration("webhook_tolerance", p.WebhookTolerance),
 		slog.Duration("request_timeout", p.RequestTimeout),
 		// The offers are logged as the declaration an operator wrote: which
@@ -295,10 +372,14 @@ func (p Payments) LogValue() slog.Value {
 // copy a caller makes on the way to a format verb.
 func (p Payments) String() string {
 	return "config.Payments{provider:" + p.Provider +
-		" secret_key:[redacted] webhook_signing_secret:[redacted]" +
+		" api_token:[redacted] webhook_signing_secret:[redacted]" +
 		" provider_account_key:" + p.ProviderAccountKey +
 		" api_base_url:" + p.APIBaseURL +
-		" checkout_return_url:" + p.CheckoutReturnURL +
+		" bank_account_xid:" + p.BankAccountXID +
+		" order_va_holder_name:" + p.VAHolderName +
+		" order_tid:" + p.TID +
+		" order_va_prefix:" + p.VAPrefix +
+		" qrcode_template:" + p.QRCodeTemplate +
 		" webhook_tolerance:" + p.WebhookTolerance.String() +
 		" request_timeout:" + p.RequestTimeout.String() +
 		" top_up_offer_ids:[" + strings.Join(topUpOfferIDs(p.TopUpOffers), ",") + "]}"
@@ -316,11 +397,20 @@ func (p Payments) GoString() string { return p.String() }
 // ends up silently running no payments instead of failing loudly.
 var paymentsVariables = []string{
 	"CONSOLE_API_PAYMENTS_PROVIDER",
-	"CONSOLE_API_PAYMENTS_SECRET_KEY",
+	"CONSOLE_API_PAYMENTS_API_TOKEN",
 	"CONSOLE_API_PAYMENTS_WEBHOOK_SIGNING_SECRET",
 	"CONSOLE_API_PAYMENTS_PROVIDER_ACCOUNT_KEY",
 	"CONSOLE_API_PAYMENTS_API_BASE_URL",
-	"CONSOLE_API_PAYMENTS_CHECKOUT_RETURN_URL",
+	"CONSOLE_API_PAYMENTS_BANK_ACCOUNT_XID",
+	"CONSOLE_API_PAYMENTS_ORDER_VA_HOLDER_NAME",
+	// The three optional order settings are in this list even though they are
+	// not required, and the reason is what the list is FOR: a deployment that
+	// set only one of them has said it wants a payment surface, and the probe
+	// above must notice that so the group is refused as half-configured rather
+	// than started with the setting silently dropped.
+	"CONSOLE_API_PAYMENTS_ORDER_TID",
+	"CONSOLE_API_PAYMENTS_ORDER_VA_PREFIX",
+	"CONSOLE_API_PAYMENTS_ORDER_QRCODE_TEMPLATE",
 	"CONSOLE_API_PAYMENTS_WEBHOOK_TOLERANCE",
 	"CONSOLE_API_PAYMENTS_REQUEST_TIMEOUT",
 	// The offers' own variables are spelled from the ids the list declares, so
@@ -344,11 +434,17 @@ var paymentsVariables = []string{
 // credentials would be a console taken down by an absent setting.
 //
 // The moment one variable IS set the group is all-or-nothing. The provider, the
-// API secret, the signing secret, the account key and the two URLs are required
-// — there is no default for who the provider is, and a default credential would
-// be a credential printed in this file — while the two bounds default, because
-// a tolerance and a timeout nobody tuned are survivable and a missing signing
-// secret is not.
+// API token, the signing secret, the account key, the API base URL, the bank
+// account id and the holder name are required — there is no default for who the
+// provider is, and a default credential would be a credential printed in this
+// file — while the QR template, the tolerance and the timeout default, because
+// a template, a tolerance and a timeout nobody tuned are survivable and a
+// missing signing secret is not. The three remaining order settings are
+// genuinely optional: which of them the provider needs is the provider's
+// documentation's business, it differs per bank, and it changes as the provider
+// revises its integration. They are sent only when a deployment sets them, so
+// this file never invents a value for a setting whose necessity it cannot
+// decide.
 func loadPayments(lookup LookupEnv) (Payments, error) {
 	configured := false
 	for _, name := range paymentsVariables {
@@ -367,14 +463,14 @@ func loadPayments(lookup LookupEnv) (Payments, error) {
 	}
 	cfg := Payments{Provider: provider}
 
-	secretKey, ok := lookup("CONSOLE_API_PAYMENTS_SECRET_KEY")
+	apiToken, ok := lookup("CONSOLE_API_PAYMENTS_API_TOKEN")
 	if !ok {
-		return Payments{}, fmt.Errorf("CONSOLE_API_PAYMENTS_SECRET_KEY must be set: the provider authenticates this process, and a checkout that cannot authenticate never opens")
+		return Payments{}, fmt.Errorf("CONSOLE_API_PAYMENTS_API_TOKEN must be set: the provider authenticates this process with it, and a destination that cannot be asked for is a customer with nowhere to send money")
 	}
-	if secretKey == "" {
-		return Payments{}, fmt.Errorf("CONSOLE_API_PAYMENTS_SECRET_KEY must not be empty")
+	if apiToken == "" {
+		return Payments{}, fmt.Errorf("CONSOLE_API_PAYMENTS_API_TOKEN must not be empty")
 	}
-	cfg.SecretKey = secretKey
+	cfg.APIToken = apiToken
 
 	signingSecret, ok := lookup("CONSOLE_API_PAYMENTS_WEBHOOK_SIGNING_SECRET")
 	if !ok {
@@ -400,11 +496,30 @@ func loadPayments(lookup LookupEnv) (Payments, error) {
 	}
 	cfg.APIBaseURL = apiBaseURL
 
-	returnURL, ok := lookup("CONSOLE_API_PAYMENTS_CHECKOUT_RETURN_URL")
+	bankAccountXID, ok := lookup("CONSOLE_API_PAYMENTS_BANK_ACCOUNT_XID")
 	if !ok {
-		return Payments{}, fmt.Errorf("CONSOLE_API_PAYMENTS_CHECKOUT_RETURN_URL must be set: it is where every customer lands after checkout, and this process builds it from nothing a request can name")
+		return Payments{}, fmt.Errorf("CONSOLE_API_PAYMENTS_BANK_ACCOUNT_XID must be set: it names the bank account the provider issues this deployment's destinations under, and there is nothing for this build to default it to")
 	}
-	cfg.CheckoutReturnURL = returnURL
+	cfg.BankAccountXID = bankAccountXID
+
+	vaHolderName, ok := lookup("CONSOLE_API_PAYMENTS_ORDER_VA_HOLDER_NAME")
+	if !ok {
+		return Payments{}, fmt.Errorf("CONSOLE_API_PAYMENTS_ORDER_VA_HOLDER_NAME must be set: the provider stamps it on every destination it issues, and a destination whose holder is unnamed is one a customer cannot check before sending money")
+	}
+	cfg.VAHolderName = vaHolderName
+
+	// The three optional order settings are read only when they are present, and
+	// they cross as EMPTY STRINGS when they are not. Empty is the adapter's own
+	// spelling of "this deployment did not configure this setting", and it is what
+	// keeps an unset variable out of the request the provider receives rather than
+	// in it as an empty parameter.
+	cfg.TID, _ = lookup("CONSOLE_API_PAYMENTS_ORDER_TID")
+	cfg.VAPrefix, _ = lookup("CONSOLE_API_PAYMENTS_ORDER_VA_PREFIX")
+
+	cfg.QRCodeTemplate = DefaultQRCodeTemplate
+	if value, ok := lookup("CONSOLE_API_PAYMENTS_ORDER_QRCODE_TEMPLATE"); ok {
+		cfg.QRCodeTemplate = value
+	}
 
 	cfg.WebhookTolerance = DefaultWebhookTolerance
 	if value, ok := lookup("CONSOLE_API_PAYMENTS_WEBHOOK_TOLERANCE"); ok {
@@ -441,9 +556,12 @@ func loadPayments(lookup LookupEnv) (Payments, error) {
 //
 // Each rule below is written where it is because the failure it prevents is
 // silent: a URL that carries credentials is logged by code that has no idea it
-// is holding a secret, a placeholder signing secret verifies forgeries, a stale
-// window hours wide keeps a captured delivery replayable, and a provider name
-// outside the grammar reaches a namespace that folds it into a different one.
+// is holding a secret, a placeholder signing secret verifies forgeries, a
+// tolerance wider than the provider's own window keeps a captured delivery
+// replayable here after the provider has stopped counting it, an id that needed
+// URL escaping addresses a resource the provider does not have, and a provider
+// name outside the grammar reaches a namespace that folds it into a different
+// one.
 // None of those produce an error at runtime; every one of them is a divergence
 // between what the deployment believes it configured and what it did.
 //
@@ -458,13 +576,13 @@ func validatePayments(cfg Payments) error {
 	if len(cfg.Provider) > maxPaymentsProviderLength || !validPaymentsProvider(cfg.Provider) {
 		// The value is echoed here and nowhere else in this file, and it is
 		// echoed deliberately: a provider name is not a secret, and an operator
-		// who typed "Stripe" needs to see what was refused to know that the
+		// who typed "SePay" needs to see what was refused to know that the
 		// grammar wants the lowercase form.
 		return fmt.Errorf("CONSOLE_API_PAYMENTS_PROVIDER %q must be 1 to %d characters of lowercase letters, digits, hyphens and underscores: it becomes the namespace segment of this provider's ledger command keys, and the domain folds anything outside that alphabet into a different name", cfg.Provider, maxPaymentsProviderLength)
 	}
 
-	if cfg.SecretKey == "" {
-		return fmt.Errorf("CONSOLE_API_PAYMENTS_SECRET_KEY must not be empty")
+	if cfg.APIToken == "" {
+		return fmt.Errorf("CONSOLE_API_PAYMENTS_API_TOKEN must not be empty")
 	}
 
 	if cfg.WebhookSigningSecret == "" {
@@ -495,29 +613,47 @@ func validatePayments(cfg Payments) error {
 			maxPaymentsProviderAccountKeyLength, len(cfg.ProviderAccountKey))
 	}
 
-	// THE API BASE URL IS HTTPS-ONLY, and the two URLs below are held to
-	// different rules rather than one shared one. This one carries a Bearer
-	// secret on every request the adapter makes; over cleartext that secret is
-	// readable by anyone on the path, and it is a key that can create and read
-	// charges on a live account. The return URL carries nothing and is the URL
-	// a customer's BROWSER is sent back to, where a plain-http staging
-	// deployment is a reasonable thing to run.
-	//
-	// Refusing here is better than trusting the adapter to refuse, because a
-	// deployment that boots is a deployment whose first customer payment is
-	// the thing that discovers it.
+	// THE API BASE URL IS HTTPS-ONLY, and it carries the API token as a bearer
+	// credential on every request the adapter makes; over cleartext that token is
+	// readable by anyone on the path, and it is a credential with no permission
+	// scopes — everything this merchant account can do. Refusing here is better
+	// than trusting the adapter to refuse, because a deployment that boots is a
+	// deployment whose first customer top-up is the thing that discovers it.
 	if err := validatePaymentsAPIURL("CONSOLE_API_PAYMENTS_API_BASE_URL", cfg.APIBaseURL); err != nil {
 		return err
 	}
-	if err := validatePaymentsURL("CONSOLE_API_PAYMENTS_CHECKOUT_RETURN_URL", cfg.CheckoutReturnURL); err != nil {
-		return err
+
+	// The bank account id goes into a URL PATH SEGMENT, so it is held to the
+	// alphabet an unescaped segment may carry. The adapter would refuse to escape
+	// one, and a value that had to be escaped would be one this process could not
+	// address at all — the provider answers 404 to a request that names an
+	// account it does not hold, and the customer sees a top-up that never opens
+	// instructions. Checking it here turns that into a startup line naming the
+	// variable.
+	if !validPaymentsXID(cfg.BankAccountXID) {
+		return fmt.Errorf("CONSOLE_API_PAYMENTS_BANK_ACCOUNT_XID must be one URL-safe path segment of letters, digits, hyphens, underscores and dots: it is placed in the path of the provider's own API request, so a value needing any other character, or none at all, is one this process cannot address")
+	}
+
+	if cfg.VAHolderName == "" {
+		return fmt.Errorf("CONSOLE_API_PAYMENTS_ORDER_VA_HOLDER_NAME must not be empty: the provider stamps it on every destination it issues, and it is what a customer checks before sending money")
+	}
+
+	if cfg.QRCodeTemplate == "" {
+		return fmt.Errorf("CONSOLE_API_PAYMENTS_ORDER_QRCODE_TEMPLATE must not be empty: it names which of the provider's own drawings of the transfer to ask for, and an empty name is not a choice of one")
 	}
 
 	if cfg.WebhookTolerance <= 0 {
 		return fmt.Errorf("CONSOLE_API_PAYMENTS_WEBHOOK_TOLERANCE must be greater than zero: the tolerance is what bounds how long a captured delivery stays replayable, and a window of nothing is a window a provider's clock cannot be inside")
 	}
 	if cfg.WebhookTolerance > MaxWebhookTolerance {
-		return fmt.Errorf("CONSOLE_API_PAYMENTS_WEBHOOK_TOLERANCE (%s) must be at most %s: a tolerance of hours widens the window in which a captured delivery can be replayed, and buys nothing a provider's own retry schedule needs", cfg.WebhookTolerance, MaxWebhookTolerance)
+		// The refusal is about whose clock is authoritative. The provider stamps
+		// a signature with a window of its own and treats anything older as
+		// undelivered; a tolerance wider than that window would leave this
+		// process honouring deliveries the provider has already stopped
+		// counting, which is a wider replay window bought with nothing — and a
+		// clock that disagrees with the provider's is a clock to correct, not a
+		// window to widen.
+		return fmt.Errorf("CONSOLE_API_PAYMENTS_WEBHOOK_TOLERANCE (%s) must be at most %s: a delivery this process would honour and the provider would not is not a delivery, so a tolerance wider than the provider's own window only widens how long a captured delivery stays replayable; clock skew is fixed by fixing the clock", cfg.WebhookTolerance, MaxWebhookTolerance)
 	}
 
 	if cfg.RequestTimeout <= 0 {
@@ -546,19 +682,17 @@ func validatePayments(cfg Payments) error {
 // The query and the fragment are refused for the reason the dataplane's
 // validator gives: both would be silently merged into, or dropped from, every
 // request the outbound adapter builds, so a configuration value that part of a
-// request ignores is a value that lies about what it does. Both URLs are held
-// to one shape rather than one each, so this file has a single rule to read.
+// request ignores is a value that lies about what it does.
+//
+// It is the base rule validatePaymentsAPIURL below builds on, and it is a
+// function of its own rather than three lines inside that one so that the shape
+// checks and the scheme check each have one place to be read: a second URL
+// added to this group would be held to this rule and to a scheme rule of its
+// own, and neither would have to be re-derived.
 //
 // Like validateDataPlaneURL and validatePostgresDSN, the value is never echoed
 // in a failure: url.Parse quotes the string it rejected, credentials included,
 // so its own text is deliberately not wrapped into these errors.
-// validatePaymentsURL accepts an absolute http(s) URL naming a host, with no
-// userinfo, query or fragment.
-//
-// It is the base rule both payments URLs are held to, and it admits cleartext
-// because the browser-facing return URL legitimately may be plain http on a
-// local deployment. The URL that carries a secret is held to the stricter
-// validatePaymentsAPIURL below.
 func validatePaymentsURL(name, raw string) error {
 	parsed, err := url.Parse(raw)
 	if err != nil {
@@ -582,13 +716,15 @@ func validatePaymentsURL(name, raw string) error {
 // validatePaymentsAPIURL is validatePaymentsURL with cleartext removed, and the
 // removal is the whole of it.
 //
-// The URL it guards is the one the outbound adapter sends the Bearer API secret
-// to on every checkout it opens. Over http that secret is readable by anything
-// on the network path, and it is not a per-session token: it is a key that can
-// open checkouts and read the account's charges, held by whoever reads it. The
-// browser return URL needs no such rule — nothing secret travels to it, and a
-// developer running a local deployment over http is doing something reasonable
-// that this should not refuse.
+// The URL it guards is the one the outbound adapter sends the Bearer API token
+// to on every call it makes. Over http that token is readable by anything on
+// the network path, and it is not a per-session token: the provider issues it
+// with no permission scopes, so it is the merchant's whole account, held by
+// whoever reads it. Nothing else this deployment configures carries a secret to
+// a URL, which is why this is the only URL the group holds and why the scheme
+// rule is stated here rather than left to the adapter: a deployment that boots
+// is a deployment whose first customer top-up is the thing that would discover
+// it.
 //
 // The scheme is the only difference. Everything validatePaymentsURL refuses,
 // this refuses, and a caller that wanted a scheme other than https has to say
@@ -605,9 +741,43 @@ func validatePaymentsAPIURL(name, raw string) error {
 		return fmt.Errorf("%s must be an absolute http(s) URL", name)
 	}
 	if parsed.Scheme != "https" {
-		return fmt.Errorf("%s must use the https scheme: the outbound adapter sends this deployment's payment API secret as a bearer credential to this URL, and over cleartext it is readable by anything on the path", name)
+		return fmt.Errorf("%s must use the https scheme: the outbound adapter sends this deployment's payment API token as a bearer credential to this URL, and over cleartext it is readable by anything on the path", name)
 	}
 	return nil
+}
+
+// validPaymentsXID reports whether value is one URL-safe path segment: one or
+// more characters from the unreserved set, and nothing else.
+//
+// The alphabet is the one the adapter itself refuses to escape — letters, digits,
+// hyphen, underscore and dot — and it is stated here rather than imported for
+// the reason every shared rule in this file is: configuration may not import an
+// adapter or a domain package (internal/arch/imports_test.go names the packages
+// that may, and this is not one of them), so the two cannot share a function.
+// What they share is the rule, quoted in both places so a widening of one is a
+// visible edit against the other rather than a silent divergence.
+//
+// The check is a SHAPE and not membership of a list of bank ids, because the
+// provider mints them and the world moves past any list this file could hold. A
+// value that is empty is refused with everything else: none at all is not a
+// segment, and a request whose path stops where an id should be addresses a
+// different resource.
+func validPaymentsXID(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		character := value[i]
+		switch {
+		case character >= 'a' && character <= 'z',
+			character >= 'A' && character <= 'Z',
+			character >= '0' && character <= '9',
+			character == '-', character == '_', character == '.':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // validPaymentsProvider reports whether name is inside the alphabet this
@@ -820,18 +990,17 @@ func readTopUpOffer(lookup LookupEnv, id string) (TopUpOffer, error) {
 // a price whose unit nobody stated, and this is the one figure in the group that
 // a customer is charged.
 //
-// TWO CEILINGS, NOT ONE, and the smaller of them is the one that binds.
-// MaxTopUpOfferAmountMinorUnits is the largest integer a JSON number carries
-// through a JavaScript client exactly, and a price above it would not fail — it
-// would arrive at the console as a different figure, with no error on either
-// side. ProviderMaxUnitAmountMinorUnits is the largest amount the provider's own
-// integer encoding carries, and it is far smaller: the provider's API refuses
-// anything above it, so an offer priced between the two would load cleanly here
-// and then fail every single checkout at the provider, with the payment left
-// `created` and no checkout URL for a customer to visit. Which of the two is
-// lower is a fact about the provider rather than about this file, so both are
-// checked and each refusal names the one it is about: an operator who read only
-// the other would fix the wrong ceiling.
+// TWO CEILINGS, NOT ONE, and both are checked so that each refusal names the
+// figure it is about. MaxTopUpOfferAmountMinorUnits is the largest integer a
+// JSON number carries through a JavaScript client exactly, and a price above it
+// would not fail — it would arrive at the console as a different figure, with
+// no error on either side. MaxTopUpAmountMinorUnits is this deployment's own
+// policy about the largest top-up it will sell in one payment, and it is far
+// smaller: it is the bound that actually binds today, and an operator who read
+// only the other message would edit the wrong number. Which ceiling is lower is
+// a fact about this deployment rather than about this file — a deployment that
+// raises its policy ceiling deliberately would meet the JSON bound next — so
+// both are checked rather than one being derived from the other.
 func parseTopUpOfferAmount(name, id, value string) (int64, error) {
 	if value == "" {
 		return 0, fmt.Errorf("%s must not be empty: an empty amount is not a price of nothing, it is a price nobody stated", name)
@@ -847,9 +1016,9 @@ func parseTopUpOfferAmount(name, id, value string) (int64, error) {
 		return 0, fmt.Errorf("%s: offer %q is priced at %d minor units, over the %d this build can carry to a client: JSON numbers above 2^53-1 lose precision in the console's own parser, so a price there would reach a customer as a different figure with nothing anywhere reporting a problem",
 			name, id, amount, MaxTopUpOfferAmountMinorUnits)
 	}
-	if amount > ProviderMaxUnitAmountMinorUnits {
-		return 0, fmt.Errorf("%s: offer %q is priced at %d minor units, over the %d the payment provider's API can carry: a price above it is refused by the provider itself, so the offer would load here and then fail every checkout at the provider, leaving the payment recorded with no checkout for a customer to visit",
-			name, id, amount, ProviderMaxUnitAmountMinorUnits)
+	if amount > MaxTopUpAmountMinorUnits {
+		return 0, fmt.Errorf("%s: offer %q is priced at %d minor units, over the %d this deployment will sell in one payment: the bound exists so that a mistyped digit is refused here rather than sold, and a deployment that means to sell a larger top-up raises the ceiling deliberately",
+			name, id, amount, MaxTopUpAmountMinorUnits)
 	}
 	return amount, nil
 }

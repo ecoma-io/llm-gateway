@@ -28,7 +28,7 @@ var testNow = time.Date(2026, time.September, 25, 10, 0, 0, 0, time.UTC)
 // intent.go declares it.
 var allStatuses = []Status{
 	StatusCreated,
-	StatusCheckoutOpen,
+	StatusAwaitingTransfer,
 	StatusRequiresAction,
 	StatusSucceeded,
 	StatusFailed,
@@ -45,11 +45,11 @@ var allStatuses = []Status{
 // that compared the table to itself would pass after any edit at all.
 var declaredEdges = map[Status][]Status{
 	StatusCreated: {
-		StatusCheckoutOpen,
+		StatusAwaitingTransfer,
 		StatusFailed,
 		StatusCancelled,
 	},
-	StatusCheckoutOpen: {
+	StatusAwaitingTransfer: {
 		StatusRequiresAction,
 		StatusSucceeded,
 		StatusFailed,
@@ -57,7 +57,7 @@ var declaredEdges = map[Status][]Status{
 		StatusExpired,
 	},
 	StatusRequiresAction: {
-		StatusCheckoutOpen,
+		StatusAwaitingTransfer,
 		StatusSucceeded,
 		StatusFailed,
 		StatusCancelled,
@@ -125,6 +125,53 @@ func TestTheTransitionMatrixIsExactlyTheDocumentedOne(t *testing.T) {
 	}
 }
 
+// TestTheAwaitingTransferEdgesAreTheOnesABankTransferRestsOn names the four
+// edges this instrument turns on, each for a reason both of its states have to
+// agree about.
+//
+// `created` to `awaiting_transfer` is how a payment acquires a destination: an
+// intent is durable before the provider is called, and the account the provider
+// issued is what moves it out of `created`. `awaiting_transfer` to `succeeded`
+// is the credit, reachable only from the state that was actually waiting for
+// money. `awaiting_transfer` to `expired` is a local timer running out, which is
+// a statement about this platform's patience and never about the transfer. And
+// `requires_action` to `awaiting_transfer` runs BACKWARD, because the customer
+// doing what the provider asked puts the payment back in their hands, waiting on
+// their transfer again, rather than forward into a state of its own.
+func TestTheAwaitingTransferEdgesAreTheOnesABankTransferRestsOn(t *testing.T) {
+	cases := []struct {
+		from, to Status
+		why      string
+	}{
+		{StatusCreated, StatusAwaitingTransfer, "a payment is waiting once the provider has issued it a destination"},
+		{StatusAwaitingTransfer, StatusSucceeded, "the credit is reached from the state that was waiting for the money"},
+		{StatusAwaitingTransfer, StatusExpired, "a local deadline may run out on a customer who sent nothing"},
+		{StatusRequiresAction, StatusAwaitingTransfer, "the customer answering the provider puts the payment back in their hands"},
+	}
+	for _, tc := range cases {
+		if !canMove(tc.from, tc.to) {
+			t.Errorf("canMove(%q, %q) = false, want true: %s", tc.from, tc.to, tc.why)
+		}
+		if !hasEdge(declaredEdges[tc.from], tc.to) {
+			t.Errorf("the documented matrix does not name %q to %q, which legalEdges declares", tc.from, tc.to)
+		}
+	}
+
+	// The backward move is the one that goes the wrong way through the machine,
+	// so the direction is asserted rather than assumed: a waiting payment has no
+	// edge back to `created`, and a captured one has no edge back to waiting.
+	// Returning to a state the payment already stood in is what `requires_action`
+	// to `awaiting_transfer` is for, and it is the only edge here that does it.
+	for _, pair := range [][2]Status{
+		{StatusAwaitingTransfer, StatusCreated},
+		{StatusSucceeded, StatusAwaitingTransfer},
+	} {
+		if canMove(pair[0], pair[1]) {
+			t.Errorf("canMove(%q, %q) = true, want false: the machine does not run that way", pair[0], pair[1])
+		}
+	}
+}
+
 // TestExpiredToSucceededIsALegalLatePayment pins the edge a reader should
 // question first. Expiry is this platform's patience running out, and the
 // provider is the only party entitled to say whether the customer paid; a
@@ -186,11 +233,11 @@ func TestKnownStatusNamesEveryStatusAndNothingElse(t *testing.T) {
 // two properties: the same inputs always name the same leg, and different
 // inputs never do.
 func TestTopUpCommandKeysAreDeterministicAndDistinct(t *testing.T) {
-	first, err := TopUpCommandKey("stripe", "pi_1")
+	first, err := TopUpCommandKey("acme", "ref_1")
 	if err != nil {
 		t.Fatalf("top-up key: %v", err)
 	}
-	again, err := TopUpCommandKey("stripe", "pi_1")
+	again, err := TopUpCommandKey("acme", "ref_1")
 	if err != nil {
 		t.Fatalf("top-up key: %v", err)
 	}
@@ -200,11 +247,11 @@ func TestTopUpCommandKeysAreDeterministicAndDistinct(t *testing.T) {
 
 	// Two payments of one provider, and one payment under a second provider,
 	// are three different legs.
-	other, err := TopUpCommandKey("stripe", "pi_2")
+	other, err := TopUpCommandKey("acme", "ref_2")
 	if err != nil {
 		t.Fatalf("top-up key: %v", err)
 	}
-	otherProvider, err := TopUpCommandKey("adyen", "pi_1")
+	otherProvider, err := TopUpCommandKey("acme-2", "ref_1")
 	if err != nil {
 		t.Fatalf("top-up key: %v", err)
 	}
@@ -230,16 +277,16 @@ func TestCommandKeysFoldTheProviderButNotThePaymentReference(t *testing.T) {
 		{"  aCmE  ", "acme"},
 		{"Acme Payments", "acme_payments"},
 		{"ac*m*e", "ac_m_e"},
-		{"adyen-2", "adyen-2"},
+		{"acme-2", "acme-2"},
 		{"42", "42"},
 		{"Über", "_ber"},
 	}
 	for _, tc := range cases {
-		folded, err := TopUpCommandKey(tc.spelled, "pi_1")
+		folded, err := TopUpCommandKey(tc.spelled, "ref_1")
 		if err != nil {
 			t.Fatalf("top-up key for provider %q: %v", tc.spelled, err)
 		}
-		canonical, err := TopUpCommandKey(tc.canonical, "pi_1")
+		canonical, err := TopUpCommandKey(tc.canonical, "ref_1")
 		if err != nil {
 			t.Fatalf("top-up key for provider %q: %v", tc.canonical, err)
 		}
@@ -256,7 +303,7 @@ func TestCommandKeysFoldTheProviderButNotThePaymentReference(t *testing.T) {
 		{"☃", "pay:_:topup:"},
 	}
 	for _, tc := range unusual {
-		key, err := TopUpCommandKey(tc.provider, "pi_1")
+		key, err := TopUpCommandKey(tc.provider, "ref_1")
 		if err != nil {
 			t.Fatalf("TopUpCommandKey(%q, ...): %v", tc.provider, err)
 		}
@@ -267,16 +314,16 @@ func TestCommandKeysFoldTheProviderButNotThePaymentReference(t *testing.T) {
 
 	// The reference is carried byte for byte into the digest: two spellings of
 	// one reference are two references, and the keys say so.
-	lower, err := TopUpCommandKey("stripe", "pi_abc")
+	lower, err := TopUpCommandKey("acme", "ref_abc")
 	if err != nil {
 		t.Fatalf("top-up key: %v", err)
 	}
-	upper, err := TopUpCommandKey("stripe", "PI_ABC")
+	upper, err := TopUpCommandKey("acme", "REF_ABC")
 	if err != nil {
 		t.Fatalf("top-up key: %v", err)
 	}
 	if lower == upper {
-		t.Errorf("a payment reference was case-folded: %q and %q collided", "pi_abc", "PI_ABC")
+		t.Errorf("a payment reference was case-folded: %q and %q collided", "ref_abc", "REF_ABC")
 	}
 }
 
@@ -284,11 +331,11 @@ func TestCommandKeysFoldTheProviderButNotThePaymentReference(t *testing.T) {
 // even when both name the same provider reference. If they were not, a refund
 // adjustment would be reported as a duplicate of the topup it reverses.
 func TestTopUpAndRefundKeysNeverCollide(t *testing.T) {
-	topUp, err := TopUpCommandKey("stripe", "ref_1")
+	topUp, err := TopUpCommandKey("acme", "ref_1")
 	if err != nil {
 		t.Fatalf("top-up key: %v", err)
 	}
-	refund, err := RefundCommandKey("stripe", "ref_1", 1)
+	refund, err := RefundCommandKey("acme", "ref_1", 1)
 	if err != nil {
 		t.Fatalf("refund key: %v", err)
 	}
@@ -299,7 +346,7 @@ func TestTopUpAndRefundKeysNeverCollide(t *testing.T) {
 		t.Fatalf("the purpose segment is not in the key: %q, %q", topUp, refund)
 	}
 	for _, key := range []string{topUp, refund} {
-		if !strings.HasPrefix(key, "pay:stripe:") {
+		if !strings.HasPrefix(key, "pay:acme:") {
 			t.Errorf("key %q does not carry the namespace first", key)
 		}
 	}
@@ -309,11 +356,11 @@ func TestTopUpAndRefundKeysNeverCollide(t *testing.T) {
 	// totals derives two keys. The counterpart — the same state reached twice
 	// deriving ONE key, which is the convergence a redelivery needs — is
 	// TestRefundCommandKeyNamesTheRefundedState.
-	firstRefund, err := RefundCommandKey("stripe", "pi_1", 400)
+	firstRefund, err := RefundCommandKey("acme", "ref_1", 400)
 	if err != nil {
 		t.Fatalf("refund key: %v", err)
 	}
-	secondRefund, err := RefundCommandKey("stripe", "pi_1", 1000)
+	secondRefund, err := RefundCommandKey("acme", "ref_1", 1000)
 	if err != nil {
 		t.Fatalf("refund key: %v", err)
 	}
@@ -326,16 +373,16 @@ func TestTopUpAndRefundKeysNeverCollide(t *testing.T) {
 // inputs. An absent reference is refused rather than digested: a key derived
 // from nothing is a key two different payments can share.
 func TestCommandKeysRefuseAMissingProviderOrReference(t *testing.T) {
-	if _, err := TopUpCommandKey("", "pi_1"); !errors.Is(err, ErrInvalidReference) {
+	if _, err := TopUpCommandKey("", "ref_1"); !errors.Is(err, ErrInvalidReference) {
 		t.Errorf("TopUpCommandKey with a blank provider = %v, want ErrInvalidReference", err)
 	}
-	if _, err := TopUpCommandKey("stripe", ""); !errors.Is(err, ErrInvalidReference) {
+	if _, err := TopUpCommandKey("acme", ""); !errors.Is(err, ErrInvalidReference) {
 		t.Errorf("TopUpCommandKey with a blank reference = %v, want ErrInvalidReference", err)
 	}
-	if _, err := RefundCommandKey("", "re_1", 1); !errors.Is(err, ErrInvalidReference) {
+	if _, err := RefundCommandKey("", "refund_1", 1); !errors.Is(err, ErrInvalidReference) {
 		t.Errorf("RefundCommandKey with a blank provider = %v, want ErrInvalidReference", err)
 	}
-	if _, err := RefundCommandKey("stripe", "", 1); !errors.Is(err, ErrInvalidReference) {
+	if _, err := RefundCommandKey("acme", "", 1); !errors.Is(err, ErrInvalidReference) {
 		t.Errorf("RefundCommandKey with a blank reference = %v, want ErrInvalidReference", err)
 	}
 	// The total is the third input and it is not optional either: a key naming
@@ -343,7 +390,7 @@ func TestCommandKeysRefuseAMissingProviderOrReference(t *testing.T) {
 	// A zero that were accepted would derive one key for every payment's
 	// un-refunded state, so two different payments' nothing would collide.
 	for _, total := range []int64{0, -1} {
-		if _, err := RefundCommandKey("stripe", "re_1", total); !errors.Is(err, ErrInvalidReference) {
+		if _, err := RefundCommandKey("acme", "refund_1", total); !errors.Is(err, ErrInvalidReference) {
 			t.Errorf("RefundCommandKey with a refunded total of %d = %v, want ErrInvalidReference", total, err)
 		}
 	}
@@ -361,11 +408,11 @@ func TestCommandKeysRefuseAMissingProviderOrReference(t *testing.T) {
 // implementation keyed on the payment alone passes the first and fails the
 // second, and one keyed on the delivery passes the second and fails the first.
 func TestRefundCommandKeyNamesTheRefundedState(t *testing.T) {
-	redelivered, err := RefundCommandKey("stripe", "pi_1", 400)
+	redelivered, err := RefundCommandKey("acme", "ref_1", 400)
 	if err != nil {
 		t.Fatalf("RefundCommandKey: %v", err)
 	}
-	again, err := RefundCommandKey("STRIPE", "pi_1", 400)
+	again, err := RefundCommandKey("ACME", "ref_1", 400)
 	if err != nil {
 		t.Fatalf("RefundCommandKey: %v", err)
 	}
@@ -373,7 +420,7 @@ func TestRefundCommandKeyNamesTheRefundedState(t *testing.T) {
 		t.Errorf("one refunded state under two spellings of the provider produced %q and %q", redelivered, again)
 	}
 
-	grown, err := RefundCommandKey("stripe", "pi_1", 401)
+	grown, err := RefundCommandKey("acme", "ref_1", 401)
 	if err != nil {
 		t.Fatalf("RefundCommandKey: %v", err)
 	}
@@ -392,11 +439,11 @@ func TestRefundCommandKeyNamesTheRefundedState(t *testing.T) {
 // assertDistinct fails if the two (reference, total) pairs derive one key.
 func assertDistinct(t *testing.T, firstRef string, firstTotal int64, secondRef string, secondTotal int64) {
 	t.Helper()
-	first, err := RefundCommandKey("stripe", firstRef, firstTotal)
+	first, err := RefundCommandKey("acme", firstRef, firstTotal)
 	if err != nil {
 		t.Fatalf("RefundCommandKey(%q, %d): %v", firstRef, firstTotal, err)
 	}
-	second, err := RefundCommandKey("stripe", secondRef, secondTotal)
+	second, err := RefundCommandKey("acme", secondRef, secondTotal)
 	if err != nil {
 		t.Fatalf("RefundCommandKey(%q, %d): %v", secondRef, secondTotal, err)
 	}
@@ -419,11 +466,11 @@ func assertDistinct(t *testing.T, firstRef string, firstTotal int64, secondRef s
 // is digested — everything after the digest comes from this build's own
 // arithmetic.
 func TestCommandKeysAreFixedLengthByConstruction(t *testing.T) {
-	wantLength := len("pay:stripe:topup:") + 64
-	wantRefundCeiling := len("pay:stripe:refund:") + 64 + len(".") + len("9223372036854775807")
+	wantLength := len("pay:acme:topup:") + 64
+	wantRefundCeiling := len("pay:acme:refund:") + 64 + len(".") + len("9223372036854775807")
 	for _, size := range []int{1, 2, 63, 64, 255, 256, 4096} {
 		reference := strings.Repeat("r", size)
-		key, err := TopUpCommandKey("stripe", reference)
+		key, err := TopUpCommandKey("acme", reference)
 		if err != nil {
 			t.Fatalf("top-up key for a %d-byte reference: %v", size, err)
 		}
@@ -437,7 +484,7 @@ func TestCommandKeysAreFixedLengthByConstruction(t *testing.T) {
 		// The largest total a capture can reach is the largest int64, which is
 		// also the widest the tail can be. A digest over the reference is what
 		// keeps the leading part independent of `size`.
-		refundKey, err := RefundCommandKey("stripe", reference, math.MaxInt64)
+		refundKey, err := RefundCommandKey("acme", reference, math.MaxInt64)
 		if err != nil {
 			t.Fatalf("refund key for a %d-byte reference: %v", size, err)
 		}
@@ -461,14 +508,14 @@ func TestCommandKeysSeparateNeighbouringReferences(t *testing.T) {
 		{"ref_000", "ref_001"},
 		{"a", "b"},
 		{strings.Repeat("r", 300) + "a", strings.Repeat("r", 300) + "b"},
-		{"pi_é", "pi_è"},
+		{"ref_é", "ref_è"},
 	}
 	for _, pair := range neighbours {
-		first, err := TopUpCommandKey("stripe", pair[0])
+		first, err := TopUpCommandKey("acme", pair[0])
 		if err != nil {
 			t.Fatalf("top-up key for %q: %v", pair[0], err)
 		}
-		second, err := TopUpCommandKey("stripe", pair[1])
+		second, err := TopUpCommandKey("acme", pair[1])
 		if err != nil {
 			t.Fatalf("top-up key for %q: %v", pair[1], err)
 		}

@@ -1,17 +1,17 @@
 // Package payments is the Control Plane's outbound port to an external payment
-// provider: the seam through which a customer is sent to a hosted checkout and
+// provider: the seam through which a customer is told where to send money and
 // through which money is recognised.
 //
 // It is a port in this module for the reason ports/outbound/dataplane is one and
 // for a different reason. There, the port existed because the peer was a
 // separate Go module and an import path could not cross. Here the provider is a
 // third party's HTTPS API, and the reason is the same in the end: the provider's
-// vocabulary — its endpoints, its header names, its event shapes, its
-// idempotency header, its amount encoding — is a fact about THEM, and a fact
-// about them does not belong in the domain that decides what a payment is. The
-// domain says "open a checkout for this amount in this currency" and "here is a
-// signed event, tell me what it claims". The adapter says "POST /v1/checkout and
-// here is how you read the signature".
+// vocabulary — its endpoints, its header names, its event shapes, its amount
+// encoding — is a fact about THEM, and a fact about them does not belong in the
+// domain that decides what a payment is. The domain says "obtain a destination
+// for this amount in this currency" and "here is a signed event, tell me what it
+// claims". The adapter says "POST this order endpoint and here is how you read
+// the signature".
 //
 // This port is LOCAL INFRASTRUCTURE, not a cross-plane seam. That distinction is
 // asserted mechanically in internal/arch/packages_test.go and it is the whole
@@ -24,13 +24,15 @@
 //
 // Two rules run through every member below, and both are load-bearing.
 //
-// FIRST: nothing here moves money. A Checkout creates a checkout; it does not
-// take one, and this port has no method that could. The credential is a hosted
-// checkout the customer completes on the provider's own surface; this process
-// never sees a card number, a CVV, or a cardholder field, because there is no
-// type here for one to arrive in. That is the PCI posture, and it is structural
-// rather than promised: a DTO without a card field cannot be made to accept
-// one, and a reader can see that without being told.
+// FIRST: nothing here moves money. OpenTransfer asks the provider to issue a
+// DESTINATION and answers with its own description of that destination; it does
+// not take a payment, and this port has no method that could. The instrument is
+// a bank transfer arriving at an account the provider issued for this one
+// payment, and the moment of payment is a bank's, not this process's. That is a
+// structural posture rather than a promised one: there is no type here for a
+// card number, a CVV or a cardholder field to arrive in, because money never
+// travels through this port in the outbound direction at all — it only ever
+// arrives as a claim, on the inbound side below.
 //
 // SECOND: a verified event is not a payment, it is a CLAIM about a payment. The
 // port's verification step answers one question — "did our provider, over a
@@ -50,32 +52,40 @@ import (
 	"time"
 )
 
-// Checkout opens a hosted checkout and returns the URL the customer is sent to.
+// Transfers obtains, from the provider, the destination a customer's money
+// should be sent to.
 //
 // It is one operation rather than a provider object because the port is the
 // shape the APPLICATION needs, and the application needs exactly one thing: a
-// place to send a customer who has decided to fund their account. A richer
-// session abstraction would be a shape invented before a second caller arrived,
+// destination for a customer who has decided to fund their account. A richer
+// account abstraction would be a shape invented before a second caller arrived,
 // which is the failure mode ports/outbound/dataplane's own header warns about —
 // a port member with no caller is a shape invented twice.
 //
-// The URL is returned VERBATIM and is never parsed by anything on this side. It
-// is a promise the provider makes and this process keeps on the provider's
-// behalf; a consumer that url.Parse'd it to extract a session id would be
-// interpreting a value whose only promise is that it may be handed to a
-// browser, and would break silently the first time the provider changed the
-// shape of its own URLs. The type says `string` for the same reason the fact
-// feed's payload is json.RawMessage: the wire owns the meaning.
-type Checkout interface {
-	// OpenCheckout creates a checkout for the given amount in the given
-	// currency and returns where to send the customer.
+// It is named for the movement of money and not for the provider's object,
+// because the provider's object is exactly the thing this port exists to keep
+// out of the application: one provider calls this an order, another calls it a
+// payment link, and both are the same fact — a place money can arrive that names
+// one payment.
+type Transfers interface {
+	// OpenTransfer asks the provider for a destination for the given amount in
+	// the given currency, and answers with the provider's own description of
+	// it.
 	//
 	// The amount is integer MINOR UNITS — the same int64 money.go defines and
 	// the ledger stores — and the currency is an ISO 4217 code. The provider
 	// may send amounts in a different unit of its own choosing; the adapter
 	// converts, and a conversion that is not exact is an error rather than a
-	// rounding, because a rounded amount is a charge for a figure nobody agreed
-	// to.
+	// rounding, because a rounded amount is a request for a figure nobody
+	// agreed to.
+	//
+	// It is NOT idempotent in the sense a caller might hope for, and the port
+	// is honest about that rather than promising the impossible: a provider
+	// that keys a destination on a caller-supplied identity answers a repeat
+	// with a conflict, not with the destination it already issued, and a
+	// provider that offers no way to read that destination back leaves nothing
+	// to converge on. Such a refusal is reported as ErrOrderCodeTaken, and the
+	// caller's answer is to abandon the attempt — see that sentinel.
 	//
 	// A failure wraps ErrProviderUnavailable when the provider did not answer
 	// at all, or answered that it is unwell, because the caller's response is
@@ -83,29 +93,30 @@ type Checkout interface {
 	// clears and the other is a defect. Everything else this method reports —
 	// a refused credential, a parameter the provider would not accept, an
 	// answer that does not decode — is a failure a retry cannot repair.
-	OpenCheckout(ctx context.Context, in CheckoutRequest) (CheckoutSession, error)
+	OpenTransfer(ctx context.Context, in TransferRequest) (TransferInstructions, error)
 }
 
-// CheckoutRequest is one checkout, in this port's own vocabulary.
+// TransferRequest is one transfer destination, in this port's own vocabulary.
 //
 // Every field is set by the Control Plane and none of them comes from the
 // customer's browser. The browser names a thing (see the top-up offer the
 // application resolves); the server prices it, and this struct is what it
 // priced. A port request with a caller-set amount and no policy behind it would
-// be a way to say "the customer may charge themselves whatever they typed",
-// which is the opposite of what a payment is.
+// be a way to say "the customer may pay themselves whatever they typed", which
+// is the opposite of what a payment is.
 //
 // IdempotencyKey is not optional and not decorative. It is the SAME value on
-// every attempt at the same logical checkout, and the reason is stated on the
-// method: a lost response is a normal event, not an exception, and a retry
-// that mints a new key is a second charge. The application derives it from the
-// payment intent's own identity, which is durable before the first call, so
-// "retry" and "first attempt" are the same request as far as the provider is
-// concerned. An implementation that ignores it has not implemented this port.
-type CheckoutRequest struct {
+// every attempt at the same logical transfer, and it is derived from the
+// payment intent's own identity, which is durable before the first call — so
+// "retry" and "first attempt" name the same thing on the wire, and a provider
+// that refuses a duplicate is refusing a duplicate of a request this platform
+// genuinely already made. An implementation that ignores it has not implemented
+// this port.
+type TransferRequest struct {
 	// IdempotencyKey is the caller's stable identity for this logical
-	// checkout, and the only thing standing between a network timeout and a
-	// customer charged twice. It must be identical on every retry.
+	// transfer, and the only thing standing between a repeated call and a
+	// customer handed two destinations for one payment. It must be identical
+	// on every retry.
 	IdempotencyKey string
 
 	// AmountMinorUnits is the canonical funding amount in integer minor units,
@@ -116,36 +127,69 @@ type CheckoutRequest struct {
 	// Currency is the ISO 4217 code the amount is denominated in. Uppercase.
 	Currency string
 
-	// Reference is this platform's own identifier for the payment — the intent
-	// id. It is sent so the provider echoes it on the event, which lets the
-	// application match an event to a payment it created rather than trusting a
-	// metadata field to identify one.
-	Reference string
-
-	// ReturnURL is where the provider sends the customer after checkout. It is
-	// built by this application from a configured base, never from a request
-	// parameter: a checkout API that accepts an attacker's absolute redirect
-	// URL is an open redirect on a payment page, and the URL is not merely
-	// cosmetic here — it is where the customer lands holding a session.
-	ReturnURL string
+	// ExpiresIn is how long the destination should stay valid, as this
+	// platform's own decision about its own patience.
+	//
+	// It is here rather than in the adapter's configuration because the window
+	// the console TELLS a customer and the window the provider ENFORCES are one
+	// fact, and two authorities for one fact drift. This process already
+	// decides how long it waits before giving up on a payment locally; handing
+	// that same value to the provider is what makes the printed deadline and
+	// the issued account agree. An implementation encodes it in whatever unit
+	// its provider states, exactly, and refuses a value it cannot state exactly
+	// rather than rounding it: a rounded lifetime is an account that expires at
+	// a moment nobody chose.
+	ExpiresIn time.Duration
 }
 
-// CheckoutSession is where the customer goes, and what the provider calls it.
-type CheckoutSession struct {
-	// URL is the hosted checkout, returned verbatim. Never parsed here.
-	URL string
-	// ProviderRef is the provider's own identifier for the checkout, the
-	// thing the later event will name. It is stored durably and is the link
-	// between a provider's event and a payment this platform created.
-	ProviderRef string
+// TransferInstructions is where the money goes, in the provider's own words.
+//
+// Every string in it is returned VERBATIM and is never parsed by anything on
+// this side. The bank's name and the account holder's are a promise the
+// provider makes and this process keeps on the provider's behalf, and the
+// reference is the value a later delivery will name — a consumer that tried to
+// decompose any of them would be interpreting values whose only promise is that
+// they describe a destination to a human, and would break silently the first
+// time the provider changed the shape of its own identifiers. The fields say
+// `string` for the same reason the fact feed's payload is json.RawMessage: the
+// wire owns the meaning.
+type TransferInstructions struct {
+	// TransferCode is the provider's own identifier for this destination — the
+	// account it issued for this payment alone. It is stored durably and is the
+	// link between a provider's delivery and a payment this platform created:
+	// money can only arrive at an account the provider issued, so a delivery
+	// naming it is a claim about money that really moved, and not about a
+	// customer's free text that a bank might have rewritten.
+	TransferCode string
+
+	// BankName is the provider's name for the institution the destination sits
+	// at, and AccountHolder is the name it is held in. Both are EVIDENCE FOR
+	// THE CUSTOMER — the console renders them so a person can check the
+	// destination before sending anything — and neither is ever compared
+	// against a delivery.
+	BankName      string
+	AccountHolder string
+
+	// QRURL is the provider's own image of the transfer to make, or empty when
+	// the provider issued none.
+	//
+	// Empty is an ordinary value rather than a failure: the destination above
+	// is complete without it, a customer can type an account number into a
+	// banking app, and a build that refused to open a payment because an image
+	// was missing would be refusing money over a decoration. The image is
+	// returned verbatim and never composed here, which is deliberate — see the
+	// ADR that chose this provider: an image this platform drew would be an
+	// encoding this platform has to get right, for a value whose only reader is
+	// somebody's camera.
+	QRURL string
 }
 
 // WebhookVerifier answers one question about a delivery: is it ours, and what
 // does it claim?
 //
-// It is its own interface beside Checkout rather than a member of one because
+// It is its own interface beside Transfers rather than a member of one because
 // the two have exactly one caller each and no common reason: a use case that
-// opens checkouts should not have to name the verification it never performs,
+// opens transfers should not have to name the verification it never performs,
 // and the verification is called by a transport handler, not by a use case.
 //
 // It takes the RAW BYTES as an argument rather than reading a request, and that
@@ -198,22 +242,25 @@ type ProviderEvent struct {
 	// PaymentRef below.
 	EventID string
 
-	// CheckoutRef is the provider's identifier for the CHECKOUT this platform
-	// opened, as the delivery stated it, or empty when the delivery names no
-	// checkout.
+	// TransferRef is the provider's identifier for the DESTINATION it issued
+	// for this platform's payment, as the delivery stated it, or empty when the
+	// delivery names no destination.
 	//
 	// It is the reference a CAPTURE is resolved by, because it is the one this
-	// plane wrote down before the customer was ever sent anywhere: the
-	// checkout's id is stored when the session is created, so a delivery
-	// naming it resolves against a row that already exists rather than against
-	// one the delivery itself would have to create.
+	// plane wrote down before the customer was ever shown it: the destination's
+	// id is stored when the transfer is opened, so a delivery naming it
+	// resolves against a row that already exists rather than against one the
+	// delivery itself would have to create. It is also the reason a capture
+	// needs no trust in the payload beyond the signature — the value is an
+	// account the provider issued for this payment, so money reaching it is
+	// money this platform asked for, which a transfer memo could never prove.
 	//
 	// Empty is an ordinary value and not a failure. A provider's refund
-	// delivery names the payment, not the session it was taken through — the
-	// session is not part of an event about money going back — so an
+	// delivery names the payment, not the destination it arrived at — the
+	// destination is not part of an event about money going back — so an
 	// implementation that had only this field would be unable to report a
 	// refund it had perfectly well authenticated. See PaymentRef.
-	CheckoutRef string
+	TransferRef string
 
 	// PaymentRef is the provider's identifier for the PAYMENT — the economic
 	// event — as distinct from the delivery that reported it, or empty when
@@ -231,7 +278,7 @@ type ProviderEvent struct {
 	// objects, and the application resolves them against different stored
 	// columns. Collapsing them into one field was the shape this port used to
 	// have, and its consequence was concrete: a refund carried a payment id
-	// into a lookup that only knew checkout ids, so every refund this platform
+	// into a lookup that only knew transfer ids, so every refund this platform
 	// received was recorded as a payment it could not find.
 	PaymentRef string
 
@@ -314,19 +361,46 @@ var ErrMalformedEvent = errors.New("payments: the delivery is well-signed but th
 // honest answer is an internal error.
 var ErrProviderUnavailable = errors.New("payments: the provider did not answer, or answered that it is unavailable")
 
+// ErrOrderCodeTaken reports that the provider already holds a destination under
+// the identity this request offered it, and will not issue another.
+//
+// It is a distinct sentinel because the caller's answer is neither a retry nor
+// an internal error: the attempt is UNRECOVERABLE and must be abandoned. The
+// destination the provider issued under that identity exists, but nothing on
+// this side has ever seen it — it was never returned to this process, and the
+// provider documents no way to read it back by the identity that names it — so
+// there is no value to show a customer and no way to obtain one. Retrying
+// changes nothing (the provider will refuse identically), and retrying under a
+// fresh identity is precisely what the caller must choose DELIBERATELY rather
+// than stumble into.
+//
+// The condition is reachable without a fault anywhere, and that is why it has a
+// name of its own. An identity derived from a payment's own id is refused on a
+// second attempt at that payment, and a second attempt is the ordinary
+// consequence of a lost response, a crashed process between the provider's call
+// and the durable write, or an operator replaying a failure. Every one of those
+// leaves a destination at the provider that no customer was ever told about,
+// which is money nobody can send and nobody is waiting for.
+//
+// The name is the provider's own words for the thing it refused, and that is
+// deliberate rather than a leak: this sentinel is the ONE place the port admits
+// that a provider's identity for a destination is something a caller can
+// collide with, and a neutral name like ErrAlreadyOpened would hide from the
+// adapter author exactly which condition they are translating.
+var ErrOrderCodeTaken = errors.New("payments: the provider already holds a destination under that order identity")
+
 // The two delivery kinds this build interprets, in this port's own vocabulary.
 //
 // They are constants of the PORT rather than of a provider, and that is what
-// the adapter's normalisation is FOR: a provider's `payment_intent.succeeded`
-// and another's `charge.completed` are two spellings of one thing this platform
-// does, and the application above must not have to learn either spelling. An
-// adapter maps the provider's own kind onto one of these two or refuses with
-// ErrMalformedEvent.
+// the adapter's normalisation is FOR: two providers' spellings of "the money
+// arrived" are two spellings of one thing this platform does, and the
+// application above must not have to learn either spelling. An adapter maps the
+// provider's own kind onto one of these two or refuses with ErrMalformedEvent.
 //
 // The set is deliberately tiny, and its smallness is the design rather than a
 // stage of it. `captured` and `refunded` are the only two events that can
 // change what a customer's balance is owed, and every other thing a provider
-// emits — a checkout expiring, a dispute opening, a receipt being mailed — is
+// emits — a transfer expiring, a dispute opening, a receipt being mailed — is
 // either a local decision this platform makes for itself or an operational fact
 // a reconciliation reads rather than a state machine consumes. A port with a
 // kind for each of those would be a port that grows every time a provider ships
@@ -374,5 +448,5 @@ const (
 // one layer up: here the value is not a weak secret but a name no code
 // implements.
 func ProviderName(string) (string, bool) {
-	return "stripe", true
+	return "sepay", true
 }

@@ -91,10 +91,10 @@ const (
 //     which is the one case a redelivery can change, and therefore the only 5xx.
 //
 // The handler makes no outbound call of any kind. It verifies locally and hands
-// the event to a seam; opening a checkout, calling the provider back to ask what
-// it meant, or fetching a payment from it are all operations this path does not
-// perform, because a delivery endpoint that calls out is an endpoint whose
-// availability depends on the thing it is trying to talk about.
+// the event to a seam; minting a virtual account, calling the provider back to
+// ask what it meant, or fetching a payment from it are all operations this path
+// does not perform, because a delivery endpoint that calls out is an endpoint
+// whose availability depends on the thing it is trying to talk about.
 func handleProviderWebhook(surface PaymentSurface) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		// The path segment is checked FIRST, before a header is read or a byte of
@@ -186,7 +186,7 @@ func handleProviderWebhook(surface PaymentSurface) stdhttp.HandlerFunc {
 			// provider bug this build can act on, and the provider's next attempt
 			// would carry these very bytes.
 			logWebhook(r, "the delivery authenticated and carries no readable event id, so there is nothing to record it under; nothing was written and the provider is told to stop")
-			writeJSON(w, stdhttp.StatusOK, webhookAcknowledgement{Received: true})
+			writeWebhookAcknowledgement(w)
 			return
 		default:
 			// A verification failure this transport cannot classify. Nothing has
@@ -214,11 +214,11 @@ func handleProviderWebhook(surface PaymentSurface) stdhttp.HandlerFunc {
 			writeError(w, r, err)
 			return
 		}
-		writeJSON(w, stdhttp.StatusOK, webhookAcknowledgement{Received: true})
+		writeWebhookAcknowledgement(w)
 	}
 }
 
-// handleBeginCheckout is POST /payment-intents: a customer funding their account
+// handleBeginTransfer is POST /payment-intents: a customer funding their account
 // against one of this deployment's top-up offers.
 //
 // The account is the SESSION's — resolveSession resolved it and it is passed as
@@ -240,18 +240,18 @@ func handleProviderWebhook(surface PaymentSurface) stdhttp.HandlerFunc {
 // difference a page may act on. The 503 for a provider that did not answer is
 // not this handler's to produce either; it arrives as an error from the seam and
 // renders through the one error translation point.
-func handleBeginCheckout(sessions SessionUseCases, useCases PaymentUseCases) stdhttp.HandlerFunc {
+func handleBeginTransfer(sessions SessionUseCases, useCases PaymentUseCases) stdhttp.HandlerFunc {
 	return func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		sessionPrincipal, ok := resolveSession(w, r, sessions)
 		if !ok {
 			return
 		}
-		var in beginCheckoutRequest
+		var in beginTransferRequest
 		if err := decodeJSONBody(w, r, &in); err != nil {
 			writeError(w, r, err)
 			return
 		}
-		result, err := useCases.BeginCheckout(r.Context(), accountOf(sessionPrincipal), in.Offer, in.IdempotencyKey)
+		result, err := useCases.BeginTransfer(r.Context(), accountOf(sessionPrincipal), in.Offer, in.IdempotencyKey)
 		if err != nil {
 			writeError(w, r, err)
 			return
@@ -351,6 +351,18 @@ func readWebhookBody(r *stdhttp.Request) (body []byte, oversized bool, err error
 // a verifier handed one string could not tell. The map is a COPY: the request's
 // own header map is live server state, and a verifier that appended to a slice
 // it was handed would be editing the request.
+//
+// The whole map travels, and that is the shape the signature scheme requires
+// rather than a convenience. This provider authenticates a delivery with TWO
+// headers — the signature and the timestamp it was computed at — and the
+// verifier reads both itself, because the two are one fact: the signature is
+// computed over this timestamp and these bytes, so a layer that supplied either
+// one could supply a pair that never authenticated anything. Nothing here
+// selects a header, and in particular nothing here INVENTS or DEFAULTS a
+// timestamp: a delivery that did not carry one is a delivery whose signature
+// cannot be checked, and manufacturing the missing half would turn a forged
+// delivery into a verified one. What is not present is not present, and the
+// verifier is the layer that refuses it.
 func webhookHeaders(r *stdhttp.Request) map[string][]string {
 	headers := make(map[string][]string, len(r.Header))
 	for name, values := range r.Header {
@@ -423,6 +435,39 @@ func webhookContentTypeIsJSON(r *stdhttp.Request) bool {
 		}
 	}
 	return true
+}
+
+// writeWebhookAcknowledgement answers a delivery with the one body this
+// provider treats as an acceptance, and every 2xx answer on this endpoint sends
+// it: a delivery that was applied, one already recorded, and one this build
+// could record only as quarantined all read the same bytes, because the
+// contract's rule is that nothing in the answer distinguishes them.
+//
+// The bytes are written as a literal, and this is the ONE place on the whole
+// surface where a response is not marshalled from a Go value. The reason is
+// that the body is a third party's contract to the byte rather than this
+// platform's own JSON: the provider reads `{"success": true}` and accepts the
+// delivery only if that is exactly what arrives, space included, while
+// `encoding/json` would emit `{"success":true}` and the delivery would be
+// refused and retried forever. Every other response here goes through writeJSON
+// precisely so that no response has its own idea of how JSON is spelled, and
+// that discipline is exactly why this exception has to be deliberate and
+// spelled out rather than discovered: the argument for marshalling is a good
+// one everywhere except here, where the bytes are not ours to shape.
+//
+// The headers mirror writeJSON's, because the encoding is the only thing about
+// this response the contract fixes; and there is no trailing newline, for the
+// same reason there is no marshaller — the provider compares what it read.
+func writeWebhookAcknowledgement(w stdhttp.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(stdhttp.StatusOK)
+	if _, err := io.WriteString(w, webhookAcknowledgementBody); err != nil {
+		// Status and headers are already on the wire, so a retry cannot repair a
+		// half-written response. The provider will not see the acceptance and
+		// will deliver again, which is the correct next step.
+		log.Printf("%s response acknowledgement write failed: %T", serviceName, err)
+	}
 }
 
 // logWebhook writes this endpoint's one line about a delivery it refused or

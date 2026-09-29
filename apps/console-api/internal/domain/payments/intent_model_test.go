@@ -24,10 +24,10 @@ func TestDigestReferenceIsFixedLengthAndSeparatesNeighbouringInputs(t *testing.T
 	cases := []string{
 		"",
 		"r",
-		"pi_1",
+		"ref_1",
 		strings.Repeat("r", 255),
 		strings.Repeat("r", 5000),
-		"pi_é",
+		"ref_é",
 	}
 	for _, reference := range cases {
 		digest := digestReference(reference)
@@ -49,7 +49,7 @@ func TestDigestReferenceIsFixedLengthAndSeparatesNeighbouringInputs(t *testing.T
 	}
 
 	neighbours := [][2]string{
-		{"pi_1", "pi_2"},
+		{"ref_1", "ref_2"},
 		{"a", "b"},
 		{strings.Repeat("r", 300) + "a", strings.Repeat("r", 300) + "b"},
 	}
@@ -159,7 +159,7 @@ func TestClaimRefusesAStatusOrASourceItHasNoRuleFor(t *testing.T) {
 // already finished.
 func TestClaimHandsTheStoreTheWholeClaim(t *testing.T) {
 	store := &fakeIntents{applied: true}
-	from := []Status{StatusCheckoutOpen, StatusRequiresAction}
+	from := []Status{StatusAwaitingTransfer, StatusRequiresAction}
 	err := Claim(t.Context(), store, IntentID(testPaymentID), from, StatusSucceeded, testNow)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -181,7 +181,7 @@ func TestClaimHandsTheStoreTheWholeClaim(t *testing.T) {
 // error the caller must not mistake for it.
 func TestClaimReportsALostCompareAndSwapAsItsOwnAnswer(t *testing.T) {
 	lost := &fakeIntents{applied: false}
-	err := Claim(t.Context(), lost, IntentID(testPaymentID), []Status{StatusCheckoutOpen}, StatusSucceeded, testNow)
+	err := Claim(t.Context(), lost, IntentID(testPaymentID), []Status{StatusAwaitingTransfer}, StatusSucceeded, testNow)
 	if !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("a lost compare-and-swap = %v, want ErrInvalidTransition", err)
 	}
@@ -192,7 +192,7 @@ func TestClaimReportsALostCompareAndSwapAsItsOwnAnswer(t *testing.T) {
 	// A store failure is NOT reported as a lost race: the caller must be able
 	// to tell the two apart, and does.
 	failed := &fakeIntents{applied: true, moveErr: errStoreMiss}
-	err = Claim(t.Context(), failed, IntentID(testPaymentID), []Status{StatusCheckoutOpen}, StatusSucceeded, testNow)
+	err = Claim(t.Context(), failed, IntentID(testPaymentID), []Status{StatusAwaitingTransfer}, StatusSucceeded, testNow)
 	if !errors.Is(err, errStoreMiss) {
 		t.Fatalf("a store failure = %v, want the store's own error", err)
 	}
@@ -201,29 +201,23 @@ func TestClaimReportsALostCompareAndSwapAsItsOwnAnswer(t *testing.T) {
 	}
 }
 
-// TestClaimReturnsTheStoresMissUnchanged documents the one answer the
-// documentation promises and the code cannot produce.
-//
-// FINDING: Claim's comment says it "returns ErrUnknownPayment for an id this
-// platform never opened, which is a different failure again: not 'the world
-// moved' but 'there is no payment here', and the caller's answer to that is to
-// record the event and stop." There is no branch in Claim that can produce it:
-// the store's error is returned verbatim, so a store that answers a miss with
-// persistence.ErrNotFound (the port's own vocabulary for a miss) hands the
-// caller a persistence sentinel from a domain call — precisely the shape this
-// file's header says the domain refuses so that "a refusal that arrives as a
-// driver error is a refusal some caller will not recognise as one". Either
-// Move's port contract should name payments.ErrUnknownPayment for a miss, or
-// Claim should translate one; today a caller matching errors.Is(err,
-// payments.ErrUnknownPayment) never sees it.
+// TestClaimReturnsTheStoresMissUnchanged pins the layering fact Claim's own
+// comment states: the store's error is handed back verbatim and no branch here
+// translates it. A store answering a miss with the persistence port's
+// ErrNotFound therefore hands the caller a persistence sentinel from a domain
+// call, and that is deliberate rather than overlooked — this function cannot
+// tell a missing payment from a store that could not answer, so a refusal it
+// invented would hide the second behind the first. The domain's own word for
+// the condition is minted one layer up, where the caller knows the miss came
+// from resolving a delivery rather than from reading an id.
 func TestClaimReturnsTheStoresMissUnchanged(t *testing.T) {
 	missing := &fakeIntents{applied: false, moveErr: errStoreMiss}
-	err := Claim(t.Context(), missing, IntentID(testPaymentID), []Status{StatusCheckoutOpen}, StatusSucceeded, testNow)
+	err := Claim(t.Context(), missing, IntentID(testPaymentID), []Status{StatusAwaitingTransfer}, StatusSucceeded, testNow)
 	if !errors.Is(err, errStoreMiss) {
 		t.Fatalf("Claim = %v, want the store's error", err)
 	}
 	if errors.Is(err, ErrUnknownPayment) {
-		t.Fatalf("Claim translated the miss after all; this finding is stale")
+		t.Fatalf("Claim translated the store's miss into %v; that word is minted by the caller that resolved a delivery, not here", ErrUnknownPayment)
 	}
 	if err.Error() != errStoreMiss.Error() {
 		t.Errorf("Claim rewrote the store's error as %v, want it unchanged", err)

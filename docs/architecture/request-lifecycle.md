@@ -492,12 +492,13 @@ B15 builds the PAYG top-up half of that path. The word **(verified)** above is
 where its whole security argument lives, and it is worth saying here what it
 resolved to:
 
-- **The verified webhook is the only financial authority.** The customer's
-  browser returns to a page that re-reads the payment's status from this
-  plane's own rows; it credits nothing, and no code path exists by which it
-  could. A provider event is resolved against a payment row this plane wrote,
-  and the account and the funding bucket come from that row rather than from
-  the payload — so a signed message cannot name whose money moves.
+- **The verified webhook is the only financial authority.** The customer is
+  given a destination to pay into and a QR image of it, and both are an
+  affordance: the page that shows them re-reads the payment's status from this
+  plane's own rows, credits nothing, and has no code path by which it could. A
+  provider event is resolved against a payment row this plane wrote, and the
+  account and the funding bucket come from that row rather than from the
+  payload — so a signed message cannot name whose money moves.
 - **The signature is computed over the exact bytes that are interpreted.** A
   parsed-then-re-serialised body loses its whitespace, key order and number
   spellings, and an HMAC over it authenticates a message the provider never
@@ -508,11 +509,13 @@ resolved to:
 - **Refunds are recognised and recorded, not booked.** A refund is a debit that
   leaves `settled`, and the accounting algebra has no movement for a customer
   who has already spent the money. ADR
-  [0013](../adr/0013-payment-integration.md) §9 records why every alternative
-  was worse.
+  [0014](../adr/0014-sepay-bank-transfer.md) §4 keeps this doctrine untouched,
+  and ADR [0013](../adr/0013-payment-integration.md) §9 records why every
+  alternative was worse.
 
 Still out of scope, and named so their absence is a decision rather than a gap:
-card data of any kind (the checkout is provider-hosted, and no field for it
-exists), issuing refunds, provider payouts and fees, reconciliation against the
-provider, and multi-currency — the settlement currency is a platform-wide
-singleton, and the currency on a payment must equal the provider's.
+card data of any kind (the instrument is a bank transfer, and no type or column
+here can carry one), issuing refunds, provider payouts and fees, reconciliation
+against the provider (ADR [0014](../adr/0014-sepay-bank-transfer.md) §9 names
+what it needs), and multi-currency — the settlement currency is a platform-wide
+singleton, and the currency on a payment is the platform's own constant.

@@ -1062,10 +1062,16 @@ paths:
   # The other half of the accounting section above — a `topup` leg is written
   # because one of these completed, and never because a client said so. The
   # three operations here are what a customer can choose, the money coming in,
-  # and neither of them moves money with a card: the payment is a hosted
-  # checkout the customer completes on the provider's own page, and this
-  # process never sees a card number, a CVV or a cardholder field. There is no
-  # type here for one to arrive in.
+  # and the way a customer actually pays is a bank transfer: this process asks
+  # the provider for an account to receive the money in, hands the customer the
+  # provider's own description of it, and then waits for the provider's servers
+  # to say the money arrived. Neither this process nor the console ever sees a
+  # card number, a CVV or a cardholder field, and there is no type here for one
+  # to arrive in — but that is now a consequence of the instrument rather than
+  # the reason for it. The reason is that a bank transfer has no browser
+  # completion at all, so nothing a customer does on a page can be mistaken for
+  # a payment: the only account of the money this plane accepts is the signed
+  # delivery described at the end of this section.
   # ---------------------------------------------------------------------------
 
   /top-up-offers:
@@ -1149,8 +1155,10 @@ paths:
         status was written by a signed delivery from the provider's servers,
         and a page that rendered a payment as settled is rendering the
         provider's word as this plane recorded it. That is why the console
-        reloads a payment after sending a customer to checkout instead of
-        assuming the answer from the redirect.
+        reloads a payment a customer says they have paid instead of assuming
+        the answer from what the customer did on the page — a customer
+        announcing a transfer is a person talking, and the provider is the
+        only party that gets to say the money arrived.
       security:
         - sessionCookie: []
       parameters:
@@ -1211,9 +1219,18 @@ paths:
         key that cannot make a retry the same request. That ordering is also
         what makes the 503 below safe to retry.
 
+        The provider is then asked for a destination to pay into, and the
+        answer is returned in `transfer_instructions`: the account the customer
+        transfers to, the bank and holder it is held in, and the provider's own
+        QR drawing of the same. This operation does not compose any part of
+        that — it does not mint a reference, encode a QR, or pick a bank — it
+        asks the provider and reproduces what came back, because the account a
+        payment is resolved by has to be one the provider will name again when
+        the money arrives.
+
         A retried request carrying the same `idempotency_key` converges: it is
         answered with the payment the account already has, the same `id` and
-        the same checkout, rather than opening a second one. The 201 is the
+        the same instructions, rather than opening a second one. The 201 is the
         answer on both the first call and the converged repeat, because the
         client asked for a payment and now holds it; which of the two happened
         is not a difference a page may act on, so the contract does not make
@@ -1222,7 +1239,10 @@ paths:
         Nothing here decides that a payment succeeded. The provider does, from
         its own servers, at an endpoint no browser can call — see
         `POST /payment-webhooks/{provider}` — and a console learns the outcome
-        by re-reading the payment.
+        by re-reading the payment. A customer saying they have transferred the
+        money is not evidence, and this surface has no member that could carry
+        such a claim: the only writes to a payment's state come from a
+        signature-verified delivery.
       security:
         - sessionCookie: []
       parameters:
@@ -1243,11 +1263,12 @@ paths:
             201 answers both the first call and the converged repeat, and the
             converged answer may carry a payment in a LATER state than the one
             this call's request would have opened — including a payment that
-            has already succeeded. Which of the two happened is not a
-            difference a page may act on, so the contract does not make one
-            available: a client renders the payment it was handed, and a
-            retry after a customer already paid does not send them to a
-            checkout again.
+            has already succeeded, whose recorded destination is returned
+            beside a status that says it has been paid. Which of the two
+            happened is not a difference a page may act on, so the contract
+            does not make one available: a client renders the payment it was
+            handed, and what it renders of a payment already paid is that
+            payment, not a destination to send money to.
           headers:
             X-Request-Id:
               $ref: "./shared/console.yaml#/components/headers/RequestID"
@@ -1328,22 +1349,47 @@ paths:
             way fails the same way until something else changes, and the
             client cannot see what that something is.
 
-            One state produces it today: an account whose own state does not
-            permit a new payment. It is refused here rather than at a later
-            screen, because the money would land somewhere this account cannot
-            currently use — a suspended or closed account may not fund itself
-            — and the code is `conflict` rather than `invalid_request` for the
-            reason above: the body is well-formed, no edit to it would help,
-            and the account's state is the fact that has to change.
+            Two states produce it today, and neither is about the body.
 
-            The idempotency key is deliberately NOT a second cause. A repeated
+            An account whose own state does not permit a new payment. It is
+            refused here rather than at a later screen, because the money would
+            land somewhere this account cannot currently use — a suspended or
+            closed account may not fund itself — and the code is `conflict`
+            rather than `invalid_request` for the reason above: the body is
+            well-formed, no edit to it would help, and the account's state is
+            the fact that has to change.
+
+            A payment for which the provider already holds an order this
+            deployment can no longer reach. The provider is asked for a
+            destination keyed by a value derived from the payment's identity,
+            which is what makes a retry the same request rather than a second
+            one; if that value is already taken while this plane has no
+            destination stored for it, the payment was opened and the answer
+            was lost before it could be recorded. There is no operation that
+            recovers the destination — the provider's own lookup cannot be
+            searched by that value — and nothing else changes on a retry, so
+            the honest answer is a refusal rather than a `503` the caller would
+            keep retrying. The payment is left `cancelled`, which is this
+            platform's statement that it will not pursue it, and the way
+            forward is a NEW payment: a fresh `idempotency_key` under this same
+            offer opens a fresh payment with a fresh destination, which is what
+            a caller that received this response should do. No money was ever
+            sent to the unreachable destination in this case, because a
+            destination is only ever shown to a customer once it has been
+            recorded — the one thing this branch has established is that it was
+            not.
+
+            The idempotency key is deliberately NOT a third cause. A repeated
             key is the caller saying two requests are ONE act, and the answer
             to that is the payment the key already names — a 201, whether the
             repeat arrives a second later or after the customer has paid.
             Turning a repeat into a refusal would break the very protection
             the key exists to provide, and it would say "you asked twice" where
             the caller's actual situation is "you asked once and did not hear
-            the answer".
+            the answer". The case above is not a repeat being refused: it is a
+            repeat that could not be served, and the payment it converged on is
+            the one named in the answer's own words — a different payment, with
+            a different key, is what resolves it.
           headers:
             X-Request-Id:
               $ref: "./shared/console.yaml#/components/headers/RequestID"
@@ -1359,21 +1405,21 @@ paths:
           $ref: "./shared/errors.yaml#/components/responses/InternalError"
         "503":
           description: >-
-            The payment provider that would open the checkout did not answer,
-            so there is no checkout to send the customer to. The code is
+            The payment provider that would name a destination did not answer,
+            so there is nowhere to tell the customer to send money. The code is
             `upstream_unavailable`: the condition is the provider's and is
             expected to clear, so the caller retries later rather than
             differently.
 
             The payment itself is durable and is NOT lost — it exists in
-            `created` with a null `checkout_url`, written before the provider
-            was called precisely so that this case has something to retry
-            against. A retry under the same idempotency key converges on that
-            same payment and opens the checkout this attempt could not, which
-            is the retry the provider's own key semantics are built to absorb.
-            The key is required of every attempt for exactly this reason: an
-            attempt without one could not be retried as the same request at
-            all.
+            `created` with null `transfer_instructions`, written before the
+            provider was called precisely so that this case has something to
+            retry against. A retry under the same idempotency key converges on
+            that same payment and obtains the instructions this attempt could
+            not, which is the retry the provider's own key semantics are built
+            to absorb. The key is required of every attempt for exactly this
+            reason: an attempt without one could not be retried as the same
+            request at all.
           headers:
             X-Request-Id:
               $ref: "./shared/console.yaml#/components/headers/RequestID"
@@ -1558,9 +1604,10 @@ paths:
         verification, because a decoded object has lost its whitespace, its
         key order, its duplicate keys and its number spellings, and a
         signature computed over that authenticates something the provider
-        never sent. The header below carries the signature; the path segment
-        is an ADDRESS, not a request parameter, and this process answers for
-        exactly one of them — see the parameter and the 404 below.
+        never sent. The signature travels in the headers below, together with
+        the moment it was signed at, and both are part of what is verified; the
+        path segment is an ADDRESS, not a request parameter, and this process
+        answers for exactly one of them — see the parameter and the 404 below.
 
         The statuses are a deliberate and unusual shape, and the rule that
         produces them is one sentence: **2xx means "this event needs no
@@ -1654,44 +1701,88 @@ paths:
             type: string
             minLength: 1
             maxLength: 64
-        - name: Stripe-Signature
+        - name: X-SePay-Signature
           in: header
           required: true
           description: >-
             The signature header this deployment's provider signs its
             deliveries with, spelled exactly as that provider spells it — the
-            adapter reads this one name and no other. It is a fixed name of
-            this contract and not a slot a caller fills in: the deployment
-            speaks exactly one provider, that provider's signature scheme
-            fixes the header, and a second provider arrives as a code change
-            with its own contract change rather than as a string a caller
-            picks. A delivery whose signature arrives only under some other
-            header name is one this deployment cannot verify, and it is
-            refused 400 — the same answer as a delivery carrying no signature
-            at all, because it is the same fact seen twice: this is the name
-            the check reads, and nothing else on the request is read as a
-            signature.
+            adapter reads this name and the timestamp header beside it, and no
+            other name. It is a fixed name of this contract and not a slot a
+            caller fills in: the deployment speaks exactly one provider, that
+            provider's signature scheme fixes the header, and a second provider
+            arrives as a code change with its own contract change rather than
+            as a string a caller picks. A delivery whose signature arrives only
+            under some other header name is one this deployment cannot verify,
+            and it is refused 400 — the same answer as a delivery carrying no
+            signature at all, because it is the same fact seen twice: these are
+            the names the check reads, and nothing else on the request is read
+            as a signature.
 
-            The value is the provider's signature over the exact bytes of the
-            request body, together with the timestamp the provider signed it
-            at, in the provider's own element syntax. It must be present, and
-            it must appear at most once — a request carrying two is refused
-            rather than resolved to either, because accepting "the first of
-            several" is how a smuggled value wins — and it is compared against
-            the signature this deployment computes in constant time. Absent,
-            repeated, or unequal is a 400: the delivery did not authenticate,
-            and a wrong signature will be wrong again. So is a signature that
-            is correct over a MOMENT this deployment no longer accepts: the
-            provider's signature covers a timestamp as well as the body, this
-            deployment bounds how old a signed delivery may be, and a delivery
-            outside that bound is refused as a replay. No request carries that
-            bound — it is configuration — and the two refusals share one
-            status because they share one property: neither becomes usable on
-            a second attempt.
+            The value is a prefixed hexadecimal digest — `sha256=` and then the
+            lowercase hex of an HMAC-SHA-256 over the signed timestamp, a
+            literal `.`, and the exact bytes of the request body, keyed by this
+            deployment's webhook signing secret. The separator and the body are
+            inside the digest rather than concatenated loosely, which is what
+            binds the two headers to one another: a signature computed over a
+            body alone could be replayed under any timestamp, and a signature
+            over a timestamp alone would cover no content at all.
+
+            It must be present, and it must appear at most once — a request
+            carrying two is refused rather than resolved to either, because
+            accepting "the first of several" is how a smuggled value wins — and
+            it is compared against the signature this deployment computes in
+            constant time. Absent, repeated, or unequal is a 400: the delivery
+            did not authenticate, and a wrong signature will be wrong again. So
+            is a signature that is correct over a MOMENT this deployment no
+            longer accepts: the signed timestamp is what fixes that moment, the
+            value below carries it, this deployment bounds how old a signed
+            delivery may be, and a delivery outside that bound is refused as a
+            replay. No request carries that bound — it is configuration — and
+            the two refusals share one status because they share one property:
+            neither becomes usable on a second attempt.
+
+            The digest's exact spelling is a string comparison of bytes this
+            plane computed against bytes that arrived, and nothing here is
+            normalised: case is part of the value, and a client that tried
+            "the same hash in uppercase" would be sending a different string.
           schema:
             type: string
             minLength: 1
             maxLength: 1024
+        - name: X-SePay-Timestamp
+          in: header
+          required: true
+          description: >-
+            The moment the provider signed the delivery, in Unix seconds — a
+            decimal integer and nothing else, spelled exactly as that provider
+            spells it. It is a required member of the signature and not an
+            independent hint: the digest above covers it, so a delivery whose
+            timestamp was altered is a delivery whose signature no longer
+            verifies, and the two are refused identically. It is read as the
+            first half of the signed material and, separately, as the moment
+            the freshness tolerance is measured from.
+
+            It must be present, it must appear at most once for the reason the
+            signature header must, and it must parse as an integer in the
+            provider's own unit — a value that does not is a delivery this
+            deployment cannot measure, and it is refused 400 with the
+            signature header's refusals rather than treated as absent. A
+            timestamp outside the tolerance is a 400 and never a 5xx: the
+            delivery is a replay rather than a delivery, and its redelivery
+            carries the same signed value, so a retry could only repeat the
+            refusal.
+
+            The tolerance exists because a signature proves WHO sent a message
+            and only the bound on this value makes it proof about WHEN. Both
+            the provider's clock and this deployment's are involved and neither
+            is adjusted for, so a deployment whose clock is skewed beyond the
+            bound refuses every honest delivery — which is the one way this
+            header's check fails closed and loudly rather than silently.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 32
       requestBody:
         required: true
         content:
@@ -1752,9 +1843,10 @@ paths:
             this endpoint will not decode — a compressed body is not the body
             that was signed; it declared a Content-Type that cannot carry the
             JSON this endpoint verifies; it is larger than the read bound; the
-            delivery did not authenticate — the signature header is absent,
-            appears more than once, or does not equal what this deployment
-            computes over these exact bytes; or it authenticated but is STALE,
+            delivery did not authenticate — either header below is absent or
+            appears more than once, the timestamp is not an integer, or the
+            signature does not equal what this deployment computes over these
+            exact bytes; or it authenticated but is STALE,
             arriving outside the freshness tolerance this deployment allows
             between the moment the provider signed it and the moment it was
             received, which is a replay rather than a delivery. None becomes

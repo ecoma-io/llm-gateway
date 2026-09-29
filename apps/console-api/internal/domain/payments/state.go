@@ -13,7 +13,7 @@ import (
 // can see whole, in one place, rather than spread across the branches of the
 // code that happens to consult it. It is also what makes an out-of-order rule
 // VISIBLE, and there are TWO of those rather than one: a move BACKWARD, from
-// `requires_action` to `checkout_open`, and a move forward into a state this
+// `requires_action` to `awaiting_transfer`, and a move forward into a state this
 // platform had already stopped waiting for, from `expired` to `succeeded`.
 // Both are legible here, each on a line of its own, rather than buried in a
 // conditional nobody would find.
@@ -25,17 +25,17 @@ import (
 // happen, which is the opposite of what a diagram is for; and the four a
 // shortened version loses are exactly the ones nobody can guess, because they
 // are the two surprising edges above plus the pair that leaves `created`
-// without a checkout ever opening.
+// without a destination ever being recorded.
 //
-//	created ──────────────▶ checkout_open
+//	created ──────────────▶ awaiting_transfer
 //	created ──────────────▶ failed              a provider answered in the crash
 //	created ──────────────▶ cancelled           window — see the table below
-//	checkout_open ────────▶ requires_action
-//	checkout_open ────────▶ succeeded           the credit
-//	checkout_open ────────▶ failed
-//	checkout_open ────────▶ cancelled
-//	checkout_open ────────▶ expired
-//	requires_action ──────▶ checkout_open       BACKWARD — the customer did it
+//	awaiting_transfer ────▶ requires_action
+//	awaiting_transfer ────▶ succeeded           the credit
+//	awaiting_transfer ────▶ failed
+//	awaiting_transfer ────▶ cancelled
+//	awaiting_transfer ────▶ expired
+//	requires_action ──────▶ awaiting_transfer   BACKWARD — the customer did it
 //	requires_action ──────▶ succeeded           the credit
 //	requires_action ──────▶ failed
 //	requires_action ──────▶ cancelled
@@ -50,31 +50,31 @@ import (
 // FOUR of these need defending, and each is one a reader should question if
 // they ever move.
 //
-// `requires_action → checkout_open` is the BACKWARD edge, and it is there
+// `requires_action → awaiting_transfer` is the BACKWARD edge, and it is there
 // because `requires_action` is not a state a payment leaves the customer
 // behind in. It is where the provider has asked them for something — a
 // challenge, an authentication step — and the customer answering it puts the
-// session back in their hands: open again, waiting on them, with the challenge
-// satisfied. A table without this edge would refuse the provider's own
-// description of its own checkout, the payment would sit in `requires_action`
-// for the rest of its life, and the console would go on telling a customer to
-// complete a step they had already completed.
+// payment back in their hands: waiting on their transfer again, with the
+// challenge satisfied. A table without this edge would refuse the provider's
+// own description of its own transaction, the payment would sit in
+// `requires_action` for the rest of its life, and the console would go on
+// telling a customer to complete a step they had already completed.
 //
 // `created → failed` and `created → cancelled` are the crash-window edges, and
 // the table below carries the argument in full: an intent is durable before the
 // provider is called, so a provider that answered before this platform recorded
 // its answer has a payment for the event to land on. Refusing it would lose the
-// record of a checkout the customer reached.
+// record of a payment the customer reached.
 //
 // `expired → succeeded` and `cancelled → succeeded` are the late-payment edges.
 // Expiry and cancellation are LOCAL decisions: this platform stopped waiting,
 // or the customer walked away. Neither is a statement about the money, and the
 // provider is the only party that gets to make that statement. A customer who
-// completed a checkout thirty seconds after this platform's patience ran out
+// sent the transfer thirty seconds after this platform's patience ran out
 // has PAID, and refusing to fund them because a local timer fired first is the
 // failure mode this edge exists to prevent. The price is that expiry is
 // therefore not final, and any code that treats it as final — a sweep that
-// forgets open checkouts, a report that counts them as lost revenue — is
+// forgets un-settled payments, a report that counts them as lost revenue — is
 // describing a set of payments that may still arrive. That is stated here
 // because the alternative is a rule nobody knows to distrust.
 //
@@ -87,17 +87,17 @@ import (
 // provider contradicting itself, and the caller quarantines it.
 var legalEdges = map[Status][]Status{
 	StatusCreated: {
-		StatusCheckoutOpen,
-		// A payment that is never opened can still be reported as failed or
-		// cancelled by a provider that was called before this platform's
-		// response was written — the crash window between the provider's call
-		// and the recording of its answer. The payment exists, so the event
-		// has somewhere to land; refusing it would lose the record of a
-		// checkout the customer reached.
+		StatusAwaitingTransfer,
+		// A payment that is never given a destination can still be reported as
+		// failed or cancelled by a provider that was called before this
+		// platform's response was written — the crash window between the
+		// provider's call and the recording of its answer. The payment exists,
+		// so the event has somewhere to land; refusing it would lose the record
+		// of a payment the customer reached.
 		StatusFailed,
 		StatusCancelled,
 	},
-	StatusCheckoutOpen: {
+	StatusAwaitingTransfer: {
 		StatusRequiresAction,
 		StatusSucceeded,
 		StatusFailed,
@@ -105,7 +105,7 @@ var legalEdges = map[Status][]Status{
 		StatusExpired,
 	},
 	StatusRequiresAction: {
-		StatusCheckoutOpen,
+		StatusAwaitingTransfer,
 		StatusSucceeded,
 		StatusFailed,
 		StatusCancelled,
@@ -146,7 +146,7 @@ func canMove(from, to Status) bool {
 // state machine has never considered into the same vocabulary as one it has.
 func knownStatus(s Status) bool {
 	switch s {
-	case StatusCreated, StatusCheckoutOpen, StatusRequiresAction, StatusSucceeded,
+	case StatusCreated, StatusAwaitingTransfer, StatusRequiresAction, StatusSucceeded,
 		StatusFailed, StatusCancelled, StatusExpired,
 		StatusPartiallyRefunded, StatusRefunded, StatusQuarantined:
 		return true

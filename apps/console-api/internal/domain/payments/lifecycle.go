@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// The lifecycle: how a payment comes into existence, how an open checkout
-// records where it sends the customer, how a provider's capture is matched
+// The lifecycle: how a payment comes into existence, how a payment records the
+// destination its customer was given, how a provider's capture is matched
 // against what this platform sent, and how a refund is recognised.
 //
 // Everything here is a decision made BEFORE a statement runs. That is the
@@ -58,16 +58,16 @@ type NewPayment struct {
 	// per account. Two clicks of one button are one payment.
 	IdempotencyKey string
 
-	// CheckoutTTL is how long this platform waits for the customer before
+	// TransferTTL is how long this platform waits for the customer before
 	// giving up. It is a local deadline and NOT a statement about the money —
 	// see the expired → succeeded edge in state.go.
-	CheckoutTTL time.Duration
+	TransferTTL time.Duration
 
 	// Now is the caller's clock reading. The adapter passes the DATABASE's
 	// clock, never the process's, and that is a rule rather than a
 	// preference: two replicas of this plane minting payments with their own
 	// clocks produce two payment timelines that no reconciliation can
-	// interleave, and a checkout whose expiry is judged against a clock that
+	// interleave, and a payment whose expiry is judged against a clock that
 	// runs a minute fast expires a minute early for everyone.
 	Now time.Time
 
@@ -79,14 +79,14 @@ type NewPayment struct {
 	MintedAt time.Time
 }
 
-// maxCheckoutTTL bounds how long a checkout may be waited on.
+// maxTransferTTL bounds how long a payment may be waited on.
 //
 // It is a product policy expressed as a constant because a payment integration
 // has no table to read it from, and a bound nobody wrote down is not a policy.
-// Thirty days is far past any provider's own session lifetime and comfortably
-// past any customer's patience; a longer one means a checkout this platform has
-// abandoned is still in the console's live list.
-const maxCheckoutTTL = 30 * 24 * time.Hour
+// Thirty days is far past any provider's own destination lifetime and
+// comfortably past any customer's patience; a longer one means a payment this
+// platform has abandoned is still in the console's live list.
+const maxTransferTTL = 30 * 24 * time.Hour
 
 // NewIntent mints a time-ordered payment identifier.
 //
@@ -191,11 +191,11 @@ func New(in NewPayment) (Intent, error) {
 	if err := CheckIdempotencyKey(in.IdempotencyKey); err != nil {
 		return Intent{}, fmt.Errorf("%w: %w", ErrInvalidReference, err)
 	}
-	if in.CheckoutTTL <= 0 {
-		return Intent{}, fmt.Errorf("%w: a checkout must be given a lifetime", ErrInvalidReference)
+	if in.TransferTTL <= 0 {
+		return Intent{}, fmt.Errorf("%w: a payment must be given a lifetime", ErrInvalidReference)
 	}
-	if in.CheckoutTTL > maxCheckoutTTL {
-		return Intent{}, fmt.Errorf("%w: a checkout lifetime of %s is over the %s ceiling", ErrInvalidReference, in.CheckoutTTL, maxCheckoutTTL)
+	if in.TransferTTL > maxTransferTTL {
+		return Intent{}, fmt.Errorf("%w: a payment lifetime of %s is over the %s ceiling", ErrInvalidReference, in.TransferTTL, maxTransferTTL)
 	}
 	if in.MintedID == "" {
 		return Intent{}, fmt.Errorf("%w: a payment has an identity", ErrInvalidReference)
@@ -218,7 +218,7 @@ func New(in NewPayment) (Intent, error) {
 		StateVersion:       0,
 		CreatedAt:          in.MintedAt,
 		UpdatedAt:          in.MintedAt,
-		ExpiresAt:          in.MintedAt.Add(in.CheckoutTTL),
+		ExpiresAt:          in.MintedAt.Add(in.TransferTTL),
 	}, nil
 }
 
@@ -313,62 +313,85 @@ func validMinorUnitExponent(n int) bool {
 	return n >= 0 && n <= 4
 }
 
-// OpenedCheckout is what a provider gave this platform when a hosted checkout
-// was created: where to send the customer, and what the provider calls it.
+// TransferInstructions is what a provider gave this platform when it issued a
+// destination for a payment: where the customer sends the money, what the
+// provider calls that destination, and the provider's own account of who holds
+// it.
 //
-// The domain carries its own two-field type rather than the outbound port's
-// CheckoutSession, and the reason is the import rule this module already
-// enforces everywhere else: a domain package that names a port's type is a
-// domain that has decided it knows what a provider protocol looks like. The
-// dependency runs the other way — the port's type is convertible into this one
-// by the adapter that owns both — and the day a second provider appears with a
-// richer session shape, the port grows and this file does not.
+// The domain carries its own four-field type rather than the outbound port's,
+// and the reason is the import rule this module already enforces everywhere
+// else: a domain package that names a port's type is a domain that has decided
+// it knows what a provider protocol looks like. The dependency runs the other
+// way — the port's type is convertible into this one by the adapter that owns
+// both — and the day a second provider appears with a richer answer, the port
+// grows and this file does not.
 //
-// The URL is carried as a string and is NEVER parsed. It is a promise the
-// provider makes and this process keeps on the provider's behalf; a consumer
-// that url.Parse'd it to pull out a session id would be interpreting a value
-// whose only contract is that a browser may be sent to it, and would break
-// silently the first time the provider changed the shape of its own URLs.
-type OpenedCheckout struct {
-	// URL is the hosted checkout, verbatim.
-	URL string
-	// ProviderRef is the provider's identifier for the checkout, and the
+// None of the four is parsed, and for once the rule is not only about URLs. The
+// code is an identifier, the bank name and the holder are the provider's
+// presentation text, and the image is a URL this process never fetches: a
+// consumer that pulled a bank out of the image, or host-checked the URL, or
+// re-derived the code from the other three, would be interpreting values whose
+// only contract is that a customer can act on them.
+type TransferInstructions struct {
+	// TransferCode is the provider's identifier for the destination, and the
 	// thing a later delivery names. It is stored durably and is the link
 	// between a provider's event and a payment this platform created.
-	ProviderRef string
+	TransferCode string
+	// BankName is the provider's name for the institution the destination
+	// sits at.
+	BankName string
+	// AccountHolder is the name the destination is held in.
+	AccountHolder string
+	// QRURL is the provider's own image of the transfer, verbatim, or empty
+	// when the provider issued none. Empty is an ordinary value rather than a
+	// failure: a destination with a code and a bank name is one a customer can
+	// pay into without ever scanning anything.
+	QRURL string
 }
 
-// OpenCheckout records that a hosted checkout has been opened, and returns the
-// payment as it now stands.
+// RecordTransfer records that a destination has been issued for this payment,
+// and returns the payment as it now stands.
 //
-// The provider's reference and URL are the only two things that change, and
-// neither is interpreted: the URL is stored because a customer who comes back
-// to a payment needs to be sent to the same checkout, and the reference is
-// stored because it is the only thing a later delivery can be MATCHED on. A
-// value this function does not have a rule for is refused rather than stored,
-// because a blank reference means the payment can never be matched and a blank
-// URL means the console will render a button that goes nowhere — both are
-// states that look like a working feature.
+// The provider's four strings are the only things that change, and none of them
+// is interpreted: they are stored because a customer who comes back to a
+// payment needs to be shown the same destination they were given, and because
+// the transfer code is the only thing a later delivery can be MATCHED on. A
+// value this function does not have a rule for is refused rather than stored: a
+// blank code means the payment can never be matched, and a blank bank name or
+// holder means the console would render a destination a customer cannot check
+// before sending money to it — both are states that look like a working
+// feature.
+//
+// The IMAGE is the one member that may be empty, and the asymmetry is the
+// provider's rather than this build's: an image is an affordance, and a
+// destination without one is still a destination. Refusing to record a payable
+// account because the provider did not also draw a picture of it would strand a
+// payment that works.
 //
 // The move itself is the caller's compare-and-swap, not this function's: the
 // returned payment still shows the state this function validated, and the
 // caller writes it under that expectation. A caller that skips the swap and
 // writes unconditionally would race its own second attempt, and the two
-// checkouts that came back would have one winner with no way to tell which.
-func (i Intent) OpenCheckout(checkout OpenedCheckout, now time.Time) (Intent, error) {
-	if !canMove(i.Status, StatusCheckoutOpen) {
-		return Intent{}, fmt.Errorf("%w: a payment at %s cannot open a checkout", ErrInvalidTransition, i.Status)
+// destinations that came back would have one winner with no way to tell which.
+func (i Intent) RecordTransfer(transfer TransferInstructions, now time.Time) (Intent, error) {
+	if !canMove(i.Status, StatusAwaitingTransfer) {
+		return Intent{}, fmt.Errorf("%w: a payment at %s cannot be given a destination", ErrInvalidTransition, i.Status)
 	}
-	if checkout.URL == "" {
-		return Intent{}, fmt.Errorf("%w: an opened checkout has a URL to send the customer to", ErrInvalidReference)
+	if !validProviderReference(transfer.TransferCode) {
+		return Intent{}, fmt.Errorf("%w: %q is not a transfer reference this build carries", ErrInvalidReference, transfer.TransferCode)
 	}
-	if !validProviderReference(checkout.ProviderRef) {
-		return Intent{}, fmt.Errorf("%w: %q is not a checkout reference this build carries", ErrInvalidReference, checkout.ProviderRef)
+	if transfer.BankName == "" {
+		return Intent{}, fmt.Errorf("%w: a destination names the bank it is held at, and this one names none", ErrInvalidReference)
+	}
+	if transfer.AccountHolder == "" {
+		return Intent{}, fmt.Errorf("%w: a destination names the account holder, and this one names none", ErrInvalidReference)
 	}
 	next := i
-	next.ProviderCheckoutRef = checkout.ProviderRef
-	next.CheckoutURL = checkout.URL
-	next.Status = StatusCheckoutOpen
+	next.ProviderTransferRef = transfer.TransferCode
+	next.ProviderQRURL = transfer.QRURL
+	next.ProviderBankName = transfer.BankName
+	next.ProviderAccountHolder = transfer.AccountHolder
+	next.Status = StatusAwaitingTransfer
 	next.UpdatedAt = now
 	return next, nil
 }
@@ -412,7 +435,7 @@ type CaptureMatch struct {
 //  2. The payment must be in a state the state machine can move to
 //     succeeded. A payment that is already refunded has had its final word
 //     and a capture arriving after it is a provider contradicting itself; a
-//     payment that is `created` cannot be captured because no checkout was
+//     payment that is `created` cannot be captured because no destination was
 //     ever sent to anybody. canMove is consulted rather than a switch here
 //     so the two copies of the rule cannot drift — the Go one and the
 //     plpgsql trigger, which is the one that actually holds when a second
@@ -660,19 +683,20 @@ func (i Intent) RecordRefund(refundRef string, amount *int64, currency string) (
 // record the delivery and let the capture arrive.
 var ErrRefundAheadOfCapture = fmt.Errorf("payments: a refund was reported before the capture it refunds")
 
-// SettleExpired moves a payment to expired once its checkout's deadline has
-// passed, and reports whether the payment was in a state that could wait.
+// SettleExpired moves a payment to expired once its deadline has passed, and
+// reports whether the payment was in a state that could wait.
 //
 // The clock is the DATABASE's, and the reason is the one state.go gives for
 // the late-payment edge: expiry is a local decision about patience, and a local
 // decision made against a local clock is a decision two replicas make
-// differently. The customer whose provider session has already expired sees
-// `expired` in one replica's console and `checkout_open` in another's.
+// differently. The customer whose transfer window has already closed sees
+// `expired` in one replica's console and `awaiting_transfer` in another's.
 //
-// The states it waits on are the two that are still WAITING — a checkout the
-// customer has been sent to but not completed, and one the provider says needs
-// something from them — but the ORDER of the two checks below is not the order
-// that sentence suggests, and stating it is the point of this paragraph.
+// The states it waits on are the two that are still WAITING — a payment whose
+// customer has been given a destination but has not sent anything, and one the
+// provider says needs something from them — but the ORDER of the two checks
+// below is not the order that sentence suggests, and stating it is the point of
+// this paragraph.
 //
 // The STATUS gate runs FIRST and the deadline SECOND. A payment whose status is
 // not one of the two is not this sweep's payment at all: it is answered with no
@@ -695,13 +719,13 @@ var ErrRefundAheadOfCapture = fmt.Errorf("payments: a refund was reported before
 // have to add the edge to the table rather than loosen the gate, because the
 // table is what the trigger enforces and the two would then agree.
 //
-// The three states a completed or abandoned checkout leaves behind — succeeded,
+// The three states a settled or abandoned payment leaves behind — succeeded,
 // failed, cancelled — are not waiting for anybody and are not swept, and
 // neither is any other status outside the pair above: a payment this sweep does
 // not wait on gets the same "no move" as one its deadline has not reached, with
 // no error, because there is nothing here for a caller to act on.
 func (i Intent) SettleExpired(now time.Time) (Intent, bool, error) {
-	waited := []Status{StatusCheckoutOpen, StatusRequiresAction}
+	waited := []Status{StatusAwaitingTransfer, StatusRequiresAction}
 	for _, from := range waited {
 		if i.Status != from {
 			continue
@@ -713,7 +737,7 @@ func (i Intent) SettleExpired(now time.Time) (Intent, bool, error) {
 			return Intent{}, false, fmt.Errorf("%w: %s waits but cannot expire", ErrInvalidTransition, from)
 		}
 	}
-	if i.Status != StatusCheckoutOpen && i.Status != StatusRequiresAction {
+	if i.Status != StatusAwaitingTransfer && i.Status != StatusRequiresAction {
 		return Intent{}, false, nil
 	}
 	if now.Before(i.ExpiresAt) {

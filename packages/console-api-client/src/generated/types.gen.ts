@@ -242,7 +242,7 @@ export type CreatePaymentIntentRequest = {
    */
   offer: string;
   /**
-   * The caller's identity for this top-up, bounded at 128 characters. Every attempt at the same logical top-up carries the same value — the first try, the retry after a dropped response, and the retry after a provider outage — and a request repeating a key is answered with the payment that key already names rather than with a second one. That payment may be in any state by then, including one that has already succeeded, and the honest thing for a client to do with a converged answer is render what it was told: a retry after a customer paid must not send them to a checkout again.
+   * The caller's identity for this top-up, bounded at 128 characters. Every attempt at the same logical top-up carries the same value — the first try, the retry after a dropped response, and the retry after a provider outage — and a request repeating a key is answered with the payment that key already names rather than with a second one. That payment may be in any state by then, including one that has already succeeded, and the honest thing for a client to do with a converged answer is render what it was told: a retry after a customer paid must not present them with a destination to send money to again.
    */
   idempotency_key: string;
 };
@@ -461,8 +461,8 @@ export type PageEnvelope = {
 };
 
 /**
- * One payment: what this platform asked the provider to charge, and what became of it. The amount was priced **here**, from the offer the customer named, and it is the figure the ledger is credited with when a signed delivery reports the capture — the two are compared, and a delivery that disagrees funds nothing.
- * `checkout_url` is the provider's own page, returned verbatim and never parsed: it is a promise the provider makes and this plane keeps on the provider's behalf. The status is the provider's word and cannot be set by a client — a browser that decided a payment had succeeded would be deciding the instant a customer's balance moved.
+ * One payment: what this platform asked the provider to collect, and what became of it. The amount was priced **here**, from the offer the customer named, and it is the figure the ledger is credited with when a signed delivery reports the capture — the two are compared, and a delivery that disagrees funds nothing.
+ * `transfer_instructions` is what a customer is handed to pay with: where to send the money, and a QR the provider drew. Returned verbatim and never parsed: it is a promise the provider makes and this plane keeps on the provider's behalf. The status is the provider's word and cannot be set by a client — a browser that decided a payment had succeeded would be deciding the instant a customer's balance moved.
  */
 export type PaymentIntent = {
   /**
@@ -483,12 +483,13 @@ export type PaymentIntent = {
    */
   minor_unit_exponent: number;
   /**
-   * The provider's hosted checkout, where the customer completes the payment. Returned verbatim and never parsed, rewritten or re-derived by anything on this side — the URL is the provider's to shape, and a client that read a session id out of it would break the day that shape changed. Null exactly while the payment is `created`: a payment exists before its checkout does, deliberately, so that the provider's idempotency key can be derived from a durable identity. A customer returning to a payment they started is sent back to this same URL.
+   * How to pay this payment, or null when this plane holds none. What this field answers is whether a destination EXISTS, and null says it does not — which is two states and deliberately not a biconditional about `created`. A payment this platform has just opened is null because it exists before the provider has been asked for anything, deliberately, so that the provider's own idempotency key can be derived from a durable identity: that is the state the `503` below describes, and the one a retry under the same idempotency key resolves. A payment the provider refused a destination for is ALSO null, and is `cancelled` rather than `created`: the destination it was refused is one the provider holds under this payment's own transfer identity and cannot be shown to anyone, which is the `409` below. A client that read null as "still opening" would offer to resume a payment this platform has abandoned and can never pay. Whether the attempt is still open is a question for the status beside this field.
+   * It is a copy of what was recorded and not a judgement about the payment: a payment whose destination has been recorded keeps it, in every later state, because the account it names is the account the money is resolved by and a payment whose destination disappeared from its own record would be a payment whose deliveries could not be explained to the customer who sent them. Whether a destination should be SHOWN is a question about the status beside this field, and it is a client's to answer rather than this field's to pre-answer.
    */
-  checkout_url: string | null;
+  transfer_instructions: PaymentTransferInstructions | null;
   created_at: string;
   /**
-   * When an uncompleted checkout stops being waited on. It is a deadline on this platform's PATIENCE and not a fact about the money: a delivery arriving after it is still honoured, because the provider alone gets to say whether the customer paid.
+   * When an uncompleted transfer stops being waited on. It is a deadline on this platform's PATIENCE and not a fact about the money: a delivery arriving after it is still honoured, because the provider alone gets to say whether the customer paid.
    */
   expires_at: string;
 };
@@ -499,11 +500,11 @@ export type PaymentIntentPage = PageEnvelope & {
 
 /**
  * Where a payment stands. It is the provider's account of the money and never the client's: a payment moves because a signed delivery said so, and no operation on this surface can set this field.
- * `created` is a payment this platform opened **before** it called the provider, and it is a durable state rather than a moment: the provider's own idempotency key is derived from the payment's identity, so the payment has to exist before the call that can fail. `checkout_open` is a customer at the provider's hosted page who has not finished, and `requires_action` is the provider asking them for one more step — a separate state rather than a flag, because the customer's next act is different and a console that rendered the two alike would be telling them to do something the provider did not ask for. `succeeded` is the one irreversible move: it is the only state from which a funding leg is written, and every balance on a bucket follows from it. `expired` and `cancelled` are LOCAL decisions — this platform stopped waiting, or the customer walked away — and neither is a fact about the money, which is why a delivery arriving later still funds the customer: the provider is the only party that gets to say whether they paid. `partially_refunded` and `refunded` describe money the provider gave back, which changes what the customer keeps and not what was funded. `quarantined` is the one member a payment never moves into: it is what a delivery that authenticated and could not be interpreted is recorded as, so an operator reads one state vocabulary rather than two, and the payment's own status stays whatever the money says it is.
+ * `created` is a payment this platform opened **before** it called the provider, and it is a durable state rather than a moment: the provider's own idempotency key is derived from the payment's identity, so the payment has to exist before the call that can fail. `awaiting_transfer` is a customer who has been given a destination to pay into and has not been seen paying — the state this deployment's provider spends a payment's whole life in, because its instrument is a bank transfer rather than a page a customer completes. `requires_action` is the provider asking the customer for one more step — a separate state rather than a flag, because the customer's next act is different and a console that rendered the two alike would be telling them to do something the provider did not ask for; the provider this deployment speaks never reports it, and it is kept because it is a fact about money rather than about one provider's vocabulary. `succeeded` is the one irreversible move: it is the only state from which a funding leg is written, and every balance on a bucket follows from it. `expired` and `cancelled` are LOCAL decisions — this platform stopped waiting, or the customer walked away — and neither is a fact about the money, which is why a delivery arriving later still funds the customer: the provider is the only party that gets to say whether they paid. `partially_refunded` and `refunded` describe money the provider gave back, which changes what the customer keeps and not what was funded; they are reachable only from a provider that reports a refund, and this deployment's does not, which is a fact about the provider rather than a rule this surface enforces. `quarantined` is the one member a payment never moves into: it is what a delivery that authenticated and could not be interpreted is recorded as, so an operator reads one state vocabulary rather than two, and the payment's own status stays whatever the money says it is.
  */
 export type PaymentIntentState =
   | "created"
-  | "checkout_open"
+  | "awaiting_transfer"
   | "requires_action"
   | "succeeded"
   | "failed"
@@ -512,6 +513,32 @@ export type PaymentIntentState =
   | "partially_refunded"
   | "refunded"
   | "quarantined";
+
+/**
+ * Where to send the money, as the provider stated it. Every member is the provider's own value, returned verbatim: `transfer_code` is the reference the payment resolves by when a delivery reports money arriving at it, `bank_name` and `account_holder` are what a customer checks before sending and what a banking app fills in when the QR is scanned, and `qr_url` is an image the provider drew.
+ * Nothing here has been parsed, normalised or re-derived. A client renders these and does not interpret them: a console that read a bank or an amount out of `qr_url`, or that composed its own QR from the other three, would be reimplementing an encoding the provider owns and would break the day that encoding changed.
+ */
+export type PaymentTransferInstructions = {
+  /**
+   * The account number the customer transfers to — the provider's virtual account for this payment, minted by the provider when these instructions were obtained. It is the value the provider echoes back when money arrives at it, which is what makes it the key a delivery is resolved by, and it is unique to this payment across the deployment.
+   * It is a DESTINATION and not a reference the customer types: the customer sends money TO it, which is why it can be the key at all. A customer's own free text — the transfer memo — never is, because a memo is theirs to edit and their bank's to rewrite, and a payment whose correlation rested on one would be a payment that stopped resolving the first time somebody's app shortened it.
+   * Bounded at 255 characters, which is the column's own bound: a value longer than this is one this plane could not have stored.
+   */
+  transfer_code: string;
+  /**
+   * The bank the virtual account is held at, as the provider named it. It is shown so a customer can check the destination before sending and so a customer typing the account number by hand knows where it goes. It is not parsed, not matched against anything, and not a code: the provider's spelling is the whole of its meaning.
+   */
+  bank_name: string;
+  /**
+   * The name the account is held in, as the provider stated it. It is the third thing a customer checks before sending money and the thing their banking app verifies against — the one field that tells them the destination is this business and not somebody else's. Returned verbatim, like everything else here.
+   */
+  account_holder: string;
+  /**
+   * The provider's own QR image for this transfer, as a URL. Returned verbatim and never parsed, rewritten or re-derived by anything on this side — the URL is the provider's to shape, and a client that read an account number or an amount out of its query string would break the day that shape changed.
+   * Null when the provider drew none, which is a fact about the provider's answer and not a failure: the three members above are always present and are always enough to pay, and a console that treated a missing image as a missing payment would be refusing a transfer a customer could make.
+   */
+  qr_url: string | null;
+};
 
 export type Plan = {
   id: string;
@@ -653,7 +680,7 @@ export type TopUpOffer = {
    */
   id: string;
   /**
-   * What choosing this offer charges, in integer minor units of `currency`. Strictly positive, because a free offer is not a top-up and a zero here would be a payment that funds nothing while still occupying the customer's checkout. Bounded by `Number.MAX_SAFE_INTEGER` — 2^53 − 1 — for the same reason `PaymentIntent.amount_minor_units` is: the console is JavaScript, where an integer above it has no exact representation, so a price this surface published above it would be a number the console could not compare or render without silently rounding it.
+   * What choosing this offer charges, in integer minor units of `currency`. Strictly positive, because a free offer is not a top-up and a zero here would be a payment that funds nothing while still taking a destination from the provider that another payment could have used. Bounded by `Number.MAX_SAFE_INTEGER` — 2^53 − 1 — for the same reason `PaymentIntent.amount_minor_units` is: the console is JavaScript, where an integer above it has no exact representation, so a price this surface published above it would be a number the console could not compare or render without silently rounding it.
    */
   amount_minor_units: number;
   /**
@@ -708,8 +735,9 @@ export type UserPage = PageEnvelope & {
 export type WebhookAcknowledgement = {
   /**
    * Always true. It acknowledges the delivery and says nothing about it — not the disposition, not the payment, not the amount. A provider that read more into an acknowledgement than "stop sending this one" would be reading a claim this body does not make.
+   * The member is spelled `success` rather than `received` because the provider this deployment speaks names it, and the name is load-bearing in a way a field name usually is not: that provider decides from this body whether a delivery was accepted at all, so a body it does not recognise as an acknowledgement would be a delivery it retries. This is the one member of this contract whose spelling is somebody else's, and the operation's description says what that costs — the response is written as exact bytes rather than produced by a serialiser, because a serialiser is free to reformat, and "the same members in a different order" is indistinguishable from "not an acknowledgement" to the program reading it.
    */
-  received: boolean;
+  success: boolean;
 };
 
 export type Error = {
@@ -1701,8 +1729,10 @@ export type CreatePaymentIntentErrors = {
   405: ErrorEnvelope;
   /**
    * The request is well-formed and this server's own state refuses it, and the code is `conflict`. It is not a 400 and the difference is the client's next move: there is nothing wrong with the request to correct, and no edit to it would help — asking again in the same way fails the same way until something else changes, and the client cannot see what that something is.
-   * One state produces it today: an account whose own state does not permit a new payment. It is refused here rather than at a later screen, because the money would land somewhere this account cannot currently use — a suspended or closed account may not fund itself — and the code is `conflict` rather than `invalid_request` for the reason above: the body is well-formed, no edit to it would help, and the account's state is the fact that has to change.
-   * The idempotency key is deliberately NOT a second cause. A repeated key is the caller saying two requests are ONE act, and the answer to that is the payment the key already names — a 201, whether the repeat arrives a second later or after the customer has paid. Turning a repeat into a refusal would break the very protection the key exists to provide, and it would say "you asked twice" where the caller's actual situation is "you asked once and did not hear the answer".
+   * Two states produce it today, and neither is about the body.
+   * An account whose own state does not permit a new payment. It is refused here rather than at a later screen, because the money would land somewhere this account cannot currently use — a suspended or closed account may not fund itself — and the code is `conflict` rather than `invalid_request` for the reason above: the body is well-formed, no edit to it would help, and the account's state is the fact that has to change.
+   * A payment for which the provider already holds an order this deployment can no longer reach. The provider is asked for a destination keyed by a value derived from the payment's identity, which is what makes a retry the same request rather than a second one; if that value is already taken while this plane has no destination stored for it, the payment was opened and the answer was lost before it could be recorded. There is no operation that recovers the destination — the provider's own lookup cannot be searched by that value — and nothing else changes on a retry, so the honest answer is a refusal rather than a `503` the caller would keep retrying. The payment is left `cancelled`, which is this platform's statement that it will not pursue it, and the way forward is a NEW payment: a fresh `idempotency_key` under this same offer opens a fresh payment with a fresh destination, which is what a caller that received this response should do. No money was ever sent to the unreachable destination in this case, because a destination is only ever shown to a customer once it has been recorded — the one thing this branch has established is that it was not.
+   * The idempotency key is deliberately NOT a third cause. A repeated key is the caller saying two requests are ONE act, and the answer to that is the payment the key already names — a 201, whether the repeat arrives a second later or after the customer has paid. Turning a repeat into a refusal would break the very protection the key exists to provide, and it would say "you asked twice" where the caller's actual situation is "you asked once and did not hear the answer". The case above is not a repeat being refused: it is a repeat that could not be served, and the payment it converged on is the one named in the answer's own words — a different payment, with a different key, is what resolves it.
    */
   409: ErrorEnvelope;
   /**
@@ -1714,8 +1744,8 @@ export type CreatePaymentIntentErrors = {
    */
   500: ErrorEnvelope;
   /**
-   * The payment provider that would open the checkout did not answer, so there is no checkout to send the customer to. The code is `upstream_unavailable`: the condition is the provider's and is expected to clear, so the caller retries later rather than differently.
-   * The payment itself is durable and is NOT lost — it exists in `created` with a null `checkout_url`, written before the provider was called precisely so that this case has something to retry against. A retry under the same idempotency key converges on that same payment and opens the checkout this attempt could not, which is the retry the provider's own key semantics are built to absorb. The key is required of every attempt for exactly this reason: an attempt without one could not be retried as the same request at all.
+   * The payment provider that would name a destination did not answer, so there is nowhere to tell the customer to send money. The code is `upstream_unavailable`: the condition is the provider's and is expected to clear, so the caller retries later rather than differently.
+   * The payment itself is durable and is NOT lost — it exists in `created` with null `transfer_instructions`, written before the provider was called precisely so that this case has something to retry against. A retry under the same idempotency key converges on that same payment and obtains the instructions this attempt could not, which is the retry the provider's own key semantics are built to absorb. The key is required of every attempt for exactly this reason: an attempt without one could not be retried as the same request at all.
    */
   503: ErrorEnvelope;
 };
@@ -1724,7 +1754,7 @@ export type CreatePaymentIntentError = CreatePaymentIntentErrors[keyof CreatePay
 
 export type CreatePaymentIntentResponses = {
   /**
-   * The payment, priced and durable. It is the account's own payment, created under the session's account and never under one the request could name, and a repeat under the same idempotency key answers with this same payment rather than a second one. The same 201 answers both the first call and the converged repeat, and the converged answer may carry a payment in a LATER state than the one this call's request would have opened — including a payment that has already succeeded. Which of the two happened is not a difference a page may act on, so the contract does not make one available: a client renders the payment it was handed, and a retry after a customer already paid does not send them to a checkout again.
+   * The payment, priced and durable. It is the account's own payment, created under the session's account and never under one the request could name, and a repeat under the same idempotency key answers with this same payment rather than a second one. The same 201 answers both the first call and the converged repeat, and the converged answer may carry a payment in a LATER state than the one this call's request would have opened — including a payment that has already succeeded, whose recorded destination is returned beside a status that says it has been paid. Which of the two happened is not a difference a page may act on, so the contract does not make one available: a client renders the payment it was handed, and what it renders of a payment already paid is that payment, not a destination to send money to.
    */
   201: PaymentIntent;
 };
@@ -1871,10 +1901,18 @@ export type ReceiveProviderWebhookData = {
      */
     "X-Request-Id"?: RequestId;
     /**
-     * The signature header this deployment's provider signs its deliveries with, spelled exactly as that provider spells it — the adapter reads this one name and no other. It is a fixed name of this contract and not a slot a caller fills in: the deployment speaks exactly one provider, that provider's signature scheme fixes the header, and a second provider arrives as a code change with its own contract change rather than as a string a caller picks. A delivery whose signature arrives only under some other header name is one this deployment cannot verify, and it is refused 400 — the same answer as a delivery carrying no signature at all, because it is the same fact seen twice: this is the name the check reads, and nothing else on the request is read as a signature.
-     * The value is the provider's signature over the exact bytes of the request body, together with the timestamp the provider signed it at, in the provider's own element syntax. It must be present, and it must appear at most once — a request carrying two is refused rather than resolved to either, because accepting "the first of several" is how a smuggled value wins — and it is compared against the signature this deployment computes in constant time. Absent, repeated, or unequal is a 400: the delivery did not authenticate, and a wrong signature will be wrong again. So is a signature that is correct over a MOMENT this deployment no longer accepts: the provider's signature covers a timestamp as well as the body, this deployment bounds how old a signed delivery may be, and a delivery outside that bound is refused as a replay. No request carries that bound — it is configuration — and the two refusals share one status because they share one property: neither becomes usable on a second attempt.
+     * The signature header this deployment's provider signs its deliveries with, spelled exactly as that provider spells it — the adapter reads this name and the timestamp header beside it, and no other name. It is a fixed name of this contract and not a slot a caller fills in: the deployment speaks exactly one provider, that provider's signature scheme fixes the header, and a second provider arrives as a code change with its own contract change rather than as a string a caller picks. A delivery whose signature arrives only under some other header name is one this deployment cannot verify, and it is refused 400 — the same answer as a delivery carrying no signature at all, because it is the same fact seen twice: these are the names the check reads, and nothing else on the request is read as a signature.
+     * The value is a prefixed hexadecimal digest — `sha256=` and then the lowercase hex of an HMAC-SHA-256 over the signed timestamp, a literal `.`, and the exact bytes of the request body, keyed by this deployment's webhook signing secret. The separator and the body are inside the digest rather than concatenated loosely, which is what binds the two headers to one another: a signature computed over a body alone could be replayed under any timestamp, and a signature over a timestamp alone would cover no content at all.
+     * It must be present, and it must appear at most once — a request carrying two is refused rather than resolved to either, because accepting "the first of several" is how a smuggled value wins — and it is compared against the signature this deployment computes in constant time. Absent, repeated, or unequal is a 400: the delivery did not authenticate, and a wrong signature will be wrong again. So is a signature that is correct over a MOMENT this deployment no longer accepts: the signed timestamp is what fixes that moment, the value below carries it, this deployment bounds how old a signed delivery may be, and a delivery outside that bound is refused as a replay. No request carries that bound — it is configuration — and the two refusals share one status because they share one property: neither becomes usable on a second attempt.
+     * The digest's exact spelling is a string comparison of bytes this plane computed against bytes that arrived, and nothing here is normalised: case is part of the value, and a client that tried "the same hash in uppercase" would be sending a different string.
      */
-    "Stripe-Signature": string;
+    "X-SePay-Signature": string;
+    /**
+     * The moment the provider signed the delivery, in Unix seconds — a decimal integer and nothing else, spelled exactly as that provider spells it. It is a required member of the signature and not an independent hint: the digest above covers it, so a delivery whose timestamp was altered is a delivery whose signature no longer verifies, and the two are refused identically. It is read as the first half of the signed material and, separately, as the moment the freshness tolerance is measured from.
+     * It must be present, it must appear at most once for the reason the signature header must, and it must parse as an integer in the provider's own unit — a value that does not is a delivery this deployment cannot measure, and it is refused 400 with the signature header's refusals rather than treated as absent. A timestamp outside the tolerance is a 400 and never a 5xx: the delivery is a replay rather than a delivery, and its redelivery carries the same signed value, so a retry could only repeat the refusal.
+     * The tolerance exists because a signature proves WHO sent a message and only the bound on this value makes it proof about WHEN. Both the provider's clock and this deployment's are involved and neither is adjusted for, so a deployment whose clock is skewed beyond the bound refuses every honest delivery — which is the one way this header's check fails closed and loudly rather than silently.
+     */
+    "X-SePay-Timestamp": string;
   };
   path: {
     /**
@@ -1888,7 +1926,7 @@ export type ReceiveProviderWebhookData = {
 
 export type ReceiveProviderWebhookErrors = {
   /**
-   * This delivery may not be acted on, and never will be. The code is `invalid_request`, and there are exactly five ways to earn it. In the order the branches run: the body declared a Content-Encoding this endpoint will not decode — a compressed body is not the body that was signed; it declared a Content-Type that cannot carry the JSON this endpoint verifies; it is larger than the read bound; the delivery did not authenticate — the signature header is absent, appears more than once, or does not equal what this deployment computes over these exact bytes; or it authenticated but is STALE, arriving outside the freshness tolerance this deployment allows between the moment the provider signed it and the moment it was received, which is a replay rather than a delivery. None becomes usable on a second attempt: a malformed body carries its own defect, a wrong signature will be wrong again, and a redelivery re-sends the same signed timestamp.
+   * This delivery may not be acted on, and never will be. The code is `invalid_request`, and there are exactly five ways to earn it. In the order the branches run: the body declared a Content-Encoding this endpoint will not decode — a compressed body is not the body that was signed; it declared a Content-Type that cannot carry the JSON this endpoint verifies; it is larger than the read bound; the delivery did not authenticate — either header below is absent or appears more than once, the timestamp is not an integer, or the signature does not equal what this deployment computes over these exact bytes; or it authenticated but is STALE, arriving outside the freshness tolerance this deployment allows between the moment the provider signed it and the moment it was received, which is a replay rather than a delivery. None becomes usable on a second attempt: a malformed body carries its own defect, a wrong signature will be wrong again, and a redelivery re-sends the same signed timestamp.
    * The one thing this response deliberately does NOT cover is a body this build cannot read. An authenticated delivery whose event is unreadable is answered 200, because a status that meant both would be a status an operator could not monitor, and a signature failure and a provider bug are not one event. The refusal is a 4xx rather than a 5xx on purpose: a 400 keeps a permanently unusable delivery out of the provider's retry budget, which is the one thing a provider's retry could not fix.
    */
   400: ErrorEnvelope;

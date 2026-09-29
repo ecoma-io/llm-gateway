@@ -290,13 +290,14 @@ func main() {
 	// deployment serves no payment surface. It is built HERE, beside the
 	// accounting primitives it funds through and before any listener opens, so
 	// that a payment configuration which cannot work is a startup line rather
-	// than a customer's failed checkout. The HTTP surface that serves it is
+	// than a customer who transferred money to an account this deployment never
+	// asked for. The HTTP surface that serves it is
 	// composed BESIDE it and not inside it: paymentSurfaces below is what
 	// crosses the use cases into the transport's own vocabulary, and the two
 	// functions are separate so that neither holds both of this integration's
-	// secrets — that one is handed the API secret, because calling the provider
-	// needs it, and this one is handed the signing secret, because verifying a
-	// delivery needs that.
+	// credentials — that one is handed the API token, because calling the
+	// provider needs it, and this one is handed the signing secret, because
+	// verifying a delivery needs that.
 	paymentsSurface, err := buildPaymentsSurface(store, accounting, cfg.Payments)
 	if err != nil {
 		log.Printf("console-api payments: %v", err)
@@ -949,11 +950,20 @@ func buildPaymentsSurface(store persistence.Store, accountingUseCases *applicati
 	// reach. Handing the use case itself is what the interface is for: the port
 	// did not have to be smeared across three adapters to stay narrow.
 	//
-	// The provider adapter holds the API secret and the verifier holds the
-	// signing secret, which is why the constructor below is handed the first and
-	// not the second — the webhook path's verifier is composed by the seam that
-	// serves it.
-	provider := paymentprovideradapter.New(cfg.APIBaseURL, cfg.SecretKey, cfg.RequestTimeout)
+	// The provider adapter holds the API token and the merchant's order
+	// configuration — the bank account and holder a virtual account is issued
+	// under, and the two optional spellings the provider's documentation decides
+	// — while the verifier holds the signing secret. That is why the constructor
+	// below is handed the first and not the second: the webhook path's verifier
+	// is composed by the seam that serves it, and no single function here holds
+	// both credentials.
+	provider := paymentprovideradapter.New(cfg.APIBaseURL, cfg.APIToken, paymentprovideradapter.OrderSettings{
+		BankAccountXID: cfg.BankAccountXID,
+		VAHolderName:   cfg.VAHolderName,
+		TID:            cfg.TID,
+		VAPrefix:       cfg.VAPrefix,
+		QRCodeTemplate: cfg.QRCodeTemplate,
+	}, cfg.RequestTimeout)
 
 	return application.NewPayments(
 		store,
@@ -970,7 +980,6 @@ func buildPaymentsSurface(store persistence.Store, accountingUseCases *applicati
 		application.PaymentsSettings{
 			Provider:           cfg.Provider,
 			ProviderAccountKey: cfg.ProviderAccountKey,
-			CheckoutReturnURL:  cfg.CheckoutReturnURL,
 		},
 	), nil
 }

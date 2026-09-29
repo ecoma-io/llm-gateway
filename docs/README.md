@@ -27,6 +27,7 @@ that is not recorded as an ADR has not been made.
 | [0011](adr/0011-reaper-and-reconciliation.md)                 | The reaper and the reconciliation pass — a second door into an ending, and a second look at what the Control Plane derived |
 | [0012](adr/0012-management-console.md)                        | The management console — its surface, its read model, and what it does not have                                            |
 | [0013](adr/0013-payment-integration.md)                       | Payment integration — what has financial authority, and what merely has a browser                                          |
+| [0014](adr/0014-sepay-bank-transfer.md)                       | Payment integration, revised — the bank-transfer instrument and the destination that is the key                            |
 
 ## Architecture pages
 
@@ -62,3 +63,18 @@ and the serving domains are still design.
 
 These pages link; they do not restate. Where a page and an ADR disagree, the
 ADR wins and the page is wrong.
+
+## Operations
+
+Runbooks for what an operator does to a deployment rather than to its code —
+written to be followed in one direction, from an empty account to a verified
+end-to-end payment, with each refusal the step can produce explained beside the
+step that produces it. They describe the deployment as it ships; where a
+runbook and an ADR disagree about what the system does, the ADR is right and
+the runbook is a defect.
+
+- [SePay onboarding and sandbox testing](operations/sepay-onboarding.md) —
+  registering the merchant account, minting the API token, wiring the webhook,
+  mapping the `CONSOLE_API_PAYMENTS_*` variables, reproducing a real transfer in
+  SePay's own sandbox, and reading a rejected delivery or a quarantine row when
+  one appears.

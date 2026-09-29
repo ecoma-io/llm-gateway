@@ -37,9 +37,8 @@ import (
 const (
 	paymentsAccountID    = "11111111-1111-4111-8111-111111111111"
 	paymentsAccount2ID   = "22222222-2222-4222-8222-222222222222"
-	paymentsProviderName = "stripe"
-	paymentsMerchant     = "acct_merchant_1"
-	paymentsReturnURL    = "https://console.example/payments/return"
+	paymentsProviderName = "sepay"
+	paymentsMerchant     = "merchant_1"
 )
 
 // paymentsNow is the instant every payments test's clock reads, so a failure
@@ -56,7 +55,7 @@ var (
 	// errPaymentsProviderRefused is the other class: the provider answered, and
 	// answered that it will not do this. No retry supplies what it refused, so
 	// the application must not report it as an outage.
-	errPaymentsProviderRefused = errors.New("fakes: the provider refused the checkout")
+	errPaymentsProviderRefused = errors.New("fakes: the provider refused the transfer")
 	errPaymentsLedgerDown      = errors.New("fakes: the ledger refused the leg")
 )
 
@@ -71,7 +70,7 @@ type paymentsWorld struct {
 
 	intents          map[payments.IntentID]payments.Intent
 	intentByKey      map[string]payments.IntentID
-	intentByCheckout map[string]payments.IntentID
+	intentByTransfer map[string]payments.IntentID
 	intentByPayment  map[string]payments.IntentID
 
 	events      map[string]payments.ProviderEventRecord
@@ -86,10 +85,12 @@ type paymentsWorld struct {
 	offers   []TopUpOffer
 	settings PaymentsSettings
 
-	// The provider's stand-in.
-	providerSession paymentprovider.CheckoutSession
-	providerCalls   []paymentprovider.CheckoutRequest
-	providerErr     error
+	// The provider's stand-in. providerInstructions is the answer it gives when
+	// it is asked for a destination; providerCalls is every request it was
+	// asked, in order.
+	providerInstructions paymentprovider.TransferInstructions
+	providerCalls        []paymentprovider.TransferRequest
+	providerErr          error
 	// onProviderCall runs while the provider is "answering", which is how a
 	// test lands another writer's commit in the window between the call and the
 	// recording of its answer.
@@ -124,7 +125,7 @@ type paymentsWorld struct {
 type paymentsSnapshot struct {
 	intents          map[payments.IntentID]payments.Intent
 	intentByKey      map[string]payments.IntentID
-	intentByCheckout map[string]payments.IntentID
+	intentByTransfer map[string]payments.IntentID
 	intentByPayment  map[string]payments.IntentID
 	events           map[string]payments.ProviderEventRecord
 	quarantines      []payments.QuarantineRecord
@@ -138,7 +139,7 @@ func newPaymentsWorld(t *testing.T) *paymentsWorld {
 	w := &paymentsWorld{
 		intents:          map[payments.IntentID]payments.Intent{},
 		intentByKey:      map[string]payments.IntentID{},
-		intentByCheckout: map[string]payments.IntentID{},
+		intentByTransfer: map[string]payments.IntentID{},
 		intentByPayment:  map[string]payments.IntentID{},
 		events:           map[string]payments.ProviderEventRecord{},
 		accounts:         map[identity.AccountID]identity.Account{},
@@ -155,11 +156,15 @@ func newPaymentsWorld(t *testing.T) *paymentsWorld {
 		settings: PaymentsSettings{
 			Provider:           paymentsProviderName,
 			ProviderAccountKey: paymentsMerchant,
-			CheckoutReturnURL:  paymentsReturnURL,
 		},
-		providerSession: paymentprovider.CheckoutSession{
-			URL:         "https://pay.example/checkout/session_1",
-			ProviderRef: "cs_1",
+		// The destination the stand-in provider issues: a code, the bank it
+		// sits at, the name it is held in and an image of the transfer. The
+		// strings are the provider's to choose and this world only carries them.
+		providerInstructions: paymentprovider.TransferInstructions{
+			TransferCode:  "dest_1",
+			BankName:      "Vietcombank",
+			AccountHolder: "ACME CO",
+			QRURL:         "https://qr.example/dest_1",
 		},
 		failOn: map[string]error{},
 	}
@@ -180,7 +185,7 @@ func newPayments(w *paymentsWorld) *Payments {
 		fakeBucketReader{world: w},
 		fakeAccountFunding{world: w},
 		fakeTopUpWriter{world: w},
-		fakeCheckoutProvider{world: w},
+		fakeTransferProvider{world: w},
 		NewTopUpCatalogue(w.offers),
 		w.settings,
 	)
@@ -198,8 +203,8 @@ func (w *paymentsWorld) put(intent payments.Intent) {
 	if intent.IdempotencyKey != "" {
 		w.intentByKey[paymentsKey(intent.AccountID, intent.IdempotencyKey)] = intent.ID
 	}
-	if intent.ProviderCheckoutRef != "" {
-		w.intentByCheckout[paymentsProviderKey(intent.Provider, intent.ProviderCheckoutRef)] = intent.ID
+	if intent.ProviderTransferRef != "" {
+		w.intentByTransfer[paymentsProviderKey(intent.Provider, intent.ProviderTransferRef)] = intent.ID
 	}
 	if intent.ProviderPaymentRef != "" {
 		w.intentByPayment[paymentsProviderKey(intent.Provider, intent.ProviderPaymentRef)] = intent.ID
@@ -232,7 +237,7 @@ func (w *paymentsWorld) snapshot() paymentsSnapshot {
 	return paymentsSnapshot{
 		intents:          copyIntentMap(w.intents),
 		intentByKey:      copyIDIndex(w.intentByKey),
-		intentByCheckout: copyIDIndex(w.intentByCheckout),
+		intentByTransfer: copyIDIndex(w.intentByTransfer),
 		intentByPayment:  copyIDIndex(w.intentByPayment),
 		events:           copyEventMap(w.events),
 		quarantines:      append([]payments.QuarantineRecord(nil), w.quarantines...),
@@ -244,7 +249,7 @@ func (w *paymentsWorld) snapshot() paymentsSnapshot {
 
 func (w *paymentsWorld) restore(s paymentsSnapshot) {
 	w.intents, w.intentByKey = s.intents, s.intentByKey
-	w.intentByCheckout, w.intentByPayment = s.intentByCheckout, s.intentByPayment
+	w.intentByTransfer, w.intentByPayment = s.intentByTransfer, s.intentByPayment
 	w.events, w.quarantines = s.events, s.quarantines
 	w.buckets, w.bucketByAccount, w.legs = s.buckets, s.bucketByAccount, s.legs
 }
@@ -275,6 +280,12 @@ func (w *paymentsWorld) seedFunding(t *testing.T, accountID string) accounting.B
 // seedIntent writes a payment directly, for the tests that start from a state
 // the use cases would have reached later. It is a struct literal rather than a
 // constructor because the interesting fixtures are states New refuses to build.
+//
+// The default is a payment that has been given its destination: that is the
+// state a delivery resolves against, and it is the state every capture and
+// refund test starts from. The destination is the same one the stand-in
+// provider would have issued, so a fixture and a run through the use cases
+// describe the same world.
 func (w *paymentsWorld) seedIntent(t *testing.T, tweak func(*payments.Intent)) payments.Intent {
 	t.Helper()
 	bucketID := accounting.FundingBucketID("bucket-" + paymentsAccountID)
@@ -282,19 +293,22 @@ func (w *paymentsWorld) seedIntent(t *testing.T, tweak func(*payments.Intent)) p
 		w.seedFunding(t, paymentsAccountID)
 	}
 	intent := payments.Intent{
-		ID:                  payments.IntentID(fmt.Sprintf("33333333-3333-4333-8333-%012d", len(w.intents)+1)),
-		AccountID:           paymentsAccountID,
-		FundingBucketID:     string(bucketID),
-		AmountMinorUnits:    1000,
-		Currency:            "USD",
-		MinorUnitExponent:   2,
-		Provider:            paymentsProviderName,
-		ProviderCheckoutRef: "cs_1",
-		IdempotencyKey:      fmt.Sprintf("idem-%d", len(w.intents)+1),
-		Status:              payments.StatusCheckoutOpen,
-		CreatedAt:           w.now,
-		UpdatedAt:           w.now,
-		ExpiresAt:           w.now.Add(30 * time.Minute),
+		ID:                    payments.IntentID(fmt.Sprintf("33333333-3333-4333-8333-%012d", len(w.intents)+1)),
+		AccountID:             paymentsAccountID,
+		FundingBucketID:       string(bucketID),
+		AmountMinorUnits:      1000,
+		Currency:              "USD",
+		MinorUnitExponent:     2,
+		Provider:              paymentsProviderName,
+		ProviderTransferRef:   w.providerInstructions.TransferCode,
+		ProviderBankName:      w.providerInstructions.BankName,
+		ProviderAccountHolder: w.providerInstructions.AccountHolder,
+		ProviderQRURL:         w.providerInstructions.QRURL,
+		IdempotencyKey:        fmt.Sprintf("idem-%d", len(w.intents)+1),
+		Status:                payments.StatusAwaitingTransfer,
+		CreatedAt:             w.now,
+		UpdatedAt:             w.now,
+		ExpiresAt:             w.now.Add(30 * time.Minute),
 	}
 	if tweak != nil {
 		tweak(&intent)
@@ -348,16 +362,16 @@ func (w *paymentsWorld) eventRecord(eventID string) (payments.ProviderEventRecor
 // delivery builds a verified delivery the way a transport would hand one over:
 // a normalised event beside the bytes it was verified over.
 //
-// checkoutRef is the session this platform opened and paymentRef is the
+// transferRef is the destination this platform recorded and paymentRef is the
 // provider's id for the money. Either may be empty, and which of the two a
 // delivery carries is the whole difference between a capture and a refund: a
 // capture states both and a refund states only the payment.
-func (w *paymentsWorld) delivery(eventID, kind, checkoutRef, paymentRef string, amount int64, currency string) ProviderDelivery {
+func (w *paymentsWorld) delivery(eventID, kind, transferRef, paymentRef string, amount int64, currency string) ProviderDelivery {
 	return ProviderDelivery{
 		Event: paymentprovider.ProviderEvent{
 			Kind:             kind,
 			EventID:          eventID,
-			CheckoutRef:      checkoutRef,
+			TransferRef:      transferRef,
 			PaymentRef:       paymentRef,
 			AmountMinorUnits: &amount,
 			Currency:         currency,
@@ -369,12 +383,12 @@ func (w *paymentsWorld) delivery(eventID, kind, checkoutRef, paymentRef string, 
 
 // noAmountDelivery is a delivery that states no amount at all, for the paths
 // whose refusal is about an absent figure rather than a wrong one.
-func (w *paymentsWorld) noAmountDelivery(eventID, kind, checkoutRef, paymentRef, currency string) ProviderDelivery {
+func (w *paymentsWorld) noAmountDelivery(eventID, kind, transferRef, paymentRef, currency string) ProviderDelivery {
 	return ProviderDelivery{
 		Event: paymentprovider.ProviderEvent{
 			Kind:        kind,
 			EventID:     eventID,
-			CheckoutRef: checkoutRef,
+			TransferRef: transferRef,
 			PaymentRef:  paymentRef,
 			Currency:    currency,
 			OccurredAt:  w.now,
@@ -502,11 +516,11 @@ func (f fakePaymentIntents) ByAccountAndIdempotencyKey(_ context.Context, accoun
 
 // The two provider-reference lookups record WHICH one was asked, because the
 // order between them is a decision: a capture carries both references and must
-// resolve through the checkout this platform wrote, while a refund carries only
-// the payment and has no other route.
-func (f fakePaymentIntents) ByProviderCheckoutRef(_ context.Context, provider, ref string) (payments.Intent, error) {
-	f.world.resolveLookups = append(f.world.resolveLookups, "checkout:"+ref)
-	id, ok := f.world.intentByCheckout[paymentsProviderKey(provider, ref)]
+// resolve through the destination this platform wrote down, while a refund
+// carries only the payment and has no other route.
+func (f fakePaymentIntents) ByProviderTransferRef(_ context.Context, provider, ref string) (payments.Intent, error) {
+	f.world.resolveLookups = append(f.world.resolveLookups, "transfer:"+ref)
+	id, ok := f.world.intentByTransfer[paymentsProviderKey(provider, ref)]
 	if !ok {
 		return payments.Intent{}, persistence.ErrNotFound
 	}
@@ -522,12 +536,12 @@ func (f fakePaymentIntents) ByProviderPaymentRef(_ context.Context, provider, re
 	return f.world.intents[id], nil
 }
 
-// RecordCheckout is the compare-and-swap on status and state version together:
+// RecordTransfer is the compare-and-swap on status and state version together:
 // a row that has moved under the caller's feet matches nothing and answers
-// false, and the caller's reference is NOT written.
-func (f fakePaymentIntents) RecordCheckout(_ context.Context, id payments.IntentID, checkout payments.OpenedCheckout, from []payments.Status, now time.Time) (bool, error) {
+// false, and the caller's destination is NOT written.
+func (f fakePaymentIntents) RecordTransfer(_ context.Context, id payments.IntentID, transfer payments.TransferInstructions, from []payments.Status, now time.Time) (bool, error) {
 	w := f.world
-	w.record("record-checkout")
+	w.record("record-transfer")
 	intent, ok := w.intents[id]
 	if !ok {
 		return false, persistence.ErrNotFound
@@ -535,13 +549,38 @@ func (f fakePaymentIntents) RecordCheckout(_ context.Context, id payments.Intent
 	if !hasPaymentsStatus(from, intent.Status) {
 		return false, nil
 	}
-	intent.ProviderCheckoutRef = checkout.ProviderRef
-	intent.CheckoutURL = checkout.URL
-	intent.Status = payments.StatusCheckoutOpen
+	intent.ProviderTransferRef = transfer.TransferCode
+	intent.ProviderBankName = transfer.BankName
+	intent.ProviderAccountHolder = transfer.AccountHolder
+	intent.ProviderQRURL = transfer.QRURL
+	intent.Status = payments.StatusAwaitingTransfer
 	intent.UpdatedAt = now
 	intent.StateVersion++
 	w.put(intent)
 	return true, nil
+}
+
+// MoveStatus is the same compare-and-swap with no field to write: the row must
+// still show one of the states the caller read, and it is moved to the state
+// the caller named. It is the member the abandonment path uses — a payment
+// whose provider identity was already taken moves out of `created` and stays
+// there — and the fake runs it under the same guard the adapter's statement
+// carries, so a test can see both the move and a lost race.
+func (f fakePaymentIntents) MoveStatus(_ context.Context, id payments.IntentID, from []payments.Status, to payments.Status, now time.Time) (payments.Intent, bool, error) {
+	w := f.world
+	w.record("move-status")
+	intent, ok := w.intents[id]
+	if !ok {
+		return payments.Intent{}, false, persistence.ErrNotFound
+	}
+	if !hasPaymentsStatus(from, intent.Status) {
+		return payments.Intent{}, false, nil
+	}
+	intent.Status = to
+	intent.UpdatedAt = now
+	intent.StateVersion++
+	w.put(intent)
+	return intent, true, nil
 }
 
 // RecordCapture records the provider's payment reference and moves the payment
@@ -865,15 +904,15 @@ func (f fakeTopUpWriter) TopUp(ctx context.Context, bucketID accounting.FundingB
 	return bucket, nil
 }
 
-// fakeCheckoutProvider is the provider's stand-in. It records the depth of the
+// fakeTransferProvider is the provider's stand-in. It records the depth of the
 // open units of work at the moment it was called and whether the context it was
 // handed was a transaction's — the two facts the "outside any unit of work"
 // property is stated against.
-type fakeCheckoutProvider struct {
+type fakeTransferProvider struct {
 	world *paymentsWorld
 }
 
-func (f fakeCheckoutProvider) OpenCheckout(ctx context.Context, in paymentprovider.CheckoutRequest) (paymentprovider.CheckoutSession, error) {
+func (f fakeTransferProvider) OpenTransfer(ctx context.Context, in paymentprovider.TransferRequest) (paymentprovider.TransferInstructions, error) {
 	w := f.world
 	w.providerCalls = append(w.providerCalls, in)
 	w.providerInTx = append(w.providerInTx, inTransaction(ctx))
@@ -883,7 +922,7 @@ func (f fakeCheckoutProvider) OpenCheckout(ctx context.Context, in paymentprovid
 		w.onProviderCall(len(w.providerCalls))
 	}
 	if w.providerErr != nil {
-		return paymentprovider.CheckoutSession{}, w.providerErr
+		return paymentprovider.TransferInstructions{}, w.providerErr
 	}
-	return w.providerSession, nil
+	return w.providerInstructions, nil
 }

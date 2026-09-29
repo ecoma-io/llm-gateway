@@ -39,10 +39,10 @@ var (
 	_ WebhookVerifier = (*fakeWebhookVerifier)(nil)
 )
 
-// checkoutCall is one BeginCheckout as it reached the seam. The three fields are
+// transferCall is one BeginTransfer as it reached the seam. The three fields are
 // the whole request, and the account is its own field because "the account came
 // from the session" is the claim this fake exists to make.
-type checkoutCall struct {
+type transferCall struct {
 	AccountID      string
 	OfferID        string
 	IdempotencyKey string
@@ -61,8 +61,8 @@ type fakePaymentUseCases struct {
 
 	// The configured answers. A zero-value fake answers nothing useful, which is
 	// why every test starts from newFakePayments.
-	checkout        PaymentIntentResult
-	checkoutErr     error
+	transfer        PaymentIntentResult
+	transferErr     error
 	appliedOutcome  WebhookOutcome
 	applyErr        error
 	paymentsPage    PaymentPageResult
@@ -71,20 +71,20 @@ type fakePaymentUseCases struct {
 	offersErr       error
 
 	// The calls received, in order.
-	checkoutCalls    []checkoutCall
+	transferCalls    []transferCall
 	applyCalls       []WebhookDelivery
 	paymentsPageCall []paymentPageCall
 	offersCallCount  int
 }
 
-func (f *fakePaymentUseCases) BeginCheckout(_ context.Context, accountID, offerID, idempotencyKey string) (PaymentIntentResult, error) {
+func (f *fakePaymentUseCases) BeginTransfer(_ context.Context, accountID, offerID, idempotencyKey string) (PaymentIntentResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.checkoutCalls = append(f.checkoutCalls, checkoutCall{AccountID: accountID, OfferID: offerID, IdempotencyKey: idempotencyKey})
-	if f.checkoutErr != nil {
-		return PaymentIntentResult{}, f.checkoutErr
+	f.transferCalls = append(f.transferCalls, transferCall{AccountID: accountID, OfferID: offerID, IdempotencyKey: idempotencyKey})
+	if f.transferErr != nil {
+		return PaymentIntentResult{}, f.transferErr
 	}
-	return f.checkout, nil
+	return f.transfer, nil
 }
 
 func (f *fakePaymentUseCases) ApplyProviderEvent(_ context.Context, delivery WebhookDelivery) (WebhookOutcome, error) {
@@ -119,10 +119,10 @@ func (f *fakePaymentUseCases) ListTopUpOffers(_ context.Context) (TopUpOfferList
 
 // The accessors copy under the lock, so a test reads a consistent list and the
 // handler goroutine never shares the slice with the assertion.
-func (f *fakePaymentUseCases) checkouts() []checkoutCall {
+func (f *fakePaymentUseCases) transfers() []transferCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]checkoutCall(nil), f.checkoutCalls...)
+	return append([]transferCall(nil), f.transferCalls...)
 }
 
 func (f *fakePaymentUseCases) deliveries() []WebhookDelivery {
@@ -175,10 +175,11 @@ func (f *fakeWebhookVerifier) verifications() []verifyCall {
 	return append([]verifyCall(nil), f.calls...)
 }
 
-// livePaymentIntent is a payment in the one state the fixture's checkout URL
-// belongs to. The amount is 500 minor units in a currency with a THOUSAND of
-// them — the shape a client would multiply out, which is the reason the exponent
-// travels beside the payment rather than being assumed.
+// livePaymentIntent is a payment in the state a customer is shown it in: a
+// destination has been recorded and the money has not yet arrived. The amount is
+// 500 minor units in a currency with a THOUSAND of them — the shape a client
+// would multiply out, which is the reason the exponent travels beside the
+// payment rather than being assumed.
 //
 // The exponent is deliberately not 2. A fixture priced in a hundred-unit
 // currency is the one a render that wrote a literal `2` would pass, and the
@@ -188,13 +189,18 @@ func (f *fakeWebhookVerifier) verifications() []verifyCall {
 func livePaymentIntent() PaymentIntentRecord {
 	return PaymentIntentRecord{
 		ID:                "44444444-4444-4444-8444-444444444444",
-		Status:            "created",
+		Status:            "awaiting_transfer",
 		AmountMinorUnits:  500,
 		Currency:          "KWD",
 		MinorUnitExponent: 3,
-		CheckoutURL:       "https://checkout.example/session/abc",
-		CreatedAt:         fixtureTime,
-		ExpiresAt:         fixtureTime,
+		TransferInstructions: &PaymentTransferInstructions{
+			TransferCode:  "va_sepay_9f2",
+			BankName:      "Vietcombank",
+			AccountHolder: "CONG TY TNHH VI DU",
+			QRURL:         "https://qr.sepay.vn/img?acc=0011002222333&des=va_sepay_9f2",
+		},
+		CreatedAt: fixtureTime,
+		ExpiresAt: fixtureTime,
 	}
 }
 
@@ -227,7 +233,7 @@ func paymentSessionAccount() string { return liveSessionResult().Principal.Accou
 
 func newFakePayments() *fakePaymentUseCases {
 	return &fakePaymentUseCases{
-		checkout:     PaymentIntentResult{Intent: livePaymentIntent()},
+		transfer:     PaymentIntentResult{Intent: livePaymentIntent()},
 		paymentsPage: PaymentPageResult{Items: []PaymentIntentRecord{livePaymentIntent()}},
 		offers:       TopUpOfferListResult{Items: liveTopUpOffers()},
 	}
@@ -236,12 +242,18 @@ func newFakePayments() *fakePaymentUseCases {
 func newFakeWebhookVerifier() *fakeWebhookVerifier {
 	amount := int64(500)
 	return &fakeWebhookVerifier{event: VerifiedEvent{
-		Kind:             "payment.succeeded",
-		EventID:          "evt-1",
-		CheckoutRef:      "cs_1",
-		PaymentRef:       "pi_1",
+		// The port's own word for money arriving, which is the only kind that
+		// funds anything: a handler that classified kinds could not tell this
+		// from a capture it had decided was something else.
+		Kind:    paymentport.KindCaptured,
+		EventID: "92704",
+		// The destination the money arrived at, and the transaction's own id.
+		// They are different fields because the application resolves each
+		// against a different stored column.
+		TransferRef:      "va_sepay_destination",
+		PaymentRef:       "92704",
 		AmountMinorUnits: &amount,
-		Currency:         "USD",
+		Currency:         "VND",
 		OccurredAt:       time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC),
 	}}
 }
@@ -261,18 +273,43 @@ func newPaymentServer(payments *fakePaymentUseCases, verifier *fakeWebhookVerifi
 		newFakeConsoleReadUseCases(), stubUsage(), PaymentSurface{
 			Payments: payments,
 			Verifier: verifier,
-			Provider: "stripe",
+			Provider: "sepay",
 		})
 }
 
+// The provider's two header names, spelled as the handler's own header map
+// carries them.
+//
+// The wire spelling is `X-SePay-Signature`, and net/http canonicalises header
+// keys on the way in — `CanonicalMIMEHeaderKey` upper-cases only the first
+// letter of each dash-separated word, so the provider's capital P arrives as
+// `X-Sepay-Signature`. Nothing depends on which spelling a reader calls the
+// name: the scheme is case-insensitive, and the verifier matches the header it
+// is looking for with a fold. These constants are the spelling the map holds,
+// written out rather than canonicalised at run time so that a change to either
+// name is visible in the test that pins it.
+const (
+	sepaySignatureHeader = "X-Sepay-Signature"
+	sepayTimestampHeader = "X-Sepay-Timestamp"
+)
+
 // webhookRequest is one provider delivery as a provider's server sends it: no
-// cookie, no Origin, no CSRF token, a JSON content type and a signature header.
-// That absence is the point — the route's class says a browser's guards must not
-// be applied to it, and this is the shape that proves they are not.
+// cookie, no Origin, no CSRF token, a JSON content type and BOTH of the
+// provider's headers. That absence is the point — the route's class says a
+// browser's guards must not be applied to it, and this is the shape that proves
+// they are not.
+//
+// The two headers are the scheme rather than decoration: the signature is
+// computed over the timestamp and the body together, so a request carrying one
+// without the other is one this endpoint cannot authenticate at all. The fixture
+// carries both, and the values are deliberately not a signature over this body —
+// this is a fake verifier's request, and the real scheme's arithmetic is
+// exercised in the adapter's own tests and at the composition root.
 func webhookRequest(body string) *stdhttp.Request {
-	req := httptest.NewRequest(stdhttp.MethodPost, "/payment-webhooks/stripe", strings.NewReader(body))
+	req := httptest.NewRequest(stdhttp.MethodPost, "/payment-webhooks/sepay", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Payment-Signature", "t=1759000000,v1=deadbeef")
+	req.Header.Set(sepaySignatureHeader, "sha256=deadbeef")
+	req.Header.Set(sepayTimestampHeader, "1759000000")
 	req.Header.Set(RequestIDHeader, "webhook-request")
 	return req
 }
@@ -297,6 +334,14 @@ func captureLog(t *testing.T, run func()) string {
 	run()
 	return captured.String()
 }
+
+// theProviderAcceptsThisBody is the acknowledgement the provider's own
+// documentation requires, and it is spelled here as its own raw string rather
+// than read from the production constant. The two are the same bytes today, and
+// a test that took the constant's word for it could not see the constant change:
+// the space after the colon is part of a third party's contract, so the byte
+// string is asserted from outside the implementation that writes it.
+const theProviderAcceptsThisBody = `{"success": true}`
 
 // errorCode reads the envelope's code, which is the part of a refusal a client
 // branches on and the part these tests assert. The message is asserted where the
@@ -407,8 +452,14 @@ func TestTheWebhookAcknowledgesAnUnreadableDeliveryWithoutWritingAnything(t *tes
 	if rec.Code != stdhttp.StatusOK {
 		t.Fatalf("status = %d, want 200; a 4xx here would put a permanent refusal into the provider's retry budget (body %q)", rec.Code, rec.Body.String())
 	}
-	if got := rec.Body.String(); got != "{\"received\":true}\n" {
-		t.Errorf("body = %q, want the same acknowledgement every 2xx carries", got)
+	if got := rec.Body.String(); got != theProviderAcceptsThisBody {
+		t.Errorf("body = %q, want %q byte for byte; the provider accepts a delivery only on that exact body, and `encoding/json` would have emitted the same document without the space", got, theProviderAcceptsThisBody)
+	}
+	// The body is written as literal bytes rather than marshalled, and the type
+	// is still the one every other response declares: a provider that checked it
+	// would be reading a refusal from a JSON document.
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json; the encoding is the only thing about this response the contract fixes, so the one exception to this surface's JSON discipline may not change anything else", got)
 	}
 	if got := len(payments.deliveries()); got != 0 {
 		t.Errorf("the application was handed %d deliveries for a body with no readable event id; want none", got)
@@ -450,8 +501,8 @@ func TestEveryDispositionOfARecordedDeliveryAnswersOneIdenticalBody(t *testing.T
 	}
 
 	for disposition, body := range bodies {
-		if body != "{\"received\":true}\n" {
-			t.Errorf("%s: body = %q, want one identical acknowledgement for every outcome", disposition, body)
+		if body != theProviderAcceptsThisBody {
+			t.Errorf("%s: body = %q, want %q — one identical acknowledgement for every outcome", disposition, body, theProviderAcceptsThisBody)
 		}
 		for _, other := range outcomes {
 			if other.Disposition == disposition {
@@ -551,7 +602,7 @@ func TestTheWebhookVerifiesAndForwardsTheSameBytes(t *testing.T) {
 	if &verified[0].RawBody[0] != &delivered[0].RawBody[0] {
 		t.Errorf("the bytes that were verified and the bytes that were interpreted are different slices; the application re-read or re-encoded the message")
 	}
-	if got := delivered[0].Event.EventID; got != "evt-1" {
+	if got := delivered[0].Event.EventID; got != "92704" {
 		t.Errorf("the event that reached the application carries the id %q, want the verifier's answer", got)
 	}
 }
@@ -655,7 +706,7 @@ func TestTheWebhookRequiresABodyThatCanBeJSON(t *testing.T) {
 		{"", true}, // a delivery that declared nothing declared nothing wrong
 		{"application/json", true},
 		{"application/json; charset=utf-8", true},
-		{"application/vnd.stripe+json", true},
+		{"application/vnd.sepay+json", true},
 		{"text/plain", false},
 		{"text/html", false},
 		{"; charset=utf-8", false},
@@ -734,18 +785,22 @@ func TestTheWebhookReadsEveryDeclaredContentTypeAndNotOnlyTheFirst(t *testing.T)
 	}
 }
 
-// TestTheWebhookHandsTheVerifierEveryHeaderValue is what makes "the signature
-// header appears twice is a refusal" implementable at all.
+// TestTheWebhookHandsTheVerifierEveryHeaderValue is what makes "a header
+// appearing twice is a refusal" implementable at all, for BOTH of this
+// provider's headers.
 //
 // A verifier handed a single joined string could not tell one header from two,
 // and accepting "the first of several" is how a smuggled value wins. The whole
 // map travels, multiplicity intact, and the copy the handler makes is what keeps
-// a verifier from editing live request state.
+// a verifier from editing live request state. The timestamp is asserted as well
+// as the signature because it is half of what was signed: a layer that passed
+// one through and defaulted or dropped the other would leave the verifier unable
+// to say which instant these bytes authenticated.
 func TestTheWebhookHandsTheVerifierEveryHeaderValue(t *testing.T) {
 	payments := newFakePayments()
 	verifier := newFakeWebhookVerifier()
 	req := webhookRequest(`{"id":"evt-1"}`)
-	req.Header.Add("X-Payment-Signature", "t=1759000000,v1=second")
+	req.Header.Add(sepaySignatureHeader, "sha256=cafebabe")
 
 	deliver(newPaymentServer(payments, verifier), req)
 
@@ -753,12 +808,19 @@ func TestTheWebhookHandsTheVerifierEveryHeaderValue(t *testing.T) {
 	if len(verifications) != 1 {
 		t.Fatalf("the verifier was asked %d times, want once", len(verifications))
 	}
-	got := verifications[0].Headers["X-Payment-Signature"]
+	got := verifications[0].Headers[sepaySignatureHeader]
 	if len(got) != 2 {
 		t.Fatalf("the verifier saw %d values for the signature header, want 2; a repeated signature is a refusal and the verifier is the only layer that can see it", len(got))
 	}
-	if got[0] != "t=1759000000,v1=deadbeef" || got[1] != "t=1759000000,v1=second" {
+	if got[0] != "sha256=deadbeef" || got[1] != "sha256=cafebabe" {
 		t.Errorf("the verifier saw %q, want both values in order", got)
+	}
+	// And the SECOND header travels too, unmodified and un-defaulted: the
+	// signature is computed over this instant, so a layer that supplied one of
+	// its own would be authenticating a pair that never existed. Both are read
+	// by the verifier and neither is manufactured here.
+	if stamp := verifications[0].Headers[sepayTimestampHeader]; len(stamp) != 1 || stamp[0] != "1759000000" {
+		t.Errorf("the verifier saw the timestamp header as %q, want the one value the delivery arrived with", stamp)
 	}
 }
 
@@ -809,13 +871,13 @@ func TestTheWebhookIsNotABrowserOperation(t *testing.T) {
 	}
 }
 
-// TestBeginCheckoutTakesTheAccountFromTheSession is ADR 0012 §2 as a signature.
+// TestBeginTransferTakesTheAccountFromTheSession is ADR 0012 §2 as a signature.
 //
 // The request names another account in its query and in a body field, and the
 // assertion is about what reached the use case: the session's account. A payment
 // is money, and "which account funds itself" is the last question a browser
 // should be able to answer about one.
-func TestBeginCheckoutTakesTheAccountFromTheSession(t *testing.T) {
+func TestBeginTransferTakesTheAccountFromTheSession(t *testing.T) {
 	payments := newFakePayments()
 	handler := newPaymentServer(payments, newFakeWebhookVerifier())
 	foreign := "99999999-9999-4999-8999-999999999999"
@@ -828,7 +890,7 @@ func TestBeginCheckoutTakesTheAccountFromTheSession(t *testing.T) {
 	if rec.Code != stdhttp.StatusCreated {
 		t.Fatalf("status = %d, want 201 (body %q)", rec.Code, rec.Body.String())
 	}
-	calls := payments.checkouts()
+	calls := payments.transfers()
 	if len(calls) != 1 {
 		t.Fatalf("the use case was called %d times, want once", len(calls))
 	}
@@ -844,16 +906,17 @@ func TestBeginCheckoutTakesTheAccountFromTheSession(t *testing.T) {
 	}
 }
 
-// TestBeginCheckoutRendersThePaymentAndConverges asserts the wire shape on both
+// TestBeginTransferRendersThePaymentAndConverges asserts the wire shape on both
 // halves of the 201: the first call and the converged repeat are the same
 // response.
 //
 // A repeat that rendered "this already existed" differently would be the first
 // place a page could branch on which of the two happened — and the contract
 // states that a converged answer may carry a payment in a LATER state, so a
-// client that rendered a checkout link from the first call's answer would be
-// sending a customer to pay for something they already paid for.
-func TestBeginCheckoutRendersThePaymentAndConverges(t *testing.T) {
+// client that rendered the first call's transfer instructions as the thing to
+// pay into would be showing a customer an account their money has already
+// reached.
+func TestBeginTransferRendersThePaymentAndConverges(t *testing.T) {
 	payments := newFakePayments()
 	handler := newPaymentServer(payments, newFakeWebhookVerifier())
 
@@ -863,7 +926,7 @@ func TestBeginCheckoutRendersThePaymentAndConverges(t *testing.T) {
 	}
 
 	payments.mu.Lock()
-	payments.checkout = PaymentIntentResult{Intent: livePaymentIntent(), Converged: true}
+	payments.transfer = PaymentIntentResult{Intent: livePaymentIntent(), Converged: true}
 	payments.mu.Unlock()
 
 	repeat := callOn(handler, stdhttp.MethodPost, "/payment-intents", `{"offer":"starter","idempotency_key":"topup-1"}`, requestOptions{})
@@ -876,12 +939,12 @@ func TestBeginCheckoutRendersThePaymentAndConverges(t *testing.T) {
 	}
 
 	body := decode(t, first)
-	want := []string{"amount_minor_units", "checkout_url", "created_at", "currency", "expires_at", "id", "minor_unit_exponent", "status"}
+	want := []string{"amount_minor_units", "created_at", "currency", "expires_at", "id", "minor_unit_exponent", "status", "transfer_instructions"}
 	got := topLevelKeys(body)
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("the payment carries %v, want exactly %v", got, want)
 	}
-	if body["status"] != "created" {
+	if body["status"] != "awaiting_transfer" {
 		t.Errorf("status = %#v, want the state the application recorded", body["status"])
 	}
 	// The exponent crosses untouched, and the fixture's is 3 rather than the
@@ -892,31 +955,53 @@ func TestBeginCheckoutRendersThePaymentAndConverges(t *testing.T) {
 		t.Errorf("minor_unit_exponent = %#v, want 3; the amount is integer minor units and this is the only thing that says how many of them make one unit",
 			body["minor_unit_exponent"])
 	}
-	if body["checkout_url"] != "https://checkout.example/session/abc" {
-		t.Errorf("checkout_url = %#v, want the URL the application stored", body["checkout_url"])
+
+	// The destination is an OBJECT on the wire, not a flat set of fields and not
+	// a string: a customer is given four things to act on — the code a bank
+	// statement will carry, the bank, the holder and an image — and a render that
+	// flattened them, or that dropped the image because it is the only one that
+	// can be absent, would be answering a payment with instructions to transfer
+	// money that name nowhere to send it.
+	instructions, ok := body["transfer_instructions"].(map[string]any)
+	if !ok {
+		t.Fatalf("transfer_instructions = %#v, want the destination object the application recorded", body["transfer_instructions"])
+	}
+	nested := []string{"account_holder", "bank_name", "qr_url", "transfer_code"}
+	if got := topLevelKeys(instructions); strings.Join(got, ",") != strings.Join(nested, ",") {
+		t.Errorf("the destination carries %v, want exactly %v", got, nested)
+	}
+	if instructions["transfer_code"] != "va_sepay_9f2" {
+		t.Errorf("transfer_code = %#v, want the provider's identifier for the destination", instructions["transfer_code"])
+	}
+	if instructions["bank_name"] != "Vietcombank" || instructions["account_holder"] != "CONG TY TNHH VI DU" {
+		t.Errorf("bank details = %#v / %#v, want the provider's own words for where the money goes", instructions["bank_name"], instructions["account_holder"])
+	}
+	if instructions["qr_url"] != "https://qr.sepay.vn/img?acc=0011002222333&des=va_sepay_9f2" {
+		t.Errorf("qr_url = %#v, want the provider's image verbatim: this layer does not parse, rewrite or fetch it", instructions["qr_url"])
 	}
 
-	// And the pair: a payment with no checkout yet renders an explicit null
-	// rather than an empty string. The schema types the field `[string, "null"]`
-	// and null is the value of a payment whose checkout does not exist — the two
-	// are different values on the wire and a client acts differently on them.
+	// And the pair: a payment with no recorded destination renders an explicit
+	// null rather than an empty object. The schema types the field as the object
+	// OR null, and null is the value of a payment whose destination does not
+	// exist yet — the two are different values on the wire and a client acts
+	// differently on them.
 	payments.mu.Lock()
 	absent := livePaymentIntent()
-	absent.CheckoutURL = ""
-	payments.checkout = PaymentIntentResult{Intent: absent}
+	absent.TransferInstructions = nil
+	payments.transfer = PaymentIntentResult{Intent: absent}
 	payments.mu.Unlock()
 
 	fresh := callOn(handler, stdhttp.MethodPost, "/payment-intents", `{"offer":"starter","idempotency_key":"topup-2"}`, requestOptions{})
-	if value, present := decode(t, fresh)["checkout_url"]; !present || value != nil {
-		t.Errorf("a payment with no checkout answered checkout_url = %#v, want an explicit null", value)
+	if value, present := decode(t, fresh)["transfer_instructions"]; !present || value != nil {
+		t.Errorf("a payment with no recorded destination answered transfer_instructions = %#v, want an explicit null", value)
 	}
 }
 
-// TestBeginCheckoutIsGuardedLikeEveryOtherBrowserWrite asserts the derived guard
+// TestBeginTransferIsGuardedLikeEveryOtherBrowserWrite asserts the derived guard
 // reaches the new write. The row is a POST and inherits the origin, content-type
 // and double-submit guards by existing; this is the request that would otherwise
 // open payments against a victim's account from a cross-origin page.
-func TestBeginCheckoutIsGuardedLikeEveryOtherBrowserWrite(t *testing.T) {
+func TestBeginTransferIsGuardedLikeEveryOtherBrowserWrite(t *testing.T) {
 	payments := newFakePayments()
 	handler := newPaymentServer(payments, newFakeWebhookVerifier())
 	const body = `{"offer":"starter","idempotency_key":"topup-1"}`
@@ -925,7 +1010,7 @@ func TestBeginCheckoutIsGuardedLikeEveryOtherBrowserWrite(t *testing.T) {
 	if rec.Code != stdhttp.StatusForbidden {
 		t.Fatalf("a cross-site top-up answered %d, want 403 (body %q)", rec.Code, rec.Body.String())
 	}
-	if got := len(payments.checkouts()); got != 0 {
+	if got := len(payments.transfers()); got != 0 {
 		t.Errorf("a cross-site top-up reached the use case %d times; want none", got)
 	}
 
@@ -937,7 +1022,7 @@ func TestBeginCheckoutIsGuardedLikeEveryOtherBrowserWrite(t *testing.T) {
 	}
 }
 
-// TestBeginCheckoutRefusesWhatTheTransportCannotReadAndNothingMore pins the
+// TestBeginTransferRefusesWhatTheTransportCannotReadAndNothingMore pins the
 // boundary of this layer's judgement.
 //
 // An offer's vocabulary is the deployment's configuration and an idempotency
@@ -945,7 +1030,7 @@ func TestBeginCheckoutIsGuardedLikeEveryOtherBrowserWrite(t *testing.T) {
 // the layer that knows what either should have been is the layer that refuses,
 // with a message naming it. A body that is not a well-formed JSON object is the
 // transport's own refusal, and it never reaches the use case.
-func TestBeginCheckoutRefusesWhatTheTransportCannotReadAndNothingMore(t *testing.T) {
+func TestBeginTransferRefusesWhatTheTransportCannotReadAndNothingMore(t *testing.T) {
 	payments := newFakePayments()
 	handler := newPaymentServer(payments, newFakeWebhookVerifier())
 
@@ -953,14 +1038,14 @@ func TestBeginCheckoutRefusesWhatTheTransportCannotReadAndNothingMore(t *testing
 	if rec.Code != stdhttp.StatusBadRequest {
 		t.Fatalf("a malformed body answered %d, want 400 (body %q)", rec.Code, rec.Body.String())
 	}
-	if got := len(payments.checkouts()); got != 0 {
+	if got := len(payments.transfers()); got != 0 {
 		t.Errorf("a malformed body reached the use case %d times; want none", got)
 	}
 
 	if rec := callOn(handler, stdhttp.MethodPost, "/payment-intents", `{}`, requestOptions{}); rec.Code != stdhttp.StatusCreated {
 		t.Fatalf("an empty top-up request answered %d, want 201; the transport does not validate the offer's vocabulary or the key's meaning (body %q)", rec.Code, rec.Body.String())
 	}
-	calls := payments.checkouts()
+	calls := payments.transfers()
 	if len(calls) != 1 {
 		t.Fatalf("the use case was called %d times, want exactly once — only the well-formed empty body reached it", len(calls))
 	}
@@ -1317,10 +1402,10 @@ func TestAnUnwiredPaymentSurfaceFailsClosed(t *testing.T) {
 		body    string
 		webhook bool
 	}{
-		{name: "begin a checkout", method: stdhttp.MethodPost, path: "/payment-intents", body: `{"offer":"starter","idempotency_key":"topup-1"}`},
+		{name: "begin a top-up", method: stdhttp.MethodPost, path: "/payment-intents", body: `{"offer":"starter","idempotency_key":"topup-1"}`},
 		{name: "list the payments", method: stdhttp.MethodGet, path: "/payment-intents"},
 		{name: "list the offers", method: stdhttp.MethodGet, path: "/top-up-offers"},
-		{name: "receive a delivery", method: stdhttp.MethodPost, path: "/payment-webhooks/stripe", body: `{"id":"evt-1"}`, webhook: true},
+		{name: "receive a delivery", method: stdhttp.MethodPost, path: "/payment-webhooks/sepay", body: `{"id":"evt-1"}`, webhook: true},
 	}
 
 	for _, tc := range cases {
@@ -1350,10 +1435,11 @@ func TestAnUnwiredPaymentSurfaceFailsClosed(t *testing.T) {
 // TestNewRefusesAPaymentSurfaceThatIsNotExactlyOneCompletePair is the
 // constructor's own refusal, and it is the moment the missing half is diagnosed.
 //
-// A process that can open payments but cannot verify a delivery would create
-// checkouts it can never settle — a customer pays and nothing records it — so
-// the two halves travel together and either one alone is refused here, where the
-// stack names the wiring, rather than in a request goroutine.
+// A process that can open payments but cannot verify a delivery would tell
+// customers to transfer money into an account it could never confirm they paid
+// — the money arrives and nothing records it — so the two halves travel together
+// and either one alone is refused here, where the stack names the wiring, rather
+// than in a request goroutine.
 func TestNewRefusesAPaymentSurfaceThatIsNotExactlyOneCompletePair(t *testing.T) {
 	cases := []struct {
 		name     string
